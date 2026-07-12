@@ -1,0 +1,43 @@
+"""Compile-time host contract shared by future runtime and FFI crates."""
+
+load("//bazel:rust.bzl", "nml_rust_library", "nml_rust_test")
+
+# Build settings cross the Bazel/Rust boundary as explicit cfg values. Listing
+# every accepted cfg in --check-cfg keeps `-Dwarnings` useful: a misspelled
+# backend name fails compilation instead of quietly selecting no code.
+_BACKEND_RUSTC_FLAGS = [
+    "--check-cfg=cfg(nml_cpu)",
+    "--check-cfg=cfg(nml_cuda)",
+] + select({
+    "//platforms:cpu.enabled": ["--cfg=nml_cpu"],
+    "//conditions:default": [],
+}) + select({
+    "//platforms:cuda.enabled": ["--cfg=nml_cuda"],
+    "//conditions:default": [],
+})
+
+nml_rust_library(
+    name = "nml_platform",
+    srcs = ["src/lib.rs"],
+    crate_root = "src/lib.rs",
+    rustc_flags = _BACKEND_RUSTC_FLAGS,
+    visibility = [
+        "//:__pkg__",
+        "//crates:__subpackages__",
+    ],
+)
+
+# This is a permanent contract test. It
+# guards the public host matrix that every later PJRT artifact selection relies
+# on, and therefore remains useful after the runtime is fully implemented.
+nml_rust_test(
+    name = "host_contract_test",
+    size = "small",
+    srcs = ["tests/host_contract.rs"],
+    crate_root = "tests/host_contract.rs",
+    # rustc's generated test harness expands through cfg(test). Once a target
+    # opts into explicit cfg checking, that built-in test-only name must be
+    # admitted alongside NML's backend names.
+    rustc_flags = _BACKEND_RUSTC_FLAGS + ["--check-cfg=cfg(test)"],
+    deps = [":nml_platform"],
+)

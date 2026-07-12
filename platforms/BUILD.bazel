@@ -1,0 +1,100 @@
+"""NML host identities and compiled-in PJRT backends.
+
+Host identity and backend inclusion are orthogonal. Bazel platforms describe
+OS/architecture, while independent flags decide which PJRT loaders and packages
+enter the binary. This follows ZML and permits a Linux process to retain the CPU
+reference path while also loading CUDA. Libc and GPU capability constraints
+remain with the XLA and CUDA packages that actually consume them.
+"""
+
+load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+
+exports_files(
+    ["defs.bzl"],
+    visibility = ["//bazel:__pkg__"],
+)
+
+# CPU stays enabled by default because it is NML's correctness oracle and a
+# performance backend. CUDA is opt-in until a caller requests its loader and
+# redistribution closure. The flags are independent: enabling CUDA does not
+# silently remove CPU.
+bool_flag(
+    name = "cpu",
+    build_setting_default = True,
+    visibility = ["//visibility:public"],
+)
+
+bool_flag(
+    name = "cuda",
+    build_setting_default = False,
+    visibility = ["//visibility:public"],
+)
+
+# Named config_settings keep downstream select() expressions declarative. PJRT
+# loader, packaging, profiling, and kernel targets can depend on these labels
+# without repeating string-valued flag comparisons.
+config_setting(
+    name = "cpu.enabled",
+    flag_values = {":cpu": "True"},
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "cuda.enabled",
+    flag_values = {":cuda": "True"},
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "is_linux_x86_64",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "is_linux_aarch64",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
+    name = "is_macos_aarch64",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:macos",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+platform(
+    name = "linux_x86_64",
+    constraint_values = [
+        "@platforms//cpu:x86_64",
+        "@platforms//os:linux",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+platform(
+    name = "linux_aarch64",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:linux",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+platform(
+    name = "macos_aarch64",
+    constraint_values = [
+        "@platforms//cpu:aarch64",
+        "@platforms//os:macos",
+    ],
+    visibility = ["//visibility:public"],
+)

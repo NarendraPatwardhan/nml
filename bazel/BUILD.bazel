@@ -1,0 +1,10 @@
+"""Repository-local rules that encode NML build policy."""
+
+exports_files(
+    [
+        "http_deb_archive.bzl",
+        "patchelf.bzl",
+        "rust.bzl",
+    ],
+    visibility = ["//visibility:public"],
+)

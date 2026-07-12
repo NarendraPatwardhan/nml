@@ -1,0 +1,18 @@
+"""Rust binding generator backed by NML's single lifted LLVM graph."""
+
+load("@rules_rust_bindgen//:defs.bzl", "rust_bindgen_toolchain")
+
+rust_bindgen_toolchain(
+    name = "toolchain_impl",
+    bindgen = "@rules_rust_bindgen//3rdparty:bindgen",
+    clang = "@llvm-project//clang:clang",
+    # Binding generation is a compiler action, not repository formatting.
+    default_rustfmt = False,
+    libclang = "@llvm-project//clang:libclang",
+)
+
+toolchain(
+    name = "toolchain",
+    toolchain = ":toolchain_impl",
+    toolchain_type = "@rules_rust_bindgen//:toolchain_type",
+)

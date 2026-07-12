@@ -1,0 +1,40 @@
+"""Stable repository entry points.
+
+Internal crates may be reorganized as the implementation grows. Root aliases
+give callers and verification commands durable labels without making every
+internal package part of NML's public build API.
+"""
+
+alias(
+    name = "nml_platform",
+    # Spell out the target: the package directory uses filesystem-friendly
+    # kebab case while the Rust crate and Bazel target use identifier-safe
+    # snake case.
+    actual = "//crates/nml-platform:nml_platform",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "nml_pjrt_cpu",
+    actual = "//crates/nml-pjrt-cpu:nml_pjrt_cpu",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "nml_pjrt_cuda",
+    actual = "//crates/nml-pjrt-cuda:nml_pjrt_cuda",
+    visibility = ["//visibility:public"],
+)
+
+test_suite(
+    name = "tests",
+    tests = [
+        "//crates/nml-pjrt-cuda:cuda_disabled_contract_test",
+        "//crates/nml-pjrt-cuda:cuda_package_contract_test",
+        "//crates/nml-pjrt-cuda:cuda_runtime_contract_test",
+        "//crates/nml-pjrt-cpu:cpu_disabled_contract_test",
+        "//crates/nml-pjrt-cpu:cpu_runtime_contract_test",
+        "//crates/nml-platform:host_contract_test",
+    ],
+    visibility = ["//visibility:public"],
+)

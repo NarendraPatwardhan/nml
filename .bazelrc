@@ -1,0 +1,18 @@
+# NML keeps repository-wide Bazel policy deliberately small. Backend-specific
+# flags belong beside the backend that consumes them; putting them here would
+# make every target depend on implementation details of XLA, PJRT, or CUDA.
+
+# A failed test should explain itself in the terminal while preserving Bazel's
+# complete test log as the authoritative artifact.
+test --test_output=errors
+
+# XLA/LLVM require C++17. Keeping the language level repository-wide matches
+# the ZML graph and prevents build tools from selecting a host compiler default.
+common --cxxopt=-std=c++17
+common --host_cxxopt=-std=c++17
+
+# Performance is a product property, so optimized builds have a stable spelling.
+# The default remains Bazel's fast development mode; performance gates must opt
+# into this configuration explicitly rather than accidentally benchmarking it.
+build:release --compilation_mode=opt
+test:release --compilation_mode=opt

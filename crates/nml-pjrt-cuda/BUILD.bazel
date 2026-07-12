@@ -1,0 +1,82 @@
+"""CUDA-specific PJRT runtime initialization and client policy."""
+
+load("//bazel:rust.bzl", "nml_rust_library", "nml_rust_test")
+
+_CUDA_RUNTIME_DATA = select({
+    "//platforms:cuda.enabled": ["//platforms/cuda:runtime"],
+    "//conditions:default": [],
+})
+
+_CUDA_RUNTIME_ENV = select({
+    "//platforms:cuda.enabled": {
+        "NML_CUDA_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime)",
+    },
+    "//conditions:default": {
+        "NML_CUDA_RUNTIME_RLOCATION": "",
+    },
+})
+
+nml_rust_library(
+    name = "nml_pjrt_cuda",
+    srcs = ["src/lib.rs"],
+    crate_root = "src/lib.rs",
+    data = _CUDA_RUNTIME_DATA,
+    rustc_env = _CUDA_RUNTIME_ENV,
+    deps = [
+        "//crates/nml-pjrt:nml_pjrt",
+        "@rules_rust//rust/runfiles",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = [
+        "//:__pkg__",
+        "//crates:__subpackages__",
+    ],
+)
+
+nml_rust_test(
+    name = "cuda_package_contract_test",
+    size = "small",
+    srcs = ["tests/package_contract.rs"],
+    crate_root = "tests/package_contract.rs",
+    data = ["//platforms/cuda:runtime"],
+    rustc_env = {
+        "NML_CUDA_RUNTIME_CONTRACT_RLOCATION": "$(rlocationpath //platforms/cuda:runtime)",
+    },
+    deps = [
+        ":nml_pjrt_cuda",
+        "@rules_rust//rust/runfiles",
+    ],
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
+# GPU state is a host resource, not a declared file input. Run this contract
+# locally on every invocation so Bazel cannot hide /dev/nvidiactl in a sandbox
+# or reuse a result produced for a different device/driver state.
+nml_rust_test(
+    name = "cuda_runtime_contract_test",
+    size = "small",
+    srcs = ["tests/runtime_contract.rs"],
+    crate_root = "tests/runtime_contract.rs",
+    local = True,
+    tags = ["external"],
+    deps = [":nml_pjrt_cuda"],
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
+nml_rust_test(
+    name = "cuda_disabled_contract_test",
+    size = "small",
+    srcs = ["tests/disabled_contract.rs"],
+    crate_root = "tests/disabled_contract.rs",
+    deps = [":nml_pjrt_cuda"],
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+)

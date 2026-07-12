@@ -1,0 +1,11 @@
+"""Safe ownership layer over the common PJRT C API."""
+
+load("//bazel:rust.bzl", "nml_rust_library")
+
+nml_rust_library(
+    name = "nml_pjrt",
+    srcs = ["src/lib.rs"],
+    crate_root = "src/lib.rs",
+    deps = ["//crates/nml-pjrt-sys:nml_pjrt_sys"],
+    visibility = ["//crates:__subpackages__"],
+)

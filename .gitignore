@@ -1,0 +1,21 @@
+# Bazel creates convenience symlinks in the repository root. Their targets live
+# in Bazel's output base and are machine-local, so neither the links nor their
+# contents belong in source control.
+/bazel-*
+
+# ZML is a continuously readable reference checkout, not an NML source or build
+# dependency. Its exact revision is recorded in FORK.md instead of vendoring its
+# Git history into NML.
+/references/
+
+# NML is Bazel-owned. These directories are ignored defensively so an ad-hoc
+# Cargo invocation cannot introduce a second build-output tree into commits.
+/target/
+**/target/
+
+# Host filesystem and editor recovery files carry no product state.
+.DS_Store
+**/.DS_Store
+*.swp
+*.swo
+*~

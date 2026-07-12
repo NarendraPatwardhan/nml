@@ -1,0 +1,6 @@
+"""Ownership boundary for Rust product crates.
+
+Crates are private implementation units by default. A crate becomes an external
+build API only through a deliberate root alias or another explicitly public
+facade; directory placement alone never publishes it.
+"""

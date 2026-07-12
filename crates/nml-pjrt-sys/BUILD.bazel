@@ -1,0 +1,48 @@
+"""Generated Rust declarations for the pinned PJRT C ABI."""
+
+load("//bazel:rust.bzl", "nml_rust_library")
+load("@rules_rust_bindgen//:defs.bzl", "rust_bindgen")
+
+# Keep generation and compilation as separate Bazel edges. The PJRT header is
+# an ABI description, not a C++ library to link into the Rust rlib; spelling
+# that distinction out also avoids relying on rules_rust_bindgen's deprecated
+# behavior of placing a CcInfo provider in a Rust `deps` collection.
+rust_bindgen(
+    name = "bindings",
+    bindgen_flags = [
+        "--allowlist-function=GetPjrtApi",
+        "--allowlist-type=PJRT_.*",
+        "--allowlist-var=PJRT_.*",
+        # C plugins may return enum values added by a newer PJRT minor. Integer
+        # constants preserve those values for explicit compatibility handling;
+        # a generated Rust enum would make an unknown discriminant undefined
+        # behavior before the safe layer could reject or preserve it.
+        "--default-enum-style=consts",
+        "--no-doc-comments",
+        # Several PJRT handles are deliberately opaque forward declarations.
+        # Bindgen's arithmetic layout assertions cannot describe those zero-
+        # sized Rust placeholders, while all ABI use is correctly by pointer.
+        "--no-layout-tests",
+    ],
+    cc_lib = "@xla_pjrt_headers//:pjrt_c_api_headers",
+    header = "@xla_pjrt_headers//:xla/pjrt/c/pjrt_c_api_gpu_extension.h",
+    # This target describes an ABI; it has no C objects to merge into the Rust
+    # archive. Plugin implementations arrive as separately loaded shared libs.
+    merge_cc_lib_objects_into_rlib = False,
+)
+
+nml_rust_library(
+    name = "nml_pjrt_sys",
+    srcs = [":bindings"],
+    crate_root = "bindings.rs",
+    # These names are the C ABI. Renaming them would make review against the
+    # pinned header harder and would create an unnecessary translation layer.
+    # The allowances are confined to generated declarations; product crates
+    # continue to compile under the repository-wide `-Dwarnings` policy.
+    rustc_flags = [
+        "-Anon_camel_case_types",
+        "-Anon_snake_case",
+        "-Anon_upper_case_globals",
+    ],
+    visibility = ["//crates:__subpackages__"],
+)

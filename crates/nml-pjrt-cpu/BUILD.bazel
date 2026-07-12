@@ -1,0 +1,63 @@
+"""CPU-specific PJRT artifact resolution and loader."""
+
+load("//bazel:rust.bzl", "nml_rust_library", "nml_rust_test")
+
+_CPU_RUNTIME_DATA = select({
+    "//platforms:cpu.enabled": ["//platforms/cpu:runtime"],
+    "//conditions:default": [],
+})
+
+_CPU_RUNTIME_ENV = select({
+    "//platforms:cpu.enabled": {
+        "NML_CPU_PJRT_RLOCATION": "$(rlocationpath //platforms/cpu:runtime)",
+    },
+    "//conditions:default": {
+        "NML_CPU_PJRT_RLOCATION": "",
+    },
+})
+
+nml_rust_library(
+    name = "nml_pjrt_cpu",
+    srcs = ["src/lib.rs"],
+    crate_root = "src/lib.rs",
+    data = _CPU_RUNTIME_DATA,
+    rustc_env = _CPU_RUNTIME_ENV,
+    deps = [
+        "//crates/nml-pjrt:nml_pjrt",
+        "@rules_rust//rust/runfiles",
+    ],
+    visibility = [
+        "//:__pkg__",
+        "//crates:__subpackages__",
+    ],
+)
+
+# This test is a permanent runtime contract: it loads the hermetically packaged
+# CPU plugin, initializes PJRT, creates a real client, and enumerates a real CPU
+# device. It is intentionally incompatible when the CPU backend is disabled.
+nml_rust_test(
+    name = "cpu_runtime_contract_test",
+    size = "small",
+    srcs = ["tests/runtime_contract.rs"],
+    crate_root = "tests/runtime_contract.rs",
+    deps = [":nml_pjrt_cpu"],
+    target_compatible_with = select({
+        "//platforms:cpu.enabled": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
+# The inverse contract guards dependency closure: disabling CPU must keep the
+# Rust API buildable without packaging a CPU shared object, and load() must fail
+# deterministically before runfiles lookup or dlopen.
+nml_rust_test(
+    name = "cpu_disabled_contract_test",
+    size = "small",
+    srcs = ["tests/disabled_contract.rs"],
+    crate_root = "tests/disabled_contract.rs",
+    deps = [":nml_pjrt_cpu"],
+    target_compatible_with = select({
+        "//platforms:cpu.enabled": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+)

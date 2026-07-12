@@ -1,0 +1,16 @@
+"""CPU PJRT runtime selected independently from host identity."""
+
+exports_files(
+    ["cpu.bzl"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "runtime",
+    srcs = select({
+        "//platforms:is_linux_x86_64": ["@libpjrt_cpu_linux_amd64//:libpjrt_cpu"],
+        "//platforms:is_linux_aarch64": ["@libpjrt_cpu_linux_arm64//:libpjrt_cpu"],
+        "//platforms:is_macos_aarch64": ["@libpjrt_cpu_darwin_arm64//:libpjrt_cpu"],
+    }),
+    visibility = ["//crates:__subpackages__"],
+)

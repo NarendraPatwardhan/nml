@@ -1,0 +1,145 @@
+"""The hermetic toolchain root for NML.
+
+This file answers only repository-wide questions: which Bazel generation owns
+the graph, which Rust rules define Rust actions, and which exact stable compiler
+builds the product. Native libraries such as XLA and PJRT will be introduced by
+focused module extensions when their real targets exist; eagerly declaring the
+entire ZML dependency graph here would create unused complexity.
+"""
+
+module(
+    name = "nml",
+    bazel_compatibility = [">=9.1.0"],
+)
+
+# `platforms` is a direct dependency because NML names its constraints directly.
+# Depending on a transitive copy from rules_rust would make platform policy an
+# accidental property of another module's implementation.
+bazel_dep(name = "platforms", version = "1.1.0")
+
+# ZML models backend enablement with independent boolean build settings. NML
+# retains that design through skylib's typed bool_flag rather than encoding
+# CPU/CUDA as mutually exclusive target platforms.
+bazel_dep(name = "bazel_skylib", version = "1.9.0")
+bazel_dep(name = "bazel_lib", version = "3.2.2")
+bazel_dep(name = "llvm", version = "0.8.9")
+bazel_dep(name = "patchelf", version = "0.18.0.bcr.1")
+bazel_dep(name = "rules_cc", version = "0.2.19")
+bazel_dep(name = "tar.bzl", version = "0.10.4")
+
+# Keep this at the current rules_rust release when deliberately updating the
+# toolchain. The compiler pin below remains independent: rules and compiler are
+# different compatibility surfaces and should move only when each is reviewed.
+bazel_dep(name = "rules_rust", version = "0.71.3")
+bazel_dep(name = "rules_rust_bindgen", version = "0.71.3")
+
+RUST_EDITION = "2024"
+RUST_VERSION = "1.97.0"
+
+# rules_rust can discover these checksums from Rust's signed channel manifest,
+# but recording them makes repository evaluation canonical on every supported
+# host. Keys are the exact `.tar.xz` artifacts fetched by the toolchain rule.
+RUST_SHA256S = {
+    # Linux x86-64.
+    "cargo-1.97.0-x86_64-unknown-linux-gnu.tar.xz": "5c5bc94af02797b699bb7d4e85b356192eab9fb50376053a1e6edf509fcf7129",
+    "clippy-1.97.0-x86_64-unknown-linux-gnu.tar.xz": "1f7bd64e545de3c1921dc68b4d1e6ceae034b0d8c40d66b795c04e946d4262c0",
+    "llvm-tools-1.97.0-x86_64-unknown-linux-gnu.tar.xz": "a847ff42fffb4cd8919c63238a7981d89789bb732e2b784c346347ed3d55bd95",
+    "rust-std-1.97.0-x86_64-unknown-linux-gnu.tar.xz": "0c43618128a7a6b96b0b04c04cf7b28dd52fb0991a74c9615fbd1a684ff88712",
+    "rustc-1.97.0-x86_64-unknown-linux-gnu.tar.xz": "0a8787303c88b018af61b5c53a0c7024d516d175e623eeab35a35eab11dbcad0",
+
+    # Linux AArch64, including DGX Spark-class hosts.
+    "cargo-1.97.0-aarch64-unknown-linux-gnu.tar.xz": "71f0457abe8fdf9fc048009f867acc27b21e25c8e06a1a3e9a12c637833b6aab",
+    "clippy-1.97.0-aarch64-unknown-linux-gnu.tar.xz": "5c0be7373a456b684d7dcc34d8cc6a037f7149caf1668c527a59831f27ba1d6c",
+    "llvm-tools-1.97.0-aarch64-unknown-linux-gnu.tar.xz": "0e620b0cf1c4e1c48282782273393dc4a01f7823a4a6cc08e4cace755211b245",
+    "rust-std-1.97.0-aarch64-unknown-linux-gnu.tar.xz": "b6a90dab26527f17e7e395e24b2d79976e30432c41feb073fe920d3b26b709a0",
+    "rustc-1.97.0-aarch64-unknown-linux-gnu.tar.xz": "06a71688ee297515ebc6a815e42c779735c09423b0bed056e0896c80c7295399",
+
+    # macOS Apple Silicon. Intel macOS is deliberately absent.
+    "cargo-1.97.0-aarch64-apple-darwin.tar.xz": "ca46bbef082ff751c06807b29872b59c05296c3acd4da1a98fac6367bb8bb2c5",
+    "clippy-1.97.0-aarch64-apple-darwin.tar.xz": "4c74f4390fb9381d28e0ccb06439c9dda9d5b293b3c25d4465e879eb42d70094",
+    "llvm-tools-1.97.0-aarch64-apple-darwin.tar.xz": "70abd5460151294f959de6f0bf4767a12827c710b8e8b0568706be60d1e0e7e5",
+    "rust-std-1.97.0-aarch64-apple-darwin.tar.xz": "df26b872f1bbcc5cd700eacb76231d6ba97aeda76ccd44f5b7de3db3757a38ee",
+    "rustc-1.97.0-aarch64-apple-darwin.tar.xz": "53e339f16382bb348566f648d01775797e038fdd6bfc6ddd8859c5a0eac09f68",
+}
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = RUST_EDITION,
+    # Cross-compilation platforms are out under D-019. Each supported host gets
+    # its native standard library; foreign target standard libraries are not
+    # registered merely because rules_rust offers them by default.
+    extra_target_triples = [],
+    # An exact stable version makes builds reproducible and, unlike an implicit
+    # channel, makes it impossible for nightly to enter through tool resolution.
+    sha256s = RUST_SHA256S,
+    versions = [RUST_VERSION],
+)
+use_repo(rust, "rust_toolchains")
+
+# Register only the toolchains created by the declaration above. In particular,
+# do not register rules_rust's implicit stable-plus-nightly defaults.
+register_toolchains("@rust_toolchains//:all")
+
+# This is the same bootstrapped LLVM toolchain family ZML selects for XLA and
+# native dependencies. Rust binding generation must consume it too; NML does
+# not build a second unrelated LLVM solely for bindgen.
+register_toolchains("@llvm//toolchain:all")
+
+# Expose the source-built LLVM repository already configured by the `llvm`
+# module so Rust bindgen can use its clang/libclang. This is not a third LLVM:
+# it is the source side of the same module whose toolchains are registered
+# above, and it is also the module family ZML uses around XLA.
+llvm_source = use_extension("@llvm//extensions:llvm_source.bzl", "llvm_source")
+use_repo(llvm_source, "llvm-raw", "llvm_config", "llvm_zlib", "llvm_zstd")
+
+llvm_project = use_extension("@llvm//extensions:llvm.bzl", "llvm")
+use_repo(llvm_project, "llvm-project")
+
+# Rust needs bindgen where Zig uses translate-c. The only intentional language
+# adaptation is the generator; clang and libclang come from the lifted LLVM
+# graph above.
+register_toolchains("//tools/bindgen:toolchain")
+
+# CUDA's hermetic Debian runtime fragments are extracted with the same pinned
+# BSD tar toolchains ZML uses. Only NML's supported hosts are materialized.
+tar_toolchains = use_extension("@tar.bzl//tar:extensions.bzl", "toolchains")
+use_repo(
+    tar_toolchains,
+    "bsd_tar_toolchains_darwin_arm64",
+    "bsd_tar_toolchains_linux_amd64",
+    "bsd_tar_toolchains_linux_arm64",
+)
+
+# Import only the self-contained PJRT C header at this layer. The full pinned
+# XLA source/build extension enters when NML implements StableHLO compilation;
+# making raw ABI bindings depend on the whole compiler would invert ownership.
+pjrt_headers = use_extension("//third_party/xla:pjrt_headers.bzl", "pjrt_headers")
+use_repo(pjrt_headers, "xla_pjrt_headers")
+
+# CPU and CUDA are distinct PJRT plugin packages. This extension owns only the
+# CPU artifacts and includes the Linux AArch64 artifact omitted from ZML's
+# MODULE declaration even though it exists in the same pinned release.
+cpu = use_extension("//platforms/cpu:cpu.bzl", "cpu_pjrt_plugin")
+use_repo(
+    cpu,
+    "libpjrt_cpu_darwin_arm64",
+    "libpjrt_cpu_linux_amd64",
+    "libpjrt_cpu_linux_arm64",
+)
+
+# Retain ZML's CUDA package topology: the PJRT repositories assemble their own
+# hermetic runtime trees from sibling repositories created by this one
+# extension. Root code needs direct names only for the plugin packages and the
+# headers/runtime fragments consumed outside those trees.
+cuda = use_extension("//platforms/cuda:cuda.bzl", "cuda_packages")
+use_repo(
+    cuda,
+    "cuda_nvml_dev_linux_sbsa",
+    "cuda_nvml_dev_linux_x86_64",
+    "cuda_nvtx_linux_sbsa",
+    "cuda_nvtx_linux_x86_64",
+    "libpjrt_cuda_linux_amd64",
+    "libpjrt_cuda_linux_arm64",
+    "zlib1g_linux_amd64",
+    "zlib1g_linux_arm64",
+)

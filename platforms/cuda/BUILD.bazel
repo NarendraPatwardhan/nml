@@ -1,0 +1,60 @@
+"""CUDA PJRT runtime tools and host-selected hermetic runtime tree."""
+
+load("//bazel:patchelf.bzl", "patchelf")
+load("//bazel:rust.bzl", "nml_rust_binary", "nml_rust_shared_library")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+exports_files(
+    [
+        "cuda.bzl",
+        "libpjrt_cuda.BUILD.bazel",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+nml_rust_binary(
+    name = "driver_compatibility",
+    srcs = ["driver_compatibility.rs"],
+    crate_root = "driver_compatibility.rs",
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = ["//visibility:public"],
+)
+
+# ZML interposes the plugin's unversioned dlopen requests so hermetically
+# packaged, versioned CUDA libraries win. Rust changes the implementation
+# language, not the ABI or lookup behavior.
+nml_rust_shared_library(
+    name = "dynamic_library_redirector_unversioned",
+    srcs = ["dynamic_library_redirector.rs"],
+    crate_name = "nml_cuda",
+    target_compatible_with = ["@platforms//os:linux"],
+    visibility = [":__pkg__"],
+)
+
+patchelf(
+    name = "dynamic_library_redirector",
+    src = ":dynamic_library_redirector_unversioned",
+    soname = "libnml_cuda.so.0",
+    set_rpath = "$ORIGIN",
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "runtime",
+    srcs = select({
+        "//platforms:is_linux_x86_64": ["@libpjrt_cuda_linux_amd64//:runtime"],
+        "//platforms:is_linux_aarch64": ["@libpjrt_cuda_linux_arm64//:runtime"],
+        "//conditions:default": [],
+    }),
+    visibility = ["//crates:__subpackages__"],
+)
+
+cc_library(
+    name = "nvtx_headers",
+    visibility = ["//visibility:public"],
+    deps = select({
+        "//platforms:is_linux_x86_64": ["@cuda_nvtx_linux_x86_64//:headers"],
+        "//platforms:is_linux_aarch64": ["@cuda_nvtx_linux_sbsa//:headers"],
+        "//conditions:default": [],
+    }),
+)

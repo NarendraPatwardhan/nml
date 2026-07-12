@@ -1,0 +1,6 @@
+"""Pinned, minimal XLA surfaces imported before the full compiler graph."""
+
+exports_files(
+    ["pjrt_headers.bzl"],
+    visibility = ["//visibility:public"],
+)

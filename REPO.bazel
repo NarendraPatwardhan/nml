@@ -1,0 +1,11 @@
+# Visibility is private unless a BUILD file deliberately publishes a target.
+# This turns package ownership into a checked property instead of a convention.
+repo(default_visibility = ["//visibility:private"])
+
+# The ZML checkout is evidence for the rewrite, never an NML build input. Using
+# Bazel's repository-level ignore mechanism also prevents `//...` from walking
+# the nested reference repository and mistaking its targets for NML targets.
+ignore_directories([
+    "bazel-*",
+    "references/**",
+])
