@@ -6,6 +6,7 @@
 //! are packaged. Platform crates own runtime selection and policy.
 
 use nml_pjrt_sys as sys;
+use nml_types::{DType, Layout, Shape};
 use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
@@ -15,9 +16,12 @@ use std::mem::{offset_of, size_of, zeroed};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{NonNull, addr_of};
+use std::sync::Arc;
 
 type PluginInitializeFn =
     unsafe extern "C" fn(*mut sys::PJRT_Plugin_Initialize_Args) -> *mut sys::PJRT_Error;
+type PluginAttributesFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Plugin_Attributes_Args) -> *mut sys::PJRT_Error;
 type ErrorDestroyFn = unsafe extern "C" fn(*mut sys::PJRT_Error_Destroy_Args);
 type ErrorMessageFn = unsafe extern "C" fn(*mut sys::PJRT_Error_Message_Args);
 type ErrorGetCodeFn =
@@ -34,6 +38,53 @@ type DeviceGetDescriptionFn =
     unsafe extern "C" fn(*mut sys::PJRT_Device_GetDescription_Args) -> *mut sys::PJRT_Error;
 type DeviceDescriptionAttributesFn =
     unsafe extern "C" fn(*mut sys::PJRT_DeviceDescription_Attributes_Args) -> *mut sys::PJRT_Error;
+type DeviceDescriptionIdFn =
+    unsafe extern "C" fn(*mut sys::PJRT_DeviceDescription_Id_Args) -> *mut sys::PJRT_Error;
+type EventDestroyFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Event_Destroy_Args) -> *mut sys::PJRT_Error;
+type EventIsReadyFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Event_IsReady_Args) -> *mut sys::PJRT_Error;
+type EventAwaitFn = unsafe extern "C" fn(*mut sys::PJRT_Event_Await_Args) -> *mut sys::PJRT_Error;
+type ClientCompileFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Client_Compile_Args) -> *mut sys::PJRT_Error;
+type ClientBufferFromHostBufferFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Client_BufferFromHostBuffer_Args) -> *mut sys::PJRT_Error;
+type BufferDestroyFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Buffer_Destroy_Args) -> *mut sys::PJRT_Error;
+type BufferElementTypeFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Buffer_ElementType_Args) -> *mut sys::PJRT_Error;
+type BufferDimensionsFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Buffer_Dimensions_Args) -> *mut sys::PJRT_Error;
+type BufferToHostBufferFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Buffer_ToHostBuffer_Args) -> *mut sys::PJRT_Error;
+type BufferReadyEventFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Buffer_ReadyEvent_Args) -> *mut sys::PJRT_Error;
+type BufferDeleteFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Buffer_Delete_Args) -> *mut sys::PJRT_Error;
+type BufferIsDeletedFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Buffer_IsDeleted_Args) -> *mut sys::PJRT_Error;
+type BufferMemoryFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Buffer_Memory_Args) -> *mut sys::PJRT_Error;
+type LoadedExecutableDestroyFn =
+    unsafe extern "C" fn(*mut sys::PJRT_LoadedExecutable_Destroy_Args) -> *mut sys::PJRT_Error;
+type LoadedExecutableGetExecutableFn = unsafe extern "C" fn(
+    *mut sys::PJRT_LoadedExecutable_GetExecutable_Args,
+) -> *mut sys::PJRT_Error;
+type LoadedExecutableExecuteFn =
+    unsafe extern "C" fn(*mut sys::PJRT_LoadedExecutable_Execute_Args) -> *mut sys::PJRT_Error;
+type LoadedExecutableAddressableDevicesFn = unsafe extern "C" fn(
+    *mut sys::PJRT_LoadedExecutable_AddressableDevices_Args,
+) -> *mut sys::PJRT_Error;
+type LoadedExecutableDeleteFn =
+    unsafe extern "C" fn(*mut sys::PJRT_LoadedExecutable_Delete_Args) -> *mut sys::PJRT_Error;
+type LoadedExecutableIsDeletedFn =
+    unsafe extern "C" fn(*mut sys::PJRT_LoadedExecutable_IsDeleted_Args) -> *mut sys::PJRT_Error;
+type ExecutableDestroyFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Executable_Destroy_Args) -> *mut sys::PJRT_Error;
+type ExecutableNameFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Executable_Name_Args) -> *mut sys::PJRT_Error;
+type ExecutableNumOutputsFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Executable_NumOutputs_Args) -> *mut sys::PJRT_Error;
 
 /// Failures at the dynamic-library or PJRT ABI boundary.
 #[derive(Debug)]
@@ -68,6 +119,18 @@ pub enum Error {
         actual: usize,
     },
     CyclicExtensionChain,
+    InvalidHostBuffer {
+        expected: usize,
+        actual: usize,
+    },
+    UnsupportedLayout {
+        actual: Layout,
+        expected: Layout,
+    },
+    ForeignClientObject(&'static str),
+    UnknownBufferType(u32),
+    NoAddressableDevice,
+    TensorMetadataOverflow,
 }
 
 impl fmt::Display for Error {
@@ -118,6 +181,26 @@ impl fmt::Display for Error {
             ),
             Self::CyclicExtensionChain => {
                 f.write_str("PJRT plugin returned a cyclic extension chain")
+            }
+            Self::InvalidHostBuffer { expected, actual } => write!(
+                f,
+                "host buffer has {actual} bytes, tensor metadata requires {expected}"
+            ),
+            Self::UnsupportedLayout { actual, expected } => write!(
+                f,
+                "PJRT transfer does not support physical layout {:?}; expected row-major {:?}",
+                actual.minor_to_major(),
+                expected.minor_to_major()
+            ),
+            Self::ForeignClientObject(object) => {
+                write!(f, "{object} belongs to a different PJRT client")
+            }
+            Self::UnknownBufferType(value) => {
+                write!(f, "PJRT returned unsupported buffer element type {value}")
+            }
+            Self::NoAddressableDevice => f.write_str("PJRT executable has no addressable device"),
+            Self::TensorMetadataOverflow => {
+                f.write_str("tensor metadata exceeds host address space")
             }
         }
     }
@@ -180,6 +263,13 @@ pub struct ApiVersion {
     pub minor: i32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct StableHloVersion {
+    pub major: i64,
+    pub minor: i64,
+    pub patch: i64,
+}
+
 /// PJRT's two GPU custom-call ABIs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(i32)]
@@ -224,15 +314,15 @@ pub struct GpuCustomCallHandlers {
 }
 
 /// A validated GPU custom-call extension borrowed from a loaded plugin.
-pub struct GpuCustomCalls<'plugin> {
-    plugin: &'plugin Plugin,
+pub struct GpuCustomCalls {
+    plugin: Plugin,
     register_fn: GpuRegisterCustomCallFn,
 }
 
 type GpuRegisterCustomCallFn =
     unsafe extern "C" fn(*mut sys::PJRT_Gpu_Register_Custom_Call_Args) -> *mut sys::PJRT_Error;
 
-impl GpuCustomCalls<'_> {
+impl GpuCustomCalls {
     /// Registers a process-lifetime custom-call target with XLA's GPU backend.
     ///
     /// # Safety
@@ -281,11 +371,12 @@ pub enum NamedValue<'a> {
 
 /// A loaded and initialized PJRT plugin.
 ///
-/// The dynamic-library handle and API pointer are one ownership unit. Clients
-/// borrow this value, so Rust prevents unloading a plugin while any PJRT object
-/// created from it remains live.
+/// The dynamic-library handle and API pointer are one reference-counted
+/// ownership unit. Every dependent object retains this state directly, so
+/// dropping the loader handle cannot unload code behind a live PJRT object.
+#[derive(Clone)]
 pub struct Plugin {
-    library: DynamicLibrary,
+    library: Arc<DynamicLibrary>,
     api: NonNull<sys::PJRT_Api>,
     api_size: usize,
     version: ApiVersion,
@@ -340,7 +431,7 @@ impl Plugin {
         }
 
         let plugin = Self {
-            library,
+            library: Arc::new(library),
             api,
             api_size: actual_size,
             version,
@@ -354,12 +445,49 @@ impl Plugin {
         self.version
     }
 
+    /// Maximum StableHLO portable-artifact version accepted by this plugin.
+    pub fn stablehlo_version(&self) -> Result<Option<StableHloVersion>, Error> {
+        let mut args: sys::PJRT_Plugin_Attributes_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Plugin_Attributes_Args_STRUCT_SIZE as usize;
+        let error = unsafe { (self.plugin_attributes_fn()?)(&mut args) };
+        self.into_result(error)?;
+        if args.num_attributes != 0 && args.attributes.is_null() {
+            return Err(Error::NullResult("PJRT_Plugin_Attributes"));
+        }
+        if args.num_attributes == 0 {
+            return Ok(None);
+        }
+        let attributes =
+            unsafe { std::slice::from_raw_parts(args.attributes, args.num_attributes) };
+        for attribute in attributes {
+            if copy_bytes(attribute.name, attribute.name_size)? != b"stablehlo_current_version" {
+                continue;
+            }
+            if attribute.type_ != sys::PJRT_NamedValue_Type_PJRT_NamedValue_kInt64List
+                || attribute.value_size != 3
+            {
+                return Ok(None);
+            }
+            let values = unsafe { attribute.__bindgen_anon_1.int64_array_value };
+            if values.is_null() {
+                return Err(Error::NullResult("stablehlo_current_version"));
+            }
+            let values = unsafe { std::slice::from_raw_parts(values, 3) };
+            return Ok(Some(StableHloVersion {
+                major: values[0],
+                minor: values[1],
+                patch: values[2],
+            }));
+        }
+        Ok(None)
+    }
+
     /// Finds and validates PJRT's GPU custom-call registration extension.
     ///
     /// Absence is not an ABI error: CPU plugins and older GPU plugins may not
     /// publish it. A present but truncated or cyclic extension list is rejected
     /// because invoking it would be undefined behavior.
-    pub fn gpu_custom_calls(&self) -> Result<Option<GpuCustomCalls<'_>>, Error> {
+    pub fn gpu_custom_calls(&self) -> Result<Option<GpuCustomCalls>, Error> {
         // SAFETY: extension_start is in the size-checked PJRT_Api prefix.
         let mut current = unsafe { addr_of!((*self.api.as_ptr()).extension_start).read() };
         let mut visited = HashSet::new();
@@ -394,7 +522,7 @@ impl Plugin {
                     .custom_call
                     .ok_or(Error::MissingFunction("PJRT_Gpu_Register_Custom_Call"))?;
                 return Ok(Some(GpuCustomCalls {
-                    plugin: self,
+                    plugin: self.clone(),
                     register_fn,
                 }));
             }
@@ -403,14 +531,11 @@ impl Plugin {
         Ok(None)
     }
 
-    pub fn create_client(&self) -> Result<Client<'_>, Error> {
+    pub fn create_client(&self) -> Result<Client, Error> {
         self.create_client_with_options(&[])
     }
 
-    pub fn create_client_with_options(
-        &self,
-        options: &[NamedValue<'_>],
-    ) -> Result<Client<'_>, Error> {
+    pub fn create_client_with_options(&self, options: &[NamedValue<'_>]) -> Result<Client, Error> {
         let raw_options: Vec<_> = options.iter().map(named_value_to_raw).collect();
         // SAFETY: zero is the PJRT-defined absence value for every optional
         // callback/output field; struct_size opts into the complete pinned args.
@@ -428,9 +553,11 @@ impl Plugin {
         self.into_result(error)?;
         let inner = NonNull::new(args.client).ok_or(Error::NullResult("PJRT_Client_Create"))?;
         Ok(Client {
-            plugin: self,
-            inner,
-            _not_send_or_sync: PhantomData,
+            state: Arc::new(ClientState {
+                plugin: self.clone(),
+                inner,
+                _not_send_or_sync: PhantomData,
+            }),
         })
     }
 
@@ -448,6 +575,7 @@ impl Plugin {
         self.error_message_fn()?;
         self.error_get_code_fn()?;
         self.plugin_initialize_fn()?;
+        self.plugin_attributes_fn()?;
         self.client_create_fn()?;
         self.client_destroy_fn()?;
         self.client_platform_name_fn()?;
@@ -516,6 +644,15 @@ impl Plugin {
             .ok_or(Error::MissingFunction("PJRT_Plugin_Initialize"))
     }
 
+    fn plugin_attributes_fn(&self) -> Result<PluginAttributesFn, Error> {
+        self.require_function_field(
+            offset_of!(sys::PJRT_Api, PJRT_Plugin_Attributes),
+            "PJRT_Plugin_Attributes",
+        )?;
+        unsafe { addr_of!((*self.api.as_ptr()).PJRT_Plugin_Attributes).read() }
+            .ok_or(Error::MissingFunction("PJRT_Plugin_Attributes"))
+    }
+
     fn error_destroy_fn(&self) -> Result<ErrorDestroyFn, Error> {
         // SAFETY: field is within the size-checked prefix.
         unsafe { addr_of!((*self.api.as_ptr()).PJRT_Error_Destroy).read() }
@@ -578,6 +715,183 @@ impl Plugin {
             .ok_or(Error::MissingFunction("PJRT_DeviceDescription_Attributes"))
     }
 
+    fn device_description_id_fn(&self) -> Result<DeviceDescriptionIdFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_DeviceDescription_Id),
+            "PJRT_DeviceDescription_Id",
+            |api| unsafe { addr_of!((*api).PJRT_DeviceDescription_Id).read() },
+        )
+    }
+
+    fn event_destroy_fn(&self) -> Result<EventDestroyFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Event_Destroy),
+            "PJRT_Event_Destroy",
+            |api| unsafe { addr_of!((*api).PJRT_Event_Destroy).read() },
+        )
+    }
+    fn event_is_ready_fn(&self) -> Result<EventIsReadyFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Event_IsReady),
+            "PJRT_Event_IsReady",
+            |api| unsafe { addr_of!((*api).PJRT_Event_IsReady).read() },
+        )
+    }
+    fn event_await_fn(&self) -> Result<EventAwaitFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Event_Await),
+            "PJRT_Event_Await",
+            |api| unsafe { addr_of!((*api).PJRT_Event_Await).read() },
+        )
+    }
+    fn client_compile_fn(&self) -> Result<ClientCompileFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Client_Compile),
+            "PJRT_Client_Compile",
+            |api| unsafe { addr_of!((*api).PJRT_Client_Compile).read() },
+        )
+    }
+    fn client_buffer_from_host_buffer_fn(&self) -> Result<ClientBufferFromHostBufferFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Client_BufferFromHostBuffer),
+            "PJRT_Client_BufferFromHostBuffer",
+            |api| unsafe { addr_of!((*api).PJRT_Client_BufferFromHostBuffer).read() },
+        )
+    }
+    fn buffer_destroy_fn(&self) -> Result<BufferDestroyFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Buffer_Destroy),
+            "PJRT_Buffer_Destroy",
+            |api| unsafe { addr_of!((*api).PJRT_Buffer_Destroy).read() },
+        )
+    }
+    fn buffer_element_type_fn(&self) -> Result<BufferElementTypeFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Buffer_ElementType),
+            "PJRT_Buffer_ElementType",
+            |api| unsafe { addr_of!((*api).PJRT_Buffer_ElementType).read() },
+        )
+    }
+    fn buffer_dimensions_fn(&self) -> Result<BufferDimensionsFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Buffer_Dimensions),
+            "PJRT_Buffer_Dimensions",
+            |api| unsafe { addr_of!((*api).PJRT_Buffer_Dimensions).read() },
+        )
+    }
+    fn buffer_to_host_buffer_fn(&self) -> Result<BufferToHostBufferFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Buffer_ToHostBuffer),
+            "PJRT_Buffer_ToHostBuffer",
+            |api| unsafe { addr_of!((*api).PJRT_Buffer_ToHostBuffer).read() },
+        )
+    }
+    fn buffer_ready_event_fn(&self) -> Result<BufferReadyEventFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Buffer_ReadyEvent),
+            "PJRT_Buffer_ReadyEvent",
+            |api| unsafe { addr_of!((*api).PJRT_Buffer_ReadyEvent).read() },
+        )
+    }
+    fn buffer_delete_fn(&self) -> Result<BufferDeleteFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Buffer_Delete),
+            "PJRT_Buffer_Delete",
+            |api| unsafe { addr_of!((*api).PJRT_Buffer_Delete).read() },
+        )
+    }
+    fn buffer_is_deleted_fn(&self) -> Result<BufferIsDeletedFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Buffer_IsDeleted),
+            "PJRT_Buffer_IsDeleted",
+            |api| unsafe { addr_of!((*api).PJRT_Buffer_IsDeleted).read() },
+        )
+    }
+    fn buffer_memory_fn(&self) -> Result<BufferMemoryFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Buffer_Memory),
+            "PJRT_Buffer_Memory",
+            |api| unsafe { addr_of!((*api).PJRT_Buffer_Memory).read() },
+        )
+    }
+    fn loaded_executable_destroy_fn(&self) -> Result<LoadedExecutableDestroyFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_LoadedExecutable_Destroy),
+            "PJRT_LoadedExecutable_Destroy",
+            |api| unsafe { addr_of!((*api).PJRT_LoadedExecutable_Destroy).read() },
+        )
+    }
+    fn loaded_executable_get_executable_fn(
+        &self,
+    ) -> Result<LoadedExecutableGetExecutableFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_LoadedExecutable_GetExecutable),
+            "PJRT_LoadedExecutable_GetExecutable",
+            |api| unsafe { addr_of!((*api).PJRT_LoadedExecutable_GetExecutable).read() },
+        )
+    }
+    fn loaded_executable_execute_fn(&self) -> Result<LoadedExecutableExecuteFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_LoadedExecutable_Execute),
+            "PJRT_LoadedExecutable_Execute",
+            |api| unsafe { addr_of!((*api).PJRT_LoadedExecutable_Execute).read() },
+        )
+    }
+    fn loaded_executable_addressable_devices_fn(
+        &self,
+    ) -> Result<LoadedExecutableAddressableDevicesFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_LoadedExecutable_AddressableDevices),
+            "PJRT_LoadedExecutable_AddressableDevices",
+            |api| unsafe { addr_of!((*api).PJRT_LoadedExecutable_AddressableDevices).read() },
+        )
+    }
+    fn loaded_executable_delete_fn(&self) -> Result<LoadedExecutableDeleteFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_LoadedExecutable_Delete),
+            "PJRT_LoadedExecutable_Delete",
+            |api| unsafe { addr_of!((*api).PJRT_LoadedExecutable_Delete).read() },
+        )
+    }
+    fn loaded_executable_is_deleted_fn(&self) -> Result<LoadedExecutableIsDeletedFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_LoadedExecutable_IsDeleted),
+            "PJRT_LoadedExecutable_IsDeleted",
+            |api| unsafe { addr_of!((*api).PJRT_LoadedExecutable_IsDeleted).read() },
+        )
+    }
+    fn executable_destroy_fn(&self) -> Result<ExecutableDestroyFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Executable_Destroy),
+            "PJRT_Executable_Destroy",
+            |api| unsafe { addr_of!((*api).PJRT_Executable_Destroy).read() },
+        )
+    }
+    fn executable_name_fn(&self) -> Result<ExecutableNameFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Executable_Name),
+            "PJRT_Executable_Name",
+            |api| unsafe { addr_of!((*api).PJRT_Executable_Name).read() },
+        )
+    }
+    fn executable_num_outputs_fn(&self) -> Result<ExecutableNumOutputsFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Executable_NumOutputs),
+            "PJRT_Executable_NumOutputs",
+            |api| unsafe { addr_of!((*api).PJRT_Executable_NumOutputs).read() },
+        )
+    }
+
+    fn function<T: Copy>(
+        &self,
+        offset: usize,
+        name: &'static str,
+        read: impl FnOnce(*mut sys::PJRT_Api) -> Option<T>,
+    ) -> Result<T, Error> {
+        self.require_function_field(offset, name)?;
+        read(self.api.as_ptr()).ok_or(Error::MissingFunction(name))
+    }
+
     fn require_function_field(&self, offset: usize, name: &'static str) -> Result<(), Error> {
         if self.api_size < offset + size_of::<usize>() {
             Err(Error::MissingFunction(name))
@@ -596,24 +910,33 @@ impl fmt::Debug for Plugin {
     }
 }
 
-/// A PJRT client tied to the lifetime of its originating plugin.
-pub struct Client<'plugin> {
-    plugin: &'plugin Plugin,
+/// A PJRT client whose final dependent object owns its destruction boundary.
+#[derive(Clone)]
+pub struct Client {
+    state: Arc<ClientState>,
+}
+
+struct ClientState {
+    plugin: Plugin,
     inner: NonNull<sys::PJRT_Client>,
     // PJRT thread-safety is an API/object-specific contract. Do not infer Send
     // or Sync for the whole client merely from its opaque pointer.
     _not_send_or_sync: PhantomData<*mut ()>,
 }
 
-impl<'plugin> Client<'plugin> {
+impl Client {
+    pub fn stablehlo_version(&self) -> Result<Option<StableHloVersion>, Error> {
+        self.state.plugin.stablehlo_version()
+    }
+
     pub fn platform_name(&self) -> Result<String, Error> {
         // SAFETY: zero is valid for the output pointer and length.
         let mut args: sys::PJRT_Client_PlatformName_Args = unsafe { zeroed() };
         args.struct_size = sys::PJRT_Client_PlatformName_Args_STRUCT_SIZE as usize;
-        args.client = self.inner.as_ptr();
+        args.client = self.state.inner.as_ptr();
         // SAFETY: validated function pointer and client/args owned by self.
-        let error = unsafe { (self.plugin.client_platform_name_fn()?)(&mut args) };
-        self.plugin.into_result(error)?;
+        let error = unsafe { (self.state.plugin.client_platform_name_fn()?)(&mut args) };
+        self.state.plugin.into_result(error)?;
         if args.platform_name.is_null() {
             return Err(Error::NullResult("PJRT_Client_PlatformName"));
         }
@@ -629,7 +952,7 @@ impl<'plugin> Client<'plugin> {
         self.raw_devices().map(|(_, count)| count)
     }
 
-    pub fn devices(&self) -> Result<Vec<Device<'_, 'plugin>>, Error> {
+    pub fn devices(&self) -> Result<Vec<Device>, Error> {
         let (devices, count) = self.raw_devices()?;
         if count == 0 {
             return Ok(Vec::new());
@@ -642,7 +965,7 @@ impl<'plugin> Client<'plugin> {
             .map(|device| {
                 NonNull::new(*device)
                     .map(|inner| Device {
-                        client: self,
+                        client: self.clone(),
                         inner,
                     })
                     .ok_or(Error::NullResult("PJRT_Client_Devices entry"))
@@ -650,14 +973,101 @@ impl<'plugin> Client<'plugin> {
             .collect()
     }
 
+    /// Copies a dense row-major host tensor to a selected PJRT device.
+    pub fn buffer_from_host(
+        &self,
+        data: &[u8],
+        shape: Shape,
+        device: &Device,
+    ) -> Result<HostTransfer, Error> {
+        self.require_own_device(device)?;
+        let expected_layout =
+            Layout::row_major(shape.rank()).map_err(|_| Error::TensorMetadataOverflow)?;
+        if shape.layout() != expected_layout {
+            return Err(Error::UnsupportedLayout {
+                actual: shape.layout(),
+                expected: expected_layout,
+            });
+        }
+        let expected = shape
+            .byte_count()
+            .map_err(|_| Error::TensorMetadataOverflow)?;
+        if data.len() != expected {
+            return Err(Error::InvalidHostBuffer {
+                expected,
+                actual: data.len(),
+            });
+        }
+        let mut args: sys::PJRT_Client_BufferFromHostBuffer_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE as usize;
+        args.client = self.state.inner.as_ptr();
+        args.data = data.as_ptr().cast();
+        args.type_ = dtype_to_pjrt(shape.dtype());
+        args.dims = shape.dimensions().as_ptr();
+        args.num_dims = shape.rank();
+        args.host_buffer_semantics =
+            sys::PJRT_HostBufferSemantics_PJRT_HostBufferSemantics_kImmutableOnlyDuringCall;
+        args.device = device.inner.as_ptr();
+        // A null memory and layout request the plugin's default memory and its
+        // canonical dense layout, matching the dense host contract above.
+        let error = unsafe { (self.state.plugin.client_buffer_from_host_buffer_fn()?)(&mut args) };
+        self.state.plugin.into_result(error)?;
+        // Wrap both independent outputs before validating either one. If a
+        // broken plugin returns only one, the owned half is still destroyed
+        // when this function reports the missing result.
+        let buffer = NonNull::new(args.buffer).map(|buffer| Buffer::from_raw(self, buffer));
+        let done = NonNull::new(args.done_with_host_buffer)
+            .map(|event| Event::from_raw(&self.state.plugin, event));
+        match (buffer, done) {
+            (Some(buffer), Some(done)) => Ok(HostTransfer { buffer, done }),
+            (None, _) => Err(Error::NullResult("PJRT_Client_BufferFromHostBuffer buffer")),
+            (_, None) => Err(Error::NullResult("PJRT_Client_BufferFromHostBuffer event")),
+        }
+    }
+
+    /// Compiles an MLIR/StableHLO program with serialized XLA options.
+    pub fn compile(&self, mlir: &[u8], compile_options: &[u8]) -> Result<LoadedExecutable, Error> {
+        let format = b"mlir";
+        let program = sys::PJRT_Program {
+            struct_size: sys::PJRT_Program_STRUCT_SIZE as usize,
+            extension_start: std::ptr::null_mut(),
+            code: mlir.as_ptr().cast_mut().cast(),
+            code_size: mlir.len(),
+            format: format.as_ptr().cast(),
+            format_size: format.len(),
+        };
+        let mut args: sys::PJRT_Client_Compile_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Client_Compile_Args_STRUCT_SIZE as usize;
+        args.client = self.state.inner.as_ptr();
+        args.program = &program;
+        args.compile_options = compile_options.as_ptr().cast();
+        args.compile_options_size = compile_options.len();
+        let error = unsafe { (self.state.plugin.client_compile_fn()?)(&mut args) };
+        self.state.plugin.into_result(error)?;
+        let inner = NonNull::new(args.executable)
+            .ok_or(Error::NullResult("PJRT_Client_Compile executable"))?;
+        Ok(LoadedExecutable {
+            client: self.clone(),
+            inner,
+        })
+    }
+
+    fn require_own_device(&self, device: &Device) -> Result<(), Error> {
+        if Arc::ptr_eq(&self.state, &device.client.state) {
+            Ok(())
+        } else {
+            Err(Error::ForeignClientObject("device"))
+        }
+    }
+
     fn raw_devices(&self) -> Result<(*const *mut sys::PJRT_Device, usize), Error> {
         // SAFETY: zero is valid for the output pointer and length.
         let mut args: sys::PJRT_Client_Devices_Args = unsafe { zeroed() };
         args.struct_size = sys::PJRT_Client_Devices_Args_STRUCT_SIZE as usize;
-        args.client = self.inner.as_ptr();
+        args.client = self.state.inner.as_ptr();
         // SAFETY: validated function pointer and client/args owned by self.
-        let error = unsafe { (self.plugin.client_devices_fn()?)(&mut args) };
-        self.plugin.into_result(error)?;
+        let error = unsafe { (self.state.plugin.client_devices_fn()?)(&mut args) };
+        self.state.plugin.into_result(error)?;
         if args.num_devices != 0 && args.devices.is_null() {
             return Err(Error::NullResult("PJRT_Client_Devices"));
         }
@@ -665,24 +1075,26 @@ impl<'plugin> Client<'plugin> {
     }
 }
 
-/// A non-owning device whose lifetime is bounded by its PJRT client.
-pub struct Device<'client, 'plugin> {
-    client: &'client Client<'plugin>,
+/// A client-owned device identity. The PJRT device itself is non-owning, while
+/// the retained client keeps the pointer valid independently of lexical scope.
+pub struct Device {
+    client: Client,
     inner: NonNull<sys::PJRT_Device>,
 }
 
-impl Device<'_, '_> {
+impl Device {
+    pub fn id(&self) -> Result<i64, Error> {
+        let description = self.description()?;
+        let mut args: sys::PJRT_DeviceDescription_Id_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_DeviceDescription_Id_Args_STRUCT_SIZE as usize;
+        args.device_description = description.as_ptr();
+        let error = unsafe { (self.client.state.plugin.device_description_id_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)?;
+        Ok(args.id.into())
+    }
+
     pub fn string_attribute(&self, requested_name: &str) -> Result<Option<String>, Error> {
-        // SAFETY: zero is valid for the output description pointer.
-        let mut description_args: sys::PJRT_Device_GetDescription_Args = unsafe { zeroed() };
-        description_args.struct_size = sys::PJRT_Device_GetDescription_Args_STRUCT_SIZE as usize;
-        description_args.device = self.inner.as_ptr();
-        // SAFETY: function pointer is available and device/args are live.
-        let error =
-            unsafe { (self.client.plugin.device_get_description_fn()?)(&mut description_args) };
-        self.client.plugin.into_result(error)?;
-        let description = NonNull::new(description_args.device_description)
-            .ok_or(Error::NullResult("PJRT_Device_GetDescription"))?;
+        let description = self.description()?;
 
         // SAFETY: zero is valid for the output attributes pointer/count.
         let mut attributes_args: sys::PJRT_DeviceDescription_Attributes_Args = unsafe { zeroed() };
@@ -691,9 +1103,13 @@ impl Device<'_, '_> {
         attributes_args.device_description = description.as_ptr();
         // SAFETY: function pointer is available and description/args are live.
         let error = unsafe {
-            (self.client.plugin.device_description_attributes_fn()?)(&mut attributes_args)
+            (self
+                .client
+                .state
+                .plugin
+                .device_description_attributes_fn()?)(&mut attributes_args)
         };
-        self.client.plugin.into_result(error)?;
+        self.client.state.plugin.into_result(error)?;
         if attributes_args.num_attributes != 0 && attributes_args.attributes.is_null() {
             return Err(Error::NullResult("PJRT_DeviceDescription_Attributes"));
         }
@@ -720,15 +1136,391 @@ impl Device<'_, '_> {
         }
         Ok(None)
     }
+
+    fn description(&self) -> Result<NonNull<sys::PJRT_DeviceDescription>, Error> {
+        let mut args: sys::PJRT_Device_GetDescription_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Device_GetDescription_Args_STRUCT_SIZE as usize;
+        args.device = self.inner.as_ptr();
+        let error = unsafe { (self.client.state.plugin.device_get_description_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)?;
+        NonNull::new(args.device_description).ok_or(Error::NullResult("PJRT_Device_GetDescription"))
+    }
 }
 
-impl fmt::Debug for Client<'_> {
+/// Owned completion event returned by PJRT asynchronous operations.
+pub struct Event {
+    plugin: Plugin,
+    inner: NonNull<sys::PJRT_Event>,
+}
+
+impl Event {
+    fn from_raw(plugin: &Plugin, inner: NonNull<sys::PJRT_Event>) -> Self {
+        Self {
+            plugin: plugin.clone(),
+            inner,
+        }
+    }
+
+    pub fn is_ready(&self) -> Result<bool, Error> {
+        let mut args: sys::PJRT_Event_IsReady_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Event_IsReady_Args_STRUCT_SIZE as usize;
+        args.event = self.inner.as_ptr();
+        let error = unsafe { (self.plugin.event_is_ready_fn()?)(&mut args) };
+        self.plugin.into_result(error)?;
+        Ok(args.is_ready)
+    }
+
+    pub fn wait(&self) -> Result<(), Error> {
+        let mut args: sys::PJRT_Event_Await_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Event_Await_Args_STRUCT_SIZE as usize;
+        args.event = self.inner.as_ptr();
+        let error = unsafe { (self.plugin.event_await_fn()?)(&mut args) };
+        self.plugin.into_result(error)
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        let mut args: sys::PJRT_Event_Destroy_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Event_Destroy_Args_STRUCT_SIZE as usize;
+        args.event = self.inner.as_ptr();
+        if let Ok(function) = self.plugin.event_destroy_fn() {
+            let error = unsafe { function(&mut args) };
+            let _ = self.plugin.into_result(error);
+        }
+    }
+}
+
+/// Host-to-device transfer products. The buffer may be consumed immediately;
+/// `done` reports when PJRT has completed its host-side transfer work.
+pub struct HostTransfer {
+    pub buffer: Buffer,
+    pub done: Event,
+}
+
+/// Owned device buffer whose client and plugin necessarily remain live.
+pub struct Buffer {
+    client: Client,
+    inner: NonNull<sys::PJRT_Buffer>,
+}
+
+impl Buffer {
+    fn from_raw(client: &Client, inner: NonNull<sys::PJRT_Buffer>) -> Self {
+        Self {
+            client: client.clone(),
+            inner,
+        }
+    }
+
+    pub fn dtype(&self) -> Result<DType, Error> {
+        let mut args: sys::PJRT_Buffer_ElementType_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Buffer_ElementType_Args_STRUCT_SIZE as usize;
+        args.buffer = self.inner.as_ptr();
+        let error = unsafe { (self.client.state.plugin.buffer_element_type_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)?;
+        dtype_from_pjrt(args.type_)
+    }
+
+    pub fn dimensions(&self) -> Result<Vec<i64>, Error> {
+        let mut args: sys::PJRT_Buffer_Dimensions_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Buffer_Dimensions_Args_STRUCT_SIZE as usize;
+        args.buffer = self.inner.as_ptr();
+        let error = unsafe { (self.client.state.plugin.buffer_dimensions_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)?;
+        if args.num_dims != 0 && args.dims.is_null() {
+            return Err(Error::NullResult("PJRT_Buffer_Dimensions"));
+        }
+        Ok(if args.num_dims == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(args.dims, args.num_dims) }.to_vec()
+        })
+    }
+
+    pub fn shape(&self) -> Result<Shape, Error> {
+        Shape::new(self.dtype()?, &self.dimensions()?).map_err(|_| Error::TensorMetadataOverflow)
+    }
+
+    pub fn ready_event(&self) -> Result<Event, Error> {
+        let mut args: sys::PJRT_Buffer_ReadyEvent_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Buffer_ReadyEvent_Args_STRUCT_SIZE as usize;
+        args.buffer = self.inner.as_ptr();
+        let error = unsafe { (self.client.state.plugin.buffer_ready_event_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)?;
+        let inner = NonNull::new(args.event).ok_or(Error::NullResult("PJRT_Buffer_ReadyEvent"))?;
+        Ok(Event::from_raw(&self.client.state.plugin, inner))
+    }
+
+    pub fn to_host(&self) -> Result<Vec<u8>, Error> {
+        let byte_count = self
+            .shape()?
+            .byte_count()
+            .map_err(|_| Error::TensorMetadataOverflow)?;
+        let mut bytes = vec![0u8; byte_count];
+        let mut args: sys::PJRT_Buffer_ToHostBuffer_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE as usize;
+        args.src = self.inner.as_ptr();
+        args.dst = bytes.as_mut_ptr().cast();
+        args.dst_size = bytes.len();
+        let error = unsafe { (self.client.state.plugin.buffer_to_host_buffer_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)?;
+        let event =
+            NonNull::new(args.event).ok_or(Error::NullResult("PJRT_Buffer_ToHostBuffer event"))?;
+        Event::from_raw(&self.client.state.plugin, event).wait()?;
+        Ok(bytes)
+    }
+
+    pub fn delete(&self) -> Result<(), Error> {
+        let mut args: sys::PJRT_Buffer_Delete_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Buffer_Delete_Args_STRUCT_SIZE as usize;
+        args.buffer = self.inner.as_ptr();
+        let error = unsafe { (self.client.state.plugin.buffer_delete_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)
+    }
+
+    pub fn is_deleted(&self) -> Result<bool, Error> {
+        let mut args: sys::PJRT_Buffer_IsDeleted_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Buffer_IsDeleted_Args_STRUCT_SIZE as usize;
+        args.buffer = self.inner.as_ptr();
+        let error = unsafe { (self.client.state.plugin.buffer_is_deleted_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)?;
+        Ok(args.is_deleted)
+    }
+
+    pub fn memory(&self) -> Result<Memory, Error> {
+        let mut args: sys::PJRT_Buffer_Memory_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Buffer_Memory_Args_STRUCT_SIZE as usize;
+        args.buffer = self.inner.as_ptr();
+        let error = unsafe { (self.client.state.plugin.buffer_memory_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)?;
+        let inner = NonNull::new(args.memory).ok_or(Error::NullResult("PJRT_Buffer_Memory"))?;
+        Ok(Memory {
+            client: self.client.clone(),
+            inner,
+        })
+    }
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        let mut args: sys::PJRT_Buffer_Destroy_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Buffer_Destroy_Args_STRUCT_SIZE as usize;
+        args.buffer = self.inner.as_ptr();
+        if let Ok(function) = self.client.state.plugin.buffer_destroy_fn() {
+            let error = unsafe { function(&mut args) };
+            let _ = self.client.state.plugin.into_result(error);
+        }
+    }
+}
+
+/// Client-owned memory space referenced by a buffer.
+pub struct Memory {
+    #[allow(dead_code)]
+    client: Client,
+    inner: NonNull<sys::PJRT_Memory>,
+}
+
+impl Memory {
+    pub fn as_raw_identity(&self) -> usize {
+        self.inner.as_ptr() as usize
+    }
+}
+
+/// Owned unloaded executable metadata extracted from a loaded executable.
+pub struct Executable {
+    client: Client,
+    inner: NonNull<sys::PJRT_Executable>,
+}
+
+impl Executable {
+    pub fn name(&self) -> Result<String, Error> {
+        let mut args: sys::PJRT_Executable_Name_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Executable_Name_Args_STRUCT_SIZE as usize;
+        args.executable = self.inner.as_ptr();
+        let error = unsafe { (self.client.state.plugin.executable_name_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)?;
+        let bytes = copy_bytes(args.executable_name, args.executable_name_size)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    pub fn output_count(&self) -> Result<usize, Error> {
+        let mut args: sys::PJRT_Executable_NumOutputs_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Executable_NumOutputs_Args_STRUCT_SIZE as usize;
+        args.executable = self.inner.as_ptr();
+        let error = unsafe { (self.client.state.plugin.executable_num_outputs_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)?;
+        Ok(args.num_outputs)
+    }
+}
+
+impl Drop for Executable {
+    fn drop(&mut self) {
+        let mut args: sys::PJRT_Executable_Destroy_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Executable_Destroy_Args_STRUCT_SIZE as usize;
+        args.executable = self.inner.as_ptr();
+        if let Ok(function) = self.client.state.plugin.executable_destroy_fn() {
+            let error = unsafe { function(&mut args) };
+            let _ = self.client.state.plugin.into_result(error);
+        }
+    }
+}
+
+/// Owned executable installed into one PJRT client.
+pub struct LoadedExecutable {
+    client: Client,
+    inner: NonNull<sys::PJRT_LoadedExecutable>,
+}
+
+impl LoadedExecutable {
+    pub fn executable(&self) -> Result<Executable, Error> {
+        let mut args: sys::PJRT_LoadedExecutable_GetExecutable_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_LoadedExecutable_GetExecutable_Args_STRUCT_SIZE as usize;
+        args.loaded_executable = self.inner.as_ptr();
+        let error = unsafe {
+            (self
+                .client
+                .state
+                .plugin
+                .loaded_executable_get_executable_fn()?)(&mut args)
+        };
+        self.client.state.plugin.into_result(error)?;
+        let inner = NonNull::new(args.executable)
+            .ok_or(Error::NullResult("PJRT_LoadedExecutable_GetExecutable"))?;
+        Ok(Executable {
+            client: self.client.clone(),
+            inner,
+        })
+    }
+
+    pub fn addressable_devices(&self) -> Result<Vec<Device>, Error> {
+        let mut args: sys::PJRT_LoadedExecutable_AddressableDevices_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_LoadedExecutable_AddressableDevices_Args_STRUCT_SIZE as usize;
+        args.executable = self.inner.as_ptr();
+        let error = unsafe {
+            (self
+                .client
+                .state
+                .plugin
+                .loaded_executable_addressable_devices_fn()?)(&mut args)
+        };
+        self.client.state.plugin.into_result(error)?;
+        if args.num_addressable_devices != 0 && args.addressable_devices.is_null() {
+            return Err(Error::NullResult(
+                "PJRT_LoadedExecutable_AddressableDevices",
+            ));
+        }
+        if args.num_addressable_devices == 0 {
+            return Ok(Vec::new());
+        }
+        unsafe {
+            std::slice::from_raw_parts(args.addressable_devices, args.num_addressable_devices)
+        }
+        .iter()
+        .map(|device| {
+            Ok(Device {
+                client: self.client.clone(),
+                inner: NonNull::new(*device).ok_or(Error::NullResult(
+                    "PJRT_LoadedExecutable_AddressableDevices entry",
+                ))?,
+            })
+        })
+        .collect()
+    }
+
+    pub fn execute_one(
+        &self,
+        inputs: &[&Buffer],
+        device: Option<&Device>,
+    ) -> Result<Execution, Error> {
+        for input in inputs {
+            if !Arc::ptr_eq(&self.client.state, &input.client.state) {
+                return Err(Error::ForeignClientObject("buffer"));
+            }
+        }
+        if let Some(device) = device {
+            self.client.require_own_device(device)?;
+        }
+        let output_count = self.executable()?.output_count()?;
+        let argument_pointers: Vec<_> = inputs.iter().map(|buffer| buffer.inner.as_ptr()).collect();
+        let argument_lists = [argument_pointers.as_ptr()];
+        let mut output_pointers = vec![std::ptr::null_mut(); output_count];
+        let output_lists = [output_pointers.as_mut_ptr()];
+        let mut complete_events = [std::ptr::null_mut()];
+        let mut options: sys::PJRT_ExecuteOptions = unsafe { zeroed() };
+        options.struct_size = sys::PJRT_ExecuteOptions_STRUCT_SIZE as usize;
+        let mut args: sys::PJRT_LoadedExecutable_Execute_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_LoadedExecutable_Execute_Args_STRUCT_SIZE as usize;
+        args.executable = self.inner.as_ptr();
+        args.options = &mut options;
+        args.argument_lists = argument_lists.as_ptr();
+        args.num_devices = 1;
+        args.num_args = inputs.len();
+        args.output_lists = output_lists.as_ptr();
+        args.device_complete_events = complete_events.as_mut_ptr();
+        args.execute_device = device.map_or(std::ptr::null_mut(), |device| device.inner.as_ptr());
+        let error =
+            unsafe { (self.client.state.plugin.loaded_executable_execute_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)?;
+        // PJRT transfers ownership of every non-null output on success. Adopt
+        // all of them before reporting a malformed partial result so no later
+        // entry leaks merely because an earlier entry was null.
+        let outputs = output_pointers
+            .into_iter()
+            .map(|buffer| NonNull::new(buffer).map(|inner| Buffer::from_raw(&self.client, inner)))
+            .collect::<Vec<_>>();
+        let complete = NonNull::new(complete_events[0])
+            .map(|event| Event::from_raw(&self.client.state.plugin, event));
+        if outputs.iter().any(Option::is_none) {
+            return Err(Error::NullResult("PJRT_LoadedExecutable_Execute output"));
+        }
+        let outputs = outputs.into_iter().flatten().collect();
+        let complete = complete.ok_or(Error::NullResult("PJRT_LoadedExecutable_Execute event"))?;
+        Ok(Execution { outputs, complete })
+    }
+
+    pub fn delete(&self) -> Result<(), Error> {
+        let mut args: sys::PJRT_LoadedExecutable_Delete_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_LoadedExecutable_Delete_Args_STRUCT_SIZE as usize;
+        args.executable = self.inner.as_ptr();
+        let error = unsafe { (self.client.state.plugin.loaded_executable_delete_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)
+    }
+
+    pub fn is_deleted(&self) -> Result<bool, Error> {
+        let mut args: sys::PJRT_LoadedExecutable_IsDeleted_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_LoadedExecutable_IsDeleted_Args_STRUCT_SIZE as usize;
+        args.executable = self.inner.as_ptr();
+        let error =
+            unsafe { (self.client.state.plugin.loaded_executable_is_deleted_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)?;
+        Ok(args.is_deleted)
+    }
+}
+
+impl Drop for LoadedExecutable {
+    fn drop(&mut self) {
+        let mut args: sys::PJRT_LoadedExecutable_Destroy_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_LoadedExecutable_Destroy_Args_STRUCT_SIZE as usize;
+        args.executable = self.inner.as_ptr();
+        if let Ok(function) = self.client.state.plugin.loaded_executable_destroy_fn() {
+            let error = unsafe { function(&mut args) };
+            let _ = self.client.state.plugin.into_result(error);
+        }
+    }
+}
+
+pub struct Execution {
+    pub outputs: Vec<Buffer>,
+    pub complete: Event,
+}
+
+impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Client").finish_non_exhaustive()
     }
 }
 
-impl Drop for Client<'_> {
+impl Drop for ClientState {
     fn drop(&mut self) {
         // SAFETY: zero initializes the extension pointer and self owns client.
         let mut args: sys::PJRT_Client_Destroy_Args = unsafe { zeroed() };
@@ -895,4 +1687,45 @@ fn copy_bytes(pointer: *const c_char, length: usize) -> Result<Vec<u8>, Error> {
     // SAFETY: callers pass PJRT-owned pointers with the accompanying length.
     // Copying prevents an FFI-owned borrow from escaping its owner.
     Ok(unsafe { std::slice::from_raw_parts(pointer.cast(), length) }.to_vec())
+}
+
+fn dtype_to_pjrt(dtype: DType) -> sys::PJRT_Buffer_Type {
+    match dtype {
+        DType::Bool => sys::PJRT_Buffer_Type_PJRT_Buffer_Type_PRED,
+        DType::I8 => sys::PJRT_Buffer_Type_PJRT_Buffer_Type_S8,
+        DType::I16 => sys::PJRT_Buffer_Type_PJRT_Buffer_Type_S16,
+        DType::I32 => sys::PJRT_Buffer_Type_PJRT_Buffer_Type_S32,
+        DType::I64 => sys::PJRT_Buffer_Type_PJRT_Buffer_Type_S64,
+        DType::U8 => sys::PJRT_Buffer_Type_PJRT_Buffer_Type_U8,
+        DType::U16 => sys::PJRT_Buffer_Type_PJRT_Buffer_Type_U16,
+        DType::U32 => sys::PJRT_Buffer_Type_PJRT_Buffer_Type_U32,
+        DType::U64 => sys::PJRT_Buffer_Type_PJRT_Buffer_Type_U64,
+        DType::F16 => sys::PJRT_Buffer_Type_PJRT_Buffer_Type_F16,
+        DType::Bf16 => sys::PJRT_Buffer_Type_PJRT_Buffer_Type_BF16,
+        DType::F32 => sys::PJRT_Buffer_Type_PJRT_Buffer_Type_F32,
+        DType::F64 => sys::PJRT_Buffer_Type_PJRT_Buffer_Type_F64,
+        DType::C64 => sys::PJRT_Buffer_Type_PJRT_Buffer_Type_C64,
+        DType::C128 => sys::PJRT_Buffer_Type_PJRT_Buffer_Type_C128,
+    }
+}
+
+fn dtype_from_pjrt(dtype: sys::PJRT_Buffer_Type) -> Result<DType, Error> {
+    match dtype {
+        sys::PJRT_Buffer_Type_PJRT_Buffer_Type_PRED => Ok(DType::Bool),
+        sys::PJRT_Buffer_Type_PJRT_Buffer_Type_S8 => Ok(DType::I8),
+        sys::PJRT_Buffer_Type_PJRT_Buffer_Type_S16 => Ok(DType::I16),
+        sys::PJRT_Buffer_Type_PJRT_Buffer_Type_S32 => Ok(DType::I32),
+        sys::PJRT_Buffer_Type_PJRT_Buffer_Type_S64 => Ok(DType::I64),
+        sys::PJRT_Buffer_Type_PJRT_Buffer_Type_U8 => Ok(DType::U8),
+        sys::PJRT_Buffer_Type_PJRT_Buffer_Type_U16 => Ok(DType::U16),
+        sys::PJRT_Buffer_Type_PJRT_Buffer_Type_U32 => Ok(DType::U32),
+        sys::PJRT_Buffer_Type_PJRT_Buffer_Type_U64 => Ok(DType::U64),
+        sys::PJRT_Buffer_Type_PJRT_Buffer_Type_F16 => Ok(DType::F16),
+        sys::PJRT_Buffer_Type_PJRT_Buffer_Type_BF16 => Ok(DType::Bf16),
+        sys::PJRT_Buffer_Type_PJRT_Buffer_Type_F32 => Ok(DType::F32),
+        sys::PJRT_Buffer_Type_PJRT_Buffer_Type_F64 => Ok(DType::F64),
+        sys::PJRT_Buffer_Type_PJRT_Buffer_Type_C64 => Ok(DType::C64),
+        sys::PJRT_Buffer_Type_PJRT_Buffer_Type_C128 => Ok(DType::C128),
+        other => Err(Error::UnknownBufferType(other)),
+    }
 }

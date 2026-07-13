@@ -1,0 +1,22 @@
+"""Validated XLA compilation options serialized by pinned generated schemas."""
+
+load("//bazel:rust.bzl", "nml_rust_library", "nml_rust_test")
+
+nml_rust_library(
+    name = "nml_xla",
+    srcs = ["src/lib.rs"],
+    crate_root = "src/lib.rs",
+    deps = ["//crates/nml-xla-sys:nml_xla_sys"],
+    visibility = [
+        "//:__pkg__",
+        "//crates:__subpackages__",
+    ],
+)
+
+nml_rust_test(
+    name = "compile_options_contract_test",
+    size = "small",
+    srcs = ["tests/compile_options_contract.rs"],
+    crate_root = "tests/compile_options_contract.rs",
+    deps = [":nml_xla"],
+)

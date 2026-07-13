@@ -1,0 +1,49 @@
+"""Raw declarations for XLA's pinned MLIR, StableHLO, and Shardy C APIs."""
+
+load("//bazel:rust.bzl", "nml_rust_library")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_rust_bindgen//:defs.bzl", "rust_bindgen")
+
+cc_library(
+    name = "mlir_c_api",
+    srcs = ["src/support.c"],
+    hdrs = ["include/nml_mlir.h"],
+    includes = ["include"],
+    deps = [
+        "@llvm-project//mlir:CAPIArith",
+        "@llvm-project//mlir:CAPIIR",
+        "@llvm-project//mlir:CAPITransforms",
+        "@shardy//shardy/integrations/c:sdy_capi",
+        "@stablehlo//:stablehlo_dialect_capi",
+    ],
+)
+
+rust_bindgen(
+    name = "bindings",
+    bindgen_flags = [
+        "--allowlist-function=mlir.*",
+        "--allowlist-function=nml_mlir_.*",
+        "--allowlist-function=stablehlo.*",
+        "--allowlist-function=sdy.*",
+        "--allowlist-type=Mlir.*",
+        "--allowlist-var=MLIR_.*",
+        "--no-doc-comments",
+        "--no-layout-tests",
+    ],
+    cc_lib = ":mlir_c_api",
+    header = "include/nml_mlir.h",
+    merge_cc_lib_objects_into_rlib = False,
+)
+
+nml_rust_library(
+    name = "nml_mlir_sys",
+    srcs = [":bindings"],
+    crate_root = "bindings.rs",
+    link_deps = [":mlir_c_api"],
+    rustc_flags = [
+        "-Anon_camel_case_types",
+        "-Anon_snake_case",
+        "-Anon_upper_case_globals",
+    ],
+    visibility = ["//crates:__subpackages__"],
+)

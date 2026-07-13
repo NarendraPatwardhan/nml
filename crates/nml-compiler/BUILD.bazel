@@ -1,0 +1,30 @@
+"""Product orchestration from typed NML programs to loaded PJRT executables."""
+
+load("//bazel:rust.bzl", "nml_rust_library", "nml_rust_test")
+
+nml_rust_library(
+    name = "nml_compiler",
+    srcs = ["src/lib.rs"],
+    crate_root = "src/lib.rs",
+    deps = [
+        "//crates/nml-ir:nml_ir",
+        "//crates/nml-mlir:nml_mlir",
+        "//crates/nml-pjrt:nml_pjrt",
+        "//crates/nml-xla:nml_xla",
+    ],
+    visibility = [
+        "//:__pkg__",
+        "//crates:__subpackages__",
+    ],
+)
+
+nml_rust_test(
+    name = "compiler_contract_test",
+    size = "small",
+    srcs = ["tests/compiler_contract.rs"],
+    crate_root = "tests/compiler_contract.rs",
+    deps = [
+        ":nml_compiler",
+        "//crates/nml-pjrt:nml_pjrt",
+    ],
+)

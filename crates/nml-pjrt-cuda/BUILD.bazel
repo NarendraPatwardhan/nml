@@ -62,7 +62,14 @@ nml_rust_test(
     crate_root = "tests/runtime_contract.rs",
     local = True,
     tags = ["external"],
-    deps = [":nml_pjrt_cuda"],
+    deps = [
+        ":nml_pjrt_cuda",
+        "//crates/nml-compiler:nml_compiler",
+        "//crates/nml-ir:nml_ir",
+        "//crates/nml-pjrt:nml_pjrt",
+        "//crates/nml-types:nml_types",
+        "//crates/nml-xla:nml_xla",
+    ],
     target_compatible_with = select({
         "//platforms:cuda.enabled": [],
         "//conditions:default": ["@platforms//:incompatible"],

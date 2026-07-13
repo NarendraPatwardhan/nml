@@ -28,7 +28,7 @@ axis. Complexity is evidence for a decision, not the decision itself.
 | --- | --- | --- |
 | D-001 | `DECIDED` | NML is a manual, source-guided reimplementation. ZML may be read continuously, but NML product/runtime/model code is written for NML's requirements rather than copied wholesale. D-010 explicitly permits deliberate reuse and adaptation of build/dependency integration. |
 | D-002 | `DECIDED` | CPU and NVIDIA CUDA are the only accelerator targets. AMD ROCm, Google TPU, AWS Neuron/Trainium, Intel oneAPI, and Apple Metal are not NML accelerator targets. |
-| D-003 | `DECIDED` | NML will support ordinary useful dtypes such as FP32, FP16, and BF16 rather than ZML's full low-precision dtype matrix. The exact integer/index dtype set is still `UNDECIDED`. |
+| D-003 | `DECIDED` | NML's canonical ordinary scalar set is bool; signed and unsigned 8/16/32/64-bit integers; FP16, BF16, FP32, FP64; and C64/C128. Complex types are retained because FFT/IFFT and complex-form operations such as RoPE need them. The low-bit storage and compute types required by D-004 are separate quantization contracts rather than additions inferred from this ordinary set. |
 | D-004 | `DECIDED` | W4A16, W8A8, and NVFP4 are first-class NML goals. A dtype name alone does not count as quantization support. |
 | D-005 | `DECIDED` | Upstream project-service and personal-editor configuration is not ported: ZML's `.github/`, `.nvim.lua`, `.vscode/`, `.zed/`, and similar repository-personalization files are reference material only. This does not prohibit NML from later creating its own CI or editor-neutral config. |
 | D-006 | `DECIDED` | NML is an acceleration substrate for experiments, not an attempt to reproduce LLMD or a hosted serving product. |
@@ -48,6 +48,9 @@ axis. Complexity is evidence for a decision, not the decision itself.
 | D-020 | `DECIDED` | Following ZML, the Bazel platform layer owns independent `cpu` and `cuda` backend build settings in addition to host OS/architecture platforms. CPU defaults on, CUDA defaults off, and enabling CUDA does not disable CPU. These settings select the corresponding PJRT loaders, dependency/package closures, profiling hooks, and backend code as those targets are implemented. |
 | D-021 | `DECIDED` | Local Bazel invocations run from the NML repository root and reuse `../nml-bazel-cache` as their output-user-root. The startup option must precede the Bazel command: `bazel --output_user_root=../nml-bazel-cache <command> ...`. Keeping this directory beside rather than inside the repository satisfies Bazel's workspace-containment rule and preserves expensive hermetic XLA/LLVM/Rust actions across builds. |
 | D-022 | `DECIDED` | PJRT GPU custom-call registration is a foundational NML capability, not optional future surface. Retain the pinned XLA GPU extension ABI, including untyped and typed calls plus instantiate, prepare, initialize, and execute lifecycle handlers. Rust validates extension discovery and status handling; handler registration remains explicitly unsafe because PJRT exposes handler addresses as untyped `void*` values. |
+| D-023 | `DECIDED` | Follow ZML's treatment of MLIR `index`: it is a compiler-internal MLIR type, not a runtime `DataType`, tensor element type, host-storage type, or PJRT buffer type. The MLIR layer still supports index constants and signed/unsigned casts wherever compiler APIs, layouts, loops, memrefs, or dialect operations require them. |
+| D-024 | `DECIDED` | NML's initial compiler graph pins OpenXLA/XLA commit `41370d1124c74d7b93a207136a636d8c631cbed9`, matching the ZML reference integration. PJRT headers, XLA schemas, LLVM/MLIR, StableHLO, and Shardy are resolved through this graph rather than independent drifting source pins. |
+| D-025 | `DECIDED` | NML does not consume ZML's source forks of LLVM, Zig, XLA, `rules_ml_toolchain`, or other external projects. Compiler sources come from the original OpenXLA repository and its upstream-pinned dependency graph; Rust/Bazel dependencies come from their upstream registries; NVIDIA and system runtime packages come from their original distributors. Two deliberate ZML-derived inputs remain acceptable under D-010 and D-014: NML carries the audited `cuda-root-path-local-defines.patch` locally against upstream OpenXLA, and SHA-256-pinned CPU/CUDA plugin binaries are downloaded from `zml/pjrt-artifacts`. The latter is a ZML-hosted packaging dependency, not a source-fork dependency. Any future dependency on ZML-hosted forked source requires a new explicit decision. |
 
 An item is `UNDECIDED` only where this document identifies a deliberate NML
 departure that still needs an exact contract. Otherwise D-018 applies the
@@ -235,17 +238,20 @@ The layers do not support the same matrix:
 
 This is evidence that “the type exists” is not a useful support claim.
 
-FP32, FP16, and BF16 are required end to end. The exact additional ordinary
-integer/index set and explicit exclusions remain `UNDECIDED`; they must be
-recorded in the same end-to-end matrix rather than inferred from an enum:
+The ordinary scalar set is now decided by D-003. Support is still claimed per
+layer rather than inferred from enum membership, and MLIR `index` remains a
+separate compiler-only type under D-023:
 
 | Type | Host storage | File import | CPU graph | CUDA graph | Custom kernels | Public API |
 | --- | --- | --- | --- | --- | --- | --- |
 | FP32 | required | required | required | required | where used | required |
 | FP16 | required | required | required | required | where used | required |
 | BF16 | required | required | required | required | where used | required |
-| Bool and index integers | exact set `UNDECIDED` | `UNDECIDED` | `UNDECIDED` | `UNDECIDED` | as needed | `UNDECIDED` |
-| FP64/complex/2-bit/general FP8 | `UNDECIDED` unless separately excluded | — | — | — | — | — |
+| Bool; I8/I16/I32/I64; U8/U16/U32/U64 | required | as formats require | required | required | as needed | required |
+| FP64 | required | required | required | required | where used | required |
+| C64/C128 | required | required | required | required | where used | required |
+| MLIR index | none: not a storage type | none | compiler internals only | compiler internals only | none | not a `DataType` |
+| 2-bit/general FP8 | outside the ordinary set unless a quantization contract requires one | — | — | — | — | — |
 
 ### 5.3 Quantization is a representation and kernel contract
 
@@ -936,7 +942,7 @@ undecided except where earlier decisions force an answer.
 | ROCm/TPU/Neuron/oneAPI/Metal platform support | corresponding `platforms/*` | No value to declared NML accelerator scope except as design reference | Removes their packaging, branching, kernels, tests, and topology cases | `OUT` as NML targets; reference code remains readable |
 | General multi-device sharding | `zml/Sharding.zig` | Large-model and distributed experiment capability | Single-device simplicity; later distributed design required if needed | `DEFAULT-ZML` |
 | Shardy/GSPMD integration | `zml/Sharding.zig`, `zml/module.zig` | Compiler-assisted partitioning | Explicit collectives or no distribution | `DEFAULT-ZML` |
-| Ordinary dtype matrix | `zml/{dtype,floats,mlirx,pjrtx}.zig` | Broad format interop | Smaller branch/test matrix | `DECIDED: narrow`; exact set `UNDECIDED` |
+| Ordinary dtype matrix | `zml/{dtype,floats,mlirx,pjrtx}.zig` | Broad format interop | Smaller branch/test matrix | `DECIDED`: D-003 canonical set and D-023 compiler-only index |
 | W4A16 | partial names only in current ZML | Required memory-efficient inference path | Violates D-004 | `DECIDED: required`; exact recipe `UNDECIDED` |
 | W8A8 | partial names/FP8 pieces in current ZML | Required quantized inference path | Violates D-004 | `DECIDED: required`; exact recipe `UNDECIDED` |
 | NVFP4 | scalar plumbing but no end-to-end path | Required Blackwell-class quant path | Violates D-004 | `DECIDED: required`; exact scope `UNDECIDED` |

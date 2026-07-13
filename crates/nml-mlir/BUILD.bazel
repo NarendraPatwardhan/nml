@@ -1,0 +1,28 @@
+"""Safe ownership and serialization over the pinned MLIR C API."""
+
+load("//bazel:rust.bzl", "nml_rust_library", "nml_rust_test")
+
+nml_rust_library(
+    name = "nml_mlir",
+    srcs = ["src/lib.rs"],
+    crate_root = "src/lib.rs",
+    deps = [
+        "//crates/nml-mlir-sys:nml_mlir_sys",
+        "//crates/nml-types:nml_types",
+    ],
+    visibility = [
+        "//:__pkg__",
+        "//crates:__subpackages__",
+    ],
+)
+
+nml_rust_test(
+    name = "mlir_contract_test",
+    size = "small",
+    srcs = ["tests/mlir_contract.rs"],
+    crate_root = "tests/mlir_contract.rs",
+    deps = [
+        ":nml_mlir",
+        "//crates/nml-types:nml_types",
+    ],
+)

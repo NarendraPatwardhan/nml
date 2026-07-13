@@ -40,7 +40,14 @@ nml_rust_test(
     size = "small",
     srcs = ["tests/runtime_contract.rs"],
     crate_root = "tests/runtime_contract.rs",
-    deps = [":nml_pjrt_cpu"],
+    deps = [
+        ":nml_pjrt_cpu",
+        "//crates/nml-compiler:nml_compiler",
+        "//crates/nml-ir:nml_ir",
+        "//crates/nml-pjrt:nml_pjrt",
+        "//crates/nml-types:nml_types",
+        "//crates/nml-xla:nml_xla",
+    ],
     target_compatible_with = select({
         "//platforms:cpu.enabled": [],
         "//conditions:default": ["@platforms//:incompatible"],

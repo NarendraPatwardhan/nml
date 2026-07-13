@@ -2,6 +2,11 @@
 # flags belong beside the backend that consumes them; putting them here would
 # make every target depend on implementation details of XLA, PJRT, or CUDA.
 
+# Keep Bazel's mutable server state and action cache outside the source tree at
+# the single relative location established in FORK.md. Because this is a
+# startup option, it applies equally to local Bazel and BuildBuddy Remote Bazel.
+startup --output_user_root=../nml-bazel-cache
+
 # A failed test should explain itself in the terminal while preserving Bazel's
 # complete test log as the authoritative artifact.
 test --test_output=errors
@@ -10,6 +15,21 @@ test --test_output=errors
 # the ZML graph and prevents build tools from selecting a host compiler default.
 common --cxxopt=-std=c++17
 common --host_cxxopt=-std=c++17
+
+# Bazel 9 removed the legacy native C++, Python, shell, and Java rules that
+# XLA's pinned LLVM BUILD files still spell without explicit loads. Route those
+# names through the same external rule sets ZML selects.
+common --incompatible_autoload_externally=+@rules_cc,+@rules_python,+@rules_shell,+@rules_java
+
+# The generated upb runtime is linked into shared compiler/runtime boundaries.
+common:linux --copt=-fPIC
+
+# Named backend configurations are permanent acceptance entry points. CUDA is
+# additive: its configuration retains the CPU correctness/performance backend.
+common:cpu --//platforms:cpu=true
+common:cpu --//platforms:cuda=false
+common:cuda --//platforms:cpu=true
+common:cuda --//platforms:cuda=true
 
 # Performance is a product property, so optimized builds have a stable spelling.
 # The default remains Bazel's fast development mode; performance gates must opt

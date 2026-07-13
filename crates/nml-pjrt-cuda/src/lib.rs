@@ -15,10 +15,12 @@ use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const CUDA_RUNTIME_RLOCATION: &str = env!("NML_CUDA_RUNTIME_RLOCATION");
 const CUDA_LIBRARY_PATH_FRAGMENT: &str = "/cuda/";
 const RTLD_NOW: c_int = 0x2;
+static RUNTIME_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Client allocation modes exposed by XLA's CUDA PJRT plugin.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -48,6 +50,20 @@ impl Default for AllocatorOptions {
     }
 }
 
+impl AllocatorOptions {
+    fn validate(self) -> Result<(), Error> {
+        if !self.memory_fraction.is_finite() || !(0.0..=1.0).contains(&self.memory_fraction) {
+            return Err(Error::InvalidMemoryFraction(self.memory_fraction));
+        }
+        if self.collective_memory_size_bytes < 0 {
+            return Err(Error::NegativeCollectiveMemorySize(
+                self.collective_memory_size_bytes,
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClientOptions {
     pub allocator: Allocator,
@@ -61,6 +77,15 @@ impl Default for ClientOptions {
     }
 }
 
+impl ClientOptions {
+    pub fn validate(self) -> Result<(), Error> {
+        match self.allocator {
+            Allocator::Bfc(options) | Allocator::CudaAsync(options) => options.validate(),
+            Allocator::Platform => Ok(()),
+        }
+    }
+}
+
 /// A compute capability reported by the CUDA PJRT device description.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ComputeCapability {
@@ -69,6 +94,14 @@ pub struct ComputeCapability {
 }
 
 impl ComputeCapability {
+    /// CUDA 13 retains offline compilation and library support from Turing
+    /// onward. NML deliberately has no upper bound: newer capabilities remain
+    /// the responsibility of the pinned CUDA/XLA stack rather than a stale
+    /// frontend allow-list.
+    pub const fn is_supported(self) -> bool {
+        self.major > 7 || (self.major == 7 && self.minor >= 5)
+    }
+
     fn parse(value: &str) -> Option<Self> {
         let (major, minor) = value.split_once('.')?;
         if minor.contains('.') {
@@ -84,17 +117,31 @@ impl ComputeCapability {
 #[derive(Debug)]
 pub enum Error {
     Disabled,
+    AlreadyInitialized,
     NoNvidiaDevice,
     Runfiles(String),
     MissingRuntime(String),
     InvalidRuntimePath(PathBuf),
-    CompatibilityDriver { path: PathBuf, message: String },
+    ConflictingCudaDataDir(String),
+    CompatibilityDriver {
+        path: PathBuf,
+        message: String,
+    },
     Pjrt(nml_pjrt::Error),
     UnexpectedPlatform(String),
     NoCudaDevices,
     MissingComputeCapability(usize),
-    InvalidComputeCapability { device_index: usize, value: String },
+    InvalidComputeCapability {
+        device_index: usize,
+        value: String,
+    },
+    UnsupportedComputeCapability {
+        device_index: usize,
+        capability: ComputeCapability,
+    },
     MissingGpuCustomCallExtension,
+    InvalidMemoryFraction(f32),
+    NegativeCollectiveMemorySize(i64),
 }
 
 impl fmt::Display for Error {
@@ -103,6 +150,9 @@ impl fmt::Display for Error {
             Self::Disabled => {
                 f.write_str("the CUDA PJRT backend is disabled in this Bazel configuration")
             }
+            Self::AlreadyInitialized => f.write_str(
+                "the process-global CUDA PJRT runtime has already been initialized; reuse the existing Runtime",
+            ),
             Self::NoNvidiaDevice => f.write_str(
                 "no readable NVIDIA device node was found at /dev/nvidiactl or /dev/dxg",
             ),
@@ -114,6 +164,10 @@ impl fmt::Display for Error {
                 f,
                 "CUDA runtime path contains a NUL byte: {}",
                 path.display()
+            ),
+            Self::ConflictingCudaDataDir(flag) => write!(
+                f,
+                "XLA_FLAGS already selects a different CUDA data directory with {flag:?}"
             ),
             Self::CompatibilityDriver { path, message } => write!(
                 f,
@@ -135,9 +189,25 @@ impl fmt::Display for Error {
                 f,
                 "CUDA device {device_index} reported invalid compute capability {value:?}"
             ),
+            Self::UnsupportedComputeCapability {
+                device_index,
+                capability,
+            } => write!(
+                f,
+                "CUDA device {device_index} has compute capability {}.{}, but NML's pinned CUDA 13 stack requires Turing (7.5) or newer",
+                capability.major, capability.minor
+            ),
             Self::MissingGpuCustomCallExtension => {
                 f.write_str("CUDA PJRT plugin does not expose GPU custom-call registration")
             }
+            Self::InvalidMemoryFraction(value) => write!(
+                f,
+                "CUDA allocator memory_fraction must be finite and between 0 and 1, received {value}"
+            ),
+            Self::NegativeCollectiveMemorySize(value) => write!(
+                f,
+                "CUDA allocator collective_memory_size_bytes must be non-negative, received {value}"
+            ),
         }
     }
 }
@@ -168,7 +238,7 @@ impl Runtime {
     ///
     /// # Safety
     ///
-    /// This must run before the process starts any other thread that can read
+    /// This must run exactly once, before the process starts any other thread that can read
     /// environment variables. XLA requires `XLA_FLAGS` to name the hermetic
     /// CUDA directory before its plugin is loaded. Rust cannot make mutation
     /// of a process environment safe in the presence of concurrent readers.
@@ -188,8 +258,10 @@ impl Runtime {
             return Err(Error::MissingRuntime(directory.display().to_string()));
         }
 
+        let initialization = InitializationClaim::acquire()?;
+
         // SAFETY: the caller promises process-wide environment exclusivity.
-        unsafe { configure_xla_flags(&directory) };
+        unsafe { configure_xla_flags(&directory) }?;
         if use_packaged_driver(&directory) {
             load_compatibility_driver(&directory)?;
         }
@@ -197,6 +269,7 @@ impl Runtime {
         let plugin_path = directory.join("lib/libpjrt_cuda.so");
         // SAFETY: the path is a file in the digest-pinned Bazel runtime tree.
         let plugin = unsafe { Plugin::load_trusted(plugin_path) }?;
+        initialization.commit();
         Ok(Self { plugin, directory })
     }
 
@@ -205,7 +278,7 @@ impl Runtime {
     }
 
     /// Returns the CUDA plugin's validated custom-call registration interface.
-    pub fn custom_calls(&self) -> Result<GpuCustomCalls<'_>, Error> {
+    pub fn custom_calls(&self) -> Result<GpuCustomCalls, Error> {
         self.plugin
             .gpu_custom_calls()?
             .ok_or(Error::MissingGpuCustomCallExtension)
@@ -213,7 +286,8 @@ impl Runtime {
 
     /// Creates a client using ZML's XLA GPU allocation policy and validates
     /// every device exposed by the pinned plugin.
-    pub fn create_client(&self, options: ClientOptions) -> Result<Client<'_>, Error> {
+    pub fn create_client(&self, options: ClientOptions) -> Result<Client, Error> {
+        options.validate()?;
         let mut values = Vec::with_capacity(4);
         match options.allocator {
             Allocator::Platform => values.push(NamedValue::String {
@@ -264,7 +338,7 @@ fn write_allocator_options<'a>(
 
 /// Returns every CUDA device capability, rejecting incomplete or malformed
 /// device descriptions instead of silently choosing an unsupported code path.
-pub fn compute_capabilities(client: &Client<'_>) -> Result<Vec<ComputeCapability>, Error> {
+pub fn compute_capabilities(client: &Client) -> Result<Vec<ComputeCapability>, Error> {
     let platform = client.platform_name()?;
     if !platform.eq_ignore_ascii_case("cuda") {
         return Err(Error::UnexpectedPlatform(platform));
@@ -280,10 +354,19 @@ pub fn compute_capabilities(client: &Client<'_>) -> Result<Vec<ComputeCapability
             let value = device
                 .string_attribute("compute_capability")?
                 .ok_or(Error::MissingComputeCapability(index))?;
-            ComputeCapability::parse(&value).ok_or(Error::InvalidComputeCapability {
-                device_index: index,
-                value,
-            })
+            let capability =
+                ComputeCapability::parse(&value).ok_or(Error::InvalidComputeCapability {
+                    device_index: index,
+                    value,
+                })?;
+            if capability.is_supported() {
+                Ok(capability)
+            } else {
+                Err(Error::UnsupportedComputeCapability {
+                    device_index: index,
+                    capability,
+                })
+            }
         })
         .collect()
 }
@@ -309,18 +392,50 @@ fn warn_for_external_cuda_libraries() {
     }
 }
 
-unsafe fn configure_xla_flags(runtime: &Path) {
+struct InitializationClaim {
+    committed: bool,
+}
+
+impl InitializationClaim {
+    fn acquire() -> Result<Self, Error> {
+        RUNTIME_INITIALIZED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| Error::AlreadyInitialized)?;
+        Ok(Self { committed: false })
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for InitializationClaim {
+    fn drop(&mut self) {
+        if !self.committed {
+            RUNTIME_INITIALIZED.store(false, Ordering::Release);
+        }
+    }
+}
+
+unsafe fn configure_xla_flags(runtime: &Path) -> Result<(), Error> {
     let existing = std::env::var_os("XLA_FLAGS").unwrap_or_default();
+    let cuda_data_dir = format!("--xla_gpu_cuda_data_dir={}", runtime.to_string_lossy());
+    for flag in existing.to_string_lossy().split_whitespace() {
+        if flag == cuda_data_dir {
+            return Ok(());
+        }
+        if flag.starts_with("--xla_gpu_cuda_data_dir=") {
+            return Err(Error::ConflictingCudaDataDir(flag.to_owned()));
+        }
+    }
     let mut value = existing;
     if !value.is_empty() {
         value.push(" ");
     }
-    value.push(format!(
-        "--xla_gpu_cuda_data_dir={}",
-        runtime.to_string_lossy()
-    ));
+    value.push(cuda_data_dir);
     // SAFETY: this function inherits Runtime::load's process-wide exclusion.
     unsafe { std::env::set_var("XLA_FLAGS", value) };
+    Ok(())
 }
 
 fn use_packaged_driver(runtime: &Path) -> bool {

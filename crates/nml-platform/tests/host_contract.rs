@@ -1,8 +1,6 @@
 //! Executable proof that the Rust target and NML's host vocabulary agree.
 
-use nml_platform::{
-    Architecture, Backend, CPU_ENABLED, CUDA_ENABLED, Host, OperatingSystem,
-};
+use nml_platform::{Architecture, Backend, CPU_ENABLED, CUDA_ENABLED, Host, OperatingSystem};
 
 #[test]
 fn current_host_matches_the_compiler_target() {

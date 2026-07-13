@@ -1,0 +1,21 @@
+"""Canonical scalar and tensor-metadata contracts shared by NML layers."""
+
+load("//bazel:rust.bzl", "nml_rust_library", "nml_rust_test")
+
+nml_rust_library(
+    name = "nml_types",
+    srcs = ["src/lib.rs"],
+    crate_root = "src/lib.rs",
+    visibility = [
+        "//:__pkg__",
+        "//crates:__subpackages__",
+    ],
+)
+
+nml_rust_test(
+    name = "types_contract_test",
+    size = "small",
+    srcs = ["tests/types_contract.rs"],
+    crate_root = "tests/types_contract.rs",
+    deps = [":nml_types"],
+)

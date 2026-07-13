@@ -24,8 +24,8 @@ rust_bindgen(
         # sized Rust placeholders, while all ABI use is correctly by pointer.
         "--no-layout-tests",
     ],
-    cc_lib = "@xla_pjrt_headers//:pjrt_c_api_headers",
-    header = "@xla_pjrt_headers//:xla/pjrt/c/pjrt_c_api_gpu_extension.h",
+    cc_lib = "@xla//xla/pjrt/c:pjrt_c_api_gpu_extension_hdrs",
+    header = "@xla//xla/pjrt/c:pjrt_c_api_gpu_extension.h",
     # This target describes an ABI; it has no C objects to merge into the Rust
     # archive. Plugin implementations arrive as separately loaded shared libs.
     merge_cc_lib_objects_into_rlib = False,

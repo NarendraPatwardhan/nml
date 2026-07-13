@@ -15,6 +15,36 @@ alias(
 )
 
 alias(
+    name = "nml_types",
+    actual = "//crates/nml-types:nml_types",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "nml_mlir",
+    actual = "//crates/nml-mlir:nml_mlir",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "nml_ir",
+    actual = "//crates/nml-ir:nml_ir",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "nml_xla",
+    actual = "//crates/nml-xla:nml_xla",
+    visibility = ["//visibility:public"],
+)
+
+alias(
+    name = "nml_compiler",
+    actual = "//crates/nml-compiler:nml_compiler",
+    visibility = ["//visibility:public"],
+)
+
+alias(
     name = "nml_pjrt_cpu",
     actual = "//crates/nml-pjrt-cpu:nml_pjrt_cpu",
     visibility = ["//visibility:public"],
@@ -35,6 +65,10 @@ test_suite(
         "//crates/nml-pjrt-cpu:cpu_disabled_contract_test",
         "//crates/nml-pjrt-cpu:cpu_runtime_contract_test",
         "//crates/nml-platform:host_contract_test",
+        "//crates/nml-types:types_contract_test",
+        "//crates/nml-mlir:mlir_contract_test",
+        "//crates/nml-ir:ir_contract_test",
+        "//crates/nml-xla:compile_options_contract_test",
     ],
     visibility = ["//visibility:public"],
 )

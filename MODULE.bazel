@@ -1,10 +1,10 @@
 """The hermetic toolchain root for NML.
 
-This file answers only repository-wide questions: which Bazel generation owns
-the graph, which Rust rules define Rust actions, and which exact stable compiler
-builds the product. Native libraries such as XLA and PJRT will be introduced by
-focused module extensions when their real targets exist; eagerly declaring the
-entire ZML dependency graph here would create unused complexity.
+This file answers repository-wide questions: which Bazel generation owns the
+graph, which exact stable Rust compiler builds the product, and which pinned
+external repositories supply XLA and the PJRT packages. Focused module
+extensions below materialize only the native dependency graph used by real NML
+targets; unrelated parts of ZML's dependency universe remain absent.
 """
 
 module(
@@ -16,6 +16,27 @@ module(
 # Depending on a transitive copy from rules_rust would make platform policy an
 # accidental property of another module's implementation.
 bazel_dep(name = "platforms", version = "1.1.0")
+
+# XLA is a WORKSPACE-shaped source repository and expects these names in its
+# repository mapping. Pin the same module family ZML uses so XLA, MLIR,
+# StableHLO, Shardy, and generated upb schemas share one dependency universe.
+bazel_dep(name = "abseil-cpp", version = "20260526.0", repo_name = "com_google_absl")
+single_version_override(
+    module_name = "abseil-cpp",
+    patch_strip = 1,
+    patches = ["//:third_party/abseil-cpp/bmi2intrin.patch"],
+    version = "20260526.0",
+)
+bazel_dep(name = "protobuf", version = "35.0", repo_name = "com_google_protobuf")
+bazel_dep(name = "pybind11_bazel", version = "3.0.1")
+bazel_dep(name = "re2", version = "2025-11-05", repo_name = "com_googlesource_code_re2")
+bazel_dep(name = "rules_license", version = "1.0.0")
+bazel_dep(name = "rules_proto", version = "7.1.0")
+bazel_dep(name = "rules_python", version = "1.9.0")
+bazel_dep(name = "rules_shell", version = "0.6.1")
+bazel_dep(name = "zlib-ng", version = "2.3.3", repo_name = "llvm_zlib")
+bazel_dep(name = "zstd", version = "1.5.7.bcr.1", repo_name = "llvm_zstd")
+bazel_dep(name = "with_cfg.bzl", version = "0.14.4")
 
 # ZML models backend enablement with independent boolean build settings. NML
 # retains that design through skylib's typed bool_flag rather than encoding
@@ -80,24 +101,73 @@ use_repo(rust, "rust_toolchains")
 # do not register rules_rust's implicit stable-plus-nightly defaults.
 register_toolchains("@rust_toolchains//:all")
 
-# This is the same bootstrapped LLVM toolchain family ZML selects for XLA and
-# native dependencies. Rust binding generation must consume it too; NML does
-# not build a second unrelated LLVM solely for bindgen.
+# Reuse ZML's bootstrapped Bazel LLVM toolchain for native build actions and
+# Rust bindgen. This is build tooling; product MLIR libraries remain pinned by
+# XLA below. Keeping the roles distinct avoids rebuilding XLA's full Clang
+# frontend merely to translate C headers.
 register_toolchains("@llvm//toolchain:all")
 
-# Expose the source-built LLVM repository already configured by the `llvm`
-# module so Rust bindgen can use its clang/libclang. This is not a third LLVM:
-# it is the source side of the same module whose toolchains are registered
-# above, and it is also the module family ZML uses around XLA.
-llvm_source = use_extension("@llvm//extensions:llvm_source.bzl", "llvm_source")
-use_repo(llvm_source, "llvm-raw", "llvm_config", "llvm_zlib", "llvm_zstd")
+bindgen_llvm_source = use_extension("@llvm//extensions:llvm_source.bzl", "llvm_source")
+use_repo(
+    bindgen_llvm_source,
+    "llvm-raw",
+    "llvm_config",
+    bindgen_llvm_zlib = "llvm_zlib",
+    bindgen_llvm_zstd = "llvm_zstd",
+)
 
-llvm_project = use_extension("@llvm//extensions:llvm.bzl", "llvm")
-use_repo(llvm_project, "llvm-project")
+bindgen_llvm = use_extension("@llvm//extensions:llvm.bzl", "llvm")
+use_repo(bindgen_llvm, bindgen_llvm_project = "llvm-project")
+
+# XLA is the source of truth for PJRT headers, StableHLO, Shardy, compiler
+# schemas, and the exact LLVM/MLIR revision. The two-stage extension mirrors
+# XLA's own workspace structure: first materialize the pinned source, then load
+# its repository declarations to create the dependency graph.
+xla_source = use_extension("//third_party/xla:repo.bzl", "xla_source")
+use_repo(xla_source, "xla")
+
+xla_dependencies = use_extension("//third_party/xla:xla.bzl", "xla_dependencies")
+use_repo(
+    xla_dependencies,
+    "com_github_grpc_grpc",
+    "eigen_archive",
+    "farmhash_archive",
+    "farmhash_gpu_archive",
+    "highwayhash",
+    "hwloc",
+    "local_config_cuda",
+    "local_config_remote_execution",
+    "local_config_rocm",
+    "local_config_sycl",
+    "local_config_tensorrt",
+    "ml_dtypes_py",
+    "python_version_repo",
+    "rules_ml_toolchain",
+    "shardy",
+    "snappy",
+    "stablehlo",
+    "sycl_configure",
+    "sycl_configure_ext",
+    "triton",
+    "tsl",
+    xla_llvm_raw = "llvm-raw",
+)
+
+# Configure MLIR from XLA's own llvm-raw repository. This prevents the PJRT
+# ABI, StableHLO dialect, and MLIR C API from drifting across LLVM revisions.
+xla_llvm = use_extension("//third_party/xla:llvm.bzl", "llvm")
+xla_llvm.configure(targets = [
+    # Unlike ZML's empty target list (which enables every LLVM backend), NML's
+    # product policy admits only its two host architectures and NVIDIA GPUs.
+    "AArch64",
+    "X86",
+    "NVPTX",
+])
+use_repo(xla_llvm, "llvm-project")
 
 # Rust needs bindgen where Zig uses translate-c. The only intentional language
-# adaptation is the generator; clang and libclang come from the lifted LLVM
-# graph above.
+# adaptation is the generator. Its Clang is a build tool supplied by the
+# bootstrapped @llvm toolchain; product MLIR remains XLA-owned above.
 register_toolchains("//tools/bindgen:toolchain")
 
 # CUDA's hermetic Debian runtime fragments are extracted with the same pinned
@@ -109,12 +179,6 @@ use_repo(
     "bsd_tar_toolchains_linux_amd64",
     "bsd_tar_toolchains_linux_arm64",
 )
-
-# Import only the self-contained PJRT C header at this layer. The full pinned
-# XLA source/build extension enters when NML implements StableHLO compilation;
-# making raw ABI bindings depend on the whole compiler would invert ownership.
-pjrt_headers = use_extension("//third_party/xla:pjrt_headers.bzl", "pjrt_headers")
-use_repo(pjrt_headers, "xla_pjrt_headers")
 
 # CPU and CUDA are distinct PJRT plugin packages. This extension owns only the
 # CPU artifacts and includes the Linux AArch64 artifact omitted from ZML's

@@ -1,6 +1,11 @@
-"""Pinned, minimal XLA surfaces imported before the full compiler graph."""
+"""Pinned XLA source, compiler dependency, and LLVM configuration logic."""
 
 exports_files(
-    ["pjrt_headers.bzl"],
+    [
+        "cuda-root-path-local-defines.patch",
+        "llvm.bzl",
+        "repo.bzl",
+        "xla.bzl",
+    ],
     visibility = ["//visibility:public"],
 )

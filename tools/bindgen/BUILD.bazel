@@ -5,10 +5,10 @@ load("@rules_rust_bindgen//:defs.bzl", "rust_bindgen_toolchain")
 rust_bindgen_toolchain(
     name = "toolchain_impl",
     bindgen = "@rules_rust_bindgen//3rdparty:bindgen",
-    clang = "@llvm-project//clang:clang",
+    clang = "@bindgen_llvm_project//clang:clang",
     # Binding generation is a compiler action, not repository formatting.
     default_rustfmt = False,
-    libclang = "@llvm-project//clang:libclang",
+    libclang = "@bindgen_llvm_project//clang:libclang",
 )
 
 toolchain(
