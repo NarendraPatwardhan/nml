@@ -73,8 +73,11 @@ impl<T> Complex<T> {
     }
 }
 
-pub type Complex32 = Complex<f32>;
-pub type Complex64 = Complex<f64>;
+/// Host representation of StableHLO C64: two F32 components, 64 bits total.
+pub type Complex64 = Complex<f32>;
+
+/// Host representation of StableHLO C128: two F64 components, 128 bits total.
+pub type Complex128 = Complex<f64>;
 
 /// The ordinary tensor element types supported by NML.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

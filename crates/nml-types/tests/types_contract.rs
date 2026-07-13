@@ -1,5 +1,5 @@
 use nml_types::{
-    AxisTag, BFloat16, Complex32, Complex64, DType, DTypeClass, F16, Layout, MAX_RANK, Partition,
+    AxisTag, BFloat16, Complex64, Complex128, DType, DTypeClass, F16, Layout, MAX_RANK, Partition,
     Shape, ShapeError,
 };
 use std::mem::{align_of, size_of};
@@ -38,12 +38,12 @@ fn canonical_dtype_contract_is_exhaustive() {
 fn host_storage_layouts_match_dtype_contract() {
     assert_eq!((size_of::<F16>(), align_of::<F16>()), (2, 2));
     assert_eq!((size_of::<BFloat16>(), align_of::<BFloat16>()), (2, 2));
-    assert_eq!((size_of::<Complex32>(), align_of::<Complex32>()), (8, 4));
-    assert_eq!((size_of::<Complex64>(), align_of::<Complex64>()), (16, 8));
+    assert_eq!((size_of::<Complex64>(), align_of::<Complex64>()), (8, 4));
+    assert_eq!((size_of::<Complex128>(), align_of::<Complex128>()), (16, 8));
     assert_eq!(F16::from_bits(0x3c00).to_bits(), 0x3c00);
     assert_eq!(BFloat16::from_bits(0x3f80).to_bits(), 0x3f80);
 
-    let value = Complex32::new(2.5, -7.0);
+    let value = Complex64::new(2.5, -7.0);
     assert_eq!(value.real, 2.5);
     assert_eq!(value.imaginary, -7.0);
 }
