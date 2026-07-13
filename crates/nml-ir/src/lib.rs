@@ -77,6 +77,8 @@ pub enum Error {
         expected: Layout,
     },
     NoOutputs,
+    DuplicateInputName(String),
+    DuplicateOutputName(String),
     Shape(ShapeError),
     Mlir(MlirError),
 }
@@ -147,6 +149,8 @@ impl fmt::Display for Error {
                 expected.minor_to_major()
             ),
             Self::NoOutputs => formatter.write_str("program must expose at least one output"),
+            Self::DuplicateInputName(name) => write!(formatter, "duplicate input name {name:?}"),
+            Self::DuplicateOutputName(name) => write!(formatter, "duplicate output name {name:?}"),
             Self::Shape(error) => error.fmt(formatter),
             Self::Mlir(error) => error.fmt(formatter),
         }
@@ -170,6 +174,7 @@ impl From<MlirError> for Error {
 pub struct ProgramBuilder {
     identifier: u64,
     inputs: Vec<usize>,
+    input_kinds: Vec<InputKind>,
     values: Vec<Value>,
     operations: Vec<Operation>,
 }
@@ -179,18 +184,28 @@ impl ProgramBuilder {
         Self {
             identifier: NEXT_PROGRAM_ID.fetch_add(1, Ordering::Relaxed),
             inputs: Vec::new(),
+            input_kinds: Vec::new(),
             values: Vec::new(),
             operations: Vec::new(),
         }
     }
 
     pub fn input(&mut self, name: impl Into<String>, shape: Shape) -> Tensor {
+        self.named_input(name, shape, InputKind::Activation)
+    }
+
+    pub fn parameter(&mut self, name: impl Into<String>, shape: Shape) -> Tensor {
+        self.named_input(name, shape, InputKind::Parameter)
+    }
+
+    fn named_input(&mut self, name: impl Into<String>, shape: Shape, kind: InputKind) -> Tensor {
         let value = self.values.len();
         self.values.push(Value {
             name: name.into(),
             shape,
         });
         self.inputs.push(value);
+        self.input_kinds.push(kind);
         self.tensor(value)
     }
 
@@ -198,6 +213,90 @@ impl ProgramBuilder {
         self.require_rank(left, "matmul left operand", 2)?;
         self.require_rank(right, "matmul right operand", 2)?;
         self.dot_general(left, right, &[], &[], &[1], &[0])
+    }
+
+    pub fn add(&mut self, left: Tensor, right: Tensor) -> Result<Tensor, Error> {
+        self.require_local(left)?;
+        self.require_local(right)?;
+        if left.shape.dtype() != right.shape.dtype() {
+            return Err(Error::DTypeMismatch {
+                left: left.shape.dtype(),
+                right: right.shape.dtype(),
+            });
+        }
+        require_matching_shape_metadata("add", left.shape, right.shape)?;
+        let result = self.push_value("add", left.shape);
+        self.operations.push(Operation::Add {
+            left: left.value,
+            right: right.value,
+            result: result.value,
+        });
+        Ok(result)
+    }
+
+    pub fn broadcast_in_dim(
+        &mut self,
+        input: Tensor,
+        result_shape: Shape,
+        dimensions: &[usize],
+    ) -> Result<Tensor, Error> {
+        self.require_local(input)?;
+        require_supported_layout(result_shape)?;
+        if input.shape.dtype() != result_shape.dtype() {
+            return Err(Error::DTypeMismatch {
+                left: input.shape.dtype(),
+                right: result_shape.dtype(),
+            });
+        }
+        if dimensions.len() != input.shape.rank() {
+            return Err(Error::AxisCountMismatch);
+        }
+        validate_axes(dimensions, result_shape.rank(), "broadcast result")?;
+        for (input_axis, &result_axis) in dimensions.iter().enumerate() {
+            let input_dim = input.shape.dimensions()[input_axis];
+            let result_dim = result_shape.dimensions()[result_axis];
+            if input_dim != 1 && input_dim != result_dim {
+                return Err(Error::DimensionMismatch {
+                    left_axis: input_axis,
+                    right_axis: result_axis,
+                    left: input_dim,
+                    right: result_dim,
+                });
+            }
+        }
+        let result = self.push_value("broadcast", result_shape);
+        self.operations.push(Operation::BroadcastInDim {
+            input: input.value,
+            result: result.value,
+            dimensions: dimensions.to_vec(),
+        });
+        Ok(result)
+    }
+
+    /// Conventional `[batch, in] * [out, in] + [out]` linear layer.
+    pub fn linear(
+        &mut self,
+        input: Tensor,
+        weight: Tensor,
+        bias: Option<Tensor>,
+    ) -> Result<Tensor, Error> {
+        self.require_rank(input, "linear input", 2)?;
+        self.require_rank(weight, "linear weight", 2)?;
+        let product = self.dot_general(input, weight, &[], &[], &[1], &[1])?;
+        let Some(bias) = bias else {
+            return Ok(product);
+        };
+        self.require_rank(bias, "linear bias", 1)?;
+        if bias.shape.dimensions()[0] != product.shape.dimensions()[1] {
+            return Err(Error::DimensionMismatch {
+                left_axis: 0,
+                right_axis: 1,
+                left: bias.shape.dimensions()[0],
+                right: product.shape.dimensions()[1],
+            });
+        }
+        let bias = self.broadcast_in_dim(bias, product.shape, &[1])?;
+        self.add(product, bias)
     }
 
     pub fn dot_general(
@@ -358,12 +457,31 @@ impl ProgramBuilder {
     }
 
     pub fn finish(self, outputs: &[Tensor]) -> Result<Program, Error> {
+        let named = outputs
+            .iter()
+            .enumerate()
+            .map(|(index, tensor)| (format!("result{index}"), *tensor))
+            .collect::<Vec<_>>();
+        self.finish_named(&named)
+    }
+
+    pub fn finish_named(self, outputs: &[(String, Tensor)]) -> Result<Program, Error> {
         if outputs.is_empty() {
             return Err(Error::NoOutputs);
         }
-        for output in outputs {
+        for (_, output) in outputs {
             self.require_local(*output)?;
         }
+        require_unique_names(
+            self.inputs
+                .iter()
+                .map(|&value| self.values[value].name.as_str()),
+            Error::DuplicateInputName,
+        )?;
+        require_unique_names(
+            outputs.iter().map(|(name, _)| name.as_str()),
+            Error::DuplicateOutputName,
+        )?;
         // StableHLO tensor types describe logical shapes, while the current
         // PJRT transfer boundary is deliberately dense row-major. Reject a
         // physical layout we cannot preserve instead of silently compiling a
@@ -373,9 +491,11 @@ impl ProgramBuilder {
         }
         Ok(Program {
             inputs: self.inputs,
+            input_kinds: self.input_kinds,
             values: self.values,
             operations: self.operations,
-            outputs: outputs.iter().map(|tensor| tensor.value).collect(),
+            outputs: outputs.iter().map(|(_, tensor)| tensor.value).collect(),
+            output_names: outputs.iter().map(|(name, _)| name.clone()).collect(),
         })
     }
 
@@ -495,9 +615,11 @@ impl Default for ProgramBuilder {
 
 pub struct Program {
     inputs: Vec<usize>,
+    input_kinds: Vec<InputKind>,
     values: Vec<Value>,
     operations: Vec<Operation>,
     outputs: Vec<usize>,
+    output_names: Vec<String>,
 }
 
 impl Program {
@@ -505,6 +627,23 @@ impl Program {
         self.inputs
             .iter()
             .map(|value| self.values[*value].name.as_str())
+    }
+
+    pub fn inputs(&self) -> impl Iterator<Item = (&str, Shape, InputKind)> {
+        self.inputs.iter().enumerate().map(|(index, value)| {
+            (
+                self.values[*value].name.as_str(),
+                self.values[*value].shape,
+                self.input_kinds[index],
+            )
+        })
+    }
+
+    pub fn outputs(&self) -> impl Iterator<Item = (&str, Shape)> {
+        self.outputs
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (self.output_names[index].as_str(), self.values[*value].shape))
     }
 
     /// Returns MLIR's canonical text for the same owned module sent to XLA.
@@ -554,6 +693,30 @@ impl Program {
                         &axes_i64(right_batch),
                         &axes_i64(left_contract),
                         &axes_i64(right_contract),
+                    )?,
+                    *result,
+                ),
+                Operation::Add {
+                    left,
+                    right,
+                    result,
+                } => (
+                    context.add(
+                        mlir_value(&values, *left),
+                        mlir_value(&values, *right),
+                        types[*result],
+                    )?,
+                    *result,
+                ),
+                Operation::BroadcastInDim {
+                    input,
+                    result,
+                    dimensions,
+                } => (
+                    context.broadcast_in_dim(
+                        mlir_value(&values, *input),
+                        types[*result],
+                        &axes_i64(dimensions),
                     )?,
                     *result,
                 ),
@@ -641,6 +804,16 @@ enum Operation {
         left_contract: Vec<usize>,
         right_contract: Vec<usize>,
     },
+    Add {
+        left: usize,
+        right: usize,
+        result: usize,
+    },
+    BroadcastInDim {
+        input: usize,
+        result: usize,
+        dimensions: Vec<usize>,
+    },
     Complex {
         real: usize,
         imaginary: usize,
@@ -667,6 +840,12 @@ pub enum FftType {
     Irfft,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputKind {
+    Activation,
+    Parameter,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Component {
     Real,
@@ -690,6 +869,19 @@ fn validate_axes(axes: &[usize], rank: usize, side: &'static str) -> Result<(), 
         }
         if !seen.insert(axis) {
             return Err(Error::DuplicateAxis { side, axis });
+        }
+    }
+    Ok(())
+}
+
+fn require_unique_names<'a>(
+    names: impl Iterator<Item = &'a str>,
+    duplicate: fn(String) -> Error,
+) -> Result<(), Error> {
+    let mut seen = HashSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            return Err(duplicate(name.to_owned()));
         }
     }
     Ok(())

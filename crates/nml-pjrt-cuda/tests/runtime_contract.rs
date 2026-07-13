@@ -1,5 +1,6 @@
 //! Runtime contract for the packaged CUDA PJRT backend on a real NVIDIA GPU.
 
+use nml_tensor::Slice;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
@@ -44,24 +45,14 @@ fn packaged_cuda_runtime_matches_the_host() {
         .iter()
         .flat_map(|value| value.to_ne_bytes())
         .collect();
-    let transfer = client
-        .buffer_from_host(
-            &host_bytes,
-            nml_types::Shape::new(nml_types::DType::F32, &[2, 2]).unwrap(),
-            &devices[0],
-        )
-        .expect("CUDA host-to-device transfer must start");
-    transfer
-        .done
-        .wait()
-        .expect("CUDA host-to-device transfer must complete");
-    assert_eq!(transfer.buffer.dtype().unwrap(), nml_types::DType::F32);
-    assert_eq!(transfer.buffer.dimensions().unwrap(), &[2, 2]);
-    let returned = transfer
-        .buffer
-        .to_host()
+    let shape = nml_types::Shape::new(nml_types::DType::F32, &[2, 2]).unwrap();
+    let buffer = upload(&client, &host_bytes, shape, &devices[0]);
+    assert_eq!(buffer.dtype().unwrap(), nml_types::DType::F32);
+    assert_eq!(buffer.dimensions().unwrap(), &[2, 2]);
+    let returned = buffer
+        .to_slice_alloc()
         .expect("CUDA device-to-host transfer must complete");
-    assert_eq!(returned, host_bytes);
+    assert_eq!(returned.contiguous_bytes().unwrap(), host_bytes);
 
     execute_matmul_contract(&client, &devices[0]);
     execute_complex_contract(&client, &devices[0]);
@@ -87,22 +78,21 @@ fn execute_matmul_contract(client: &nml_pjrt::Client, device: &nml_pjrt::Device)
 
     let left_values: Vec<f32> = (0..15).map(|value| value as f32 / 7.0 - 1.0).collect();
     let right_values: Vec<f32> = (0..20).map(|value| value as f32 / 11.0 - 0.5).collect();
-    let left_transfer = client
-        .buffer_from_host(&f32_bytes(&left_values), left.shape(), device)
-        .unwrap();
-    let right_transfer = client
-        .buffer_from_host(&f32_bytes(&right_values), right.shape(), device)
-        .unwrap();
-    left_transfer.done.wait().unwrap();
-    right_transfer.done.wait().unwrap();
+    let left_bytes = f32_bytes(&left_values);
+    let right_bytes = f32_bytes(&right_values);
+    let left_buffer = upload(client, &left_bytes, left.shape(), device);
+    let right_buffer = upload(client, &right_bytes, right.shape(), device);
     let execution = executable
-        .execute_one(
-            &[&left_transfer.buffer, &right_transfer.buffer],
-            Some(device),
-        )
+        .execute_one(&[&left_buffer, &right_buffer], Some(device))
         .expect("CUDA executable launch must succeed");
     execution.complete.wait().unwrap();
-    let actual = decode_f32(&execution.outputs[0].to_host().unwrap());
+    let actual = decode_f32(
+        execution.outputs[0]
+            .to_slice_alloc()
+            .unwrap()
+            .contiguous_bytes()
+            .unwrap(),
+    );
     let mut expected = vec![0.0f32; 12];
     for row in 0..3 {
         for column in 0..4 {
@@ -131,25 +121,32 @@ fn execute_complex_contract(client: &nml_pjrt::Client, device: &nml_pjrt::Device
     let executable = nml_compiler::compile(client, &program, &options).unwrap();
     let real_values = [1.0f32, -2.0, 3.5, 0.25];
     let imaginary_values = [-4.0f32, 0.5, 8.0, -1.25];
-    let real_transfer = client
-        .buffer_from_host(&f32_bytes(&real_values), shape, device)
-        .unwrap();
-    let imaginary_transfer = client
-        .buffer_from_host(&f32_bytes(&imaginary_values), shape, device)
-        .unwrap();
+    let real_bytes = f32_bytes(&real_values);
+    let imaginary_bytes = f32_bytes(&imaginary_values);
+    let real_buffer = upload(client, &real_bytes, shape, device);
+    let imaginary_buffer = upload(client, &imaginary_bytes, shape, device);
     let execution = executable
-        .execute_one(
-            &[&real_transfer.buffer, &imaginary_transfer.buffer],
-            Some(device),
-        )
+        .execute_one(&[&real_buffer, &imaginary_buffer], Some(device))
         .unwrap();
     execution.complete.wait().unwrap();
     assert_close(
-        &decode_f32(&execution.outputs[0].to_host().unwrap()),
+        &decode_f32(
+            execution.outputs[0]
+                .to_slice_alloc()
+                .unwrap()
+                .contiguous_bytes()
+                .unwrap(),
+        ),
         &real_values,
     );
     assert_close(
-        &decode_f32(&execution.outputs[1].to_host().unwrap()),
+        &decode_f32(
+            execution.outputs[1]
+                .to_slice_alloc()
+                .unwrap()
+                .contiguous_bytes()
+                .unwrap(),
+        ),
         &imaginary_values,
     );
 }
@@ -159,6 +156,20 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
         .iter()
         .flat_map(|value| value.to_ne_bytes())
         .collect()
+}
+
+fn upload(
+    client: &nml_pjrt::Client,
+    bytes: &[u8],
+    shape: nml_types::Shape,
+    device: &nml_pjrt::Device,
+) -> nml_pjrt::Buffer {
+    let slice = Slice::from_bytes(shape, bytes).unwrap();
+    client
+        .buffer_from_host(&slice, device)
+        .unwrap()
+        .wait()
+        .unwrap()
 }
 
 fn decode_f32(bytes: &[u8]) -> Vec<f32> {

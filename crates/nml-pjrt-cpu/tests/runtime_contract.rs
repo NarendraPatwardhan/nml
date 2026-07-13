@@ -1,5 +1,7 @@
 //! End-to-end contract for the packaged CPU PJRT runtime.
 
+use nml_tensor::Slice;
+
 #[test]
 fn packaged_cpu_plugin_creates_a_real_cpu_client() {
     let plugin = nml_pjrt_cpu::load().expect("packaged CPU PJRT plugin must load and initialize");
@@ -22,48 +24,45 @@ fn packaged_cpu_plugin_creates_a_real_cpu_client() {
     );
 
     let devices = client.devices().expect("CPU devices must be queryable");
-    assert!(matches!(
-        client.buffer_from_host(
-            &[0, 1, 2],
-            nml_types::Shape::new(nml_types::DType::F32, &[]).unwrap(),
-            &devices[0],
-        ),
-        Err(nml_pjrt::Error::InvalidHostBuffer {
-            expected: 4,
-            actual: 3
-        })
-    ));
     let column_major = nml_types::Shape::new(nml_types::DType::F32, &[2, 2])
         .unwrap()
         .with_layout(nml_types::Layout::from_minor_to_major(&[0, 1]).unwrap())
         .unwrap();
-    assert!(matches!(
-        client.buffer_from_host(&[0; 16], column_major, &devices[0]),
-        Err(nml_pjrt::Error::UnsupportedLayout { .. })
-    ));
+    // Physical bytes [1, 2, 3, 4] under column-major strides represent the
+    // logical row-major matrix [[1, 3], [2, 4]].
+    let column_major_bytes = [1.0f32, 2.0, 3.0, 4.0]
+        .into_iter()
+        .flat_map(f32::to_ne_bytes)
+        .collect::<Vec<_>>();
+    let column_major_slice = Slice::from_bytes(column_major, &column_major_bytes).unwrap();
+    let column_major_buffer = client
+        .buffer_from_host(&column_major_slice, &devices[0])
+        .unwrap()
+        .wait()
+        .unwrap();
+    assert_eq!(
+        decode_f32(
+            column_major_buffer
+                .to_slice_alloc()
+                .unwrap()
+                .contiguous_bytes()
+                .unwrap()
+        ),
+        [1.0, 3.0, 2.0, 4.0]
+    );
     let values = [1.0f32, -2.5, 7.25, 0.0];
     let host_bytes: Vec<_> = values
         .iter()
         .flat_map(|value| value.to_ne_bytes())
         .collect();
-    let transfer = client
-        .buffer_from_host(
-            &host_bytes,
-            nml_types::Shape::new(nml_types::DType::F32, &[2, 2]).unwrap(),
-            &devices[0],
-        )
-        .expect("CPU host-to-device transfer must start");
-    transfer
-        .done
-        .wait()
-        .expect("CPU host-to-device transfer must complete");
-    assert_eq!(transfer.buffer.dtype().unwrap(), nml_types::DType::F32);
-    assert_eq!(transfer.buffer.dimensions().unwrap(), &[2, 2]);
-    let returned = transfer
-        .buffer
-        .to_host()
+    let shape = nml_types::Shape::new(nml_types::DType::F32, &[2, 2]).unwrap();
+    let buffer = upload(&client, &host_bytes, shape, &devices[0]);
+    assert_eq!(buffer.dtype().unwrap(), nml_types::DType::F32);
+    assert_eq!(buffer.dimensions().unwrap(), &[2, 2]);
+    let returned = buffer
+        .to_slice_alloc()
         .expect("CPU device-to-host transfer must complete");
-    assert_eq!(returned, host_bytes);
+    assert_eq!(returned.contiguous_bytes().unwrap(), host_bytes);
 
     for (shape, bytes) in [
         (
@@ -75,12 +74,12 @@ fn packaged_cpu_plugin_creates_a_real_cpu_client() {
             Vec::new(),
         ),
     ] {
-        let transfer = client
-            .buffer_from_host(&bytes, shape, &devices[0])
-            .expect("scalar and empty CPU transfers must start");
-        transfer.done.wait().unwrap();
-        assert_eq!(transfer.buffer.shape().unwrap(), shape);
-        assert_eq!(transfer.buffer.to_host().unwrap(), bytes);
+        let buffer = upload(&client, &bytes, shape, &devices[0]);
+        assert_eq!(buffer.shape().unwrap(), shape);
+        assert_eq!(
+            buffer.to_slice_alloc().unwrap().contiguous_bytes().unwrap(),
+            bytes
+        );
     }
 
     execute_matmul_contract(&client, &devices[0]);
@@ -113,15 +112,9 @@ fn pjrt_objects_retain_client_plugin_and_library_ownership() {
             nml_xla::CompileOptions::single_device(device.id().unwrap(), nml_xla::Backend::Cpu)
                 .unwrap();
         let executable = nml_compiler::compile(&client, &program, &options).unwrap();
-        let left = client
-            .buffer_from_host(&left_bytes, left.shape(), &device)
-            .unwrap();
-        let right = client
-            .buffer_from_host(&right_bytes, right.shape(), &device)
-            .unwrap();
-        left.done.wait().unwrap();
-        right.done.wait().unwrap();
-        (executable, device, left.buffer, right.buffer)
+        let left = upload(&client, &left_bytes, left.shape(), &device);
+        let right = upload(&client, &right_bytes, right.shape(), &device);
+        (executable, device, left, right)
     };
 
     // The lexical Plugin and Client handles are gone. Every call below crosses
@@ -137,7 +130,13 @@ fn pjrt_objects_retain_client_plugin_and_library_ownership() {
         .execute_one(&[&left, &right], Some(&device))
         .unwrap();
     execution.complete.wait().unwrap();
-    let actual = decode_f32(&execution.outputs[0].to_host().unwrap());
+    let actual = decode_f32(
+        execution.outputs[0]
+            .to_slice_alloc()
+            .unwrap()
+            .contiguous_bytes()
+            .unwrap(),
+    );
     let mut expected = vec![0.0f32; 12];
     for row in 0..3 {
         for column in 0..4 {
@@ -184,22 +183,19 @@ fn execute_matmul_contract(client: &nml_pjrt::Client, device: &nml_pjrt::Device)
     let right_values: Vec<f32> = (0..20).map(|value| value as f32 / 11.0 - 0.5).collect();
     let left_bytes = f32_bytes(&left_values);
     let right_bytes = f32_bytes(&right_values);
-    let left_transfer = client
-        .buffer_from_host(&left_bytes, left.shape(), device)
-        .unwrap();
-    let right_transfer = client
-        .buffer_from_host(&right_bytes, right.shape(), device)
-        .unwrap();
-    left_transfer.done.wait().unwrap();
-    right_transfer.done.wait().unwrap();
+    let left_buffer = upload(client, &left_bytes, left.shape(), device);
+    let right_buffer = upload(client, &right_bytes, right.shape(), device);
     let execution = executable
-        .execute_one(
-            &[&left_transfer.buffer, &right_transfer.buffer],
-            Some(device),
-        )
+        .execute_one(&[&left_buffer, &right_buffer], Some(device))
         .expect("CPU executable launch must succeed");
     execution.complete.wait().unwrap();
-    let actual = decode_f32(&execution.outputs[0].to_host().unwrap());
+    let actual = decode_f32(
+        execution.outputs[0]
+            .to_slice_alloc()
+            .unwrap()
+            .contiguous_bytes()
+            .unwrap(),
+    );
     let mut expected = vec![0.0f32; 12];
     for row in 0..3 {
         for column in 0..4 {
@@ -230,23 +226,30 @@ fn execute_complex_contract(client: &nml_pjrt::Client, device: &nml_pjrt::Device
     let imaginary_values = [-4.0f32, 0.5, 8.0, -1.25];
     let real_bytes = f32_bytes(&real_values);
     let imaginary_bytes = f32_bytes(&imaginary_values);
-    let real_transfer = client.buffer_from_host(&real_bytes, shape, device).unwrap();
-    let imaginary_transfer = client
-        .buffer_from_host(&imaginary_bytes, shape, device)
-        .unwrap();
+    let real_buffer = upload(client, &real_bytes, shape, device);
+    let imaginary_buffer = upload(client, &imaginary_bytes, shape, device);
     let execution = executable
-        .execute_one(
-            &[&real_transfer.buffer, &imaginary_transfer.buffer],
-            Some(device),
-        )
+        .execute_one(&[&real_buffer, &imaginary_buffer], Some(device))
         .unwrap();
     execution.complete.wait().unwrap();
     assert_close(
-        &decode_f32(&execution.outputs[0].to_host().unwrap()),
+        &decode_f32(
+            execution.outputs[0]
+                .to_slice_alloc()
+                .unwrap()
+                .contiguous_bytes()
+                .unwrap(),
+        ),
         &real_values,
     );
     assert_close(
-        &decode_f32(&execution.outputs[1].to_host().unwrap()),
+        &decode_f32(
+            execution.outputs[1]
+                .to_slice_alloc()
+                .unwrap()
+                .contiguous_bytes()
+                .unwrap(),
+        ),
         &imaginary_values,
     );
 }
@@ -256,6 +259,20 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
         .iter()
         .flat_map(|value| value.to_ne_bytes())
         .collect()
+}
+
+fn upload(
+    client: &nml_pjrt::Client,
+    bytes: &[u8],
+    shape: nml_types::Shape,
+    device: &nml_pjrt::Device,
+) -> nml_pjrt::Buffer {
+    let slice = Slice::from_bytes(shape, bytes).unwrap();
+    client
+        .buffer_from_host(&slice, device)
+        .unwrap()
+        .wait()
+        .unwrap()
 }
 
 fn decode_f32(bytes: &[u8]) -> Vec<f32> {

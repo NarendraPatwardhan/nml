@@ -6,6 +6,12 @@ internal package part of NML's public build API.
 """
 
 alias(
+    name = "nml",
+    actual = "//crates/nml:nml",
+    visibility = ["//visibility:public"],
+)
+
+alias(
     name = "nml_platform",
     # Spell out the target: the package directory uses filesystem-friendly
     # kebab case while the Rust crate and Bazel target use identifier-safe
@@ -59,6 +65,12 @@ alias(
 test_suite(
     name = "tests",
     tests = [
+        "//crates/nml-checkpoint:safetensors_contract_test",
+        "//crates/nml-runtime:runtime_structure_contract_test",
+        "//crates/nml-tensor:slice_contract_test",
+        "//crates/nml:linear_cpu_contract_test",
+        "//crates/nml:linear_cuda_contract_test",
+        "//crates/nml:structural_contract_test",
         "//crates/nml-pjrt-cuda:cuda_disabled_contract_test",
         "//crates/nml-pjrt-cuda:cuda_package_contract_test",
         "//crates/nml-pjrt-cuda:cuda_runtime_contract_test",

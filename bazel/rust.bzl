@@ -7,7 +7,7 @@ Keeping the wrappers thin preserves ordinary rules_rust semantics and makes a
 future native `link_deps` edge visible at its BUILD target.
 """
 
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_shared_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_proc_macro", "rust_shared_library", "rust_test")
 load("//platforms:defs.bzl", "supported_host_compatible_with")
 
 _EDITION = "2024"
@@ -56,6 +56,20 @@ def nml_rust_shared_library(
         **kwargs):
     """Declares a C-compatible Rust shared library under NML policy."""
     rust_shared_library(
+        name = name,
+        edition = _EDITION,
+        rustc_flags = _COMMON_RUSTC_FLAGS + rustc_flags,
+        target_compatible_with = supported_host_compatible_with() + target_compatible_with,
+        **kwargs
+    )
+
+def nml_rust_proc_macro(
+        name,
+        rustc_flags = [],
+        target_compatible_with = [],
+        **kwargs):
+    """Declares a procedural macro with the same stable host policy as NML."""
+    rust_proc_macro(
         name = name,
         edition = _EDITION,
         rustc_flags = _COMMON_RUSTC_FLAGS + rustc_flags,

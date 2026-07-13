@@ -6,7 +6,8 @@
 //! are packaged. Platform crates own runtime selection and policy.
 
 use nml_pjrt_sys as sys;
-use nml_types::{DType, Layout, Shape};
+use nml_tensor::Slice;
+use nml_types::{DType, Shape};
 use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
@@ -34,12 +35,23 @@ type ClientPlatformNameFn =
     unsafe extern "C" fn(*mut sys::PJRT_Client_PlatformName_Args) -> *mut sys::PJRT_Error;
 type ClientDevicesFn =
     unsafe extern "C" fn(*mut sys::PJRT_Client_Devices_Args) -> *mut sys::PJRT_Error;
+type ClientAddressableMemoriesFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Client_AddressableMemories_Args) -> *mut sys::PJRT_Error;
 type DeviceGetDescriptionFn =
     unsafe extern "C" fn(*mut sys::PJRT_Device_GetDescription_Args) -> *mut sys::PJRT_Error;
 type DeviceDescriptionAttributesFn =
     unsafe extern "C" fn(*mut sys::PJRT_DeviceDescription_Attributes_Args) -> *mut sys::PJRT_Error;
 type DeviceDescriptionIdFn =
     unsafe extern "C" fn(*mut sys::PJRT_DeviceDescription_Id_Args) -> *mut sys::PJRT_Error;
+type DeviceDefaultMemoryFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Device_DefaultMemory_Args) -> *mut sys::PJRT_Error;
+type DeviceAddressableMemoriesFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Device_AddressableMemories_Args) -> *mut sys::PJRT_Error;
+type MemoryKindFn = unsafe extern "C" fn(*mut sys::PJRT_Memory_Kind_Args) -> *mut sys::PJRT_Error;
+type MemoryKindIdFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Memory_Kind_Id_Args) -> *mut sys::PJRT_Error;
+type MemoryAddressableByDevicesFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Memory_AddressableByDevices_Args) -> *mut sys::PJRT_Error;
 type EventDestroyFn =
     unsafe extern "C" fn(*mut sys::PJRT_Event_Destroy_Args) -> *mut sys::PJRT_Error;
 type EventIsReadyFn =
@@ -49,6 +61,31 @@ type ClientCompileFn =
     unsafe extern "C" fn(*mut sys::PJRT_Client_Compile_Args) -> *mut sys::PJRT_Error;
 type ClientBufferFromHostBufferFn =
     unsafe extern "C" fn(*mut sys::PJRT_Client_BufferFromHostBuffer_Args) -> *mut sys::PJRT_Error;
+type ClientDmaMapFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Client_DmaMap_Args) -> *mut sys::PJRT_Error;
+type ClientDmaUnmapFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Client_DmaUnmap_Args) -> *mut sys::PJRT_Error;
+type ClientCreateUninitializedBufferFn = unsafe extern "C" fn(
+    *mut sys::PJRT_Client_CreateUninitializedBuffer_Args,
+) -> *mut sys::PJRT_Error;
+type ClientCreateBuffersForAsyncHostToDeviceFn = unsafe extern "C" fn(
+    *mut sys::PJRT_Client_CreateBuffersForAsyncHostToDevice_Args,
+) -> *mut sys::PJRT_Error;
+type AsyncTransferManagerDestroyFn = unsafe extern "C" fn(
+    *mut sys::PJRT_AsyncHostToDeviceTransferManager_Destroy_Args,
+) -> *mut sys::PJRT_Error;
+type AsyncTransferManagerTransferDataFn = unsafe extern "C" fn(
+    *mut sys::PJRT_AsyncHostToDeviceTransferManager_TransferData_Args,
+) -> *mut sys::PJRT_Error;
+type AsyncTransferManagerRetrieveBufferFn = unsafe extern "C" fn(
+    *mut sys::PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer_Args,
+) -> *mut sys::PJRT_Error;
+type AsyncTransferManagerBufferCountFn = unsafe extern "C" fn(
+    *mut sys::PJRT_AsyncHostToDeviceTransferManager_BufferCount_Args,
+) -> *mut sys::PJRT_Error;
+type AsyncTransferManagerBufferSizeFn = unsafe extern "C" fn(
+    *mut sys::PJRT_AsyncHostToDeviceTransferManager_BufferSize_Args,
+) -> *mut sys::PJRT_Error;
 type BufferDestroyFn =
     unsafe extern "C" fn(*mut sys::PJRT_Buffer_Destroy_Args) -> *mut sys::PJRT_Error;
 type BufferElementTypeFn =
@@ -65,6 +102,12 @@ type BufferIsDeletedFn =
     unsafe extern "C" fn(*mut sys::PJRT_Buffer_IsDeleted_Args) -> *mut sys::PJRT_Error;
 type BufferMemoryFn =
     unsafe extern "C" fn(*mut sys::PJRT_Buffer_Memory_Args) -> *mut sys::PJRT_Error;
+type BufferOnDeviceSizeInBytesFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Buffer_OnDeviceSizeInBytes_Args) -> *mut sys::PJRT_Error;
+type BufferCopyToDeviceFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Buffer_CopyToDevice_Args) -> *mut sys::PJRT_Error;
+type BufferCopyToMemoryFn =
+    unsafe extern "C" fn(*mut sys::PJRT_Buffer_CopyToMemory_Args) -> *mut sys::PJRT_Error;
 type LoadedExecutableDestroyFn =
     unsafe extern "C" fn(*mut sys::PJRT_LoadedExecutable_Destroy_Args) -> *mut sys::PJRT_Error;
 type LoadedExecutableGetExecutableFn = unsafe extern "C" fn(
@@ -123,14 +166,12 @@ pub enum Error {
         expected: usize,
         actual: usize,
     },
-    UnsupportedLayout {
-        actual: Layout,
-        expected: Layout,
-    },
     ForeignClientObject(&'static str),
     UnknownBufferType(u32),
     NoAddressableDevice,
+    NoMatchingMemory(String),
     TensorMetadataOverflow,
+    HostTensor(nml_tensor::Error),
 }
 
 impl fmt::Display for Error {
@@ -186,12 +227,6 @@ impl fmt::Display for Error {
                 f,
                 "host buffer has {actual} bytes, tensor metadata requires {expected}"
             ),
-            Self::UnsupportedLayout { actual, expected } => write!(
-                f,
-                "PJRT transfer does not support physical layout {:?}; expected row-major {:?}",
-                actual.minor_to_major(),
-                expected.minor_to_major()
-            ),
             Self::ForeignClientObject(object) => {
                 write!(f, "{object} belongs to a different PJRT client")
             }
@@ -199,14 +234,24 @@ impl fmt::Display for Error {
                 write!(f, "PJRT returned unsupported buffer element type {value}")
             }
             Self::NoAddressableDevice => f.write_str("PJRT executable has no addressable device"),
+            Self::NoMatchingMemory(kind) => {
+                write!(f, "PJRT client has no addressable memory of kind {kind:?}")
+            }
             Self::TensorMetadataOverflow => {
                 f.write_str("tensor metadata exceeds host address space")
             }
+            Self::HostTensor(error) => error.fmt(f),
         }
     }
 }
 
 impl StdError for Error {}
+
+impl From<nml_tensor::Error> for Error {
+    fn from(error: nml_tensor::Error) -> Self {
+        Self::HostTensor(error)
+    }
+}
 
 /// Stable PJRT status categories, preserving unknown future integer values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -695,6 +740,14 @@ impl Plugin {
             .ok_or(Error::MissingFunction("PJRT_Client_Devices"))
     }
 
+    fn client_addressable_memories_fn(&self) -> Result<ClientAddressableMemoriesFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Client_AddressableMemories),
+            "PJRT_Client_AddressableMemories",
+            |api| unsafe { addr_of!((*api).PJRT_Client_AddressableMemories).read() },
+        )
+    }
+
     fn device_get_description_fn(&self) -> Result<DeviceGetDescriptionFn, Error> {
         self.require_function_field(
             offset_of!(sys::PJRT_Api, PJRT_Device_GetDescription),
@@ -720,6 +773,41 @@ impl Plugin {
             offset_of!(sys::PJRT_Api, PJRT_DeviceDescription_Id),
             "PJRT_DeviceDescription_Id",
             |api| unsafe { addr_of!((*api).PJRT_DeviceDescription_Id).read() },
+        )
+    }
+    fn device_default_memory_fn(&self) -> Result<DeviceDefaultMemoryFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Device_DefaultMemory),
+            "PJRT_Device_DefaultMemory",
+            |api| unsafe { addr_of!((*api).PJRT_Device_DefaultMemory).read() },
+        )
+    }
+    fn device_addressable_memories_fn(&self) -> Result<DeviceAddressableMemoriesFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Device_AddressableMemories),
+            "PJRT_Device_AddressableMemories",
+            |api| unsafe { addr_of!((*api).PJRT_Device_AddressableMemories).read() },
+        )
+    }
+    fn memory_kind_fn(&self) -> Result<MemoryKindFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Memory_Kind),
+            "PJRT_Memory_Kind",
+            |api| unsafe { addr_of!((*api).PJRT_Memory_Kind).read() },
+        )
+    }
+    fn memory_kind_id_fn(&self) -> Result<MemoryKindIdFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Memory_Kind_Id),
+            "PJRT_Memory_Kind_Id",
+            |api| unsafe { addr_of!((*api).PJRT_Memory_Kind_Id).read() },
+        )
+    }
+    fn memory_addressable_by_devices_fn(&self) -> Result<MemoryAddressableByDevicesFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Memory_AddressableByDevices),
+            "PJRT_Memory_AddressableByDevices",
+            |api| unsafe { addr_of!((*api).PJRT_Memory_AddressableByDevices).read() },
         )
     }
 
@@ -756,6 +844,101 @@ impl Plugin {
             offset_of!(sys::PJRT_Api, PJRT_Client_BufferFromHostBuffer),
             "PJRT_Client_BufferFromHostBuffer",
             |api| unsafe { addr_of!((*api).PJRT_Client_BufferFromHostBuffer).read() },
+        )
+    }
+    fn client_dma_map_fn(&self) -> Result<ClientDmaMapFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Client_DmaMap),
+            "PJRT_Client_DmaMap",
+            |api| unsafe { addr_of!((*api).PJRT_Client_DmaMap).read() },
+        )
+    }
+    fn client_dma_unmap_fn(&self) -> Result<ClientDmaUnmapFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Client_DmaUnmap),
+            "PJRT_Client_DmaUnmap",
+            |api| unsafe { addr_of!((*api).PJRT_Client_DmaUnmap).read() },
+        )
+    }
+    fn client_create_uninitialized_buffer_fn(
+        &self,
+    ) -> Result<ClientCreateUninitializedBufferFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Client_CreateUninitializedBuffer),
+            "PJRT_Client_CreateUninitializedBuffer",
+            |api| unsafe { addr_of!((*api).PJRT_Client_CreateUninitializedBuffer).read() },
+        )
+    }
+    fn client_create_buffers_for_async_host_to_device_fn(
+        &self,
+    ) -> Result<ClientCreateBuffersForAsyncHostToDeviceFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Client_CreateBuffersForAsyncHostToDevice),
+            "PJRT_Client_CreateBuffersForAsyncHostToDevice",
+            |api| unsafe { addr_of!((*api).PJRT_Client_CreateBuffersForAsyncHostToDevice).read() },
+        )
+    }
+    fn async_transfer_manager_destroy_fn(&self) -> Result<AsyncTransferManagerDestroyFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_AsyncHostToDeviceTransferManager_Destroy),
+            "PJRT_AsyncHostToDeviceTransferManager_Destroy",
+            |api| unsafe { addr_of!((*api).PJRT_AsyncHostToDeviceTransferManager_Destroy).read() },
+        )
+    }
+    fn async_transfer_manager_transfer_data_fn(
+        &self,
+    ) -> Result<AsyncTransferManagerTransferDataFn, Error> {
+        self.function(
+            offset_of!(
+                sys::PJRT_Api,
+                PJRT_AsyncHostToDeviceTransferManager_TransferData
+            ),
+            "PJRT_AsyncHostToDeviceTransferManager_TransferData",
+            |api| unsafe {
+                addr_of!((*api).PJRT_AsyncHostToDeviceTransferManager_TransferData).read()
+            },
+        )
+    }
+    fn async_transfer_manager_retrieve_buffer_fn(
+        &self,
+    ) -> Result<AsyncTransferManagerRetrieveBufferFn, Error> {
+        self.function(
+            offset_of!(
+                sys::PJRT_Api,
+                PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer
+            ),
+            "PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer",
+            |api| unsafe {
+                addr_of!((*api).PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer).read()
+            },
+        )
+    }
+    fn async_transfer_manager_buffer_count_fn(
+        &self,
+    ) -> Result<AsyncTransferManagerBufferCountFn, Error> {
+        self.function(
+            offset_of!(
+                sys::PJRT_Api,
+                PJRT_AsyncHostToDeviceTransferManager_BufferCount
+            ),
+            "PJRT_AsyncHostToDeviceTransferManager_BufferCount",
+            |api| unsafe {
+                addr_of!((*api).PJRT_AsyncHostToDeviceTransferManager_BufferCount).read()
+            },
+        )
+    }
+    fn async_transfer_manager_buffer_size_fn(
+        &self,
+    ) -> Result<AsyncTransferManagerBufferSizeFn, Error> {
+        self.function(
+            offset_of!(
+                sys::PJRT_Api,
+                PJRT_AsyncHostToDeviceTransferManager_BufferSize
+            ),
+            "PJRT_AsyncHostToDeviceTransferManager_BufferSize",
+            |api| unsafe {
+                addr_of!((*api).PJRT_AsyncHostToDeviceTransferManager_BufferSize).read()
+            },
         )
     }
     fn buffer_destroy_fn(&self) -> Result<BufferDestroyFn, Error> {
@@ -812,6 +995,27 @@ impl Plugin {
             offset_of!(sys::PJRT_Api, PJRT_Buffer_Memory),
             "PJRT_Buffer_Memory",
             |api| unsafe { addr_of!((*api).PJRT_Buffer_Memory).read() },
+        )
+    }
+    fn buffer_on_device_size_in_bytes_fn(&self) -> Result<BufferOnDeviceSizeInBytesFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Buffer_OnDeviceSizeInBytes),
+            "PJRT_Buffer_OnDeviceSizeInBytes",
+            |api| unsafe { addr_of!((*api).PJRT_Buffer_OnDeviceSizeInBytes).read() },
+        )
+    }
+    fn buffer_copy_to_device_fn(&self) -> Result<BufferCopyToDeviceFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Buffer_CopyToDevice),
+            "PJRT_Buffer_CopyToDevice",
+            |api| unsafe { addr_of!((*api).PJRT_Buffer_CopyToDevice).read() },
+        )
+    }
+    fn buffer_copy_to_memory_fn(&self) -> Result<BufferCopyToMemoryFn, Error> {
+        self.function(
+            offset_of!(sys::PJRT_Api, PJRT_Buffer_CopyToMemory),
+            "PJRT_Buffer_CopyToMemory",
+            |api| unsafe { addr_of!((*api).PJRT_Buffer_CopyToMemory).read() },
         )
     }
     fn loaded_executable_destroy_fn(&self) -> Result<LoadedExecutableDestroyFn, Error> {
@@ -973,43 +1177,86 @@ impl Client {
             .collect()
     }
 
-    /// Copies a dense row-major host tensor to a selected PJRT device.
-    pub fn buffer_from_host(
+    pub fn addressable_memories(&self) -> Result<Vec<Memory>, Error> {
+        let mut args: sys::PJRT_Client_AddressableMemories_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Client_AddressableMemories_Args_STRUCT_SIZE as usize;
+        args.client = self.state.inner.as_ptr();
+        let error = unsafe { (self.state.plugin.client_addressable_memories_fn()?)(&mut args) };
+        self.state.plugin.into_result(error)?;
+        memory_list(
+            self,
+            args.addressable_memories,
+            args.num_addressable_memories,
+        )
+    }
+
+    /// Copies a host tensor view to a selected PJRT device.
+    ///
+    /// The returned transfer borrows `slice`; the device buffer cannot be
+    /// detached until `HostTransfer::wait` proves PJRT has released it.
+    pub fn buffer_from_host<'host>(
         &self,
-        data: &[u8],
-        shape: Shape,
+        slice: &'host Slice<'_>,
         device: &Device,
-    ) -> Result<HostTransfer, Error> {
+    ) -> Result<HostTransfer<'host>, Error> {
+        self.buffer_from_host_in(slice, device, None)
+    }
+
+    pub fn buffer_from_host_in<'host>(
+        &self,
+        slice: &'host Slice<'_>,
+        device: &Device,
+        memory: Option<&Memory>,
+    ) -> Result<HostTransfer<'host>, Error> {
         self.require_own_device(device)?;
-        let expected_layout =
-            Layout::row_major(shape.rank()).map_err(|_| Error::TensorMetadataOverflow)?;
-        if shape.layout() != expected_layout {
-            return Err(Error::UnsupportedLayout {
-                actual: shape.layout(),
-                expected: expected_layout,
-            });
+        if let Some(memory) = memory {
+            if !Arc::ptr_eq(&self.state, &memory.client.state) {
+                return Err(Error::ForeignClientObject("memory"));
+            }
         }
-        let expected = shape
-            .byte_count()
-            .map_err(|_| Error::TensorMetadataOverflow)?;
-        if data.len() != expected {
-            return Err(Error::InvalidHostBuffer {
-                expected,
-                actual: data.len(),
-            });
+        if !slice.is_native_endian() {
+            return Err(Error::HostTensor(nml_tensor::Error::NonNativeEndian));
         }
+        let shape = slice.shape();
+        // The host strides describe how to read the logical value while the
+        // explicit tiled layout describes how PJRT should store that value.
+        // Keeping both mirrors ZML and avoids silently collapsing a declared
+        // column-major layout into the plugin default.
+        let minor_to_major = shape
+            .layout()
+            .minor_to_major()
+            .iter()
+            .map(|axis| i64::from(*axis))
+            .collect::<Vec<_>>();
+        let tiled = sys::PJRT_Buffer_MemoryLayout_Tiled {
+            struct_size: sys::PJRT_Buffer_MemoryLayout_Tiled_STRUCT_SIZE as usize,
+            extension_start: std::ptr::null_mut(),
+            minor_to_major: minor_to_major.as_ptr(),
+            minor_to_major_size: minor_to_major.len(),
+            tile_dims: std::ptr::null(),
+            tile_dim_sizes: std::ptr::null(),
+            num_tiles: 0,
+        };
+        let mut device_layout = sys::PJRT_Buffer_MemoryLayout {
+            struct_size: sys::PJRT_Buffer_MemoryLayout_STRUCT_SIZE as usize,
+            extension_start: std::ptr::null_mut(),
+            __bindgen_anon_1: sys::PJRT_Buffer_MemoryLayout__bindgen_ty_1 { tiled },
+            type_: sys::PJRT_Buffer_MemoryLayout_Type_PJRT_Buffer_MemoryLayout_Type_Tiled,
+        };
         let mut args: sys::PJRT_Client_BufferFromHostBuffer_Args = unsafe { zeroed() };
         args.struct_size = sys::PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE as usize;
         args.client = self.state.inner.as_ptr();
-        args.data = data.as_ptr().cast();
+        args.data = slice.data_pointer()?.cast();
         args.type_ = dtype_to_pjrt(shape.dtype());
         args.dims = shape.dimensions().as_ptr();
         args.num_dims = shape.rank();
+        args.byte_strides = slice.byte_strides().as_ptr();
+        args.num_byte_strides = slice.byte_strides().len();
         args.host_buffer_semantics =
-            sys::PJRT_HostBufferSemantics_PJRT_HostBufferSemantics_kImmutableOnlyDuringCall;
+            sys::PJRT_HostBufferSemantics_PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes;
         args.device = device.inner.as_ptr();
-        // A null memory and layout request the plugin's default memory and its
-        // canonical dense layout, matching the dense host contract above.
+        args.memory = memory.map_or(std::ptr::null_mut(), |memory| memory.inner.as_ptr());
+        args.device_layout = &mut device_layout;
         let error = unsafe { (self.state.plugin.client_buffer_from_host_buffer_fn()?)(&mut args) };
         self.state.plugin.into_result(error)?;
         // Wrap both independent outputs before validating either one. If a
@@ -1019,10 +1266,115 @@ impl Client {
         let done = NonNull::new(args.done_with_host_buffer)
             .map(|event| Event::from_raw(&self.state.plugin, event));
         match (buffer, done) {
-            (Some(buffer), Some(done)) => Ok(HostTransfer { buffer, done }),
+            (Some(buffer), Some(done)) => Ok(HostTransfer {
+                buffer,
+                done,
+                _host: PhantomData,
+            }),
             (None, _) => Err(Error::NullResult("PJRT_Client_BufferFromHostBuffer buffer")),
             (_, None) => Err(Error::NullResult("PJRT_Client_BufferFromHostBuffer event")),
         }
+    }
+
+    /// Registers reusable host staging storage for DMA and unregisters it at
+    /// the mapping's single destruction point.
+    pub fn dma_map<'data>(&self, data: &'data mut [u8]) -> Result<DmaMapping<'data>, Error> {
+        let mut args: sys::PJRT_Client_DmaMap_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Client_DmaMap_Args_STRUCT_SIZE as usize;
+        args.client = self.state.inner.as_ptr();
+        args.data = data.as_mut_ptr().cast();
+        args.size = data.len();
+        let error = unsafe { (self.state.plugin.client_dma_map_fn()?)(&mut args) };
+        self.state.plugin.into_result(error)?;
+        Ok(DmaMapping {
+            client: self.clone(),
+            data: NonNull::new(data.as_mut_ptr()).unwrap_or_else(NonNull::dangling),
+            length: data.len(),
+            _borrow: PhantomData,
+        })
+    }
+
+    pub fn create_uninitialized_buffer(
+        &self,
+        shape: Shape,
+        device: &Device,
+        memory: Option<&Memory>,
+    ) -> Result<Buffer, Error> {
+        self.require_own_device(device)?;
+        if let Some(memory) = memory
+            && !Arc::ptr_eq(&self.state, &memory.client.state)
+        {
+            return Err(Error::ForeignClientObject("memory"));
+        }
+        let minor_to_major = layout_axes(shape);
+        let mut layout = tiled_layout(&minor_to_major);
+        let mut args: sys::PJRT_Client_CreateUninitializedBuffer_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Client_CreateUninitializedBuffer_Args_STRUCT_SIZE as usize;
+        args.client = self.state.inner.as_ptr();
+        args.shape_dims = shape.dimensions().as_ptr();
+        args.shape_num_dims = shape.rank();
+        args.shape_element_type = dtype_to_pjrt(shape.dtype());
+        args.shape_layout = &mut layout;
+        args.device = device.inner.as_ptr();
+        args.memory = memory.map_or(std::ptr::null_mut(), |memory| memory.inner.as_ptr());
+        let error =
+            unsafe { (self.state.plugin.client_create_uninitialized_buffer_fn()?)(&mut args) };
+        self.state.plugin.into_result(error)?;
+        let inner = NonNull::new(args.buffer)
+            .ok_or(Error::NullResult("PJRT_Client_CreateUninitializedBuffer"))?;
+        Ok(Buffer::from_raw(self, inner))
+    }
+
+    pub fn create_async_transfer_manager(
+        &self,
+        shapes: &[Shape],
+        memory: &Memory,
+    ) -> Result<AsyncTransferManager, Error> {
+        if !Arc::ptr_eq(&self.state, &memory.client.state) {
+            return Err(Error::ForeignClientObject("memory"));
+        }
+        let axes = shapes.iter().copied().map(layout_axes).collect::<Vec<_>>();
+        let mut layouts = axes
+            .iter()
+            .map(|minor_to_major| tiled_layout(minor_to_major))
+            .collect::<Vec<_>>();
+        let mut layout_pointers = layouts
+            .iter_mut()
+            .map(|layout| layout as *mut _)
+            .collect::<Vec<_>>();
+        let mut specs = shapes
+            .iter()
+            .map(|shape| sys::PJRT_ShapeSpec {
+                struct_size: sys::PJRT_ShapeSpec_STRUCT_SIZE as usize,
+                extension_start: std::ptr::null_mut(),
+                dims: shape.dimensions().as_ptr(),
+                num_dims: shape.rank(),
+                element_type: dtype_to_pjrt(shape.dtype()),
+            })
+            .collect::<Vec<_>>();
+        let mut args: sys::PJRT_Client_CreateBuffersForAsyncHostToDevice_Args = unsafe { zeroed() };
+        args.struct_size =
+            sys::PJRT_Client_CreateBuffersForAsyncHostToDevice_Args_STRUCT_SIZE as usize;
+        args.client = self.state.inner.as_ptr();
+        args.shape_specs = specs.as_mut_ptr();
+        args.num_shape_specs = specs.len();
+        args.device_layouts = layout_pointers.as_mut_ptr();
+        args.num_device_layouts = layout_pointers.len();
+        args.memory = memory.inner.as_ptr();
+        let error = unsafe {
+            (self
+                .state
+                .plugin
+                .client_create_buffers_for_async_host_to_device_fn()?)(&mut args)
+        };
+        self.state.plugin.into_result(error)?;
+        let inner = NonNull::new(args.transfer_manager).ok_or(Error::NullResult(
+            "PJRT_Client_CreateBuffersForAsyncHostToDevice",
+        ))?;
+        Ok(AsyncTransferManager {
+            client: self.clone(),
+            inner,
+        })
     }
 
     /// Compiles an MLIR/StableHLO program with serialized XLA options.
@@ -1137,6 +1489,30 @@ impl Device {
         Ok(None)
     }
 
+    pub fn default_memory(&self) -> Result<Memory, Error> {
+        let mut args: sys::PJRT_Device_DefaultMemory_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Device_DefaultMemory_Args_STRUCT_SIZE as usize;
+        args.device = self.inner.as_ptr();
+        let error = unsafe { (self.client.state.plugin.device_default_memory_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)?;
+        let inner =
+            NonNull::new(args.memory).ok_or(Error::NullResult("PJRT_Device_DefaultMemory"))?;
+        Ok(Memory {
+            client: self.client.clone(),
+            inner,
+        })
+    }
+
+    pub fn addressable_memories(&self) -> Result<Vec<Memory>, Error> {
+        let mut args: sys::PJRT_Device_AddressableMemories_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Device_AddressableMemories_Args_STRUCT_SIZE as usize;
+        args.device = self.inner.as_ptr();
+        let error =
+            unsafe { (self.client.state.plugin.device_addressable_memories_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)?;
+        memory_list(&self.client, args.memories, args.num_memories)
+    }
+
     fn description(&self) -> Result<NonNull<sys::PJRT_DeviceDescription>, Error> {
         let mut args: sys::PJRT_Device_GetDescription_Args = unsafe { zeroed() };
         args.struct_size = sys::PJRT_Device_GetDescription_Args_STRUCT_SIZE as usize;
@@ -1193,9 +1569,189 @@ impl Drop for Event {
 
 /// Host-to-device transfer products. The buffer may be consumed immediately;
 /// `done` reports when PJRT has completed its host-side transfer work.
-pub struct HostTransfer {
-    pub buffer: Buffer,
-    pub done: Event,
+pub struct HostTransfer<'host> {
+    buffer: Buffer,
+    done: Event,
+    _host: PhantomData<&'host ()>,
+}
+
+impl HostTransfer<'_> {
+    pub fn wait(self) -> Result<Buffer, Error> {
+        self.done.wait()?;
+        Ok(self.buffer)
+    }
+}
+
+/// One client-registered staging allocation. The source borrow prevents the
+/// allocation from moving or being released until PJRT has been unmapped.
+pub struct DmaMapping<'data> {
+    client: Client,
+    data: NonNull<u8>,
+    length: usize,
+    _borrow: PhantomData<&'data mut [u8]>,
+}
+
+impl DmaMapping<'_> {
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the source is uniquely borrowed for this mapping's lifetime.
+        unsafe { std::slice::from_raw_parts_mut(self.data.as_ptr(), self.length) }
+    }
+}
+
+impl Drop for DmaMapping<'_> {
+    fn drop(&mut self) {
+        let mut args: sys::PJRT_Client_DmaUnmap_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Client_DmaUnmap_Args_STRUCT_SIZE as usize;
+        args.client = self.client.state.inner.as_ptr();
+        args.data = self.data.as_ptr().cast();
+        if let Ok(function) = self.client.state.plugin.client_dma_unmap_fn() {
+            let error = unsafe { function(&mut args) };
+            let _ = self.client.state.plugin.into_result(error);
+        }
+    }
+}
+
+/// PJRT's bounded collection of asynchronously filled device buffers.
+pub struct AsyncTransferManager {
+    client: Client,
+    inner: NonNull<sys::PJRT_AsyncHostToDeviceTransferManager>,
+}
+
+impl AsyncTransferManager {
+    pub fn buffer_count(&self) -> Result<usize, Error> {
+        let mut args: sys::PJRT_AsyncHostToDeviceTransferManager_BufferCount_Args =
+            unsafe { zeroed() };
+        args.struct_size =
+            sys::PJRT_AsyncHostToDeviceTransferManager_BufferCount_Args_STRUCT_SIZE as usize;
+        args.transfer_manager = self.inner.as_ptr();
+        let error = unsafe {
+            (self
+                .client
+                .state
+                .plugin
+                .async_transfer_manager_buffer_count_fn()?)(&mut args)
+        };
+        self.client.state.plugin.into_result(error)?;
+        Ok(args.buffer_count)
+    }
+
+    pub fn buffer_size(&self, index: usize) -> Result<usize, Error> {
+        let index = i32::try_from(index).map_err(|_| Error::TensorMetadataOverflow)?;
+        let mut args: sys::PJRT_AsyncHostToDeviceTransferManager_BufferSize_Args =
+            unsafe { zeroed() };
+        args.struct_size =
+            sys::PJRT_AsyncHostToDeviceTransferManager_BufferSize_Args_STRUCT_SIZE as usize;
+        args.transfer_manager = self.inner.as_ptr();
+        args.buffer_index = index;
+        let error = unsafe {
+            (self
+                .client
+                .state
+                .plugin
+                .async_transfer_manager_buffer_size_fn()?)(&mut args)
+        };
+        self.client.state.plugin.into_result(error)?;
+        Ok(args.buffer_size)
+    }
+
+    pub fn transfer_data<'mapping>(
+        &'mapping self,
+        index: usize,
+        mapping: &'mapping DmaMapping<'_>,
+        source_offset: usize,
+        length: usize,
+        destination_offset: i64,
+        is_last: bool,
+    ) -> Result<DmaTransfer<'mapping>, Error> {
+        if !Arc::ptr_eq(&self.client.state, &mapping.client.state) {
+            return Err(Error::ForeignClientObject("DMA mapping"));
+        }
+        let end = source_offset
+            .checked_add(length)
+            .ok_or(Error::TensorMetadataOverflow)?;
+        if end > mapping.length {
+            return Err(Error::InvalidHostBuffer {
+                expected: end,
+                actual: mapping.length,
+            });
+        }
+        let index = i32::try_from(index).map_err(|_| Error::TensorMetadataOverflow)?;
+        let transfer_size = i64::try_from(length).map_err(|_| Error::TensorMetadataOverflow)?;
+        // SAFETY: the checked offset remains in the live mapped allocation.
+        let data = unsafe { mapping.data.as_ptr().add(source_offset) };
+        let mut args: sys::PJRT_AsyncHostToDeviceTransferManager_TransferData_Args =
+            unsafe { zeroed() };
+        args.struct_size =
+            sys::PJRT_AsyncHostToDeviceTransferManager_TransferData_Args_STRUCT_SIZE as usize;
+        args.transfer_manager = self.inner.as_ptr();
+        args.buffer_index = index;
+        args.data = data.cast();
+        args.offset = destination_offset;
+        args.transfer_size = transfer_size;
+        args.is_last_transfer = is_last;
+        let error = unsafe {
+            (self
+                .client
+                .state
+                .plugin
+                .async_transfer_manager_transfer_data_fn()?)(&mut args)
+        };
+        self.client.state.plugin.into_result(error)?;
+        let event = NonNull::new(args.done_with_h2d_transfer).ok_or(Error::NullResult(
+            "PJRT_AsyncHostToDeviceTransferManager_TransferData",
+        ))?;
+        Ok(DmaTransfer {
+            event: Event::from_raw(&self.client.state.plugin, event),
+            _owners: PhantomData,
+        })
+    }
+
+    pub fn retrieve_buffer(&self, index: usize) -> Result<Buffer, Error> {
+        let index = i32::try_from(index).map_err(|_| Error::TensorMetadataOverflow)?;
+        let mut args: sys::PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer_Args =
+            unsafe { zeroed() };
+        args.struct_size =
+            sys::PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer_Args_STRUCT_SIZE as usize;
+        args.transfer_manager = self.inner.as_ptr();
+        args.buffer_index = index;
+        let error = unsafe {
+            (self
+                .client
+                .state
+                .plugin
+                .async_transfer_manager_retrieve_buffer_fn()?)(&mut args)
+        };
+        self.client.state.plugin.into_result(error)?;
+        let inner = NonNull::new(args.buffer_out).ok_or(Error::NullResult(
+            "PJRT_AsyncHostToDeviceTransferManager_RetrieveBuffer",
+        ))?;
+        Ok(Buffer::from_raw(&self.client, inner))
+    }
+}
+
+impl Drop for AsyncTransferManager {
+    fn drop(&mut self) {
+        let mut args: sys::PJRT_AsyncHostToDeviceTransferManager_Destroy_Args = unsafe { zeroed() };
+        args.struct_size =
+            sys::PJRT_AsyncHostToDeviceTransferManager_Destroy_Args_STRUCT_SIZE as usize;
+        args.transfer_manager = self.inner.as_ptr();
+        if let Ok(function) = self.client.state.plugin.async_transfer_manager_destroy_fn() {
+            let error = unsafe { function(&mut args) };
+            let _ = self.client.state.plugin.into_result(error);
+        }
+    }
+}
+
+/// Completion whose borrow keeps both the mapped bytes and manager alive.
+pub struct DmaTransfer<'owners> {
+    event: Event,
+    _owners: PhantomData<&'owners ()>,
+}
+
+impl DmaTransfer<'_> {
+    pub fn wait(self) -> Result<(), Error> {
+        self.event.wait()
+    }
 }
 
 /// Owned device buffer whose client and plugin necessarily remain live.
@@ -1251,12 +1807,29 @@ impl Buffer {
         Ok(Event::from_raw(&self.client.state.plugin, inner))
     }
 
-    pub fn to_host(&self) -> Result<Vec<u8>, Error> {
-        let byte_count = self
-            .shape()?
-            .byte_count()
-            .map_err(|_| Error::TensorMetadataOverflow)?;
-        let mut bytes = vec![0u8; byte_count];
+    pub fn to_slice_alloc(&self) -> Result<Slice<'static>, Error> {
+        let mut slice = Slice::alloc(self.shape()?)?;
+        self.to_slice(&mut slice)?;
+        Ok(slice)
+    }
+
+    pub fn to_slice(&self, destination: &mut Slice<'_>) -> Result<(), Error> {
+        let shape = self.shape()?;
+        if destination.shape() != shape {
+            return Err(Error::InvalidHostBuffer {
+                expected: shape
+                    .byte_count()
+                    .map_err(|_| Error::TensorMetadataOverflow)?,
+                actual: destination
+                    .shape()
+                    .byte_count()
+                    .map_err(|_| Error::TensorMetadataOverflow)?,
+            });
+        }
+        if !destination.is_native_endian() {
+            return Err(Error::HostTensor(nml_tensor::Error::NonNativeEndian));
+        }
+        let bytes = destination.contiguous_bytes_mut()?;
         let mut args: sys::PJRT_Buffer_ToHostBuffer_Args = unsafe { zeroed() };
         args.struct_size = sys::PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE as usize;
         args.src = self.inner.as_ptr();
@@ -1267,7 +1840,7 @@ impl Buffer {
         let event =
             NonNull::new(args.event).ok_or(Error::NullResult("PJRT_Buffer_ToHostBuffer event"))?;
         Event::from_raw(&self.client.state.plugin, event).wait()?;
-        Ok(bytes)
+        Ok(())
     }
 
     pub fn delete(&self) -> Result<(), Error> {
@@ -1299,6 +1872,49 @@ impl Buffer {
             inner,
         })
     }
+
+    pub fn on_device_size_in_bytes(&self) -> Result<usize, Error> {
+        let mut args: sys::PJRT_Buffer_OnDeviceSizeInBytes_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Buffer_OnDeviceSizeInBytes_Args_STRUCT_SIZE as usize;
+        args.buffer = self.inner.as_ptr();
+        let error = unsafe {
+            (self
+                .client
+                .state
+                .plugin
+                .buffer_on_device_size_in_bytes_fn()?)(&mut args)
+        };
+        self.client.state.plugin.into_result(error)?;
+        Ok(args.on_device_size_in_bytes)
+    }
+
+    pub fn copy_to_device(&self, device: &Device) -> Result<Buffer, Error> {
+        self.client.require_own_device(device)?;
+        let mut args: sys::PJRT_Buffer_CopyToDevice_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Buffer_CopyToDevice_Args_STRUCT_SIZE as usize;
+        args.buffer = self.inner.as_ptr();
+        args.dst_device = device.inner.as_ptr();
+        let error = unsafe { (self.client.state.plugin.buffer_copy_to_device_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)?;
+        let inner =
+            NonNull::new(args.dst_buffer).ok_or(Error::NullResult("PJRT_Buffer_CopyToDevice"))?;
+        Ok(Buffer::from_raw(&self.client, inner))
+    }
+
+    pub fn copy_to_memory(&self, memory: &Memory) -> Result<Buffer, Error> {
+        if !Arc::ptr_eq(&self.client.state, &memory.client.state) {
+            return Err(Error::ForeignClientObject("memory"));
+        }
+        let mut args: sys::PJRT_Buffer_CopyToMemory_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Buffer_CopyToMemory_Args_STRUCT_SIZE as usize;
+        args.buffer = self.inner.as_ptr();
+        args.dst_memory = memory.inner.as_ptr();
+        let error = unsafe { (self.client.state.plugin.buffer_copy_to_memory_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)?;
+        let inner =
+            NonNull::new(args.dst_buffer).ok_or(Error::NullResult("PJRT_Buffer_CopyToMemory"))?;
+        Ok(Buffer::from_raw(&self.client, inner))
+    }
 }
 
 impl Drop for Buffer {
@@ -1315,7 +1931,6 @@ impl Drop for Buffer {
 
 /// Client-owned memory space referenced by a buffer.
 pub struct Memory {
-    #[allow(dead_code)]
     client: Client,
     inner: NonNull<sys::PJRT_Memory>,
 }
@@ -1323,6 +1938,40 @@ pub struct Memory {
 impl Memory {
     pub fn as_raw_identity(&self) -> usize {
         self.inner.as_ptr() as usize
+    }
+
+    pub fn kind(&self) -> Result<String, Error> {
+        let mut args: sys::PJRT_Memory_Kind_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Memory_Kind_Args_STRUCT_SIZE as usize;
+        args.memory = self.inner.as_ptr();
+        let error = unsafe { (self.client.state.plugin.memory_kind_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)?;
+        let bytes = copy_bytes(args.kind, args.kind_size)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    pub fn kind_id(&self) -> Result<i32, Error> {
+        let mut args: sys::PJRT_Memory_Kind_Id_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Memory_Kind_Id_Args_STRUCT_SIZE as usize;
+        args.memory = self.inner.as_ptr();
+        let error = unsafe { (self.client.state.plugin.memory_kind_id_fn()?)(&mut args) };
+        self.client.state.plugin.into_result(error)?;
+        Ok(args.kind_id)
+    }
+
+    pub fn addressable_devices(&self) -> Result<Vec<Device>, Error> {
+        let mut args: sys::PJRT_Memory_AddressableByDevices_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Memory_AddressableByDevices_Args_STRUCT_SIZE as usize;
+        args.memory = self.inner.as_ptr();
+        let error = unsafe {
+            (self
+                .client
+                .state
+                .plugin
+                .memory_addressable_by_devices_fn()?)(&mut args)
+        };
+        self.client.state.plugin.into_result(error)?;
+        device_list(&self.client, args.devices, args.num_devices)
     }
 }
 
@@ -1687,6 +2336,83 @@ fn copy_bytes(pointer: *const c_char, length: usize) -> Result<Vec<u8>, Error> {
     // SAFETY: callers pass PJRT-owned pointers with the accompanying length.
     // Copying prevents an FFI-owned borrow from escaping its owner.
     Ok(unsafe { std::slice::from_raw_parts(pointer.cast(), length) }.to_vec())
+}
+
+fn memory_list(
+    client: &Client,
+    pointer: *const *mut sys::PJRT_Memory,
+    length: usize,
+) -> Result<Vec<Memory>, Error> {
+    if length != 0 && pointer.is_null() {
+        return Err(Error::NullResult("PJRT memory list"));
+    }
+    let entries = if length == 0 {
+        &[][..]
+    } else {
+        // SAFETY: PJRT owns a client-lifetime array with the reported length.
+        unsafe { std::slice::from_raw_parts(pointer, length) }
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            Ok(Memory {
+                client: client.clone(),
+                inner: NonNull::new(*entry).ok_or(Error::NullResult("PJRT memory list entry"))?,
+            })
+        })
+        .collect()
+}
+
+fn device_list(
+    client: &Client,
+    pointer: *const *mut sys::PJRT_Device,
+    length: usize,
+) -> Result<Vec<Device>, Error> {
+    if length != 0 && pointer.is_null() {
+        return Err(Error::NullResult("PJRT device list"));
+    }
+    let entries = if length == 0 {
+        &[][..]
+    } else {
+        // SAFETY: PJRT owns a client-lifetime array with the reported length.
+        unsafe { std::slice::from_raw_parts(pointer, length) }
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            Ok(Device {
+                client: client.clone(),
+                inner: NonNull::new(*entry).ok_or(Error::NullResult("PJRT device list entry"))?,
+            })
+        })
+        .collect()
+}
+
+fn layout_axes(shape: Shape) -> Vec<i64> {
+    shape
+        .layout()
+        .minor_to_major()
+        .iter()
+        .map(|axis| i64::from(*axis))
+        .collect()
+}
+
+fn tiled_layout(minor_to_major: &[i64]) -> sys::PJRT_Buffer_MemoryLayout {
+    let tiled = sys::PJRT_Buffer_MemoryLayout_Tiled {
+        struct_size: sys::PJRT_Buffer_MemoryLayout_Tiled_STRUCT_SIZE as usize,
+        extension_start: std::ptr::null_mut(),
+        minor_to_major: minor_to_major.as_ptr(),
+        minor_to_major_size: minor_to_major.len(),
+        tile_dims: std::ptr::null(),
+        tile_dim_sizes: std::ptr::null(),
+        num_tiles: 0,
+    };
+    sys::PJRT_Buffer_MemoryLayout {
+        struct_size: sys::PJRT_Buffer_MemoryLayout_STRUCT_SIZE as usize,
+        extension_start: std::ptr::null_mut(),
+        __bindgen_anon_1: sys::PJRT_Buffer_MemoryLayout__bindgen_ty_1 { tiled },
+        type_: sys::PJRT_Buffer_MemoryLayout_Type_PJRT_Buffer_MemoryLayout_Type_Tiled,
+    }
 }
 
 fn dtype_to_pjrt(dtype: DType) -> sys::PJRT_Buffer_Type {

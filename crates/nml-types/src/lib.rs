@@ -24,6 +24,70 @@ impl F16 {
     pub const fn to_bits(self) -> u16 {
         self.0
     }
+
+    /// Converts an IEEE binary32 value to binary16 using round-to-nearest,
+    /// ties-to-even. Keeping this conversion in NML's canonical storage type
+    /// avoids making checkpoint and reference code depend on another half
+    /// representation.
+    pub fn from_f32(value: f32) -> Self {
+        let bits = value.to_bits();
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        let exponent = ((bits >> 23) & 0xff) as i32;
+        let fraction = bits & 0x7f_ffff;
+
+        if exponent == 0xff {
+            let payload = (fraction >> 13) as u16;
+            return Self(sign | 0x7c00 | if payload == 0 { 0 } else { payload | 0x0200 });
+        }
+
+        let half_exponent = exponent - 127 + 15;
+        if half_exponent >= 0x1f {
+            return Self(sign | 0x7c00);
+        }
+        if half_exponent <= 0 {
+            if half_exponent < -10 {
+                return Self(sign);
+            }
+            let significand = fraction | 0x80_0000;
+            let shift = (14 - half_exponent) as u32;
+            let truncated = significand >> shift;
+            let remainder = significand & ((1u32 << shift) - 1);
+            let halfway = 1u32 << (shift - 1);
+            let rounded = truncated
+                + u32::from(remainder > halfway || (remainder == halfway && truncated & 1 != 0));
+            return Self(sign | rounded as u16);
+        }
+
+        let truncated = fraction >> 13;
+        let remainder = fraction & 0x1fff;
+        let rounded = truncated
+            + u32::from(remainder > 0x1000 || (remainder == 0x1000 && truncated & 1 != 0));
+        let packed = ((half_exponent as u32) << 10) + rounded;
+        Self(sign | packed as u16)
+    }
+
+    pub fn to_f32(self) -> f32 {
+        let bits = self.0;
+        let sign = ((bits & 0x8000) as u32) << 16;
+        let exponent = (bits >> 10) & 0x1f;
+        let fraction = bits & 0x03ff;
+        let value = match exponent {
+            0 if fraction == 0 => sign,
+            0 => {
+                let mut fraction = fraction as u32;
+                let mut exponent = -14i32;
+                while fraction & 0x0400 == 0 {
+                    fraction <<= 1;
+                    exponent -= 1;
+                }
+                fraction &= 0x03ff;
+                sign | (((exponent + 127) as u32) << 23) | (fraction << 13)
+            }
+            0x1f => sign | 0x7f80_0000 | ((fraction as u32) << 13),
+            _ => sign | (((exponent as u32) + 112) << 23) | ((fraction as u32) << 13),
+        };
+        f32::from_bits(value)
+    }
 }
 
 impl fmt::Debug for F16 {
@@ -47,6 +111,21 @@ impl BFloat16 {
 
     pub const fn to_bits(self) -> u16 {
         self.0
+    }
+
+    /// Converts with round-to-nearest, ties-to-even while preserving NaNs.
+    pub fn from_f32(value: f32) -> Self {
+        let bits = value.to_bits();
+        if bits & 0x7fff_ffff > 0x7f80_0000 {
+            return Self(((bits >> 16) as u16) | 0x0040);
+        }
+        let upper = bits >> 16;
+        let rounding_bias = 0x7fff + (upper & 1);
+        Self(bits.wrapping_add(rounding_bias).wrapping_shr(16) as u16)
+    }
+
+    pub fn to_f32(self) -> f32 {
+        f32::from_bits((self.0 as u32) << 16)
     }
 }
 
@@ -368,6 +447,45 @@ impl Shape {
         Ok(self)
     }
 
+    /// Reorders logical dimensions and all per-axis metadata together.
+    /// Physical layout is transformed to name the same underlying dimension
+    /// order after the logical axes have moved.
+    pub fn permuted(&self, permutation: &[usize]) -> Result<Self, ShapeError> {
+        self.require_metadata_rank(permutation.len(), "permutation")?;
+        let mut seen = [false; MAX_RANK];
+        for &axis in permutation {
+            if axis >= self.rank() || seen[axis] {
+                return Err(ShapeError::InvalidPermutation);
+            }
+            seen[axis] = true;
+        }
+
+        let mut dimensions = [0; MAX_RANK];
+        let mut tags = [AxisTag::UNKNOWN; MAX_RANK];
+        let mut partitions = [Partition::Unspecified; MAX_RANK];
+        let mut old_to_new = [0usize; MAX_RANK];
+        for (new_axis, &old_axis) in permutation.iter().enumerate() {
+            dimensions[new_axis] = self.dimensions[old_axis];
+            tags[new_axis] = self.axis_tags[old_axis];
+            partitions[new_axis] = self.partitions[old_axis];
+            old_to_new[old_axis] = new_axis;
+        }
+        let layout = self
+            .layout
+            .minor_to_major()
+            .iter()
+            .map(|&old_axis| old_to_new[old_axis as usize] as u8)
+            .collect::<Vec<_>>();
+        Ok(Self {
+            dtype: self.dtype,
+            rank: self.rank,
+            dimensions,
+            axis_tags: tags,
+            partitions,
+            layout: Layout::from_minor_to_major(&layout)?,
+        })
+    }
+
     pub fn element_count(&self) -> Result<usize, ShapeError> {
         self.dimensions()
             .iter()
@@ -420,6 +538,7 @@ pub enum ShapeError {
         axis: usize,
     },
     ByteCountOverflow,
+    InvalidPermutation,
 }
 
 impl fmt::Display for ShapeError {
@@ -444,6 +563,9 @@ impl fmt::Display for ShapeError {
                 write!(formatter, "element count overflows at dimension {axis}")
             }
             Self::ByteCountOverflow => formatter.write_str("tensor byte count overflows usize"),
+            Self::InvalidPermutation => {
+                formatter.write_str("axis permutation is not a rank-sized permutation")
+            }
         }
     }
 }

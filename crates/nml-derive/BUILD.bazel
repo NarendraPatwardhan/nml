@@ -1,0 +1,15 @@
+"""Structural derive for NML model values."""
+
+load("//bazel:rust.bzl", "nml_rust_proc_macro")
+
+nml_rust_proc_macro(
+    name = "nml_derive",
+    srcs = ["src/lib.rs"],
+    crate_root = "src/lib.rs",
+    deps = [
+        "@rust_crates//proc-macro2",
+        "@rust_crates//quote",
+        "@rust_crates//syn",
+    ],
+    visibility = ["//crates:__subpackages__"],
+)

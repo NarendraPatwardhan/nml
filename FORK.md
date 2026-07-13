@@ -51,6 +51,7 @@ axis. Complexity is evidence for a decision, not the decision itself.
 | D-023 | `DECIDED` | Follow ZML's treatment of MLIR `index`: it is a compiler-internal MLIR type, not a runtime `DataType`, tensor element type, host-storage type, or PJRT buffer type. The MLIR layer still supports index constants and signed/unsigned casts wherever compiler APIs, layouts, loops, memrefs, or dialect operations require them. |
 | D-024 | `DECIDED` | NML's initial compiler graph pins OpenXLA/XLA commit `41370d1124c74d7b93a207136a636d8c631cbed9`, matching the ZML reference integration. PJRT headers, XLA schemas, LLVM/MLIR, StableHLO, and Shardy are resolved through this graph rather than independent drifting source pins. |
 | D-025 | `DECIDED` | NML does not consume ZML's source forks of LLVM, Zig, XLA, `rules_ml_toolchain`, or other external projects. Compiler sources come from the original OpenXLA repository and its upstream-pinned dependency graph; Rust/Bazel dependencies come from their upstream registries; NVIDIA and system runtime packages come from their original distributors. Two deliberate ZML-derived inputs remain acceptable under D-010 and D-014: NML carries the audited `cuda-root-path-local-defines.patch` locally against upstream OpenXLA, and SHA-256-pinned CPU/CUDA plugin binaries are downloaded from `zml/pjrt-artifacts`. The latter is a ZML-hosted packaging dependency, not a source-fork dependency. Any future dependency on ZML-hosted forked source requires a new explicit decision. |
+| D-026 | `DECIDED` | After the first typed CPU/CUDA execution milestone, NML implements the parameter/buffer/checkpoint substrate and then ports ZML's CPU/CUDA-relevant attention architecture before beginning W4A16. This includes portable attention semantics, CUDA FlashAttention, paged KV-cache behavior, and the Triton machinery required by ZML's default CUDA paged-attention path. Quantization follows these layers so packed weights, custom kernels, model parameters, and persistent device memory use the final ownership and dispatch architecture. |
 
 An item is `UNDECIDED` only where this document identifies a deliberate NML
 departure that still needs an exact contract. Otherwise D-018 applies the
@@ -918,6 +919,164 @@ Potential substrate requirements:
 
 This does not require general autograd, but it may require operations and
 memory semantics that pure stateless inference does not.
+
+### 6.4 Ordered product milestones after the first execution path
+
+The first milestone established and validated this complete path on CPU and a
+real CUDA device:
+
+```text
+typed Rust graph
+  -> owned and verified StableHLO/MLIR
+  -> XLA compile options and portable artifact
+  -> PJRT compilation, transfer, and execution
+  -> CPU/CUDA numerical results
+```
+
+The next milestones are ordered by dependency, not by ease of demonstration.
+Each milestone is complete only when its durable CPU/CUDA, ownership, failure,
+numerical, and where applicable memory/performance contracts pass. A parser,
+enum, emitted operation, registered symbol, or compiled kernel by itself does
+not complete a milestone.
+
+#### Milestone 2: parameter, buffer, and checkpoint substrate
+
+Path:
+
+```text
+typed and aligned host storage
+  -> Slice/view shape, stride, layout, offset, and endian contracts
+  -> persistent device Buffer and memory-kind ownership
+  -> named executable parameters and reusable activation bindings
+  -> Rust structural traversal/derive support
+  -> safetensors field, alias, and tied-weight loading
+  -> repeated FP16/BF16 parameterized execution
+```
+
+This milestone preserves ZML's conceptual `Tensor`/`Slice`/`Buffer`/`Exe` and
+`Bufferized(T)` lifecycle in Rust. Ordinary product APIs stop exposing raw byte
+vectors as the tensor abstraction. Parameters are uploaded once, retained on
+the selected device, and reused across executions; transfers, donation,
+aliasing, and destruction remain explicit. Checkpoint loading must not create
+an untracked persistent converted copy.
+
+Acceptance includes loading an FP16 and BF16 linear layer with optional bias
+from safetensors, compiling it once, executing multiple inputs on CPU and CUDA,
+checking numerical results against independent host math, and proving that
+parameter storage is neither reloaded nor duplicated between invocations.
+
+#### Milestone 3: portable attention semantics and KV state
+
+Path:
+
+```text
+required tensor operations
+  -> Q/K/V projection and semantic head axes
+  -> RoPE, causal/sliding masks, and scaled dot-product attention
+  -> MHA, GQA, and MQA
+  -> prefill and decode graph forms
+  -> persistent KV allocation and updates
+  -> paged-cache/page-table semantics
+```
+
+The operation layer grows through the behavior required by the retained ZML
+attention paths: elementwise arithmetic, broadcast, reshape, transpose,
+conversion, gather/slice/update, concatenation, reductions, normalization, and
+softmax. CPU portable attention is both the correctness oracle and a
+performance implementation under D-013; the same StableHLO path also remains
+available to CUDA/XLA.
+
+Acceptance covers causal and non-causal attention, sliding windows, multiple
+query-to-KV head ratios, prefill, single-token and multi-token decode, and KV
+updates across successive executions. Results and cache contents are compared
+against independent reference math, including boundary page and sequence
+lengths. The cache lifecycle must already support the later checkpoint,
+rollback, truncate, and replay work needed by speculative decoding.
+
+#### Milestone 4: CUDA FlashAttention and Triton paged attention
+
+ZML's ordinary CUDA attention selects FlashAttention 3 for compute capability
+9.0 and FlashAttention 2 otherwise. Its default CUDA paged-attention backend is
+Triton. Retaining the CPU/CUDA attention architecture therefore requires two
+kernel integration paths rather than treating Triton as unrelated future
+tooling.
+
+FlashAttention path:
+
+```text
+upstream FlashAttention source and audited Bazel packaging
+  -> Rust loader and tensor/parameter ABI
+  -> PJRT GPU custom-call lifecycle registration
+  -> FA2/FA3 capability dispatch and hard failures
+  -> ordinary plus paged prefill/decode execution
+```
+
+D-025 still applies: ZML's build and loader logic is reference material, but a
+ZML-hosted FlashAttention source fork is not silently introduced. Required
+changes are either obtained from the original upstream project or carried as
+audited local patches. FA2 is validated on supported local hardware. FA3 is not
+called validated until its permanent contract runs on real compatible
+hardware; compilation alone is insufficient.
+
+Triton path:
+
+```text
+pinned XLA Triton/TTIR sources
+  -> narrow TTIR C bindings
+  -> safe Rust Builder, Value, dtype, argument, and control-flow API
+  -> isolated throwaway MLIR context for TTIR emission
+  -> typed Kernel input/output/config/launch contract
+  -> TTIR-bearing StableHLO custom call
+  -> XLA lowering and CUDA execution
+  -> unified 2D/3D paged-attention kernels and segment reduction
+```
+
+The Rust Triton layer preserves the useful structure of ZML's
+`kernels/triton`, `mlir/dialects/ttir`, `zml/kernel.zig`,
+`zml/attention/triton_attention.zig`, and
+`zml/attention/triton_kernels/unified_attention.zig`. Rust traits, generics, or
+derive code may replace Zig `comptime`, but the result retains typed named
+arguments, explicit output shapes and aliases, verified TTIR, launch grids,
+warp/stage configuration, and deterministic failure behavior. The oneAPI
+kernel specialization is outside D-002; this does not remove the shared Triton
+behavior used by CUDA.
+
+Acceptance compares portable CPU attention, CUDA FlashAttention, and CUDA
+Triton results for the configurations each backend supports. It exercises
+mixed prefill/decode batches, page-table boundaries, sliding windows, GQA/MQA,
+in-place KV updates, output aliasing, and repeated execution without cache
+reallocation. Kernel capability mismatches are hard diagnostic errors.
+
+#### Milestone 5: W4A16 as the first quantized execution vertical
+
+W4A16 begins only after Milestones 2 through 4 establish model parameter
+ownership, checkpoint loading, custom-kernel integration, attention state, and
+CPU/CUDA dispatch.
+
+Path:
+
+```text
+explicit W4A16 recipe and accepted checkpoint encodings
+  -> canonical packed nibble, scale, zero-point, group, and transpose contract
+  -> packed host Slice and persistent packed device Buffer
+  -> direct checkpoint import without persistent dequantization
+  -> independent CPU reference operator
+  -> CUDA kernel through the established custom-call/Triton substrate
+  -> model linear layers and attention projections
+  -> numerical, memory-footprint, capability, and performance acceptance
+```
+
+The exact W4A16 recipe remains an explicit owner decision under section 5.3;
+milestone ordering does not choose AWQ, GPTQ, group size, scale dtype, packing
+order, or accumulation policy implicitly. Support is not claimed unless a real
+checkpoint remains packed through loading and persistent device storage, CPU
+and CUDA results meet the declared tolerance, unsupported hardware fails
+clearly, and the measured memory footprint excludes a hidden full-precision
+weight copy.
+
+W8A8 and NVFP4 build on the same quantization, checkpoint, buffer, and kernel
+boundaries. Their relative implementation order and exact recipes remain
+separate owner decisions; neither is inferred merely from completing W4A16.
 
 ## 7. Subsystem decision ledger
 

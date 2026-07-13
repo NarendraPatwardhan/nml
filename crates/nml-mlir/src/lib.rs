@@ -502,6 +502,34 @@ impl Context {
             .build()
     }
 
+    pub fn add<'context>(
+        &'context self,
+        left: Value<'context>,
+        right: Value<'context>,
+        result_type: Type<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        Operation::builder(self, "stablehlo.add")
+            .results(&[result_type])
+            .operands(&[left, right])
+            .build()
+    }
+
+    pub fn broadcast_in_dim<'context>(
+        &'context self,
+        input: Value<'context>,
+        result_type: Type<'context>,
+        dimensions: &[i64],
+    ) -> Result<Operation<'context>, Error> {
+        let dimensions = format!("array<i64: {}>", comma_separated_i64(dimensions));
+        Operation::builder(self, "stablehlo.broadcast_in_dim")
+            .results(&[result_type])
+            .operands(&[input])
+            .attributes(&[
+                self.named_attribute("broadcast_dimensions", self.parse_attribute(&dimensions)?)?
+            ])
+            .build()
+    }
+
     pub fn complex<'context>(
         &'context self,
         real: Value<'context>,
