@@ -1,6 +1,5 @@
 //! Product contract for persistent FP16/BF16 checkpoint parameters.
 
-use nml::NmlStruct as _;
 use nml_types::{BFloat16, DType, F16, Shape};
 use safetensors::tensor::{Dtype as SafeDType, View};
 use std::borrow::Cow;
