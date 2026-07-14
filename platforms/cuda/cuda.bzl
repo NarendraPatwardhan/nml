@@ -135,6 +135,33 @@ NVSHMEM_PACKAGES = {
     ]),
 }
 
+# NVIDIA's redistributions also contain multi-gigabyte static development
+# archives. NML's retained ZML runtime graph names only the files below, so
+# extracting unrelated payload wastes repository disk without adding a runtime
+# capability. Patterns include versioned shared-library targets as well as the
+# stable sonames referenced by BUILD targets.
+_REDIST_INCLUDES = {
+    "cuda_nvml_dev": ["include/nvml.h"],
+    "cuda_cudart": ["include/cuda.h", "lib/libcudart.so*"],
+    "cuda_cupti": ["lib/libcupti.so*"],
+    "cuda_nvtx": ["include/nvtx3/*", "lib/libnvtx3interop.so*"],
+    "cuda_compat": ["compat/libcuda.so*", "compat/libcudadebugger.so*", "compat/libnvidia-*.so*"],
+    "libcufft": ["lib/libcufft.so*"],
+    "libcusolver": ["lib/libcusolver.so*"],
+    "libcusparse": ["lib/libcusparse.so*"],
+    "libnvjitlink": ["lib/libnvJitLink.so*"],
+    "cuda_nvcc": ["bin/ptxas", "bin/nvlink"],
+    "libnvvm": ["nvvm/bin/cicc", "nvvm/libdevice/libdevice.10.bc"],
+    "cuda_nvrtc": ["lib/libnvrtc.so*", "lib/libnvrtc-builtins.so*"],
+    "libcublas": ["lib/libcublas.so*", "lib/libcublasLt.so*"],
+    "cudnn": ["lib/libcudnn*.so*"],
+    "libnvshmem": [
+        "lib/libnvshmem_host.so*",
+        "lib/nvshmem_bootstrap_uid.so*",
+        "lib/nvshmem_transport_ibrc.so*",
+    ],
+}
+
 _PJRT_CUDA_ASSETS = {
     "amd64": {
         "sha256": "6380f724fe21b25dc9231f3ec468ae92e39d21f4bae9377bfa8ff01972521e0d",
@@ -191,6 +218,7 @@ def _create_redist_repositories(packages, redist, prefix, variant):
             http_archive(
                 name = package + "_" + arch.replace("-", "_"),
                 build_file_content = _BUILD_HEADER + build,
+                includes = _REDIST_INCLUDES[package],
                 sha256 = arch_data["sha256"],
                 strip_prefix = paths.basename(relative_path).replace(".tar.xz", ""),
                 url = prefix + relative_path,
