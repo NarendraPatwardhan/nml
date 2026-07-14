@@ -148,14 +148,33 @@ pub mod safetensors {
         }
 
         pub fn read(&self, name: &str) -> Result<Slice<'static>, super::Error> {
+            let shape = self.shape(name)?;
+            self.read_with_shape(name, shape)
+        }
+
+        pub(super) fn read_with_shape(
+            &self,
+            name: &str,
+            shape: Shape,
+        ) -> Result<Slice<'static>, super::Error> {
             if !cfg!(target_endian = "little") {
                 return Err(super::Error::NonNativeSafetensorsEndian);
             }
             let record = self.record(name)?;
+            if !storage_compatible(record.shape, shape) {
+                return Err(super::Error::ShapeMismatch {
+                    name: name.to_owned(),
+                    expected: shape,
+                    actual: record.shape,
+                });
+            }
             let mut file = File::open(&record.path).map_err(super::Error::Io)?;
             file.seek(SeekFrom::Start(record.absolute_start))
                 .map_err(super::Error::Io)?;
-            let mut slice = Slice::alloc(record.shape)?;
+            // Axis tags and logical partitions belong to the model, not to the
+            // safetensors file format. Allocate with the declared model shape
+            // while reading the identical dense payload validated above.
+            let mut slice = Slice::alloc(shape)?;
             let bytes = slice.contiguous_bytes_mut()?;
             if bytes.len() != record.byte_length {
                 return Err(super::Error::InvalidTensorBytes(name.to_owned()));
@@ -191,6 +210,12 @@ pub mod safetensors {
                 .get(name)
                 .ok_or_else(|| super::Error::MissingTensor(name.to_owned()))
         }
+    }
+
+    pub(super) fn storage_compatible(stored: Shape, declared: Shape) -> bool {
+        stored.dtype() == declared.dtype()
+            && stored.dimensions() == declared.dimensions()
+            && stored.layout() == declared.layout()
     }
 
     impl TensorReader {
@@ -391,7 +416,8 @@ pub mod io {
     use super::safetensors::TensorRegistry;
     use nml_ir::{Program, ProgramBuilder, Tensor};
     use nml_runtime::{Buffer, Bufferized, Memory, NmlStruct, Platform, Sharding};
-    use nml_types::Shape;
+    use nml_tensor::{Element, Slice};
+    use nml_types::{DType, Partition, Shape};
     use std::cell::RefCell;
     use std::collections::{BTreeMap, BTreeSet};
     use std::rc::Rc;
@@ -409,6 +435,7 @@ pub mod io {
         builder: ProgramBuilder,
         tied_symbols: BTreeMap<String, Tensor>,
         path_to_record: BTreeMap<String, String>,
+        record_shapes: BTreeMap<String, Shape>,
     }
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -428,6 +455,7 @@ pub mod io {
                     builder: ProgramBuilder::new(),
                     tied_symbols: BTreeMap::new(),
                     path_to_record: BTreeMap::new(),
+                    record_shapes: BTreeMap::new(),
                 })),
                 prefix: String::new(),
             }
@@ -458,6 +486,283 @@ pub mod io {
                 .borrow_mut()
                 .builder
                 .linear(input, weight, bias)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn constant(&self, value: &Slice<'_>) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .constant(value)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn scalar<T: Element>(&self, value: T) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .scalar(value)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn add(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .add(left, right)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn subtract(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .subtract(left, right)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn multiply(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .multiply(left, right)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn divide(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .divide(left, right)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn minimum(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .minimum(left, right)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn maximum(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .maximum(left, right)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn negate(&self, input: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .negate(input)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn equal(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .equal(left, right)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn not_equal(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .not_equal(left, right)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn greater(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .greater(left, right)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn greater_equal(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .greater_equal(left, right)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn less(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .less(left, right)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn less_equal(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .less_equal(left, right)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn select(
+            &self,
+            predicate: Tensor,
+            on_true: Tensor,
+            on_false: Tensor,
+        ) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .select(predicate, on_true, on_false)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn convert(&self, input: Tensor, dtype: DType) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .convert(input, dtype)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn reshape(&self, input: Tensor, shape: Shape) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .reshape(input, shape)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn transpose(
+            &self,
+            input: Tensor,
+            permutation: &[usize],
+        ) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .transpose(input, permutation)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn with_partitions(
+            &self,
+            input: Tensor,
+            partitions: &[Partition],
+        ) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .with_partitions(input, partitions)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn exp(&self, input: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .exp(input)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn log(&self, input: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .log(input)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn sqrt(&self, input: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .sqrt(input)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn rsqrt(&self, input: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .rsqrt(input)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn tanh(&self, input: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .tanh(input)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn sin(&self, input: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .sin(input)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn cos(&self, input: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .cos(input)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn relu(&self, input: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .relu(input)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn sigmoid(&self, input: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .sigmoid(input)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn silu(&self, input: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .silu(input)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn gelu(&self, input: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .gelu(input)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn leaky_relu(&self, input: Tensor, slope: f64) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .leaky_relu(input, slope)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn quick_gelu(&self, input: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .quick_gelu(input)
                 .map_err(super::Error::Ir)
         }
 
@@ -514,7 +819,7 @@ pub mod io {
                 return Ok(None);
             };
             let actual = store.registry.shape(&resolved)?;
-            if actual != expected {
+            if !super::safetensors::storage_compatible(actual, expected) {
                 return Err(super::Error::ShapeMismatch {
                     name: resolved,
                     expected,
@@ -522,10 +827,19 @@ pub mod io {
                 });
             }
             let tensor = if let Some(tensor) = store.tied_symbols.get(&resolved) {
+                let declared = store.record_shapes[&resolved];
+                if declared != expected {
+                    return Err(super::Error::ShapeMismatch {
+                        name: resolved,
+                        expected,
+                        actual: declared,
+                    });
+                }
                 *tensor
             } else {
-                let tensor = store.builder.parameter(resolved.clone(), actual);
+                let tensor = store.builder.parameter(resolved.clone(), expected);
                 store.tied_symbols.insert(resolved.clone(), tensor);
+                store.record_shapes.insert(resolved.clone(), expected);
                 tensor
             };
             store.path_to_record.insert(primary, resolved);
@@ -567,16 +881,14 @@ pub mod io {
                 .cloned()
                 .collect::<BTreeSet<_>>()
                 .into_iter()
+                .map(|record| {
+                    let shape = store.record_shapes[&record];
+                    (record, shape)
+                })
                 .collect::<Vec<_>>();
             let record_bytes = records
                 .iter()
-                .map(|record| {
-                    store
-                        .registry
-                        .shape(record)?
-                        .byte_count()
-                        .map_err(super::Error::Shape)
-                })
+                .map(|(_, shape)| shape.byte_count().map_err(super::Error::Shape))
                 .collect::<Result<Vec<_>, _>>()?;
             let worker_count = options.parallelism.min(records.len()).max(1);
             let peak_staging_bytes = if platform.name() == "cuda" {
@@ -612,12 +924,11 @@ pub mod io {
             };
             let mut loaded = BTreeMap::<String, Buffer>::new();
             if platform.name() == "cuda" {
-                for (completed, record) in records.iter().enumerate() {
-                    let shape = store.registry.shape(record)?;
+                for (completed, (record, shape)) in records.iter().enumerate() {
                     let mut reader = store.registry.reader(record).map_err(super::Error::Io)?;
                     let buffer = platform
                         .upload_checkpoint_from(
-                            shape,
+                            *shape,
                             options.sharding.clone(),
                             options.memory,
                             options.staging_buffers,
@@ -648,11 +959,14 @@ pub mod io {
                         scope.spawn(move || {
                             loop {
                                 let index = next.fetch_add(1, Ordering::Relaxed);
-                                let Some(record) = records.get(index) else {
+                                let Some((record, shape)) = records.get(index) else {
                                     break;
                                 };
                                 if sender
-                                    .send((record.clone(), registry.read(record)))
+                                    .send((
+                                        record.clone(),
+                                        registry.read_with_shape(record, *shape),
+                                    ))
                                     .is_err()
                                 {
                                     break;

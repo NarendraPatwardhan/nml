@@ -3,6 +3,10 @@
 # contents belong in source control.
 /bazel-*
 
+# The BuildBuddy CLI materializes remotely built artifacts here when a local
+# command consumes them. They are cache products, not repository inputs.
+/bb-out/
+
 # ZML is a continuously readable reference checkout, not an NML source or build
 # dependency. Its exact revision is recorded in FORK.md instead of vendoring its
 # Git history into NML.

@@ -10,6 +10,7 @@ nml_rust_library(
         "//crates/nml-ir:nml_ir",
         "//crates/nml-mlir:nml_mlir",
         "//crates/nml-pjrt:nml_pjrt",
+        "//crates/nml-sharding:nml_sharding",
         "//crates/nml-xla:nml_xla",
     ],
     visibility = [

@@ -1,4 +1,6 @@
-use nml_mlir::{Block, Context, Error, IndexCastKind, Region, stablehlo_current_version};
+use nml_mlir::{
+    Block, Context, Error, IndexCastKind, Region, ShardyDimension, stablehlo_current_version,
+};
 use nml_types::DType;
 
 #[test]
@@ -124,6 +126,83 @@ fn stablehlo_constants_are_built_with_owned_operations() {
 
     assert!(matches!(
         context.parse_attribute("not-an-attribute"),
+        Err(Error::InvalidAttribute { .. })
+    ));
+}
+
+#[test]
+fn shardy_manual_computation_owns_a_verified_local_region() {
+    let context = Context::new();
+    let global = context.ranked_tensor_type(DType::F32, &[4]).unwrap();
+    let local = context.ranked_tensor_type(DType::F32, &[2]).unwrap();
+    let sharding = context
+        .shardy_tensor_sharding("nml_mesh", &[ShardyDimension::Sharded("axis_1")], &[])
+        .unwrap();
+    let per_value = context.shardy_per_value_sharding(&[sharding]).unwrap();
+    let manual_axes = context.shardy_manual_axes(&["axis_1"]).unwrap();
+
+    let mut local_block = Block::new(&context, &[local]).unwrap();
+    let local_value = local_block.argument(0).unwrap();
+    local_block
+        .append_operation(context.shardy_return(&[local_value]).unwrap())
+        .unwrap();
+    let mut manual_body = Region::new(&context).unwrap();
+    manual_body.append_block(local_block).unwrap();
+
+    let mut function_block = Block::new(&context, &[global]).unwrap();
+    let global_value = function_block.argument(0).unwrap();
+    let manual = context
+        .shardy_manual_computation(
+            &[global_value],
+            &[global],
+            per_value,
+            per_value,
+            manual_axes,
+            manual_body,
+        )
+        .unwrap();
+    let result = manual.result(0).unwrap();
+    function_block.append_operation(manual).unwrap();
+    function_block
+        .append_operation(context.return_operation(&[result]).unwrap())
+        .unwrap();
+    let mut function_body = Region::new(&context).unwrap();
+    function_body.append_block(function_block).unwrap();
+    let function = context
+        .function("manual_contract", &[global], &[global], function_body)
+        .unwrap();
+
+    let mesh = context.shardy_mesh(&[("axis_1", 2)], &[]).unwrap();
+    let mut module = context.empty_module().unwrap();
+    module
+        .append_operation(context.shardy_mesh_operation("nml_mesh", mesh).unwrap())
+        .unwrap();
+    module.append_operation(function).unwrap();
+    module.verify().unwrap();
+    let text = module.text();
+    assert!(text.contains("sdy.manual_computation"));
+    assert!(text.contains("manual_axes"));
+    assert!(text.contains("axis_1"));
+    assert!(text.contains("sdy.return"));
+}
+
+#[test]
+fn shardy_mesh_rejects_invalid_topology_before_calling_the_c_api() {
+    let context = Context::new();
+    assert!(matches!(
+        context.shardy_mesh(&[], &[]),
+        Err(Error::InvalidAttribute { .. })
+    ));
+    assert!(matches!(
+        context.shardy_mesh(&[("data", 2), ("data", 2)], &[]),
+        Err(Error::InvalidAttribute { .. })
+    ));
+    assert!(matches!(
+        context.shardy_mesh(&[("data", 2)], &[0]),
+        Err(Error::InvalidAttribute { .. })
+    ));
+    assert!(matches!(
+        context.shardy_mesh(&[("data", 2)], &[0, 0]),
         Err(Error::InvalidAttribute { .. })
     ));
 }

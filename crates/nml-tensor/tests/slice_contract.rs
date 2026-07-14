@@ -1,5 +1,5 @@
 use nml_tensor::{Error, Slice};
-use nml_types::{BFloat16, DType, F16, Layout, Shape};
+use nml_types::{AxisTag, BFloat16, DType, F16, Layout, Partition, Shape};
 use std::mem::align_of;
 
 #[test]
@@ -15,6 +15,23 @@ fn owned_and_borrowed_typed_storage_share_one_slice_api() {
     assert_eq!(owned.data_pointer().unwrap().addr() % align_of::<f32>(), 0);
     owned.copy_from(&borrowed).unwrap();
     assert_eq!(owned.items::<f32>().unwrap(), &values);
+}
+
+#[test]
+fn host_copy_preserves_destination_graph_metadata() {
+    let axis = AxisTag::new(19);
+    let stored = Shape::new(DType::F32, &[2, 2]).unwrap();
+    let declared = stored
+        .with_axis_tags(&[AxisTag::new(7), AxisTag::new(8)])
+        .unwrap()
+        .with_partitions(&[Partition::Sharded(axis), Partition::Unspecified])
+        .unwrap();
+    let values = [1.0f32, 2.0, 3.0, 4.0];
+    let source = Slice::from_typed(stored, &values).unwrap();
+    let mut destination = Slice::alloc(declared).unwrap();
+    destination.copy_from(&source).unwrap();
+    assert_eq!(destination.shape(), declared);
+    assert_eq!(destination.items::<f32>().unwrap(), &values);
 }
 
 #[test]

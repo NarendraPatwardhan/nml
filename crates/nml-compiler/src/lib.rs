@@ -12,10 +12,11 @@ use std::fmt;
 pub fn compile(
     client: &Client,
     program: &nml_ir::Program,
+    sharding: &nml_sharding::Sharding,
     options: &nml_xla::CompileOptions,
 ) -> Result<LoadedExecutable, Error> {
     let context = nml_mlir::Context::new();
-    let module = program.module(&context)?;
+    let module = program.module_with_sharding(&context, sharding)?;
     let version = negotiate_stablehlo_version(client.stablehlo_version()?)?;
     let artifact = module.portable_artifact(&version)?;
     let options = options.serialize()?;

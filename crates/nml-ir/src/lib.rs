@@ -6,9 +6,16 @@
 #![forbid(unsafe_code)]
 
 use nml_mlir::{
-    Block, Context, Error as MlirError, Module, Region, StableHloFftType, Value as MlirValue,
+    Attribute as MlirAttribute, Block, Context, Error as MlirError, Module, Region,
+    ShardyDimension, StableHloBinary, StableHloComparison, StableHloComparisonType,
+    StableHloFftType, StableHloUnary, Value as MlirValue,
 };
-use nml_types::{DType, Layout, Shape, ShapeError};
+use nml_sharding::Sharding;
+use nml_tensor::{Element, Slice};
+use nml_types::{
+    AxisTag, BFloat16, Complex64, Complex128, DType, DTypeClass, F16, Layout, Partition, Shape,
+    ShapeError,
+};
 use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
@@ -76,6 +83,17 @@ pub enum Error {
         actual: Layout,
         expected: Layout,
     },
+    UnsupportedDType {
+        operation: &'static str,
+        dtype: DType,
+    },
+    ElementCountMismatch {
+        operation: &'static str,
+        input: usize,
+        output: usize,
+    },
+    Tensor(nml_tensor::Error),
+    Sharding(nml_sharding::Error),
     NoOutputs,
     DuplicateInputName(String),
     DuplicateOutputName(String),
@@ -155,6 +173,19 @@ impl fmt::Display for Error {
                 actual.minor_to_major(),
                 expected.minor_to_major()
             ),
+            Self::UnsupportedDType { operation, dtype } => {
+                write!(formatter, "{operation} does not support {dtype:?}")
+            }
+            Self::ElementCountMismatch {
+                operation,
+                input,
+                output,
+            } => write!(
+                formatter,
+                "{operation} requires equal element counts, received {input} and {output}",
+            ),
+            Self::Tensor(error) => error.fmt(formatter),
+            Self::Sharding(error) => error.fmt(formatter),
             Self::NoOutputs => formatter.write_str("program must expose at least one output"),
             Self::DuplicateInputName(name) => write!(formatter, "duplicate input name {name:?}"),
             Self::DuplicateOutputName(name) => write!(formatter, "duplicate output name {name:?}"),
@@ -189,6 +220,18 @@ impl From<ShapeError> for Error {
 impl From<MlirError> for Error {
     fn from(error: MlirError) -> Self {
         Self::Mlir(error)
+    }
+}
+
+impl From<nml_tensor::Error> for Error {
+    fn from(error: nml_tensor::Error) -> Self {
+        Self::Tensor(error)
+    }
+}
+
+impl From<nml_sharding::Error> for Error {
+    fn from(error: nml_sharding::Error) -> Self {
+        Self::Sharding(error)
     }
 }
 
@@ -239,22 +282,302 @@ impl ProgramBuilder {
     }
 
     pub fn add(&mut self, left: Tensor, right: Tensor) -> Result<Tensor, Error> {
-        self.require_local(left)?;
-        self.require_local(right)?;
-        if left.shape.dtype() != right.shape.dtype() {
-            return Err(Error::DTypeMismatch {
-                left: left.shape.dtype(),
-                right: right.shape.dtype(),
+        self.binary(left, right, Binary::Add)
+    }
+
+    pub fn constant(&mut self, value: &Slice<'_>) -> Result<Tensor, Error> {
+        let value = value.to_contiguous()?;
+        let shape = value.shape();
+        require_supported_layout(shape)?;
+        let literal = dense_literal(&value)?;
+        let result = self.push_value("constant", shape);
+        self.operations.push(Operation::Constant {
+            result: result.value,
+            literal,
+        });
+        Ok(result)
+    }
+
+    pub fn scalar<T: Element>(&mut self, value: T) -> Result<Tensor, Error> {
+        let shape = Shape::new(T::DTYPE, &[])?;
+        self.constant(&Slice::from_typed(shape, std::slice::from_ref(&value))?)
+    }
+
+    pub fn subtract(&mut self, left: Tensor, right: Tensor) -> Result<Tensor, Error> {
+        self.binary(left, right, Binary::Subtract)
+    }
+
+    pub fn multiply(&mut self, left: Tensor, right: Tensor) -> Result<Tensor, Error> {
+        self.binary(left, right, Binary::Multiply)
+    }
+
+    pub fn divide(&mut self, left: Tensor, right: Tensor) -> Result<Tensor, Error> {
+        self.binary(left, right, Binary::Divide)
+    }
+
+    pub fn minimum(&mut self, left: Tensor, right: Tensor) -> Result<Tensor, Error> {
+        self.binary(left, right, Binary::Minimum)
+    }
+
+    pub fn maximum(&mut self, left: Tensor, right: Tensor) -> Result<Tensor, Error> {
+        self.binary(left, right, Binary::Maximum)
+    }
+
+    pub fn negate(&mut self, input: Tensor) -> Result<Tensor, Error> {
+        self.require_local(input)?;
+        match input.shape.dtype().class() {
+            DTypeClass::SignedInteger | DTypeClass::Float | DTypeClass::Complex => {}
+            _ => {
+                return Err(Error::UnsupportedDType {
+                    operation: "negate",
+                    dtype: input.shape.dtype(),
+                });
+            }
+        }
+        self.unary(input, Unary::Negate)
+    }
+
+    pub fn equal(&mut self, left: Tensor, right: Tensor) -> Result<Tensor, Error> {
+        self.compare(left, right, Comparison::Eq)
+    }
+
+    pub fn not_equal(&mut self, left: Tensor, right: Tensor) -> Result<Tensor, Error> {
+        self.compare(left, right, Comparison::Ne)
+    }
+
+    pub fn greater(&mut self, left: Tensor, right: Tensor) -> Result<Tensor, Error> {
+        self.compare(left, right, Comparison::Gt)
+    }
+
+    pub fn greater_equal(&mut self, left: Tensor, right: Tensor) -> Result<Tensor, Error> {
+        self.compare(left, right, Comparison::Ge)
+    }
+
+    pub fn less(&mut self, left: Tensor, right: Tensor) -> Result<Tensor, Error> {
+        self.compare(left, right, Comparison::Lt)
+    }
+
+    pub fn less_equal(&mut self, left: Tensor, right: Tensor) -> Result<Tensor, Error> {
+        self.compare(left, right, Comparison::Le)
+    }
+
+    pub fn select(
+        &mut self,
+        predicate: Tensor,
+        on_true: Tensor,
+        on_false: Tensor,
+    ) -> Result<Tensor, Error> {
+        self.require_local(predicate)?;
+        if predicate.shape.dtype() != DType::Bool {
+            return Err(Error::UnsupportedDType {
+                operation: "select predicate",
+                dtype: predicate.shape.dtype(),
             });
         }
-        require_matching_shape_metadata("add", left.shape, right.shape)?;
-        let result = self.push_value("add", left.shape);
-        self.operations.push(Operation::Add {
-            left: left.value,
-            right: right.value,
+        let (on_true, on_false, shape) = self.elementwise_operands("select", on_true, on_false)?;
+        let predicate = if predicate.shape.rank() == 0 && shape.rank() != 0 {
+            self.broadcast_in_dim(predicate, shape.with_dtype(DType::Bool), &[])?
+        } else {
+            require_matching_shape_metadata(
+                "select predicate",
+                predicate.shape,
+                shape.with_dtype(DType::Bool),
+            )?;
+            predicate
+        };
+        let result = self.push_value("select", shape);
+        self.operations.push(Operation::Select {
+            predicate: predicate.value,
+            on_true: on_true.value,
+            on_false: on_false.value,
             result: result.value,
         });
         Ok(result)
+    }
+
+    pub fn convert(&mut self, input: Tensor, dtype: DType) -> Result<Tensor, Error> {
+        self.require_local(input)?;
+        if input.shape.dtype() == dtype {
+            return Ok(input);
+        }
+        if matches!(input.shape.dtype(), DType::C64 | DType::C128)
+            || matches!(dtype, DType::C64 | DType::C128)
+        {
+            return Err(Error::UnsupportedDType {
+                operation: "convert",
+                dtype,
+            });
+        }
+        let result = self.push_value("convert", input.shape.with_dtype(dtype));
+        self.operations.push(Operation::Convert {
+            input: input.value,
+            result: result.value,
+        });
+        Ok(result)
+    }
+
+    pub fn reshape(&mut self, input: Tensor, shape: Shape) -> Result<Tensor, Error> {
+        self.require_local(input)?;
+        require_supported_layout(shape)?;
+        if input.shape.dtype() != shape.dtype() {
+            return Err(Error::DTypeMismatch {
+                left: input.shape.dtype(),
+                right: shape.dtype(),
+            });
+        }
+        let input_elements = input.shape.element_count()?;
+        let output_elements = shape.element_count()?;
+        if input_elements != output_elements {
+            return Err(Error::ElementCountMismatch {
+                operation: "reshape",
+                input: input_elements,
+                output: output_elements,
+            });
+        }
+        let result = self.push_value("reshape", shape);
+        self.operations.push(Operation::Reshape {
+            input: input.value,
+            result: result.value,
+        });
+        let explicit_partition_change = shape
+            .partitions()
+            .iter()
+            .any(|partition| *partition != Partition::Unspecified)
+            && input.shape.partitions() != shape.partitions();
+        if !explicit_partition_change {
+            Ok(result)
+        } else {
+            let constrained = self.push_value("sharding_constraint", shape);
+            self.operations.push(Operation::ShardingConstraint {
+                input: result.value,
+                result: constrained.value,
+            });
+            Ok(constrained)
+        }
+    }
+
+    pub fn transpose(&mut self, input: Tensor, permutation: &[usize]) -> Result<Tensor, Error> {
+        self.require_local(input)?;
+        validate_axes(permutation, input.shape.rank(), "transpose")?;
+        if permutation.len() != input.shape.rank() {
+            return Err(Error::AxisCountMismatch);
+        }
+        let dimensions = permutation
+            .iter()
+            .map(|axis| input.shape.dimensions()[*axis])
+            .collect::<Vec<_>>();
+        let tags = permutation
+            .iter()
+            .map(|axis| input.shape.axis_tags()[*axis])
+            .collect::<Vec<_>>();
+        let partitions = permutation
+            .iter()
+            .map(|axis| input.shape.partitions()[*axis])
+            .collect::<Vec<_>>();
+        let shape = Shape::new(input.shape.dtype(), &dimensions)?
+            .with_axis_tags(&tags)?
+            .with_partitions(&partitions)?;
+        let result = self.push_value("transpose", shape);
+        self.operations.push(Operation::Transpose {
+            input: input.value,
+            result: result.value,
+            permutation: permutation.to_vec(),
+        });
+        Ok(result)
+    }
+
+    pub fn with_partitions(
+        &mut self,
+        input: Tensor,
+        partitions: &[Partition],
+    ) -> Result<Tensor, Error> {
+        self.require_local(input)?;
+        let shape = input.shape.with_partitions(partitions)?;
+        let result = self.push_value("sharding_constraint", shape);
+        self.operations.push(Operation::ShardingConstraint {
+            input: input.value,
+            result: result.value,
+        });
+        Ok(result)
+    }
+
+    pub fn exp(&mut self, input: Tensor) -> Result<Tensor, Error> {
+        self.float_unary(input, Unary::Exp)
+    }
+
+    pub fn log(&mut self, input: Tensor) -> Result<Tensor, Error> {
+        self.float_unary(input, Unary::Log)
+    }
+
+    pub fn sqrt(&mut self, input: Tensor) -> Result<Tensor, Error> {
+        self.float_unary(input, Unary::Sqrt)
+    }
+
+    pub fn rsqrt(&mut self, input: Tensor) -> Result<Tensor, Error> {
+        self.float_unary(input, Unary::Rsqrt)
+    }
+
+    pub fn tanh(&mut self, input: Tensor) -> Result<Tensor, Error> {
+        self.float_unary(input, Unary::Tanh)
+    }
+
+    pub fn sin(&mut self, input: Tensor) -> Result<Tensor, Error> {
+        self.float_unary(input, Unary::Sin)
+    }
+
+    pub fn cos(&mut self, input: Tensor) -> Result<Tensor, Error> {
+        self.float_unary(input, Unary::Cos)
+    }
+
+    pub fn sigmoid(&mut self, input: Tensor) -> Result<Tensor, Error> {
+        self.float_unary(input, Unary::Logistic)
+    }
+
+    pub fn relu(&mut self, input: Tensor) -> Result<Tensor, Error> {
+        self.require_float(input, "relu")?;
+        let zero = self.scalar_for(input.shape.dtype(), 0.0)?;
+        self.maximum(input, zero)
+    }
+
+    pub fn silu(&mut self, input: Tensor) -> Result<Tensor, Error> {
+        self.require_float(input, "silu")?;
+        let sigmoid = self.sigmoid(input)?;
+        self.multiply(input, sigmoid)
+    }
+
+    pub fn gelu(&mut self, input: Tensor) -> Result<Tensor, Error> {
+        self.require_float(input, "gelu")?;
+        let half = self.scalar_for(input.shape.dtype(), 0.5)?;
+        let one = self.scalar_for(input.shape.dtype(), 1.0)?;
+        let coefficient = self.scalar_for(input.shape.dtype(), 0.044715)?;
+        let scale = self.scalar_for(input.shape.dtype(), 0.7978845608028654)?;
+        let square = self.multiply(input, input)?;
+        let cube = self.multiply(square, input)?;
+        let correction = self.multiply(coefficient, cube)?;
+        let inner = self.add(input, correction)?;
+        let inner = self.multiply(scale, inner)?;
+        let inner = self.tanh(inner)?;
+        let inner = self.add(one, inner)?;
+        let inner = self.multiply(input, inner)?;
+        self.multiply(half, inner)
+    }
+
+    pub fn leaky_relu(&mut self, input: Tensor, slope: f64) -> Result<Tensor, Error> {
+        self.require_float(input, "leaky_relu")?;
+        let zero = self.scalar_for(input.shape.dtype(), 0.0)?;
+        let slope = self.scalar_for(input.shape.dtype(), slope)?;
+        let negative = self.minimum(input, zero)?;
+        let negative = self.multiply(slope, negative)?;
+        let positive = self.maximum(input, zero)?;
+        self.add(positive, negative)
+    }
+
+    pub fn quick_gelu(&mut self, input: Tensor) -> Result<Tensor, Error> {
+        self.require_float(input, "quick_gelu")?;
+        let scale = self.scalar_for(input.shape.dtype(), 1.702)?;
+        let scaled = self.multiply(scale, input)?;
+        let gate = self.sigmoid(scaled)?;
+        self.multiply(input, gate)
     }
 
     pub fn broadcast_in_dim(
@@ -582,6 +905,126 @@ impl ProgramBuilder {
         Ok(result)
     }
 
+    fn binary(&mut self, left: Tensor, right: Tensor, operation: Binary) -> Result<Tensor, Error> {
+        let (left, right, shape) = self.elementwise_operands(operation.name(), left, right)?;
+        match operation {
+            Binary::Minimum | Binary::Maximum => {
+                if !shape.dtype().supports_ordering() || shape.dtype() == DType::Bool {
+                    return Err(Error::UnsupportedDType {
+                        operation: operation.name(),
+                        dtype: shape.dtype(),
+                    });
+                }
+            }
+            _ if shape.dtype() == DType::Bool => {
+                return Err(Error::UnsupportedDType {
+                    operation: operation.name(),
+                    dtype: shape.dtype(),
+                });
+            }
+            _ => {}
+        }
+        let result = self.push_value(operation.name(), shape);
+        self.operations.push(Operation::Binary {
+            left: left.value,
+            right: right.value,
+            result: result.value,
+            operation,
+        });
+        Ok(result)
+    }
+
+    fn elementwise_operands(
+        &mut self,
+        operation: &'static str,
+        left: Tensor,
+        right: Tensor,
+    ) -> Result<(Tensor, Tensor, Shape), Error> {
+        self.require_local(left)?;
+        self.require_local(right)?;
+        if left.shape.dtype() != right.shape.dtype() {
+            return Err(Error::DTypeMismatch {
+                left: left.shape.dtype(),
+                right: right.shape.dtype(),
+            });
+        }
+        if left.shape.rank() == 0 && right.shape.rank() != 0 {
+            let left = self.broadcast_in_dim(left, right.shape, &[])?;
+            return Ok((left, right, right.shape));
+        }
+        if right.shape.rank() == 0 && left.shape.rank() != 0 {
+            let right = self.broadcast_in_dim(right, left.shape, &[])?;
+            return Ok((left, right, left.shape));
+        }
+        require_matching_shape_metadata(operation, left.shape, right.shape)?;
+        Ok((left, right, left.shape))
+    }
+
+    fn compare(
+        &mut self,
+        left: Tensor,
+        right: Tensor,
+        comparison: Comparison,
+    ) -> Result<Tensor, Error> {
+        let (left, right, shape) = self.elementwise_operands("compare", left, right)?;
+        if matches!(shape.dtype(), DType::C64 | DType::C128) {
+            return Err(Error::UnsupportedDType {
+                operation: "compare",
+                dtype: shape.dtype(),
+            });
+        }
+        let result = self.push_value("compare", shape.with_dtype(DType::Bool));
+        self.operations.push(Operation::Compare {
+            left: left.value,
+            right: right.value,
+            result: result.value,
+            comparison,
+            input_dtype: shape.dtype(),
+        });
+        Ok(result)
+    }
+
+    fn unary(&mut self, input: Tensor, operation: Unary) -> Result<Tensor, Error> {
+        self.require_local(input)?;
+        let result = self.push_value(operation.name(), input.shape);
+        self.operations.push(Operation::Unary {
+            input: input.value,
+            result: result.value,
+            operation,
+        });
+        Ok(result)
+    }
+
+    fn float_unary(&mut self, input: Tensor, operation: Unary) -> Result<Tensor, Error> {
+        self.require_float(input, operation.name())?;
+        self.unary(input, operation)
+    }
+
+    fn require_float(&self, input: Tensor, operation: &'static str) -> Result<(), Error> {
+        self.require_local(input)?;
+        if input.shape.dtype().class() == DTypeClass::Float {
+            Ok(())
+        } else {
+            Err(Error::UnsupportedDType {
+                operation,
+                dtype: input.shape.dtype(),
+            })
+        }
+    }
+
+    fn scalar_for(&mut self, dtype: DType, value: f64) -> Result<Tensor, Error> {
+        match dtype {
+            DType::F16 => self.scalar(F16::from_f32(value as f32)),
+            DType::Bf16 => self.scalar(BFloat16::from_f32(value as f32)),
+            DType::F32 => self.scalar(value as f32),
+            DType::F64 => self.scalar(value),
+            _ => Err(Error::UnsupportedDType {
+                operation: "floating-point scalar",
+                dtype,
+            }),
+        }
+    }
+
     fn validate_axis_pairs(
         &self,
         left: Tensor,
@@ -717,13 +1160,29 @@ impl Program {
         self.output_aliases.iter().copied()
     }
 
-    /// Returns MLIR's canonical text for the same owned module sent to XLA.
+    /// Returns canonical text for single-device lowering.
     pub fn stablehlo(&self) -> Result<String, Error> {
+        self.stablehlo_with_sharding(&Sharding::single())
+    }
+
+    /// Returns canonical text for the topology-specific module sent to XLA.
+    pub fn stablehlo_with_sharding(&self, sharding: &Sharding) -> Result<String, Error> {
         let context = Context::new();
-        Ok(self.module(&context)?.text())
+        Ok(self.module_with_sharding(&context, sharding)?.text())
     }
 
     pub fn module<'context>(&self, context: &'context Context) -> Result<Module<'context>, Error> {
+        self.module_with_sharding(context, &Sharding::single())
+    }
+
+    pub fn module_with_sharding<'context>(
+        &self,
+        context: &'context Context,
+        sharding: &Sharding,
+    ) -> Result<Module<'context>, Error> {
+        for value in &self.values {
+            sharding.validate_shape(value.shape)?;
+        }
         let types = self
             .values
             .iter()
@@ -747,6 +1206,10 @@ impl Program {
 
         for operation in &self.operations {
             let (result, result_index) = match operation {
+                Operation::Constant { result, literal } => (
+                    context.constant(types[*result], context.parse_attribute(literal)?)?,
+                    *result,
+                ),
                 Operation::DotGeneral {
                     left,
                     right,
@@ -767,16 +1230,49 @@ impl Program {
                     )?,
                     *result,
                 ),
-                Operation::Add {
+                Operation::Binary {
                     left,
                     right,
                     result,
+                    operation,
                 } => (
-                    context.add(
-                        mlir_value(&values, *left),
-                        mlir_value(&values, *right),
-                        types[*result],
-                    )?,
+                    match operation {
+                        Binary::Add => context.add(
+                            mlir_value(&values, *left),
+                            mlir_value(&values, *right),
+                            types[*result],
+                        )?,
+                        Binary::Subtract => context.binary(
+                            StableHloBinary::Subtract,
+                            mlir_value(&values, *left),
+                            mlir_value(&values, *right),
+                            types[*result],
+                        )?,
+                        Binary::Multiply => context.binary(
+                            StableHloBinary::Multiply,
+                            mlir_value(&values, *left),
+                            mlir_value(&values, *right),
+                            types[*result],
+                        )?,
+                        Binary::Divide => context.binary(
+                            StableHloBinary::Divide,
+                            mlir_value(&values, *left),
+                            mlir_value(&values, *right),
+                            types[*result],
+                        )?,
+                        Binary::Minimum => context.binary(
+                            StableHloBinary::Minimum,
+                            mlir_value(&values, *left),
+                            mlir_value(&values, *right),
+                            types[*result],
+                        )?,
+                        Binary::Maximum => context.binary(
+                            StableHloBinary::Maximum,
+                            mlir_value(&values, *left),
+                            mlir_value(&values, *right),
+                            types[*result],
+                        )?,
+                    },
                     *result,
                 ),
                 Operation::BroadcastInDim {
@@ -837,6 +1333,109 @@ impl Program {
                     )?,
                     *result,
                 ),
+                Operation::Compare {
+                    left,
+                    right,
+                    result,
+                    comparison,
+                    input_dtype,
+                } => (
+                    context.compare(
+                        mlir_value(&values, *left),
+                        mlir_value(&values, *right),
+                        types[*result],
+                        match comparison {
+                            Comparison::Eq => StableHloComparison::Eq,
+                            Comparison::Ne => StableHloComparison::Ne,
+                            Comparison::Ge => StableHloComparison::Ge,
+                            Comparison::Gt => StableHloComparison::Gt,
+                            Comparison::Le => StableHloComparison::Le,
+                            Comparison::Lt => StableHloComparison::Lt,
+                        },
+                        match input_dtype.class() {
+                            DTypeClass::Float => StableHloComparisonType::Float,
+                            DTypeClass::UnsignedInteger | DTypeClass::Boolean => {
+                                StableHloComparisonType::Unsigned
+                            }
+                            DTypeClass::SignedInteger => StableHloComparisonType::Signed,
+                            DTypeClass::Complex => unreachable!("complex comparisons are rejected"),
+                        },
+                    )?,
+                    *result,
+                ),
+                Operation::Select {
+                    predicate,
+                    on_true,
+                    on_false,
+                    result,
+                } => (
+                    context.select(
+                        mlir_value(&values, *predicate),
+                        mlir_value(&values, *on_true),
+                        mlir_value(&values, *on_false),
+                        types[*result],
+                    )?,
+                    *result,
+                ),
+                Operation::Convert { input, result } => (
+                    context.convert(mlir_value(&values, *input), types[*result])?,
+                    *result,
+                ),
+                Operation::Reshape { input, result } => (
+                    context.reshape(mlir_value(&values, *input), types[*result])?,
+                    *result,
+                ),
+                Operation::Transpose {
+                    input,
+                    result,
+                    permutation,
+                } => (
+                    context.transpose(
+                        mlir_value(&values, *input),
+                        types[*result],
+                        &axes_i64(permutation),
+                    )?,
+                    *result,
+                ),
+                Operation::Unary {
+                    input,
+                    result,
+                    operation,
+                } => (
+                    context.unary_math(
+                        match operation {
+                            Unary::Negate => StableHloUnary::Negate,
+                            Unary::Exp => StableHloUnary::Exponential,
+                            Unary::Log => StableHloUnary::Log,
+                            Unary::Sqrt => StableHloUnary::Sqrt,
+                            Unary::Rsqrt => StableHloUnary::Rsqrt,
+                            Unary::Tanh => StableHloUnary::Tanh,
+                            Unary::Sin => StableHloUnary::Sine,
+                            Unary::Cos => StableHloUnary::Cosine,
+                            Unary::Logistic => StableHloUnary::Logistic,
+                        },
+                        mlir_value(&values, *input),
+                        types[*result],
+                    )?,
+                    *result,
+                ),
+                Operation::ShardingConstraint { input, result } => {
+                    let attribute =
+                        tensor_sharding_attribute(context, sharding, self.values[*result].shape)?
+                            .ok_or_else(|| {
+                            Error::Mlir(MlirError::InvalidAttribute {
+                                source: "sharding constraint requires a logical mesh".to_owned(),
+                            })
+                        })?;
+                    (
+                        context.sharding_constraint(
+                            mlir_value(&values, *input),
+                            types[*result],
+                            attribute,
+                        )?,
+                        *result,
+                    )
+                }
             };
             values[result_index] = Some(result.result(0)?);
             block.append_operation(result)?;
@@ -856,14 +1455,38 @@ impl Program {
                 input_aliases[*input] = Some(output);
             }
         }
-        let function = context.function_with_input_aliases(
+        let input_shardings = self
+            .inputs
+            .iter()
+            .map(|value| tensor_sharding_attribute(context, sharding, self.values[*value].shape))
+            .collect::<Result<Vec<_>, _>>()?;
+        let result_shardings = self
+            .outputs
+            .iter()
+            .map(|value| tensor_sharding_attribute(context, sharding, self.values[*value].shape))
+            .collect::<Result<Vec<_>, _>>()?;
+        let function = context.function_with_attributes(
             "main",
             &input_types,
             &result_types,
             &input_aliases,
+            &input_shardings,
+            &result_shardings,
             body,
         )?;
         let mut module = context.empty_module()?;
+        if sharding.is_mesh() {
+            let axes = sharding
+                .mesh_axes()
+                .map(|(tag, size)| (axis_name(tag), size as i64))
+                .collect::<Vec<_>>();
+            let borrowed = axes
+                .iter()
+                .map(|(name, size)| (name.as_str(), *size))
+                .collect::<Vec<_>>();
+            let mesh = context.shardy_mesh(&borrowed, &[])?;
+            module.append_operation(context.shardy_mesh_operation("nml_mesh", mesh)?)?;
+        }
         module.append_operation(function)?;
         module.verify()?;
         Ok(module)
@@ -887,10 +1510,15 @@ enum Operation {
         left_contract: Vec<usize>,
         right_contract: Vec<usize>,
     },
-    Add {
+    Constant {
+        result: usize,
+        literal: String,
+    },
+    Binary {
         left: usize,
         right: usize,
         result: usize,
+        operation: Binary,
     },
     BroadcastInDim {
         input: usize,
@@ -913,6 +1541,103 @@ enum Operation {
         kind: FftType,
         lengths: Vec<i64>,
     },
+    Compare {
+        left: usize,
+        right: usize,
+        result: usize,
+        comparison: Comparison,
+        input_dtype: DType,
+    },
+    Select {
+        predicate: usize,
+        on_true: usize,
+        on_false: usize,
+        result: usize,
+    },
+    Convert {
+        input: usize,
+        result: usize,
+    },
+    Reshape {
+        input: usize,
+        result: usize,
+    },
+    Transpose {
+        input: usize,
+        result: usize,
+        permutation: Vec<usize>,
+    },
+    Unary {
+        input: usize,
+        result: usize,
+        operation: Unary,
+    },
+    ShardingConstraint {
+        input: usize,
+        result: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Binary {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Minimum,
+    Maximum,
+}
+
+impl Binary {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Subtract => "subtract",
+            Self::Multiply => "multiply",
+            Self::Divide => "divide",
+            Self::Minimum => "minimum",
+            Self::Maximum => "maximum",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Comparison {
+    Eq,
+    Ne,
+    Ge,
+    Gt,
+    Le,
+    Lt,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Unary {
+    Negate,
+    Exp,
+    Log,
+    Sqrt,
+    Rsqrt,
+    Tanh,
+    Sin,
+    Cos,
+    Logistic,
+}
+
+impl Unary {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Negate => "negate",
+            Self::Exp => "exp",
+            Self::Log => "log",
+            Self::Sqrt => "sqrt",
+            Self::Rsqrt => "rsqrt",
+            Self::Tanh => "tanh",
+            Self::Sin => "sin",
+            Self::Cos => "cos",
+            Self::Logistic => "sigmoid",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1011,6 +1736,149 @@ fn require_matching_shape_metadata(
         }
     }
     Ok(())
+}
+
+fn dense_literal(value: &Slice<'_>) -> Result<String, Error> {
+    let elements = match value.dtype() {
+        DType::Bool => value
+            .items::<bool>()?
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        DType::I8 => decimal_elements(value.items::<i8>()?),
+        DType::I16 => decimal_elements(value.items::<i16>()?),
+        DType::I32 => decimal_elements(value.items::<i32>()?),
+        DType::I64 => decimal_elements(value.items::<i64>()?),
+        DType::U8 => decimal_elements(value.items::<u8>()?),
+        DType::U16 => decimal_elements(value.items::<u16>()?),
+        DType::U32 => decimal_elements(value.items::<u32>()?),
+        DType::U64 => decimal_elements(value.items::<u64>()?),
+        DType::F16 => value
+            .items::<F16>()?
+            .iter()
+            .map(|value| float_literal(value.to_f32() as f64))
+            .collect(),
+        DType::Bf16 => value
+            .items::<BFloat16>()?
+            .iter()
+            .map(|value| float_literal(value.to_f32() as f64))
+            .collect(),
+        DType::F32 => value
+            .items::<f32>()?
+            .iter()
+            .map(|value| float_literal(*value as f64))
+            .collect(),
+        DType::F64 => value
+            .items::<f64>()?
+            .iter()
+            .map(|value| float_literal(*value))
+            .collect(),
+        DType::C64 => value
+            .items::<Complex64>()?
+            .iter()
+            .map(|value| {
+                format!(
+                    "({}, {})",
+                    float_literal(value.real as f64),
+                    float_literal(value.imaginary as f64)
+                )
+            })
+            .collect(),
+        DType::C128 => value
+            .items::<Complex128>()?
+            .iter()
+            .map(|value| {
+                format!(
+                    "({}, {})",
+                    float_literal(value.real),
+                    float_literal(value.imaginary)
+                )
+            })
+            .collect(),
+    };
+    let elements: Vec<String> = elements;
+    let payload = match elements.as_slice() {
+        [] => String::new(),
+        [only] if value.shape().rank() == 0 => only.clone(),
+        _ => format!("[{}]", elements.join(", ")),
+    };
+    let dimensions = value
+        .shape()
+        .dimensions()
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>();
+    let tensor_type = if dimensions.is_empty() {
+        format!("tensor<{}>", value.dtype().stablehlo_spelling())
+    } else {
+        format!(
+            "tensor<{}x{}>",
+            dimensions.join("x"),
+            value.dtype().stablehlo_spelling()
+        )
+    };
+    Ok(format!("dense<{payload}> : {tensor_type}"))
+}
+
+fn tensor_sharding_attribute<'context>(
+    context: &'context Context,
+    sharding: &Sharding,
+    shape: Shape,
+) -> Result<Option<MlirAttribute<'context>>, Error> {
+    if !sharding.is_mesh() {
+        return Ok(None);
+    }
+    let names = shape
+        .partitions()
+        .iter()
+        .map(|partition| match partition {
+            Partition::Sharded(tag) => Some(axis_name(*tag)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let dimensions = shape
+        .partitions()
+        .iter()
+        .zip(&names)
+        .map(|(partition, name)| match partition {
+            Partition::Unspecified => ShardyDimension::Open,
+            Partition::Replicated => ShardyDimension::Replicated,
+            Partition::Sharded(_) => ShardyDimension::Sharded(
+                name.as_deref().expect("sharded partition has an axis name"),
+            ),
+        })
+        .collect::<Vec<_>>();
+    let replicated = sharding
+        .replicated_mesh_axes(shape)?
+        .into_iter()
+        .map(axis_name)
+        .collect::<Vec<_>>();
+    let replicated = replicated.iter().map(String::as_str).collect::<Vec<_>>();
+    Ok(Some(context.shardy_tensor_sharding(
+        "nml_mesh",
+        &dimensions,
+        &replicated,
+    )?))
+}
+
+fn axis_name(tag: AxisTag) -> String {
+    format!("axis_{}", tag.identifier())
+}
+
+fn decimal_elements<T: ToString>(values: &[T]) -> Vec<String> {
+    values.iter().map(ToString::to_string).collect()
+}
+
+fn float_literal(value: f64) -> String {
+    if value.is_nan() {
+        "nan".to_owned()
+    } else if value == f64::INFINITY {
+        "inf".to_owned()
+    } else if value == f64::NEG_INFINITY {
+        "-inf".to_owned()
+    } else {
+        format!("{value:.17e}")
+    }
 }
 
 fn mlir_value<'context>(

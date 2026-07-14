@@ -1,6 +1,7 @@
 use nml_ir::{Error, FftType, ProgramBuilder};
 use nml_mlir::Context;
-use nml_types::{DType, Layout, Shape};
+use nml_tensor::Element;
+use nml_types::{BFloat16, Complex64, Complex128, DType, F16, Layout, Shape};
 
 #[test]
 fn matmul_is_typed_deterministic_and_verified() {
@@ -19,6 +20,38 @@ fn matmul_is_typed_deterministic_and_verified() {
     assert!(first.contains("contracting_dims = [1] x [0]"), "{first}");
     let context = Context::new();
     context.parse_module(&first).unwrap().verify().unwrap();
+}
+
+#[test]
+fn every_canonical_storage_dtype_builds_an_owned_scalar_constant() {
+    fn verify<T: Element>(value: T) {
+        let mut builder = ProgramBuilder::new();
+        let constant = builder.scalar(value).unwrap();
+        let module = builder.finish(&[constant]).unwrap().stablehlo().unwrap();
+        assert!(module.contains("stablehlo.constant"));
+    }
+
+    verify(false);
+    verify(-1i8);
+    verify(-2i16);
+    verify(-3i32);
+    verify(-4i64);
+    verify(1u8);
+    verify(2u16);
+    verify(3u32);
+    verify(4u64);
+    verify(F16::from_f32(0.5));
+    verify(BFloat16::from_f32(-0.75));
+    verify(1.25f32);
+    verify(-2.5f64);
+    verify(Complex64 {
+        real: 1.0,
+        imaginary: -2.0,
+    });
+    verify(Complex128 {
+        real: 3.0,
+        imaginary: -4.0,
+    });
 }
 
 #[test]
@@ -261,4 +294,122 @@ fn fft_builders_are_typed_and_verified_without_claiming_execution_support() {
     );
     let context = Context::new();
     program.module(&context).unwrap();
+}
+
+#[test]
+fn algebra_shape_transforms_and_activations_form_one_verified_graph() {
+    use nml_tensor::Slice;
+    use nml_types::{AxisTag, Partition};
+
+    let batch = AxisTag::new(10);
+    let sequence = AxisTag::new(11);
+    let heads = AxisTag::new(12);
+    let head_dim = AxisTag::new(13);
+    let shape = Shape::new(DType::F32, &[2, 3, 4, 8])
+        .unwrap()
+        .with_axis_tags(&[batch, sequence, heads, head_dim])
+        .unwrap()
+        .with_partitions(&[
+            Partition::Unspecified,
+            Partition::Unspecified,
+            Partition::Unspecified,
+            Partition::Unspecified,
+        ])
+        .unwrap();
+    let mut builder = ProgramBuilder::new();
+    let input = builder.input("input", shape);
+    let scalar = builder.scalar(2.0f32).unwrap();
+    let constant_shape = Shape::new(DType::F32, &[2]).unwrap();
+    let constant_values = [1.0f32, -1.0];
+    let constant = builder
+        .constant(&Slice::from_typed(constant_shape, &constant_values).unwrap())
+        .unwrap();
+    assert_eq!(constant.shape(), constant_shape);
+
+    let multiplied = builder.multiply(input, scalar).unwrap();
+    let subtracted = builder.subtract(multiplied, scalar).unwrap();
+    let divided = builder.divide(subtracted, scalar).unwrap();
+    let predicate = builder.greater(divided, scalar).unwrap();
+    let negated = builder.negate(divided).unwrap();
+    let selected = builder.select(predicate, divided, negated).unwrap();
+    let converted = builder.convert(selected, DType::F16).unwrap();
+    let converted = builder.convert(converted, DType::F32).unwrap();
+    let flattened_shape = Shape::new(DType::F32, &[6, 32])
+        .unwrap()
+        .with_axis_tags(&[batch, head_dim])
+        .unwrap()
+        .with_partitions(&[Partition::Unspecified, Partition::Unspecified])
+        .unwrap();
+    let flattened = builder.reshape(converted, flattened_shape).unwrap();
+    let transposed = builder.transpose(flattened, &[1, 0]).unwrap();
+    assert_eq!(transposed.shape().dimensions(), &[32, 6]);
+    assert_eq!(transposed.shape().axis_tags(), &[head_dim, batch]);
+    let relu = builder.relu(transposed).unwrap();
+    let sigmoid = builder.sigmoid(relu).unwrap();
+    let silu = builder.silu(sigmoid).unwrap();
+    let gelu = builder.gelu(silu).unwrap();
+    let quick = builder.quick_gelu(gelu).unwrap();
+    let output = builder.leaky_relu(quick, 0.01).unwrap();
+    let program = builder.finish(&[output]).unwrap();
+    let text = program.stablehlo().unwrap();
+    for operation in [
+        "stablehlo.constant",
+        "stablehlo.multiply",
+        "stablehlo.subtract",
+        "stablehlo.divide",
+        "stablehlo.compare",
+        "stablehlo.select",
+        "stablehlo.convert",
+        "stablehlo.reshape",
+        "stablehlo.transpose",
+        "stablehlo.logistic",
+        "stablehlo.tanh",
+    ] {
+        assert!(text.contains(operation), "missing {operation} in {text}");
+    }
+}
+
+#[test]
+fn logical_mesh_lowers_shape_partitions_to_shardy() {
+    use nml_sharding::Sharding;
+    use nml_types::{AxisTag, Partition};
+
+    let data = AxisTag::new(1);
+    let model = AxisTag::new(2);
+    let shape = Shape::new(DType::F32, &[8, 16])
+        .unwrap()
+        .with_axis_tags(&[data, model])
+        .unwrap()
+        .with_partitions(&[Partition::Sharded(data), Partition::Replicated])
+        .unwrap();
+    let mut builder = ProgramBuilder::new();
+    let input = builder.input("input", shape);
+    let constrained = builder
+        .with_partitions(input, &[Partition::Sharded(data), Partition::Replicated])
+        .unwrap();
+    let program = builder.finish(&[constrained]).unwrap();
+    let mesh = Sharding::mesh(&[(data, 2), (model, 2)]).unwrap();
+    let context = Context::new();
+    let module = program.module_with_sharding(&context, &mesh).unwrap();
+    let text = module.text();
+    assert!(text.contains("sdy.mesh"), "{text}");
+    assert!(text.contains("\"axis_1\"=2"), "{text}");
+    assert!(text.contains("\"axis_2\"=2"), "{text}");
+    assert!(text.contains("sdy.sharding_constraint"), "{text}");
+    assert!(text.contains("sdy.sharding"), "{text}");
+
+    let absent = AxisTag::new(3);
+    let invalid_shape = Shape::new(DType::F32, &[8])
+        .unwrap()
+        .with_partitions(&[Partition::Sharded(absent)])
+        .unwrap();
+    let mut invalid = ProgramBuilder::new();
+    let input = invalid.input("input", invalid_shape);
+    let invalid = invalid.finish(&[input]).unwrap();
+    assert!(matches!(
+        invalid.module_with_sharding(&context, &mesh),
+        Err(nml_ir::Error::Sharding(
+            nml_sharding::Error::MissingAxis(tag)
+        )) if tag == absent
+    ));
 }

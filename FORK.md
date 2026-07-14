@@ -29,7 +29,7 @@ axis. Complexity is evidence for a decision, not the decision itself.
 | D-001 | `DECIDED` | NML is a manual, source-guided reimplementation. ZML may be read continuously, but NML product/runtime/model code is written for NML's requirements rather than copied wholesale. D-010 explicitly permits deliberate reuse and adaptation of build/dependency integration. |
 | D-002 | `DECIDED` | CPU and NVIDIA CUDA are the only accelerator targets. AMD ROCm, Google TPU, AWS Neuron/Trainium, Intel oneAPI, and Apple Metal are not NML accelerator targets. |
 | D-003 | `DECIDED` | NML's canonical ordinary scalar set is bool; signed and unsigned 8/16/32/64-bit integers; FP16, BF16, FP32, FP64; and C64/C128. Complex types are retained because FFT/IFFT and complex-form operations such as RoPE need them. The low-bit storage and compute types required by D-004 are separate quantization contracts rather than additions inferred from this ordinary set. |
-| D-004 | `DECIDED` | W4A16, W8A8, and NVFP4 are first-class NML goals. A dtype name alone does not count as quantization support. |
+| D-004 | `DECIDED` | W4A16, W8A8, and NVFP4 are first-class NML goals. A dtype name alone does not count as quantization support. Their implementation schedule is deferred by D-028. |
 | D-005 | `DECIDED` | Upstream project-service and personal-editor configuration is not ported: ZML's `.github/`, `.nvim.lua`, `.vscode/`, `.zed/`, and similar repository-personalization files are reference material only. This does not prohibit NML from later creating its own CI or editor-neutral config. |
 | D-006 | `DECIDED` | NML is an acceleration substrate for experiments, not an attempt to reproduce LLMD or a hosted serving product. |
 | D-007 | `DECIDED` | NML will not add a general autograd engine merely to support LoRA experiments. An analytic backward pass may be expressed as another explicitly authored compiled graph. |
@@ -51,8 +51,12 @@ axis. Complexity is evidence for a decision, not the decision itself.
 | D-023 | `DECIDED` | Follow ZML's treatment of MLIR `index`: it is a compiler-internal MLIR type, not a runtime `DataType`, tensor element type, host-storage type, or PJRT buffer type. The MLIR layer still supports index constants and signed/unsigned casts wherever compiler APIs, layouts, loops, memrefs, or dialect operations require them. |
 | D-024 | `DECIDED` | NML's initial compiler graph pins OpenXLA/XLA commit `41370d1124c74d7b93a207136a636d8c631cbed9`, matching the ZML reference integration. PJRT headers, XLA schemas, LLVM/MLIR, StableHLO, and Shardy are resolved through this graph rather than independent drifting source pins. |
 | D-025 | `DECIDED` | NML does not consume ZML's source forks of LLVM, Zig, XLA, `rules_ml_toolchain`, or other external projects. Compiler sources come from the original OpenXLA repository and its upstream-pinned dependency graph; Rust/Bazel dependencies come from their upstream registries; NVIDIA and system runtime packages come from their original distributors. Two deliberate ZML-derived inputs remain acceptable under D-010 and D-014: NML carries the audited `cuda-root-path-local-defines.patch` locally against upstream OpenXLA, and SHA-256-pinned CPU/CUDA plugin binaries are downloaded from `zml/pjrt-artifacts`. The latter is a ZML-hosted packaging dependency, not a source-fork dependency. Any future dependency on ZML-hosted forked source requires a new explicit decision. |
-| D-026 | `DECIDED` | After the first typed CPU/CUDA execution milestone, NML implements the parameter/buffer/checkpoint substrate and then ports ZML's CPU/CUDA-relevant attention architecture before beginning W4A16. This includes portable attention semantics, CUDA FlashAttention, paged KV-cache behavior, and the Triton machinery required by ZML's default CUDA paged-attention path. Quantization follows these layers so packed weights, custom kernels, model parameters, and persistent device memory use the final ownership and dispatch architecture. |
-| D-027 | `DECIDED` | BuildBuddy was explicitly added after D-019. Repository configuration exposes an opt-in `--config=buildbuddy` remote cache/results profile without storing credentials; the authenticated `bb` CLI supplies the user's key. Remote Bazel builds that assemble the complete CUDA runtime request at least 20 GB free runner disk with `--runner_exec_properties=EstimatedFreeDiskBytes=20GB`. This changes build placement only, not the hermetic runtime graph or acceptance requirements. |
+| D-026 | `DECIDED` | After the first typed CPU/CUDA execution milestone, NML implements the parameter/buffer/checkpoint substrate, the Shardy-native nonlinear graph foundation recorded by D-030, and then ZML's CPU/CUDA-relevant attention architecture. This includes portable attention semantics, CUDA FlashAttention, paged KV-cache behavior, and the Triton machinery required by ZML's default CUDA paged-attention path. NML then reaches kernel and capability parity with ZML for the retained CPU/CUDA scope before entering NML-specific territory. |
+| D-027 | `DECIDED` | BuildBuddy was explicitly added after D-019. Repository configuration exposes an opt-in `--config=buildbuddy` remote cache/results profile without storing credentials; the authenticated `bb` CLI supplies the user's key. Remote Bazel commands may request runner resources, but the free hosted runner's effective disk limit remains authoritative: requesting 20 GB did not prevent exhaustion while materializing the complete CUDA runfiles tree. This changes build placement only, not the hermetic runtime graph or acceptance requirements. |
+| D-028 | `DECIDED` | The W4A16 milestone and its existing product requirements are preserved but `DEFERRED`. W4A16, W8A8, NVFP4, and other NML-specific work do not begin merely because the attention stack is complete. First, NML must achieve an audited kernel-and-capability parity gate against ZML for CPU and CUDA, within the accelerator, host, dtype, dependency, and repository-surface decisions already recorded here. Deferred quantization work resumes only after that gate passes and the owner explicitly schedules it. |
+| D-029 | `DECIDED` | NML supports Shardy as its only XLA SPMD partitioner. It does not retain ZML's legacy GSPMD lowering, `mhlo.sharding` encoding, manual-sharding custom-call path, or a public/runtime partitioner selector. The unified NML sharding model will lower through Shardy `sdy` meshes, tensor shardings, constraints, and manual computations. This deliberately departs from the reference snapshot's selectable compatibility path while retaining its default partitioner. |
+| D-030 | `DECIDED` | Functional Shardy placement and the nonlinear graph-operation foundation are implemented before attention. Logical mesh axes use `AxisTag`; tensor dimensions consume them through `Shape` partition metadata; compilation, buffer placement, checkpoint loading, and execution share the same `Sharding` contract. This ordering makes partitioning a normal property of attention-era graphs rather than a retrofit. Explicit collective APIs, multi-host execution, and multi-GPU CUDA validation remain later parity work. |
+| D-031 | `DECIDED` | Verification is split by resource ownership, not by weakening support claims. BuildBuddy remotely executes CPU and CUDA-configured compiler/runtime contracts and remotely builds the exact CUDA contract binaries to populate the authenticated action cache. The multi-gigabyte SHA-pinned CUDA runtime is `data` of its owning executable contracts, not of the reusable loader library; it is assembled only on the NVIDIA host that owns the runtime disk and supported GPU. GPU tests are local, unsandboxed, and non-cacheable; package integrity remains a cacheable host contract and compiled artifacts remain remotely cacheable. NML never treats remote CUDA compilation as CUDA execution evidence, never transfers the complete XLA/LLVM/CUDA runfiles closure with `--remote_download_all`, and never makes a no-GPU hosted runner responsible for a packaged-runtime or device gate. |
 
 An item is `UNDECIDED` only where this document identifies a deliberate NML
 departure that still needs an exact contract. Otherwise D-018 applies the
@@ -523,7 +527,7 @@ surface.
 - point-to-point, ring, mesh, tree, and isolated geometry;
 - automatic CPU/GPU/TPU/Neuron topology construction;
 - logical-to-physical binding and folding;
-- Shardy and legacy GSPMD attributes;
+- Shardy attributes and a legacy GSPMD compatibility path;
 - replicated and partitioned host/device buffers;
 - placement and host slicing.
 
@@ -532,11 +536,12 @@ multi-device workloads and model/expert/data partitioning, which may be
 important for large models even with quantization. It also contains topology
 concepts that exist specifically for excluded accelerators.
 
-NML retains ZML's multi-device, topology, Shardy/GSPMD, collective, executable,
-and sharded-buffer behavior for CPU and CUDA. Topology cases that exist solely
-for excluded accelerators are omitted as targets. Quantized packed layouts must
-preserve correct sharding and loading without accidental repacking or
-dequantized persistent copies.
+NML retains ZML's multi-device, topology, collective, executable, and
+sharded-buffer behavior for CPU and CUDA, but D-029 selects Shardy as the sole
+partitioner and removes the legacy GSPMD encoding path. Topology cases that
+exist solely for excluded accelerators are omitted as targets. Quantized packed
+layouts must preserve correct sharding and loading without accidental
+repacking or dequantized persistent copies.
 
 ### 5.12 Memory ownership, loading, and mutation
 
@@ -689,12 +694,79 @@ but a quant mode cannot be marked supported based only on parsing, enum
 plumbing, or compilation.
 
 CUDA package integrity and CUDA device execution are separate permanent
-contracts. Package integrity runs hermetically and remains cacheable. Device
-execution runs locally without test-result caching because the physical GPU,
-driver, and `/dev/nvidiactl` are host state outside Bazel's declared file
-inputs; sandboxing or reusing a result from different hardware would make the
-support claim invalid. CUDA compiler and runtime artifacts remain normally
-cached.
+contracts, but both are owned by the CUDA runtime host. Package integrity is
+hermetic and cacheable; it nevertheless needs the same multi-gigabyte runtime
+tree as device execution, so sending it to a small hosted executor is wasteful
+and can exceed that executor's disk. Device execution runs locally without
+test-result caching because the physical GPU, driver, and `/dev/nvidiactl` are
+host state outside Bazel's declared file inputs; sandboxing or reusing a result
+from different hardware would make the support claim invalid. CUDA compiler
+artifacts remain normally remotely cached.
+
+D-031 turns that distinction into the permanent verification topology. Root
+test suites classify contracts by the resource that can truthfully execute
+them:
+
+Backend configuration and execution venue are orthogonal. `--config=cpu` and
+`--config=cuda` select the product graph being built; the named suite selects
+which machine is allowed to execute its contracts. A CUDA-configured contract
+is not necessarily a GPU-owning contract, and a remote CUDA build is never
+evidence that device code ran.
+
+```text
+//:cpu_contracts
+    -> BuildBuddy builds and executes the CPU correctness/performance contracts
+
+//:cuda_remote_contracts
+    -> BuildBuddy builds and executes common compiler, runtime-structure, and
+       failure contracts under the CUDA configuration without packaged
+       runtime runfiles
+
+//:cuda_contract_binaries
+    -> BuildBuddy builds the exact Rust test executables and populates the
+       authenticated cache without assembling their runtime data
+
+//:cuda_runtime_contracts
+    -> the NVIDIA host assembles the pinned CUDA runtime and checks its package
+       -> the same host executes the device contracts locally, outside
+          sandboxes, with device-test result caching disabled
+```
+
+The ordinary command sequence is therefore:
+
+```text
+bb remote test --config=cpu //:cpu_contracts
+bb remote test --config=cuda //:cuda_remote_contracts
+bb remote build --config=cuda //:cuda_contract_binaries
+bb test --config=buildbuddy --config=cuda //:cuda_runtime_contracts
+```
+
+The final command is intentionally narrow. It downloads the cached contract
+binaries, materializes their explicitly owned CUDA runfiles on the machine
+with sufficient disk, and runs them where `/dev/nvidiactl`, the driver, and the
+selected GPU are real host state. The reusable CUDA loader library does not
+carry `//platforms/cuda:runtime` as transitive data: each product executable
+that can initialize CUDA must declare the runtime and its runfiles locator at
+the executable boundary. This keeps CPU and remote CUDA compiler consumers
+free of an accidental multi-gigabyte closure while making missing packaging a
+Bazel graph error at the owner.
+
+`bb remote test --config=cuda //...` is not a valid device gate because the
+hosted runner has no GPU. It is also not a valid cold-cache package gate: a
+free runner may be unable to materialize the complete CUDA runtime after old
+CAS blobs expire. `--remote_download_all` is likewise absent because the
+complete XLA/LLVM/CUDA transitive runfiles tree exceeds the runner's usable
+disk and transfers thousands of irrelevant intermediate outputs. Lost remote
+runtime blobs are repaired by the CUDA host's ordinary SHA-pinned repository
+fetch and local package assembly, not by making compiler contracts inherit the
+package.
+
+The suites are partitions of permanent product contracts, not reduced checks.
+A CUDA support claim requires the remote configured suite, runtime package
+contract, and device contracts; remote compilation alone remains insufficient.
+Release-wide `//...` runs may still be used on a sufficiently provisioned GPU
+host, but they are not the developer-loop mechanism for moving a
+multi-gigabyte compiler and CUDA closure between machines.
 
 ### 5.20 Error model and API stability
 
@@ -966,7 +1038,43 @@ from safetensors, compiling it once, executing multiple inputs on CPU and CUDA,
 checking numerical results against independent host math, and proving that
 parameter storage is neither reloaded nor duplicated between invocations.
 
-#### Milestone 3: portable attention semantics and KV state
+#### Milestone 3: Shardy-native execution and nonlinear graph foundations
+
+Path:
+
+```text
+logical mesh axes and Shape partition metadata
+  -> sdy.mesh, tensor shardings, and explicit constraints
+  -> partitioned PJRT compilation, buffers, and checkpoint loading
+  -> constants and primitive algebra
+  -> compiled reshape and transpose
+  -> unary math and activation compositions
+  -> checkpoint-backed nonlinear MLP on CPU and CUDA
+```
+
+Shardy becomes part of the normal graph/runtime contract before attention is
+authored. `Sharding` remains the single public placement concept: single and
+replicated execution are retained, while logical meshes bind `AxisTag` values
+to device dimensions and `Shape::partitions()` states which tensor dimensions
+consume those axes. The same object configures MLIR, XLA replicas/partitions,
+PJRT argument flattening, buffer placement, checkpoint span dispatch, and
+result reconstruction. Any disagreement is a pre-execution error.
+
+The operation foundation follows the referenced ZML behavior without adding
+public opcode or activation hierarchies. It includes owned constants and
+scalars; subtraction, multiplication, division, min/max, negation,
+comparisons, selection, and conversion; materialized compiled reshape and
+transpose; exp, log, sqrt, rsqrt, tanh, sin, and cos; and composite ReLU,
+sigmoid, SiLU, GELU, leaky ReLU, and quickGELU. Elementwise broadcasting is
+limited to exact shape/metadata matches or explicit rank-zero scalars.
+
+Acceptance includes deterministic verified Shardy IR, four-device CPU buffer
+placement and execution, a partitioned contraction that requires
+compiler-inserted communication, single-device CUDA through the same Shardy
+path, and a checkpoint-backed nonlinear FP16/BF16 model. This milestone does
+not claim explicit collective APIs or multi-GPU CUDA validation.
+
+#### Milestone 4: portable attention semantics and KV state
 
 Path:
 
@@ -994,7 +1102,7 @@ against independent reference math, including boundary page and sequence
 lengths. The cache lifecycle must already support the later checkpoint,
 rollback, truncate, and replay work needed by speculative decoding.
 
-#### Milestone 4: CUDA FlashAttention and Triton paged attention
+#### Milestone 5: CUDA FlashAttention and Triton paged attention
 
 ZML's ordinary CUDA attention selects FlashAttention 3 for compute capability
 9.0 and FlashAttention 2 otherwise. Its default CUDA paged-attention backend is
@@ -1048,11 +1156,57 @@ mixed prefill/decode batches, page-table boundaries, sliding windows, GQA/MQA,
 in-place KV updates, output aliasing, and repeated execution without cache
 reallocation. Kernel capability mismatches are hard diagnostic errors.
 
-#### Milestone 5: W4A16 as the first quantized execution vertical
+#### Milestone 6: CPU/CUDA kernel and capability parity with ZML
 
-W4A16 begins only after Milestones 2 through 4 establish model parameter
-ownership, checkpoint loading, custom-kernel integration, attention state, and
-CPU/CUDA dispatch.
+This milestone is the boundary between the source-guided rewrite and new NML
+territory. NML does not begin novel quantization work after attention merely
+because the architecture is ready for it. It first accounts for and implements
+ZML's complete CPU/CUDA-relevant kernel and capability surface.
+
+Parity is evaluated within the decisions already made in this document. It
+does not restore excluded accelerators, ordinary dtypes outside D-003,
+ZML-hosted source forks prohibited by D-025, or repository and release surface
+excluded by D-019. Within that retained scope, however, a missing capability
+cannot be dismissed simply because it is difficult, model-specific, backed by
+a custom kernel, or absent from NML's current public API.
+
+Path:
+
+```text
+line-item inventory of ZML public capabilities and kernel families
+  -> CPU/CUDA applicability and existing-decision classification
+  -> frontend, StableHLO, XLA, PJRT, and custom-call gap matrix
+  -> missing portable operations and backend dispatch
+  -> missing CPU and CUDA kernels, libraries, and lifecycle integration
+  -> permanent numerical, ownership, failure, and performance contracts
+  -> zero unexplained gaps in the audited parity matrix
+```
+
+The inventory is authoritative rather than an illustrative prose list. It must
+cover the reference snapshot's CPU/CUDA-relevant tensor and neural-network
+operations, kernel builders, external kernels, attention, MoE, collectives,
+sharding, execution behavior, and other acceleration capabilities. Each line
+ends in exactly one state: implemented and verified, inapplicable to CPU/CUDA,
+or excluded by a specific existing NML decision. “Deferred,” “not currently
+used,” and compile-only presence do not establish parity.
+
+Acceptance requires durable CPU and CUDA contracts for every applicable line,
+including real-device execution wherever the capability is hardware-specific.
+Numerical behavior, buffer ownership, aliasing/donation, repeated execution,
+capability dispatch, diagnostics, and the performance obligations of D-013 are
+part of the gate. The Rust API may remain compact and ZML-sized; parity is about
+product capability, not multiplying public wrapper types.
+
+#### Deferred milestone: W4A16 as the first quantized execution vertical
+
+**State: `DEFERRED` by D-028.** This section is intentionally retained as the
+product contract for when quantization is explicitly scheduled again. It is
+not the next milestone after attention and it does not begin automatically when
+Milestone 6 passes.
+
+When reactivated, W4A16 builds on Milestones 2 through 6: model parameter
+ownership, checkpoint loading, custom-kernel integration, attention state,
+CPU/CUDA dispatch, and the completed ZML parity audit.
 
 Path:
 
@@ -1101,11 +1255,11 @@ undecided except where earlier decisions force an answer.
 | CUDA platform | `platforms/cuda` | Required accelerated backend | Cannot omit | `DECIDED` by D-014/D-016/D-020; `//platforms:cuda` defaults off independently; full retained ZML capability range, hard error otherwise |
 | ROCm/TPU/Neuron/oneAPI/Metal platform support | corresponding `platforms/*` | No value to declared NML accelerator scope except as design reference | Removes their packaging, branching, kernels, tests, and topology cases | `OUT` as NML targets; reference code remains readable |
 | General multi-device sharding | `zml/Sharding.zig` | Large-model and distributed experiment capability | Single-device simplicity; later distributed design required if needed | `DEFAULT-ZML` |
-| Shardy/GSPMD integration | `zml/Sharding.zig`, `zml/module.zig` | Compiler-assisted partitioning | Explicit collectives or no distribution | `DEFAULT-ZML` |
+| Shardy integration | `zml/Sharding.zig`, `zml/module.zig` | Compiler-assisted partitioning through the current `sdy` model | Explicit collectives or no distribution | `DECIDED`: Shardy only by D-029; legacy GSPMD is `OUT` |
 | Ordinary dtype matrix | `zml/{dtype,floats,mlirx,pjrtx}.zig` | Broad format interop | Smaller branch/test matrix | `DECIDED`: D-003 canonical set and D-023 compiler-only index |
-| W4A16 | partial names only in current ZML | Required memory-efficient inference path | Violates D-004 | `DECIDED: required`; exact recipe `UNDECIDED` |
-| W8A8 | partial names/FP8 pieces in current ZML | Required quantized inference path | Violates D-004 | `DECIDED: required`; exact recipe `UNDECIDED` |
-| NVFP4 | scalar plumbing but no end-to-end path | Required Blackwell-class quant path | Violates D-004 | `DECIDED: required`; exact scope `UNDECIDED` |
+| W4A16 | partial names only in current ZML | Required memory-efficient inference path | Violates D-004 | `DECIDED: required`, but `DEFERRED` by D-028; exact recipe `UNDECIDED` |
+| W8A8 | partial names/FP8 pieces in current ZML | Required quantized inference path | Violates D-004 | `DECIDED: required`, but `DEFERRED` by D-028; exact recipe `UNDECIDED` |
+| NVFP4 | scalar plumbing but no end-to-end path | Required Blackwell-class quant path | Violates D-004 | `DECIDED: required`, but `DEFERRED` by D-028; exact scope `UNDECIDED` |
 | Generic custom-call boundary | `zml/ops.zig`, `zml/kernel.zig` | Escape hatch for quant/attention kernels | Compiler graph limited to built-in ops | `DEFAULT-ZML` |
 | Triton kernel builder | `kernels/triton`, `mlir/dialects/ttir` | In-language custom kernel authoring | Another CUDA kernel mechanism is needed for custom fast paths | `DEFAULT-ZML`: adapt Zig implementation to Rust |
 | External CUDA FlashAttention | `platforms/cuda/flashattn`, `third_party/flashattn` | Optimized attention | Baseline or different optimized attention needed | `DEFAULT-ZML` within D-016 capability/error policy |
@@ -1197,12 +1351,14 @@ All ten items are mandatory for a support claim. Exact models, numerical
 tolerances, and benchmark thresholds are part of each quantization recipe's
 recorded product contract. The checklist prevents enum-only support.
 
-## 10. Remaining explicit departures from ZML
+## 10. Deferred explicit departures from ZML
 
 Rust, Bazel, `rules_rust`, PJRT integration, and the product-development posture
 are settled. D-018 supplies the answer for ordinary architectural ambiguity:
 follow ZML. The remaining decisions exist because NML has deliberately departed
-from ZML's dtype and quantization scope:
+from ZML's dtype and quantization scope. Under D-028 they are recorded but not
+active planning questions until CPU/CUDA kernel-and-capability parity passes and
+the owner explicitly reactivates quantization:
 
 1. What exact ordinary dtype list is public and end-to-end supported?
 2. What is the first canonical W4A16 recipe and checkpoint encoding?

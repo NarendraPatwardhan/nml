@@ -80,7 +80,7 @@ unchecked.
 - [x] Add `nml-xla-sys` bindings to the pinned generated upb/protobuf option
       representations used by ZML.
 - [x] Add a safe compile-options model for replicas, partitions, device
-      assignment, Shardy/GSPMD configuration, and backend-specific settings.
+      assignment, mandatory Shardy partitioning, and backend-specific settings.
 - [x] Negotiate the StableHLO target version with the pinned compiler and retain
       serialized buffers for the complete PJRT compile call.
 - [x] Preserve ZML's CUDA latency-hiding scheduler override and PJRT device
@@ -348,3 +348,159 @@ partial backend remain unchecked.
       once into persistent CPU/CUDA buffers, flow through `Bufferized<T>`, and
       execute repeatedly with correct results through the compact ZML-shaped
       public API.
+
+---
+
+# Milestone 3: Shardy-native execution and nonlinear graph foundations
+
+This milestone makes partitioning part of the ordinary graph/runtime contract
+before attention is introduced. It also adds the algebra, shape transforms,
+and nonlinear operations required to express attention and genuine MLPs. The
+public surface remains one `Shape`, `Tensor`, `Sharding`, `Buffer`, and `Exe`
+model; compiler implementation records do not become product concepts.
+
+## 1. Sharding model and compiler ownership
+
+- [x] Remove the GSPMD selector and make Shardy the only XLA partitioner.
+- [x] Replace positional tiled placement with logical mesh axes identified by
+      `AxisTag`, retaining single-device and replicated placement.
+- [x] Validate unique nonzero mesh axes, checked device products, referenced
+      tensor axes, even partitioning, and exact platform device availability.
+- [x] Pass the selected `Sharding` into compilation so one topology-independent
+      `Program` can be compiled for single, replicated, or mesh execution.
+- [x] Store the resolved topology in `Exe` and reject buffers whose platform,
+      placement, shard count, or logical mesh differs before PJRT execution.
+- [x] Resolve single execution as one replica/partition, replicated execution
+      as one partition with one replica per device, and mesh execution as one
+      replica with the mesh product as its partition count.
+- [x] Generate deterministic device assignments and diagnostic hard errors for
+      unavailable or inconsistent topologies.
+
+## 2. Shardy MLIR integration
+
+- [x] Bind the pinned Shardy C attribute API and add context-owned Rust wrappers
+      for mesh, dimension-sharding, tensor-sharding, and per-value attributes.
+- [x] Emit one deterministic `sdy.mesh` declaration for mesh programs and lower
+      `Shape` partition metadata to function input/output `sdy.sharding` attrs.
+- [x] Add an explicit graph operation for intermediate
+      `sdy.sharding_constraint` placement.
+- [x] Add a region-safe internal `sdy.manual_computation` builder for future
+      custom kernels without exposing another root public abstraction.
+- [x] Reject invalid and cross-context Shardy objects before module verification
+      and keep textual and bytecode output deterministic.
+
+## 3. Runtime placement and checkpoint loading
+
+- [x] Derive tensor-local upload ranges from the logical mesh and each
+      `Shape::partitions()` entry rather than positional partition factors.
+- [x] Replicate tensor data across unused mesh axes and reject duplicate or
+      ambiguous consumption of a logical mesh axis.
+- [x] Reassemble globally ordered host tensors from partitioned PJRT buffers.
+- [x] Preserve direct checkpoint-to-local-shard loading without a second full
+      persistent host tensor.
+- [x] Accept tiled executable arguments/results only when their resolved
+      placement exactly matches the compiled topology.
+- [x] Preserve replicated loading and repeated-execution behavior and pass
+      permanent placement, mismatch, cleanup, and reconstruction contracts.
+
+## 4. Primitive algebra
+
+- [x] Add owned tensor constants and typed rank-zero scalars whose storage
+      remains valid through MLIR construction.
+- [x] Add subtraction, multiplication, division, minimum, maximum, and negation.
+- [x] Add equality, inequality, ordered comparisons, boolean selection, and
+      dtype conversion; identical conversion reuses the symbolic value.
+- [x] Follow ZML's elementwise rule: exact shape/metadata match or explicit
+      rank-zero scalar broadcasting, never implicit NumPy rank expansion.
+- [x] Preserve logical axes and partitions and reject unsupported dtype or
+      metadata combinations before MLIR emission.
+- [x] Expose the operations through `ProgramBuilder` and `TensorStore` without
+      public operation, comparison, or activation enums.
+
+## 5. Compiled reshape and transpose
+
+- [x] Add StableHLO reshape with an explicit output `Shape`, checked equal
+      element counts, and mesh-valid output partition metadata.
+- [x] Express an explicit reshape partition change as a Shardy constraint
+      rather than silently reinterpreting local storage.
+- [x] Add StableHLO transpose with a complete unique permutation, moving
+      dimensions, semantic axis tags, and partitions together.
+- [x] Define compiled transpose as a materialized row-major result while
+      retaining separate zero-copy host-view physical-layout semantics.
+- [x] Pass permanent attention-head reshape/transpose contracts for
+      `[batch, sequence, heads, head_dim]` layouts.
+
+## 6. Unary math and activations
+
+- [x] Add `exp`, `log`, `sqrt`, `rsqrt`, `tanh`, `sin`, and `cos`, preserving
+      the complete input shape metadata.
+- [x] Add ReLU, StableHLO logistic sigmoid, SiLU, ZML-compatible
+      tanh-approximate GELU, leaky ReLU, and quickGELU as graph compositions.
+- [x] Verify FP32, FP16, and BF16 behavior against independent host references
+      with dtype-appropriate tolerances.
+
+## 7. Integrated product contracts
+
+- [x] Load and execute a checkpoint-backed two-layer nonlinear MLP on CPU and
+      CUDA rather than treating individual emitted operations as completion.
+- [x] Execute the MLP on CPU in single, replicated, and logical-mesh modes.
+- [x] Execute a partitioned dot whose contracting axis requires
+      compiler-inserted communication and compare its reconstructed result with
+      the unsharded reference.
+- [x] Exercise the same Shardy-aware graph-building path on single-device CUDA.
+- [x] Verify repeated execution, parameter ownership, constants, comparisons,
+      selection, conversion, reshape, transpose, and activations through PJRT.
+
+## Milestone 3 acceptance
+
+- [x] All tests are permanent product contracts; no probe, smoke, spike, demo,
+      compatibility-only, or temporary target remains.
+- [x] BuildBuddy executes `bb remote test --config=cpu //:cpu_contracts`.
+- [x] BuildBuddy executes the CUDA-configured contracts that do not own the
+      packaged runtime or a physical device with `bb remote test --config=cuda
+      //:cuda_remote_contracts`.
+- [x] BuildBuddy compiles the exact CUDA contract binaries without assembling
+      their runtime data and populates the authenticated action cache with `bb
+      remote build --config=cuda //:cuda_contract_binaries`.
+- [x] The NVIDIA host assembles the pinned runtime package and executes only
+      those cached contracts with `bb test --config=buildbuddy --config=cuda
+      //:cuda_runtime_contracts`.
+- [x] The real CUDA contracts pass on a supported NVIDIA device and unsupported
+      GPU capabilities remain hard diagnostic errors.
+- [ ] The pushed revision's BuildBuddy workflow passes while reusing the remote
+      cache.
+- [x] `git diff --check`
+- [ ] Milestone 3 is complete only when Shardy-partitioned execution and the
+      checkpoint-backed nonlinear model work through the compact public API on
+      the applicable CPU/CUDA targets.
+
+---
+
+# Capability ledger
+
+This high-level ledger remains at the end of this file while detailed work is
+added to the milestone sections above. It tracks usable product capabilities,
+not individual IR operations or implementation artifacts. Check an item only
+when its applicable CPU/CUDA numerical, ownership, failure, and performance
+contracts are permanent and passing. Parser support, emitted StableHLO,
+successful compilation, registered symbols, or an unexecuted kernel do not by
+themselves complete an item.
+
+- [x] ReLU, GELU, SiLU, sigmoid, and other activations.
+- [ ] Multiplication, subtraction, division, and the remaining elementwise
+      operation families.
+- [x] Reshape and transpose in compiled graphs.
+- [ ] Reductions, normalization, and softmax.
+- [ ] Gather/scatter and embedding lookup.
+- [ ] Convolution and pooling.
+- [ ] Random-number generation.
+- [ ] Sorting, top-k, and sampling.
+- [ ] Attention, RoPE, and masks.
+- [ ] Persistent KV-cache allocation, updates, paging, truncation, rollback,
+      and replay.
+- [ ] CUDA FlashAttention and Triton kernels.
+- [ ] MoE routing and grouped matrix multiplication.
+- [ ] Quantization: W4A16, W8A8, and NVFP4. `DEFERRED` by D-028 until the
+      CPU/CUDA ZML parity gate passes and the owner explicitly schedules it.
+- [ ] Training or explicitly authored analytic backward graphs.
+- [ ] Real distributed sharding and collectives.

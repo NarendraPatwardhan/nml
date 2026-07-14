@@ -13,6 +13,7 @@
 #include <mlir-c/Support.h>
 #include <mlir-c/Transforms.h>
 #include "shardy/integrations/c/dialect.h"
+#include "shardy/integrations/c/attributes.h"
 #include <stablehlo/integrations/c/StablehloDialect.h>
 #include <stablehlo/integrations/c/StablehloDialectApi.h>
 

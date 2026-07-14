@@ -10,31 +10,23 @@ pub enum Backend {
     Cuda,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Partitioner {
-    Shardy,
-    Gspmd,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompileOptions {
     replicas: u32,
     partitions: u32,
     device_ids: Vec<i64>,
-    partitioner: Partitioner,
     backend: Backend,
 }
 
 impl CompileOptions {
     pub fn single_device(device_id: i64, backend: Backend) -> Result<Self, Error> {
-        Self::new(1, 1, vec![device_id], Partitioner::Shardy, backend)
+        Self::new(1, 1, vec![device_id], backend)
     }
 
     pub fn new(
         replicas: u32,
         partitions: u32,
         device_ids: Vec<i64>,
-        partitioner: Partitioner,
         backend: Backend,
     ) -> Result<Self, Error> {
         if replicas == 0 || partitions == 0 {
@@ -59,7 +51,6 @@ impl CompileOptions {
             replicas,
             partitions,
             device_ids,
-            partitioner,
             backend,
         })
     }
@@ -68,7 +59,7 @@ impl CompileOptions {
         let raw = sys::NmlXlaCompileOptions {
             num_replicas: i32::try_from(self.replicas).map_err(|_| Error::TopologyOverflow)?,
             num_partitions: i32::try_from(self.partitions).map_err(|_| Error::TopologyOverflow)?,
-            use_shardy_partitioner: self.partitioner == Partitioner::Shardy,
+            use_shardy_partitioner: true,
             enable_cuda_latency_hiding_scheduler: self.backend == Backend::Cuda,
             device_ids: self.device_ids.as_ptr(),
             num_device_ids: self.device_ids.len(),

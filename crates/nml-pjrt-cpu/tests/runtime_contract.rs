@@ -111,7 +111,13 @@ fn pjrt_objects_retain_client_plugin_and_library_ownership() {
         let options =
             nml_xla::CompileOptions::single_device(device.id().unwrap(), nml_xla::Backend::Cpu)
                 .unwrap();
-        let executable = nml_compiler::compile(&client, &program, &options).unwrap();
+        let executable = nml_compiler::compile(
+            &client,
+            &program,
+            &nml_sharding::Sharding::single(),
+            &options,
+        )
+        .unwrap();
         let left = upload(&client, &left_bytes, left.shape(), &device);
         let right = upload(&client, &right_bytes, right.shape(), &device);
         (executable, device, left, right)
@@ -176,8 +182,13 @@ fn execute_matmul_contract(client: &nml_pjrt::Client, device: &nml_pjrt::Device)
     let options =
         nml_xla::CompileOptions::single_device(device.id().unwrap(), nml_xla::Backend::Cpu)
             .unwrap();
-    let executable = nml_compiler::compile(client, &program, &options)
-        .expect("CPU XLA compilation must succeed");
+    let executable = nml_compiler::compile(
+        client,
+        &program,
+        &nml_sharding::Sharding::single(),
+        &options,
+    )
+    .expect("CPU XLA compilation must succeed");
 
     let left_values: Vec<f32> = (0..15).map(|value| value as f32 / 7.0 - 1.0).collect();
     let right_values: Vec<f32> = (0..20).map(|value| value as f32 / 11.0 - 0.5).collect();
@@ -221,7 +232,13 @@ fn execute_complex_contract(client: &nml_pjrt::Client, device: &nml_pjrt::Device
     let options =
         nml_xla::CompileOptions::single_device(device.id().unwrap(), nml_xla::Backend::Cpu)
             .unwrap();
-    let executable = nml_compiler::compile(client, &program, &options).unwrap();
+    let executable = nml_compiler::compile(
+        client,
+        &program,
+        &nml_sharding::Sharding::single(),
+        &options,
+    )
+    .unwrap();
     let real_values = [1.0f32, -2.0, 3.5, 0.25];
     let imaginary_values = [-4.0f32, 0.5, 8.0, -1.25];
     let real_bytes = f32_bytes(&real_values);

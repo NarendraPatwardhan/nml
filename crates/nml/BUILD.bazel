@@ -51,8 +51,19 @@ nml_rust_test(
     size = "large",
     srcs = ["tests/linear_contract.rs"],
     crate_root = "tests/linear_contract.rs",
+    local = True,
     rustc_env = {"NML_LINEAR_BACKEND": "cuda"},
-    tags = ["requires-gpu"],
+    # The device, driver, and plugin-visible process state are not declared
+    # file inputs.  This contract must execute on the GPU host every time even
+    # though its compiled binary and CUDA runfiles remain cacheable.
+    tags = [
+        "external",
+        "requires-gpu",
+    ],
+    data = ["//platforms/cuda:runtime"],
+    env = {
+        "NML_CUDA_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime)",
+    },
     target_compatible_with = select({
         "//platforms:cuda.enabled": ["@platforms//os:linux"],
         "//conditions:default": ["@platforms//:incompatible"],
@@ -64,4 +75,15 @@ nml_rust_test(
         "@rust_crates//safetensors",
         "@rust_crates//serde_json",
     ],
+)
+
+
+# As with the low-level runtime contract, this output-only edge lets a remote
+# builder cache the exact test binary while leaving CUDA runtime assembly to
+# the host that will execute it.
+filegroup(
+    name = "linear_cuda_contract_binary",
+    srcs = [":linear_cuda_contract_test"],
+    testonly = True,
+    visibility = ["//:__pkg__"],
 )

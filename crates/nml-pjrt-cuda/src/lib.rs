@@ -17,7 +17,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const CUDA_RUNTIME_RLOCATION: &str = env!("NML_CUDA_RUNTIME_RLOCATION");
+const CUDA_RUNTIME_RLOCATION_ENV: &str = "NML_CUDA_RUNTIME_RLOCATION";
+const CUDA_ENABLED: bool = matches!(env!("NML_CUDA_ENABLED").as_bytes(), [b'1']);
 const CUDA_LIBRARY_PATH_FRAGMENT: &str = "/cuda/";
 const RTLD_NOW: c_int = 0x2;
 static RUNTIME_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -251,9 +252,14 @@ impl Runtime {
         }
         warn_for_external_cuda_libraries();
 
+        let runtime_rlocation = std::env::var(CUDA_RUNTIME_RLOCATION_ENV).map_err(|_| {
+            Error::MissingRuntime(format!(
+                "the owning executable did not set {CUDA_RUNTIME_RLOCATION_ENV}"
+            ))
+        })?;
         let runfiles = Runfiles::create().map_err(|error| Error::Runfiles(error.to_string()))?;
-        let directory = runfiles::rlocation!(runfiles, CUDA_RUNTIME_RLOCATION)
-            .ok_or_else(|| Error::MissingRuntime(CUDA_RUNTIME_RLOCATION.to_owned()))?;
+        let directory = runfiles::rlocation!(runfiles, &runtime_rlocation)
+            .ok_or_else(|| Error::MissingRuntime(runtime_rlocation))?;
         if !directory.is_dir() {
             return Err(Error::MissingRuntime(directory.display().to_string()));
         }
@@ -306,7 +312,7 @@ impl Runtime {
 }
 
 pub fn is_enabled() -> bool {
-    !CUDA_RUNTIME_RLOCATION.is_empty()
+    CUDA_ENABLED
 }
 
 fn write_allocator_options<'a>(

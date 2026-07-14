@@ -2,26 +2,16 @@
 
 load("//bazel:rust.bzl", "nml_rust_library", "nml_rust_test")
 
-_CUDA_RUNTIME_DATA = select({
-    "//platforms:cuda.enabled": ["//platforms/cuda:runtime"],
-    "//conditions:default": [],
-})
-
-_CUDA_RUNTIME_ENV = select({
-    "//platforms:cuda.enabled": {
-        "NML_CUDA_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime)",
-    },
-    "//conditions:default": {
-        "NML_CUDA_RUNTIME_RLOCATION": "",
-    },
+_CUDA_ENABLED_ENV = select({
+    "//platforms:cuda.enabled": {"NML_CUDA_ENABLED": "1"},
+    "//conditions:default": {"NML_CUDA_ENABLED": "0"},
 })
 
 nml_rust_library(
     name = "nml_pjrt_cuda",
     srcs = ["src/lib.rs"],
     crate_root = "src/lib.rs",
-    data = _CUDA_RUNTIME_DATA,
-    rustc_env = _CUDA_RUNTIME_ENV,
+    rustc_env = _CUDA_ENABLED_ENV,
     deps = [
         "//crates/nml-pjrt:nml_pjrt",
         "@rules_rust//rust/runfiles",
@@ -52,6 +42,16 @@ nml_rust_test(
     }),
 )
 
+# This target intentionally exposes only the compiled contract binary. Remote
+# builders can populate compiler/linker outputs without assembling the
+# multi-gigabyte runtime tree that belongs to the NVIDIA host's runfiles.
+filegroup(
+    name = "cuda_package_contract_binary",
+    srcs = [":cuda_package_contract_test"],
+    testonly = True,
+    visibility = ["//:__pkg__"],
+)
+
 # GPU state is a host resource, not a declared file input. Run this contract
 # locally on every invocation so Bazel cannot hide /dev/nvidiactl in a sandbox
 # or reuse a result produced for a different device/driver state.
@@ -61,12 +61,20 @@ nml_rust_test(
     srcs = ["tests/runtime_contract.rs"],
     crate_root = "tests/runtime_contract.rs",
     local = True,
-    tags = ["external"],
+    tags = [
+        "external",
+        "requires-gpu",
+    ],
+    data = ["//platforms/cuda:runtime"],
+    env = {
+        "NML_CUDA_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime)",
+    },
     deps = [
         ":nml_pjrt_cuda",
         "//crates/nml-compiler:nml_compiler",
         "//crates/nml-ir:nml_ir",
         "//crates/nml-pjrt:nml_pjrt",
+        "//crates/nml-sharding:nml_sharding",
         "//crates/nml-tensor:nml_tensor",
         "//crates/nml-types:nml_types",
         "//crates/nml-xla:nml_xla",
@@ -75,6 +83,13 @@ nml_rust_test(
         "//platforms:cuda.enabled": [],
         "//conditions:default": ["@platforms//:incompatible"],
     }),
+)
+
+filegroup(
+    name = "cuda_runtime_contract_binary",
+    srcs = [":cuda_runtime_contract_test"],
+    testonly = True,
+    visibility = ["//:__pkg__"],
 )
 
 nml_rust_test(

@@ -7,6 +7,7 @@
 
 use nml_mlir_sys as sys;
 use nml_types::DType;
+use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::ffi::c_void;
 use std::fmt;
@@ -400,6 +401,13 @@ pub enum StableHloFftType {
     Irfft,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShardyDimension<'a> {
+    Open,
+    Replicated,
+    Sharded(&'a str),
+}
+
 impl StableHloFftType {
     const fn spelling(self) -> &'static str {
         match self {
@@ -412,6 +420,231 @@ impl StableHloFftType {
 }
 
 impl Context {
+    pub fn shardy_mesh<'context>(
+        &'context self,
+        axes: &[(&str, i64)],
+        device_ids: &[i64],
+    ) -> Result<Attribute<'context>, Error> {
+        if axes.is_empty() {
+            return Err(invalid_attribute("Shardy mesh has no axes"));
+        }
+        let mut axis_names = HashSet::new();
+        let mut device_count = 1usize;
+        for &(name, size) in axes {
+            if name.is_empty() {
+                return Err(invalid_attribute("Shardy mesh axis name is empty"));
+            }
+            if size <= 0 {
+                return Err(invalid_attribute(format!(
+                    "Shardy mesh axis {name:?} has non-positive size {size}"
+                )));
+            }
+            if !axis_names.insert(name) {
+                return Err(invalid_attribute(format!(
+                    "Shardy mesh axis {name:?} is duplicated"
+                )));
+            }
+            let size = usize::try_from(size)
+                .map_err(|_| invalid_attribute("Shardy mesh size exceeds the host index range"))?;
+            device_count = device_count
+                .checked_mul(size)
+                .ok_or_else(|| invalid_attribute("Shardy mesh device count overflows"))?;
+        }
+        if !device_ids.is_empty() && device_ids.len() != device_count {
+            return Err(invalid_attribute(format!(
+                "Shardy mesh needs {device_count} device ids, received {}",
+                device_ids.len()
+            )));
+        }
+        let mut unique_device_ids = HashSet::new();
+        if let Some(id) = device_ids
+            .iter()
+            .find(|id| **id < 0 || !unique_device_ids.insert(**id))
+        {
+            return Err(invalid_attribute(format!(
+                "Shardy mesh device id {id} is negative or duplicated"
+            )));
+        }
+        let axes = axes
+            .iter()
+            .map(|(name, size)| unsafe {
+                sys::sdyMeshAxisAttrGet(self.raw, string_ref(name.as_bytes()), *size)
+            })
+            .collect::<Vec<_>>();
+        let raw = unsafe {
+            sys::sdyMeshAttrGet(
+                self.raw,
+                axes.len() as isize,
+                axes.as_ptr(),
+                device_ids.len() as isize,
+                device_ids.as_ptr(),
+            )
+        };
+        self.attribute(raw, "Shardy mesh attribute")
+    }
+
+    pub fn shardy_tensor_sharding<'context>(
+        &'context self,
+        mesh: &str,
+        dimensions: &[ShardyDimension<'_>],
+        replicated_axes: &[&str],
+    ) -> Result<Attribute<'context>, Error> {
+        let null_attribute = sys::MlirAttribute {
+            ptr: ptr::null_mut(),
+        };
+        let axis_ref = |name: &str| unsafe {
+            sys::sdyAxisRefAttrGet(self.raw, string_ref(name.as_bytes()), null_attribute)
+        };
+        let dimensions = dimensions
+            .iter()
+            .map(|dimension| {
+                let (axes, closed) = match dimension {
+                    ShardyDimension::Open => (Vec::new(), false),
+                    ShardyDimension::Replicated => (Vec::new(), true),
+                    ShardyDimension::Sharded(axis) => (vec![axis_ref(axis)], true),
+                };
+                unsafe {
+                    sys::sdyDimensionShardingAttrGet(
+                        self.raw,
+                        axes.len() as isize,
+                        axes.as_ptr(),
+                        closed,
+                        -1,
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        let replicated_axes = replicated_axes
+            .iter()
+            .map(|axis| axis_ref(axis))
+            .collect::<Vec<_>>();
+        let mesh = unsafe { sys::mlirFlatSymbolRefAttrGet(self.raw, string_ref(mesh.as_bytes())) };
+        let raw = unsafe {
+            sys::sdyTensorShardingAttrGet(
+                self.raw,
+                mesh,
+                dimensions.len() as isize,
+                dimensions.as_ptr(),
+                replicated_axes.len() as isize,
+                replicated_axes.as_ptr(),
+                0,
+                ptr::null(),
+            )
+        };
+        self.attribute(raw, "Shardy tensor sharding attribute")
+    }
+
+    pub fn shardy_mesh_operation<'context>(
+        &'context self,
+        name: &str,
+        mesh: Attribute<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        Operation::builder(self, "sdy.mesh")
+            .attributes(&[
+                self.named_attribute("sym_name", self.string_attribute(name))?,
+                self.named_attribute("mesh", mesh)?,
+            ])
+            .build()
+    }
+
+    pub fn sharding_constraint<'context>(
+        &'context self,
+        input: Value<'context>,
+        result_type: Type<'context>,
+        sharding: Attribute<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        Operation::builder(self, "sdy.sharding_constraint")
+            .results(&[result_type])
+            .operands(&[input])
+            .attributes(&[self.named_attribute("sharding", sharding)?])
+            .build()
+    }
+
+    pub fn shardy_per_value_sharding<'context>(
+        &'context self,
+        shardings: &[Attribute<'context>],
+    ) -> Result<Attribute<'context>, Error> {
+        self.require_contexts(
+            shardings.iter().map(|sharding| sharding.context_id),
+            "Shardy per-value sharding attribute",
+        )?;
+        let shardings = shardings
+            .iter()
+            .map(|sharding| sharding.raw)
+            .collect::<Vec<_>>();
+        let raw = unsafe {
+            sys::sdyTensorShardingPerValueAttrGet(
+                self.raw,
+                shardings.len() as isize,
+                shardings.as_ptr(),
+            )
+        };
+        self.attribute(raw, "Shardy per-value sharding attribute")
+    }
+
+    pub fn shardy_manual_axes<'context>(
+        &'context self,
+        axes: &[&str],
+    ) -> Result<Attribute<'context>, Error> {
+        let axes = axes
+            .iter()
+            .map(|axis| self.string_attribute(axis).raw)
+            .collect::<Vec<_>>();
+        let raw =
+            unsafe { sys::sdyManualAxesAttrGet(self.raw, axes.len() as isize, axes.as_ptr()) };
+        self.attribute(raw, "Shardy manual axes attribute")
+    }
+
+    pub fn shardy_return<'context>(
+        &'context self,
+        values: &[Value<'context>],
+    ) -> Result<Operation<'context>, Error> {
+        Operation::builder(self, "sdy.return")
+            .operands(values)
+            .build()
+    }
+
+    /// Owns the manual-computation region until MLIR takes ownership of the
+    /// completed operation. The local block types are intentionally supplied
+    /// by the caller: they are physical shard types, whereas `results` are the
+    /// corresponding global tensor types at the surrounding graph boundary.
+    pub fn shardy_manual_computation<'context>(
+        &'context self,
+        inputs: &[Value<'context>],
+        results: &[Type<'context>],
+        input_shardings: Attribute<'context>,
+        result_shardings: Attribute<'context>,
+        manual_axes: Attribute<'context>,
+        body: Region<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        Operation::builder(self, "sdy.manual_computation")
+            .operands(inputs)
+            .results(results)
+            .attributes(&[
+                self.named_attribute("in_shardings", input_shardings)?,
+                self.named_attribute("out_shardings", result_shardings)?,
+                self.named_attribute("manual_axes", manual_axes)?,
+            ])
+            .region(body)
+            .build()
+    }
+
+    fn attribute<'context>(
+        &'context self,
+        raw: sys::MlirAttribute,
+        object: &'static str,
+    ) -> Result<Attribute<'context>, Error> {
+        if raw.ptr.is_null() {
+            Err(Error::NullObject(object))
+        } else {
+            Ok(Attribute {
+                raw,
+                context_id: self.context_id(),
+                _context: PhantomData,
+            })
+        }
+    }
+
     pub fn function<'context>(
         &'context self,
         name: &str,
@@ -434,11 +667,46 @@ impl Context {
         input_aliases: &[Option<usize>],
         body: Region<'context>,
     ) -> Result<Operation<'context>, Error> {
+        self.function_with_attributes(
+            name,
+            inputs,
+            results,
+            input_aliases,
+            &vec![None; inputs.len()],
+            &vec![None; results.len()],
+            body,
+        )
+    }
+
+    pub fn function_with_attributes<'context>(
+        &'context self,
+        name: &str,
+        inputs: &[Type<'context>],
+        results: &[Type<'context>],
+        input_aliases: &[Option<usize>],
+        input_shardings: &[Option<Attribute<'context>>],
+        result_shardings: &[Option<Attribute<'context>>],
+        body: Region<'context>,
+    ) -> Result<Operation<'context>, Error> {
         if input_aliases.len() != inputs.len() {
             return Err(Error::OutOfBounds {
                 object: "function alias input",
                 index: input_aliases.len(),
                 count: inputs.len(),
+            });
+        }
+        if input_shardings.len() != inputs.len() {
+            return Err(Error::OutOfBounds {
+                object: "function input sharding",
+                index: input_shardings.len(),
+                count: inputs.len(),
+            });
+        }
+        if result_shardings.len() != results.len() {
+            return Err(Error::OutOfBounds {
+                object: "function result sharding",
+                index: result_shardings.len(),
+                count: results.len(),
             });
         }
         if let Some(output) = input_aliases
@@ -457,19 +725,29 @@ impl Context {
             self.named_attribute("sym_name", self.string_attribute(name))?,
             self.named_attribute("function_type", self.type_attribute(function_type)?)?,
         ];
-        if input_aliases.iter().any(Option::is_some) {
+        if input_aliases.iter().any(Option::is_some) || input_shardings.iter().any(Option::is_some)
+        {
             let spelling = format!(
                 "[{}]",
                 input_aliases
                     .iter()
-                    .map(|alias| alias.map_or_else(
-                        || "{}".to_owned(),
-                        |output| format!("{{tf.aliasing_output = {output} : i32}}"),
-                    ))
+                    .zip(input_shardings)
+                    .map(|(alias, sharding)| function_value_attributes(*alias, *sharding))
                     .collect::<Vec<_>>()
                     .join(", ")
             );
             attributes.push(self.named_attribute("arg_attrs", self.parse_attribute(&spelling)?)?);
+        }
+        if result_shardings.iter().any(Option::is_some) {
+            let spelling = format!(
+                "[{}]",
+                result_shardings
+                    .iter()
+                    .map(|sharding| function_value_attributes(None, *sharding))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            attributes.push(self.named_attribute("res_attrs", self.parse_attribute(&spelling)?)?);
         }
         Operation::builder(self, "func.func")
             .attributes(&attributes)
@@ -562,13 +840,104 @@ impl Context {
             .build()
     }
 
+    pub fn binary<'context>(
+        &'context self,
+        operation: StableHloBinary,
+        left: Value<'context>,
+        right: Value<'context>,
+        result_type: Type<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        Operation::builder(self, operation.name())
+            .results(&[result_type])
+            .operands(&[left, right])
+            .build()
+    }
+
+    pub fn compare<'context>(
+        &'context self,
+        left: Value<'context>,
+        right: Value<'context>,
+        result_type: Type<'context>,
+        direction: StableHloComparison,
+        comparison_type: StableHloComparisonType,
+    ) -> Result<Operation<'context>, Error> {
+        let direction = format!("#stablehlo<comparison_direction {}>", direction.spelling());
+        let comparison_type = format!("#stablehlo<comparison_type {}>", comparison_type.spelling());
+        Operation::builder(self, "stablehlo.compare")
+            .results(&[result_type])
+            .operands(&[left, right])
+            .attributes(&[
+                self.named_attribute("comparison_direction", self.parse_attribute(&direction)?)?,
+                self.named_attribute("compare_type", self.parse_attribute(&comparison_type)?)?,
+            ])
+            .build()
+    }
+
+    pub fn select<'context>(
+        &'context self,
+        predicate: Value<'context>,
+        on_true: Value<'context>,
+        on_false: Value<'context>,
+        result_type: Type<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        Operation::builder(self, "stablehlo.select")
+            .results(&[result_type])
+            .operands(&[predicate, on_true, on_false])
+            .build()
+    }
+
+    pub fn convert<'context>(
+        &'context self,
+        input: Value<'context>,
+        result_type: Type<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        self.unary("stablehlo.convert", input, result_type)
+    }
+
+    pub fn reshape<'context>(
+        &'context self,
+        input: Value<'context>,
+        result_type: Type<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        self.unary("stablehlo.reshape", input, result_type)
+    }
+
+    pub fn transpose<'context>(
+        &'context self,
+        input: Value<'context>,
+        result_type: Type<'context>,
+        permutation: &[i64],
+    ) -> Result<Operation<'context>, Error> {
+        let permutation = format!("array<i64: {}>", comma_separated_i64(permutation));
+        Operation::builder(self, "stablehlo.transpose")
+            .results(&[result_type])
+            .operands(&[input])
+            .attributes(
+                &[self.named_attribute("permutation", self.parse_attribute(&permutation)?)?],
+            )
+            .build()
+    }
+
+    pub fn unary_math<'context>(
+        &'context self,
+        operation: StableHloUnary,
+        input: Value<'context>,
+        result_type: Type<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        self.unary(operation.name(), input, result_type)
+    }
+
     pub fn broadcast_in_dim<'context>(
         &'context self,
         input: Value<'context>,
         result_type: Type<'context>,
         dimensions: &[i64],
     ) -> Result<Operation<'context>, Error> {
-        let dimensions = format!("array<i64: {}>", comma_separated_i64(dimensions));
+        let dimensions = if dimensions.is_empty() {
+            "array<i64>".to_owned()
+        } else {
+            format!("array<i64: {}>", comma_separated_i64(dimensions))
+        };
         Operation::builder(self, "stablehlo.broadcast_in_dim")
             .results(&[result_type])
             .operands(&[input])
@@ -635,6 +1004,96 @@ impl Context {
             .results(&[result_type])
             .operands(&[input])
             .build()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StableHloBinary {
+    Subtract,
+    Multiply,
+    Divide,
+    Minimum,
+    Maximum,
+}
+
+impl StableHloBinary {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Subtract => "stablehlo.subtract",
+            Self::Multiply => "stablehlo.multiply",
+            Self::Divide => "stablehlo.divide",
+            Self::Minimum => "stablehlo.minimum",
+            Self::Maximum => "stablehlo.maximum",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StableHloUnary {
+    Negate,
+    Exponential,
+    Log,
+    Sqrt,
+    Rsqrt,
+    Tanh,
+    Sine,
+    Cosine,
+    Logistic,
+}
+
+impl StableHloUnary {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Negate => "stablehlo.negate",
+            Self::Exponential => "stablehlo.exponential",
+            Self::Log => "stablehlo.log",
+            Self::Sqrt => "stablehlo.sqrt",
+            Self::Rsqrt => "stablehlo.rsqrt",
+            Self::Tanh => "stablehlo.tanh",
+            Self::Sine => "stablehlo.sine",
+            Self::Cosine => "stablehlo.cosine",
+            Self::Logistic => "stablehlo.logistic",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StableHloComparison {
+    Eq,
+    Ne,
+    Ge,
+    Gt,
+    Le,
+    Lt,
+}
+
+impl StableHloComparison {
+    const fn spelling(self) -> &'static str {
+        match self {
+            Self::Eq => "EQ",
+            Self::Ne => "NE",
+            Self::Ge => "GE",
+            Self::Gt => "GT",
+            Self::Le => "LE",
+            Self::Lt => "LT",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StableHloComparisonType {
+    Float,
+    Signed,
+    Unsigned,
+}
+
+impl StableHloComparisonType {
+    const fn spelling(self) -> &'static str {
+        match self {
+            Self::Float => "FLOAT",
+            Self::Signed => "SIGNED",
+            Self::Unsigned => "UNSIGNED",
+        }
     }
 }
 
@@ -1234,4 +1693,21 @@ fn comma_separated_i64(values: &[i64]) -> String {
         .map(i64::to_string)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn function_value_attributes(alias: Option<usize>, sharding: Option<Attribute<'_>>) -> String {
+    let mut attributes = Vec::new();
+    if let Some(output) = alias {
+        attributes.push(format!("tf.aliasing_output = {output} : i32"));
+    }
+    if let Some(sharding) = sharding {
+        attributes.push(format!("sdy.sharding = {}", sharding.text()));
+    }
+    format!("{{{}}}", attributes.join(", "))
+}
+
+fn invalid_attribute(source: impl Into<String>) -> Error {
+    Error::InvalidAttribute {
+        source: source.into(),
+    }
 }

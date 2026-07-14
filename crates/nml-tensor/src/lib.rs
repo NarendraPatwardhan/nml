@@ -390,7 +390,11 @@ impl<'a> Slice<'a> {
     }
 
     pub fn copy_from(&mut self, source: &Slice<'_>) -> Result<(), Error> {
-        if self.shape != source.shape {
+        // Axis tags and partitions describe graph placement, not the logical
+        // index space copied between host views. PJRT shard downloads do not
+        // retain that metadata, so storage copies compare dtype and dimensions
+        // while each view's own layout/strides still determine its addresses.
+        if self.dtype() != source.dtype() || self.shape.dimensions() != source.shape.dimensions() {
             return Err(Error::ShapeMismatch {
                 expected: self.shape,
                 actual: source.shape,

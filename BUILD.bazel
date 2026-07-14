@@ -62,25 +62,75 @@ alias(
     visibility = ["//visibility:public"],
 )
 
+_COMMON_CONTRACTS = [
+    "//crates/nml-checkpoint:loader_accounting_contract_test",
+    "//crates/nml-checkpoint:safetensors_contract_test",
+    "//crates/nml-compiler:compiler_contract_test",
+    "//crates/nml-ir:ir_contract_test",
+    "//crates/nml-mlir:mlir_contract_test",
+    "//crates/nml-pjrt-cpu:cpu_runtime_contract_test",
+    "//crates/nml-platform:host_contract_test",
+    "//crates/nml-runtime:runtime_structure_contract_test",
+    "//crates/nml-sharding:sharding_contract_test",
+    "//crates/nml-tensor:slice_contract_test",
+    "//crates/nml-types:types_contract_test",
+    "//crates/nml-xla:compile_options_contract_test",
+    "//crates/nml:linear_cpu_contract_test",
+    "//crates/nml:structural_contract_test",
+]
+
+_CUDA_RUNTIME_CONTRACTS = [
+    "//crates/nml-pjrt-cuda:cuda_package_contract_test",
+    "//crates/nml-pjrt-cuda:cuda_runtime_contract_test",
+    "//crates/nml:linear_cuda_contract_test",
+]
+
+# These suites encode where a contract can truthfully execute. They do not
+# encode implementation layers: common graph/runtime contracts intentionally
+# remain in both backend configurations.
+test_suite(
+    name = "cpu_contracts",
+    tests = _COMMON_CONTRACTS + [
+        "//crates/nml-pjrt-cuda:cuda_disabled_contract_test",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+test_suite(
+    name = "cuda_remote_contracts",
+    tests = _COMMON_CONTRACTS,
+    visibility = ["//visibility:public"],
+)
+
+test_suite(
+    name = "cuda_runtime_contracts",
+    tests = _CUDA_RUNTIME_CONTRACTS,
+    visibility = ["//visibility:public"],
+)
+
+# `filegroup` deliberately propagates test executables rather than their
+# runfiles. A remote builder can therefore populate every code-generation and
+# linker action needed by the NVIDIA host without copying the CUDA runtime into
+# the hosted runner. The host assembles that SHA-pinned runtime exactly once
+# when it executes `cuda_runtime_contracts`.
+filegroup(
+    name = "cuda_contract_binaries",
+    srcs = [
+        "//crates/nml-pjrt-cuda:cuda_package_contract_binary",
+        "//crates/nml-pjrt-cuda:cuda_runtime_contract_binary",
+        "//crates/nml:linear_cuda_contract_binary",
+    ],
+    testonly = True,
+    visibility = ["//visibility:public"],
+)
+
+# The exhaustive suite remains useful on a sufficiently provisioned GPU host.
+# Resource-aware development and CI use the three suites above per D-031.
 test_suite(
     name = "tests",
-    tests = [
-        "//crates/nml-checkpoint:safetensors_contract_test",
-        "//crates/nml-runtime:runtime_structure_contract_test",
-        "//crates/nml-tensor:slice_contract_test",
-        "//crates/nml:linear_cpu_contract_test",
-        "//crates/nml:linear_cuda_contract_test",
-        "//crates/nml:structural_contract_test",
-        "//crates/nml-pjrt-cuda:cuda_disabled_contract_test",
-        "//crates/nml-pjrt-cuda:cuda_package_contract_test",
-        "//crates/nml-pjrt-cuda:cuda_runtime_contract_test",
+    tests = _COMMON_CONTRACTS + _CUDA_RUNTIME_CONTRACTS + [
         "//crates/nml-pjrt-cpu:cpu_disabled_contract_test",
-        "//crates/nml-pjrt-cpu:cpu_runtime_contract_test",
-        "//crates/nml-platform:host_contract_test",
-        "//crates/nml-types:types_contract_test",
-        "//crates/nml-mlir:mlir_contract_test",
-        "//crates/nml-ir:ir_contract_test",
-        "//crates/nml-xla:compile_options_contract_test",
+        "//crates/nml-pjrt-cuda:cuda_disabled_contract_test",
     ],
     visibility = ["//visibility:public"],
 )
