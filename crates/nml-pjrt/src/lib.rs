@@ -86,6 +86,18 @@ type AsyncTransferManagerBufferCountFn = unsafe extern "C" fn(
 type AsyncTransferManagerBufferSizeFn = unsafe extern "C" fn(
     *mut sys::PJRT_AsyncHostToDeviceTransferManager_BufferSize_Args,
 ) -> *mut sys::PJRT_Error;
+
+// Bindgen sees PJRT_ShapeSpec's early forward declaration in the GPU extension
+// header and emits it as opaque. This private mirror is the exact pinned C
+// record; the size assertion below keeps the manual ABI adaptation honest.
+#[repr(C)]
+struct RawShapeSpec {
+    struct_size: usize,
+    extension_start: *mut sys::PJRT_Extension_Base,
+    dims: *const i64,
+    num_dims: usize,
+    element_type: sys::PJRT_Buffer_Type,
+}
 type BufferDestroyFn =
     unsafe extern "C" fn(*mut sys::PJRT_Buffer_Destroy_Args) -> *mut sys::PJRT_Error;
 type BufferElementTypeFn =
@@ -1344,7 +1356,7 @@ impl Client {
             .collect::<Vec<_>>();
         let mut specs = shapes
             .iter()
-            .map(|shape| sys::PJRT_ShapeSpec {
+            .map(|shape| RawShapeSpec {
                 struct_size: sys::PJRT_ShapeSpec_STRUCT_SIZE as usize,
                 extension_start: std::ptr::null_mut(),
                 dims: shape.dimensions().as_ptr(),
@@ -1356,7 +1368,11 @@ impl Client {
         args.struct_size =
             sys::PJRT_Client_CreateBuffersForAsyncHostToDevice_Args_STRUCT_SIZE as usize;
         args.client = self.state.inner.as_ptr();
-        args.shape_specs = specs.as_mut_ptr();
+        debug_assert_eq!(
+            std::mem::size_of::<RawShapeSpec>(),
+            sys::PJRT_ShapeSpec_STRUCT_SIZE as usize
+        );
+        args.shape_specs = specs.as_mut_ptr().cast();
         args.num_shape_specs = specs.len();
         args.device_layouts = layout_pointers.as_mut_ptr();
         args.num_device_layouts = layout_pointers.len();
