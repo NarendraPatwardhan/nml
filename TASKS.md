@@ -467,10 +467,10 @@ model; compiler implementation records do not become product concepts.
       //:cuda_runtime_contracts`.
 - [x] The real CUDA contracts pass on a supported NVIDIA device and unsupported
       GPU capabilities remain hard diagnostic errors.
-- [ ] The pushed revision's BuildBuddy workflow passes while reusing the remote
+- [x] The pushed revision's BuildBuddy workflow passes while reusing the remote
       cache.
 - [x] `git diff --check`
-- [ ] Milestone 3 is complete only when Shardy-partitioned execution and the
+- [x] Milestone 3 is complete only when Shardy-partitioned execution and the
       checkpoint-backed nonlinear model work through the compact public API on
       the applicable CPU/CUDA targets.
 
