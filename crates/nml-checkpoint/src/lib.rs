@@ -5,7 +5,8 @@
 pub mod safetensors {
     use nml_tensor::Slice;
     use nml_types::{DType, Shape};
-    use serde::Deserialize;
+    use serde::de::{IgnoredAny, MapAccess, Visitor};
+    use serde::{Deserialize, Deserializer};
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs::File;
     use std::io::{Read, Seek, SeekFrom};
@@ -33,8 +34,16 @@ pub mod safetensors {
         shape: Shape,
     }
 
+    pub(super) struct TensorReader {
+        file: File,
+        absolute_start: u64,
+        byte_length: usize,
+        name: String,
+    }
+
     #[derive(Deserialize)]
     struct Index {
+        #[serde(deserialize_with = "deserialize_unique_weight_map")]
         weight_map: BTreeMap<String, String>,
     }
 
@@ -73,9 +82,8 @@ pub mod safetensors {
         }
 
         fn from_index(root: &Path, index_path: &Path) -> Result<Self, super::Error> {
-            let index: Index =
-                serde_json::from_slice(&std::fs::read(index_path).map_err(super::Error::Io)?)
-                    .map_err(super::Error::Json)?;
+            let index_bytes = read_bounded_metadata(index_path)?;
+            let index: Index = serde_json::from_slice(&index_bytes).map_err(super::Error::Json)?;
             let root = root.canonicalize().map_err(super::Error::Io)?;
             let mut shards = BTreeMap::<String, BTreeMap<String, Record>>::new();
             for shard in index.weight_map.values() {
@@ -140,6 +148,9 @@ pub mod safetensors {
         }
 
         pub fn read(&self, name: &str) -> Result<Slice<'static>, super::Error> {
+            if !cfg!(target_endian = "little") {
+                return Err(super::Error::NonNativeSafetensorsEndian);
+            }
             let record = self.record(name)?;
             let mut file = File::open(&record.path).map_err(super::Error::Io)?;
             file.seek(SeekFrom::Start(record.absolute_start))
@@ -153,11 +164,64 @@ pub mod safetensors {
             Ok(slice)
         }
 
+        pub(super) fn reader(&self, name: &str) -> std::io::Result<TensorReader> {
+            if !cfg!(target_endian = "little") {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "safetensors payload is not native-endian on this host",
+                ));
+            }
+            let record = self.inner.records.get(name).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("missing checkpoint tensor {name:?}"),
+                )
+            })?;
+            Ok(TensorReader {
+                file: File::open(&record.path)?,
+                absolute_start: record.absolute_start,
+                byte_length: record.byte_length,
+                name: name.to_owned(),
+            })
+        }
+
         fn record(&self, name: &str) -> Result<&Record, super::Error> {
             self.inner
                 .records
                 .get(name)
                 .ok_or_else(|| super::Error::MissingTensor(name.to_owned()))
+        }
+    }
+
+    impl TensorReader {
+        pub(super) fn read_at(
+            &mut self,
+            offset: usize,
+            destination: &mut [u8],
+        ) -> std::io::Result<()> {
+            let end = offset.checked_add(destination.len()).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "tensor read overflows")
+            })?;
+            if end > self.byte_length {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("tensor {:?} read exceeds its validated extent", self.name),
+                ));
+            }
+            let offset = u64::try_from(offset).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "tensor offset exceeds u64",
+                )
+            })?;
+            let absolute = self.absolute_start.checked_add(offset).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "absolute tensor offset overflows",
+                )
+            })?;
+            self.file.seek(SeekFrom::Start(absolute))?;
+            self.file.read_exact(destination)
         }
     }
 
@@ -181,6 +245,7 @@ pub mod safetensors {
                 "header must begin with `{`".to_owned(),
             ));
         }
+        validate_unique_top_level_names(&header)?;
         let metadata: ::safetensors::tensor::Metadata =
             serde_json::from_slice(&header).map_err(super::Error::Json)?;
         let expected_file_length = (data_start as u64)
@@ -228,6 +293,78 @@ pub mod safetensors {
         Ok(records)
     }
 
+    fn read_bounded_metadata(path: &Path) -> Result<Vec<u8>, super::Error> {
+        let length = File::open(path)
+            .and_then(|file| file.metadata())
+            .map_err(super::Error::Io)?
+            .len();
+        if length > MAX_HEADER_BYTES as u64 {
+            return Err(super::Error::MetadataTooLarge(path.to_owned()));
+        }
+        std::fs::read(path).map_err(super::Error::Io)
+    }
+
+    fn validate_unique_top_level_names(bytes: &[u8]) -> Result<(), super::Error> {
+        struct UniqueNames;
+
+        impl<'de> Visitor<'de> for UniqueNames {
+            type Value = ();
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a safetensors metadata object with unique names")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+                let mut names = BTreeSet::new();
+                while let Some(name) = map.next_key::<String>()? {
+                    if !names.insert(name.clone()) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate safetensors tensor name {name:?}"
+                        )));
+                    }
+                    map.next_value::<IgnoredAny>()?;
+                }
+                Ok(())
+            }
+        }
+
+        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+        deserializer
+            .deserialize_map(UniqueNames)
+            .map_err(super::Error::Json)
+    }
+
+    fn deserialize_unique_weight_map<'de, D>(
+        deserializer: D,
+    ) -> Result<BTreeMap<String, String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct UniqueWeightMap;
+
+        impl<'de> Visitor<'de> for UniqueWeightMap {
+            type Value = BTreeMap<String, String>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an index weight_map with unique tensor names")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut values = BTreeMap::new();
+                while let Some((name, shard)) = map.next_entry::<String, String>()? {
+                    if values.insert(name.clone(), shard).is_some() {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate index tensor name {name:?}"
+                        )));
+                    }
+                }
+                Ok(values)
+            }
+        }
+
+        deserializer.deserialize_map(UniqueWeightMap)
+    }
+
     fn map_dtype(dtype: ::safetensors::Dtype) -> Result<DType, super::Error> {
         use ::safetensors::Dtype as S;
         match dtype {
@@ -256,8 +393,10 @@ pub mod io {
     use nml_runtime::{Buffer, Bufferized, Memory, NmlStruct, Platform, Sharding};
     use nml_types::Shape;
     use std::cell::RefCell;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Symbolic checkpoint view and eventual direct-to-buffer loader.
     pub struct TensorStore {
@@ -270,6 +409,15 @@ pub mod io {
         builder: ProgramBuilder,
         tied_symbols: BTreeMap<String, Tensor>,
         path_to_record: BTreeMap<String, String>,
+    }
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct LoadAccounting {
+        planned: usize,
+        reads: usize,
+        allocations: usize,
+        uploads: usize,
+        peak_staging_bytes: usize,
     }
 
     impl TensorStore {
@@ -310,6 +458,19 @@ pub mod io {
                 .borrow_mut()
                 .builder
                 .linear(input, weight, bias)
+                .map_err(super::Error::Ir)
+        }
+
+        /// Declares ZML-style activation donation for an executable output.
+        pub fn reuse_buffer(
+            &self,
+            output: Tensor,
+            activation: Tensor,
+        ) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .reuse_buffer(output, activation)
                 .map_err(super::Error::Ir)
         }
 
@@ -377,6 +538,15 @@ pub mod io {
             platform: &Platform,
             options: &LoadOptions,
         ) -> Result<Bufferized<T>, super::Error> {
+            Ok(self.load_accounted(model, platform, options)?.0)
+        }
+
+        fn load_accounted<T: NmlStruct>(
+            &self,
+            model: &T,
+            platform: &Platform,
+            options: &LoadOptions,
+        ) -> Result<(Bufferized<T>, LoadAccounting), super::Error> {
             let store = self.inner.borrow();
             // Resolve the complete model before the first file read or device
             // allocation. A malformed derived structure therefore cannot
@@ -392,35 +562,139 @@ pub mod io {
                 plan.insert(path, record.clone());
             }
 
-            // The current CPU path intentionally uses one staging allocation
-            // at a time. These validated limits already form the bounded
-            // loader contract; CUDA consumes the buffer and chunk bounds when
-            // its mapped DMA path is selected.
-            let _bounds = (
-                options.parallelism,
-                options.staging_buffers,
-                options.chunk_bytes,
-            );
+            let records = plan
+                .values()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let record_bytes = records
+                .iter()
+                .map(|record| {
+                    store
+                        .registry
+                        .shape(record)?
+                        .byte_count()
+                        .map_err(super::Error::Shape)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let worker_count = options.parallelism.min(records.len()).max(1);
+            let peak_staging_bytes = if platform.name() == "cuda" {
+                record_bytes
+                    .iter()
+                    .map(|bytes| {
+                        options
+                            .staging_buffers
+                            .checked_mul((*bytes).min(options.chunk_bytes))
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or(super::Error::InvalidLoadOption(
+                        "staging byte bound overflows",
+                    ))?
+                    .into_iter()
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                let mut largest = record_bytes.clone();
+                largest.sort_unstable_by(|left, right| right.cmp(left));
+                largest
+                    .into_iter()
+                    .take(worker_count)
+                    .try_fold(0usize, usize::checked_add)
+                    .ok_or(super::Error::InvalidLoadOption(
+                        "staging byte bound overflows",
+                    ))?
+            };
+            let mut accounting = LoadAccounting {
+                planned: records.len(),
+                peak_staging_bytes,
+                ..LoadAccounting::default()
+            };
             let mut loaded = BTreeMap::<String, Buffer>::new();
-            for record in plan.values() {
-                if loaded.contains_key(record) {
-                    continue;
+            if platform.name() == "cuda" {
+                for (completed, record) in records.iter().enumerate() {
+                    let shape = store.registry.shape(record)?;
+                    let mut reader = store.registry.reader(record).map_err(super::Error::Io)?;
+                    let buffer = platform
+                        .upload_checkpoint_from(
+                            shape,
+                            options.sharding.clone(),
+                            options.memory,
+                            options.staging_buffers,
+                            options.chunk_bytes,
+                            |offset, destination| reader.read_at(offset, destination),
+                        )
+                        .map_err(super::Error::Runtime)?;
+                    accounting.reads += 1;
+                    accounting.allocations += 1;
+                    accounting.uploads += 1;
+                    loaded.insert(record.clone(), buffer);
+                    if let Some(progress) = &options.progress {
+                        progress(completed + 1, records.len());
+                    }
                 }
-                let slice = store.registry.read(record)?;
-                let buffer = platform
-                    .upload(&slice, options.sharding.clone(), options.memory)
-                    .map_err(super::Error::Runtime)?;
-                loaded.insert(record.clone(), buffer);
+            } else {
+                let next = AtomicUsize::new(0);
+                std::thread::scope(|scope| -> Result<(), super::Error> {
+                    // A rendezvous channel bounds live host tensors to the worker
+                    // count: no worker can read the next tensor until the main
+                    // thread has accepted and started uploading its current one.
+                    let (sender, receiver) = std::sync::mpsc::sync_channel(0);
+                    for _ in 0..worker_count {
+                        let sender = sender.clone();
+                        let registry = store.registry.clone();
+                        let records = &records;
+                        let next = &next;
+                        scope.spawn(move || {
+                            loop {
+                                let index = next.fetch_add(1, Ordering::Relaxed);
+                                let Some(record) = records.get(index) else {
+                                    break;
+                                };
+                                if sender
+                                    .send((record.clone(), registry.read(record)))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    drop(sender);
+                    for completed in 0..records.len() {
+                        let (record, slice) = receiver
+                            .recv()
+                            .map_err(|_| super::Error::LoaderWorkerFailed)?;
+                        let slice = slice?;
+                        accounting.reads += 1;
+                        let buffer = platform
+                            .upload(&slice, options.sharding.clone(), options.memory)
+                            .map_err(super::Error::Runtime)?;
+                        accounting.allocations += 1;
+                        accounting.uploads += 1;
+                        loaded.insert(record, buffer);
+                        if let Some(progress) = &options.progress {
+                            progress(completed + 1, records.len());
+                        }
+                    }
+                    Ok(())
+                })?;
             }
-            model.bufferize("", &mut |path, _tensor| {
+            debug_assert_eq!(accounting.reads, accounting.planned);
+            debug_assert_eq!(accounting.allocations, accounting.planned);
+            debug_assert_eq!(accounting.uploads, accounting.planned);
+            let buffers = model.bufferize("", &mut |path, _tensor| {
                 let record = plan
                     .get(path)
                     .expect("validated model traversal is deterministic");
-                Ok(loaded
-                    .get(record)
-                    .expect("every unique planned record was loaded")
-                    .clone())
-            })
+                Ok::<Buffer, super::Error>(
+                    loaded
+                        .get(record)
+                        .expect("every unique planned record was loaded")
+                        .clone(),
+                )
+            })?;
+            Ok((buffers, accounting))
         }
 
         pub fn finish(self, outputs: &[(String, Tensor)]) -> Result<Program, super::Error> {
@@ -441,6 +715,7 @@ pub mod io {
         parallelism: usize,
         staging_buffers: usize,
         chunk_bytes: usize,
+        progress: Option<Arc<dyn Fn(usize, usize) + Send + Sync>>,
     }
 
     impl LoadOptions {
@@ -451,6 +726,7 @@ pub mod io {
                 parallelism: 1,
                 staging_buffers: 2,
                 chunk_bytes: 16 * 1024 * 1024,
+                progress: None,
             }
         }
 
@@ -479,6 +755,120 @@ pub mod io {
             self.chunk_bytes = chunk_bytes;
             Ok(self)
         }
+
+        /// Reports `(completed_unique_tensors, total_unique_tensors)` after a
+        /// buffer becomes persistent. The callback never observes private load
+        /// plans, paths, or allocation identities.
+        pub fn progress(mut self, callback: impl Fn(usize, usize) + Send + Sync + 'static) -> Self {
+            self.progress = Some(Arc::new(callback));
+            self
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use ::safetensors::tensor::{Dtype, View};
+        use nml_types::{DType, Shape};
+        use std::borrow::Cow;
+
+        struct Tied {
+            first: Tensor,
+            second: Tensor,
+        }
+
+        struct TiedBuffers {
+            first: Buffer,
+            second: Buffer,
+        }
+
+        impl NmlStruct for Tied {
+            type Buffers = TiedBuffers;
+
+            fn visit_tensors(&self, prefix: &str, visitor: &mut dyn FnMut(&str, Tensor)) {
+                visitor(&join(prefix, "first"), self.first);
+                visitor(&join(prefix, "second"), self.second);
+            }
+
+            fn visit_buffers(
+                buffers: &Self::Buffers,
+                prefix: &str,
+                visitor: &mut dyn FnMut(&str, &Buffer),
+            ) {
+                visitor(&join(prefix, "first"), &buffers.first);
+                visitor(&join(prefix, "second"), &buffers.second);
+            }
+
+            fn bufferize<E>(
+                &self,
+                prefix: &str,
+                resolve: &mut impl FnMut(&str, Tensor) -> Result<Buffer, E>,
+            ) -> Result<Self::Buffers, E> {
+                Ok(TiedBuffers {
+                    first: resolve(&join(prefix, "first"), self.first)?,
+                    second: resolve(&join(prefix, "second"), self.second)?,
+                })
+            }
+        }
+
+        struct Fixture([u8; 8]);
+
+        impl View for &Fixture {
+            fn dtype(&self) -> Dtype {
+                Dtype::F16
+            }
+
+            fn shape(&self) -> &[usize] {
+                &[2, 2]
+            }
+
+            fn data(&self) -> Cow<'_, [u8]> {
+                Cow::Borrowed(&self.0)
+            }
+
+            fn data_len(&self) -> usize {
+                self.0.len()
+            }
+        }
+
+        #[test]
+        fn unique_storage_plan_is_accounted_once_for_tied_fields() {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "nml-loader-accounting-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let fixture = Fixture([0, 0, 0, 60, 0, 64, 0, 66]);
+            let tensors = BTreeMap::from([("shared", &fixture)]);
+            std::fs::write(
+                root.join("model.safetensors"),
+                ::safetensors::serialize(tensors, None).unwrap(),
+            )
+            .unwrap();
+
+            let registry = TensorRegistry::from_path(&root).unwrap();
+            let store = TensorStore::new(registry);
+            let shape = Shape::new(DType::F16, &[2, 2]).unwrap();
+            let model = Tied {
+                first: store.tensor("first", shape, &["shared"]).unwrap(),
+                second: store.tensor("second", shape, &["shared"]).unwrap(),
+            };
+            let platform = Platform::cpu().unwrap();
+            let options = LoadOptions::new(Sharding::replicated());
+            let (buffers, accounting) = store.load_accounted(&model, &platform, &options).unwrap();
+            assert_eq!(accounting.planned, 1);
+            assert_eq!(accounting.reads, 1);
+            assert_eq!(accounting.allocations, 1);
+            assert_eq!(accounting.uploads, 1);
+            assert_eq!(accounting.peak_staging_bytes, 8);
+            assert!(!buffers.first.is_uniquely_owned());
+            assert!(!buffers.second.is_uniquely_owned());
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     fn join(prefix: &str, suffix: &str) -> String {
@@ -504,6 +894,8 @@ pub enum Error {
     MissingShard(std::path::PathBuf),
     PathEscapesRepository(std::path::PathBuf),
     HeaderTooLarge,
+    MetadataTooLarge(std::path::PathBuf),
+    NonNativeSafetensorsEndian,
     InvalidHeader(String),
     FileExtent {
         path: std::path::PathBuf,
@@ -528,6 +920,7 @@ pub enum Error {
     UnboundModelPath(String),
     OutstandingTensorStoreView,
     InvalidLoadOption(&'static str),
+    LoaderWorkerFailed,
 }
 
 impl std::fmt::Display for Error {
@@ -549,6 +942,8 @@ impl std::fmt::Display for Error {
                 write!(f, "shard path escapes repository: {}", path.display())
             }
             Self::HeaderTooLarge => f.write_str("safetensors header is too large"),
+            Self::MetadataTooLarge(path) => write!(f, "checkpoint metadata is too large: {}", path.display()),
+            Self::NonNativeSafetensorsEndian => f.write_str("safetensors payloads are little-endian and cannot be transferred without conversion on this host"),
             Self::InvalidHeader(message) => write!(f, "invalid safetensors header: {message}"),
             Self::FileExtent {
                 path,
@@ -592,6 +987,9 @@ impl std::fmt::Display for Error {
                 f.write_str("TensorStore views remain live while finishing the program")
             }
             Self::InvalidLoadOption(message) => write!(f, "invalid load option: {message}"),
+            Self::LoaderWorkerFailed => {
+                f.write_str("checkpoint reader terminated before completing the load plan")
+            }
         }
     }
 }

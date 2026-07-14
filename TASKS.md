@@ -146,204 +146,204 @@ partial backend remain unchecked.
 
 ## 1. Bazel graph and public facade
 
-- [ ] Import exact upstream Rust dependencies through `rules_rust`
+- [x] Import exact upstream Rust dependencies through `rules_rust`
       crate-universe direct specifications. Bazel remains the only build graph;
       no Cargo workspace or ZML-hosted source fork is introduced.
-- [ ] Add the repository's `rust_proc_macro` wrapper with the same stable Rust,
+- [x] Add the repository's `rust_proc_macro` wrapper with the same stable Rust,
       edition, warning, unsafe-block, and supported-host policy as every other
       NML Rust target.
-- [ ] Add only the internal crate boundaries required by the implementation:
+- [x] Add only the internal crate boundaries required by the implementation:
       host tensor storage, runtime buffer/executable ownership, structural
       derive generation, and checkpoint loading. Their implementation types
       stay private to the root facade.
-- [ ] Add one `nml` facade crate and route product callers through it. Keep raw
+- [x] Add one `nml` facade crate and route product callers through it. Keep raw
       PJRT, MLIR, XLA, loader-planning, and derive-support modules out of the
       ordinary public surface.
-- [ ] Pass default, CPU, and CUDA dependency-resolution and facade-visibility
+- [x] Pass default, CPU, and CUDA dependency-resolution and facade-visibility
       contracts.
 
 ## 2. `Slice`: typed and aligned host tensor storage
 
-- [ ] Implement the single public `Slice` abstraction for shaped host storage.
+- [x] Implement the single public `Slice` abstraction for shaped host storage.
       It may either borrow caller storage or own a dtype-aligned allocation,
       while allocation strategy and mutability machinery remain private.
-- [ ] Record and validate shape, physical layout, byte offset, byte strides,
+- [x] Record and validate shape, physical layout, byte offset, byte strides,
       backing extent, mutability, and byte order. Scalars, empty dimensions,
       sub-slices, transposed views, and negative strides must use checked
       address arithmetic.
-- [ ] Implement contiguity detection, typed reads/writes, strided copies, and
+- [x] Implement contiguity detection, typed reads/writes, strided copies, and
       explicit dense materialization. Dtype, alignment, bounds, mutability, and
       endian mismatches are diagnostic errors.
-- [ ] Add correct F16 and BF16 conversion helpers for checkpoint fixtures and
+- [x] Add correct F16 and BF16 conversion helpers for checkpoint fixtures and
       independent host reference calculations.
-- [ ] Replace raw byte vectors in ordinary buffer transfer APIs with `Slice`.
+- [x] Replace raw byte vectors in ordinary buffer transfer APIs with `Slice`.
       Raw bytes remain available only at explicit FFI or serialization
       boundaries.
-- [ ] Pass permanent alignment, offset, stride, layout, endian, scalar, empty,
+- [x] Pass permanent alignment, offset, stride, layout, endian, scalar, empty,
       overflow, and ownership contracts.
 
 ## 3. PJRT memory and transfer completion
 
-- [ ] Extend the checked PJRT ABI for client/device memory discovery, default
+- [x] Extend the checked PJRT ABI for client/device memory discovery, default
       memory, memory kind and addressability, explicit layouts, uninitialized
       buffers, on-device sizes, memory/device copies, DMA mapping, and
       asynchronous host-to-device transfer managers.
-- [ ] Pass typed client creation options to PJRT, including ZML's CPU device
+- [x] Pass typed client creation options to PJRT, including ZML's CPU device
       count, without adding backend-specific public client types.
-- [ ] Preserve ZML's `Memory.Kind` choices: default, device, pinned host, and
+- [x] Preserve ZML's `Memory.Kind` choices: default, device, pinned host, and
       unpinned host. Unsupported requested memory is a structured error rather
       than a fallback.
-- [ ] Make transfer completion retain every borrowed host allocation until PJRT
+- [x] Make transfer completion retain every borrowed host allocation until PJRT
       releases it. Transfer guards and individual PJRT buffers remain runtime
       implementation details behind public `Buffer` construction.
-- [ ] Implement `Buffer.toSlice`/`toSliceAlloc`, readiness, explicit deletion,
+- [x] Implement `Buffer.toSlice`/`toSliceAlloc`, readiness, explicit deletion,
       device/memory copies, and deterministic destruction without returning raw
       byte vectors.
-- [ ] Pass the same lifecycle, memory selection, transfer, copy, error, and
+- [x] Pass the same lifecycle, memory selection, transfer, copy, error, and
       destruction contracts through the CPU and CUDA loaders.
 
 ## 4. `Sharding` and persistent `Buffer`
 
-- [ ] Port the CPU/CUDA-relevant ZML physical-mesh, logical-axis sharding,
+- [x] Port the CPU/CUDA-relevant ZML physical-mesh, logical-axis sharding,
       placement, canonical-device ordering, replicated placement, and tiled
       placement semantics.
-- [ ] Implement public `Buffer` as one logical tensor with private PJRT shards,
+- [x] Implement public `Buffer` as one logical tensor with private PJRT shards,
       its `Shape`, `Sharding`, `Platform`, and selected memory kind.
-- [ ] Upload contiguous and strided `Slice` views to the correct shard
+- [x] Upload contiguous and strided `Slice` views to the correct shard
       placement without materializing a persistent dense or converted copy.
-- [ ] Implement download/reassembly, shard readiness, byte accounting, explicit
+- [x] Implement download/reassembly, shard readiness, byte accounting, explicit
       physical copy, and shared ownership for tied parameters. Sharing a
       buffer is distinguishable internally from allocating another device
       buffer.
-- [ ] Require unique ownership for donation and preserve one destruction point
+- [x] Require unique ownership for donation and preserve one destruction point
       for shared/tied storage.
-- [ ] Exercise replicated and tiled placement through real multi-device CPU
+- [x] Exercise replicated and tiled placement through real multi-device CPU
       PJRT configuration and every available real CUDA device.
-- [ ] Pass placement arithmetic, shard reconstruction, replication,
+- [x] Pass placement arithmetic, shard reconstruction, replication,
       copy-versus-share, donation eligibility, and lifetime contracts.
 
 ## 5. `Exe`: named parameters and reusable arguments
 
-- [ ] Extend `Program` with deterministic named inputs and outputs, retaining
+- [x] Extend `Program` with deterministic named inputs and outputs, retaining
       whether each input is a parameter or an activation. Reject duplicate
       names before MLIR emission.
-- [ ] Add the StableHLO operations required by a conventional linear layer:
+- [x] Add the StableHLO operations required by a conventional linear layer:
       general dot against `[out, in]` weights, elementwise addition, and bias
       broadcasting.
-- [ ] Have compilation return public `Exe`, which owns the loaded PJRT
+- [x] Have compilation return public `Exe`, which owns the loaded PJRT
       executable and keeps input/output shapes, shardings, names, and alias
       expectations private.
-- [ ] Follow ZML's `Exe.args`, `Arguments.set`, `Arguments.bake`, `Exe.results`,
+- [x] Follow ZML's `Exe.args`, `Arguments.set`, `Arguments.bake`, `Exe.results`,
       and `Exe.call` lifecycle. Argument/result helpers live in `nml::exe`, not
       as new root-level concepts.
-- [ ] Let baked parameter buffers be reused across calls while activations are
+- [x] Let baked parameter buffers be reused across calls while activations are
       replaced. Validate name, order, dtype, shape, layout, platform, sharding,
       missing arguments, and excess arguments before PJRT execution.
-- [ ] Implement ZML-style multi-device argument flattening and result
+- [x] Implement ZML-style multi-device argument flattening and result
       reconstruction.
-- [ ] Preserve explicit output/input alias declarations. Parameters are
+- [x] Preserve explicit output/input alias declarations. Parameters are
       non-donatable unless a later mutable-parameter API says otherwise;
       activation donation consumes uniquely owned storage.
-- [ ] Pass repeated-call, baked-parameter, result reconstruction, donation,
+- [x] Pass repeated-call, baked-parameter, result reconstruction, donation,
       output-alias, and invalid-binding contracts on CPU and CUDA.
 
 ## 6. Rust `Bufferized<T>` structural generation
 
-- [ ] Implement one public `NmlStruct` derive and the public
+- [x] Implement one public `NmlStruct` derive and the public
       `Bufferized<T> = <T as NmlStruct>::Buffers` mapping. Generated companion
       types and traversal support do not become root exports.
-- [ ] Support named and tuple structs, enums, nested derived values, `Option`,
+- [x] Support named and tuple structs, enums, nested derived values, `Option`,
       `Vec`, arrays, `Box`, tuples, and explicit skipped metadata.
-- [ ] Generate deterministic symbolic-tensor traversal, buffer traversal,
+- [x] Generate deterministic symbolic-tensor traversal, buffer traversal,
       argument flattening, result reconstruction, and checkpoint field paths.
-- [ ] Strip non-tensor metadata from bufferized structures and preserve the
+- [x] Strip non-tensor metadata from bufferized structures and preserve the
       source structure wherever tensor fields exist, matching ZML's behavior.
-- [ ] Deduplicate repeated symbolic tensor identities during loading and bind
+- [x] Deduplicate repeated symbolic tensor identities during loading and bind
       every tied occurrence to the same underlying buffer.
-- [ ] Provide a manual trait implementation path for structures that cannot be
+- [x] Provide a manual trait implementation path for structures that cannot be
       derived without exposing another public traversal framework.
-- [ ] Pass nested-model, optional-bias, layer-vector, enum, skipped-metadata,
+- [x] Pass nested-model, optional-bias, layer-vector, enum, skipped-metadata,
       deterministic-order, and tied-field contracts.
 
 ## 7. Safetensors registry and `TensorStore`
 
-- [ ] Implement `nml::safetensors::TensorRegistry` for a direct safetensors
+- [x] Implement `nml::safetensors::TensorRegistry` for a direct safetensors
       file, `model.safetensors`, and `model.safetensors.index.json` repositories.
       Parse only the bounded header through the upstream safetensors metadata
       representation.
-- [ ] Validate header size, JSON, shape products, dtype byte counts, offsets,
+- [x] Validate header size, JSON, shape products, dtype byte counts, offsets,
       file extent, duplicate names, index/shard agreement, missing shards, path
       containment, and integer overflow before device allocation.
-- [ ] Map safetensors encodings in NML's canonical dtype set and reject FP8,
+- [x] Map safetensors encodings in NML's canonical dtype set and reject FP8,
       sub-byte, or otherwise unsupported encodings until their own product
       milestones.
-- [ ] Preserve safetensors' little-endian row-major contract and reject a
+- [x] Preserve safetensors' little-endian row-major contract and reject a
       non-native transfer rather than performing an implicit conversion.
-- [ ] Implement `nml::io::TensorStore` and its prefix/layer view behavior,
+- [x] Implement `nml::io::TensorStore` and its prefix/layer view behavior,
       binding checkpoint records to symbolic tensor identities as ZML does.
-- [ ] Resolve aliases deterministically: the primary name wins; with no primary,
+- [x] Resolve aliases deterministically: the primary name wins; with no primary,
       exactly one present alias is accepted; multiple present aliases are an
       ambiguity error.
-- [ ] Resolve tied weights through shared symbolic/storage identity so they are
+- [x] Resolve tied weights through shared symbolic/storage identity so they are
       read and uploaded once.
-- [ ] Pass single-file, sharded-index, prefix, optional-field, alias,
+- [x] Pass single-file, sharded-index, prefix, optional-field, alias,
       tied-weight, malformed-file, unsupported-dtype, and path-containment
       contracts.
 
 ## 8. Parallel checkpoint-to-buffer loading
 
-- [ ] Build and validate the complete unique-storage load plan before allocating
+- [x] Build and validate the complete unique-storage load plan before allocating
       device memory. Loader plan records and accounting stay private.
-- [ ] On CPU, read each unique tensor into an aligned `Slice`, upload it, wait
+- [x] On CPU, read each unique tensor into an aligned `Slice`, upload it, wait
       for completion, and release staging storage immediately afterward.
-- [ ] On CUDA, port ZML's bounded double-buffered DMA path using mapped staging
+- [x] On CUDA, port ZML's bounded double-buffered DMA path using mapped staging
       chunks, asynchronous transfer managers, reusable buffers, and completion
       events.
-- [ ] Dispatch file-order spans to tiled and replicated shards without rereading
+- [x] Dispatch file-order spans to tiled and replicated shards without rereading
       replicated bytes or retaining a full converted checkpoint.
-- [ ] Support bounded parallelism, staging-buffer count, chunk size, selected
+- [x] Support bounded parallelism, staging-buffer count, chunk size, selected
       memory kind, and progress reporting through `nml::io.LoadOptions`, the
       single additional public configuration type already analogous to ZML.
-- [ ] Clean up every submitted transfer, event, staging allocation, and
+- [x] Clean up every submitted transfer, event, staging allocation, and
       completed device buffer exactly once after any partial failure.
-- [ ] Keep allocation/read/upload counters private but inspectable by in-crate
+- [x] Keep allocation/read/upload counters private but inspectable by in-crate
       acceptance tests to prove deduplication and bounded staging memory.
-- [ ] Pass parallel loading, span dispatch, deduplication, bounded-memory,
+- [x] Pass parallel loading, span dispatch, deduplication, bounded-memory,
       truncated-read, transfer-failure, and cleanup contracts.
 
 ## 9. FP16/BF16 linear-layer product contract
 
-- [ ] Define a derived linear structure with `[out, in]` weight and optional
+- [x] Define a derived linear structure with `[out, in]` weight and optional
       `[out]` bias, constructed through a `TensorStore` view and loaded as
       `Bufferized<Linear>`.
-- [ ] Generate real single-file and sharded safetensors fixtures for FP16 and
+- [x] Generate real single-file and sharded safetensors fixtures for FP16 and
       BF16, both with and without bias, using the upstream serializer.
-- [ ] For each variant, load parameters once, compile once, bake the resulting
+- [x] For each variant, load parameters once, compile once, bake the resulting
       buffers once, and execute at least three distinct activation inputs.
-- [ ] Run identical model, loading, binding, and execution code on CPU and
+- [x] Run identical model, loading, binding, and execution code on CPU and
       CUDA.
-- [ ] Compute an independent F32 host reference, round to the output dtype, and
+- [x] Compute an independent F32 host reference, round to the output dtype, and
       require each result to be within four output-dtype ULPs with a `1e-5`
       absolute floor.
-- [ ] Prove through private runtime identity/accounting that each unique
+- [x] Prove through private runtime identity/accounting that each unique
       parameter is uploaded once, tied fields share storage, parameter storage
       remains unchanged across calls, and execution performs no checkpoint
       reads or parameter uploads.
-- [ ] Execute a separate real alias/donation contract that consumes a unique
+- [x] Execute a separate real alias/donation contract that consumes a unique
       activation and returns the correctly aliased result through `Exe`.
 
 ## Milestone 2 acceptance
 
-- [ ] All added tests are permanent product contracts; no probe, smoke, spike,
+- [x] All added tests are permanent product contracts; no probe, smoke, spike,
       demo, compatibility-only, or temporary target remains.
-- [ ] `bazel --output_user_root=../nml-bazel-cache test //...`
-- [ ] `bazel --output_user_root=../nml-bazel-cache test --config=cpu //...`
-- [ ] `bazel --output_user_root=../nml-bazel-cache test --config=cuda //...`
-- [ ] The CUDA loading, parameterized execution, donation, and alias contracts
+- [x] `bazel --output_user_root=../nml-bazel-cache test //...`
+- [x] `bazel --output_user_root=../nml-bazel-cache test --config=cpu //...`
+- [x] `bazel --output_user_root=../nml-bazel-cache test --config=cuda //...`
+- [x] The CUDA loading, parameterized execution, donation, and alias contracts
       pass on a real supported NVIDIA device.
 - [ ] The pushed revision's BuildBuddy workflow passes while reusing the remote
       cache.
-- [ ] `git diff --check`
+- [x] `git diff --check`
 - [ ] Milestone 2 is complete only when FP16/BF16 safetensors parameters load
       once into persistent CPU/CUDA buffers, flow through `Bufferized<T>`, and
       execute repeatedly with correct results through the compact ZML-shaped

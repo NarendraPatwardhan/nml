@@ -183,6 +183,7 @@ pub enum Error {
     NoAddressableDevice,
     NoMatchingMemory(String),
     TensorMetadataOverflow,
+    InvalidExecutionTopology(&'static str),
     HostTensor(nml_tensor::Error),
 }
 
@@ -251,6 +252,9 @@ impl fmt::Display for Error {
             }
             Self::TensorMetadataOverflow => {
                 f.write_str("tensor metadata exceeds host address space")
+            }
+            Self::InvalidExecutionTopology(message) => {
+                write!(f, "invalid PJRT execution topology: {message}")
             }
             Self::HostTensor(error) => error.fmt(f),
         }
@@ -1141,6 +1145,11 @@ struct ClientState {
 }
 
 impl Client {
+    /// Stable identity for safe higher-layer ownership checks.
+    pub fn as_raw_identity(&self) -> usize {
+        self.state.inner.as_ptr() as usize
+    }
+
     pub fn stablehlo_version(&self) -> Result<Option<StableHloVersion>, Error> {
         self.state.plugin.stablehlo_version()
     }
@@ -1279,8 +1288,8 @@ impl Client {
             .map(|event| Event::from_raw(&self.state.plugin, event));
         match (buffer, done) {
             (Some(buffer), Some(done)) => Ok(HostTransfer {
-                buffer,
-                done,
+                buffer: Some(buffer),
+                done: Some(done),
                 _host: PhantomData,
             }),
             (None, _) => Err(Error::NullResult("PJRT_Client_BufferFromHostBuffer buffer")),
@@ -1304,6 +1313,28 @@ impl Client {
             length: data.len(),
             _borrow: PhantomData,
         })
+    }
+
+    /// Allocates and registers one reusable owned DMA staging lane.
+    pub fn owned_dma_buffer(&self, size: usize) -> Result<Arc<OwnedDmaBuffer>, Error> {
+        if size == 0 {
+            return Err(Error::InvalidHostBuffer {
+                expected: 1,
+                actual: 0,
+            });
+        }
+        let mut bytes = vec![0u8; size].into_boxed_slice();
+        let mut args: sys::PJRT_Client_DmaMap_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Client_DmaMap_Args_STRUCT_SIZE as usize;
+        args.client = self.state.inner.as_ptr();
+        args.data = bytes.as_mut_ptr().cast();
+        args.size = bytes.len();
+        let error = unsafe { (self.state.plugin.client_dma_map_fn()?)(&mut args) };
+        self.state.plugin.into_result(error)?;
+        Ok(Arc::new(OwnedDmaBuffer {
+            client: self.clone(),
+            bytes,
+        }))
     }
 
     pub fn create_uninitialized_buffer(
@@ -1368,8 +1399,12 @@ impl Client {
         args.struct_size =
             sys::PJRT_Client_CreateBuffersForAsyncHostToDevice_Args_STRUCT_SIZE as usize;
         args.client = self.state.inner.as_ptr();
+        // PJRT_DEFINE_STRUCT_TRAITS intentionally reports the byte immediately
+        // after the last versioned field, excluding ordinary C tail padding.
+        // Array stride still uses RawShapeSpec's natural C size.
         debug_assert_eq!(
-            std::mem::size_of::<RawShapeSpec>(),
+            std::mem::offset_of!(RawShapeSpec, element_type)
+                + std::mem::size_of::<sys::PJRT_Buffer_Type>(),
             sys::PJRT_ShapeSpec_STRUCT_SIZE as usize
         );
         args.shape_specs = specs.as_mut_ptr().cast();
@@ -1586,15 +1621,29 @@ impl Drop for Event {
 /// Host-to-device transfer products. The buffer may be consumed immediately;
 /// `done` reports when PJRT has completed its host-side transfer work.
 pub struct HostTransfer<'host> {
-    buffer: Buffer,
-    done: Event,
+    buffer: Option<Buffer>,
+    done: Option<Event>,
     _host: PhantomData<&'host ()>,
 }
 
 impl HostTransfer<'_> {
-    pub fn wait(self) -> Result<Buffer, Error> {
-        self.done.wait()?;
-        Ok(self.buffer)
+    pub fn wait(mut self) -> Result<Buffer, Error> {
+        self.done
+            .take()
+            .expect("host transfer completion event")
+            .wait()?;
+        Ok(self.buffer.take().expect("host transfer buffer"))
+    }
+}
+
+impl Drop for HostTransfer<'_> {
+    fn drop(&mut self) {
+        // PJRT may still be reading caller-owned storage.  Awaiting here is
+        // the failure-path half of the host-borrow contract: abandoning a
+        // transfer must never end the Rust borrow before the plugin is done.
+        if let Some(done) = self.done.take() {
+            let _ = done.wait();
+        }
     }
 }
 
@@ -1620,6 +1669,41 @@ impl Drop for DmaMapping<'_> {
         args.struct_size = sys::PJRT_Client_DmaUnmap_Args_STRUCT_SIZE as usize;
         args.client = self.client.state.inner.as_ptr();
         args.data = self.data.as_ptr().cast();
+        if let Ok(function) = self.client.state.plugin.client_dma_unmap_fn() {
+            let error = unsafe { function(&mut args) };
+            let _ = self.client.state.plugin.into_result(error);
+        }
+    }
+}
+
+/// A reusable registered host allocation. In-flight transfers retain an Arc,
+/// so callers can refill the bytes only after the corresponding event is
+/// consumed and the lane becomes uniquely owned again.
+pub struct OwnedDmaBuffer {
+    client: Client,
+    bytes: Box<[u8]>,
+}
+
+impl OwnedDmaBuffer {
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+impl Drop for OwnedDmaBuffer {
+    fn drop(&mut self) {
+        let mut args: sys::PJRT_Client_DmaUnmap_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_Client_DmaUnmap_Args_STRUCT_SIZE as usize;
+        args.client = self.client.state.inner.as_ptr();
+        args.data = self.bytes.as_mut_ptr().cast();
         if let Ok(function) = self.client.state.plugin.client_dma_unmap_fn() {
             let error = unsafe { function(&mut args) };
             let _ = self.client.state.plugin.into_result(error);
@@ -1717,8 +1801,55 @@ impl AsyncTransferManager {
             "PJRT_AsyncHostToDeviceTransferManager_TransferData",
         ))?;
         Ok(DmaTransfer {
-            event: Event::from_raw(&self.client.state.plugin, event),
+            event: Some(Event::from_raw(&self.client.state.plugin, event)),
             _owners: PhantomData,
+        })
+    }
+
+    pub fn transfer_owned<'manager>(
+        &'manager self,
+        index: usize,
+        staging: Arc<OwnedDmaBuffer>,
+        length: usize,
+        destination_offset: i64,
+        is_last: bool,
+    ) -> Result<OwnedDmaTransfer<'manager>, Error> {
+        if !Arc::ptr_eq(&self.client.state, &staging.client.state) {
+            return Err(Error::ForeignClientObject("owned DMA buffer"));
+        }
+        if length > staging.len() {
+            return Err(Error::InvalidHostBuffer {
+                expected: length,
+                actual: staging.len(),
+            });
+        }
+        let index = i32::try_from(index).map_err(|_| Error::TensorMetadataOverflow)?;
+        let transfer_size = i64::try_from(length).map_err(|_| Error::TensorMetadataOverflow)?;
+        let mut args: sys::PJRT_AsyncHostToDeviceTransferManager_TransferData_Args =
+            unsafe { zeroed() };
+        args.struct_size =
+            sys::PJRT_AsyncHostToDeviceTransferManager_TransferData_Args_STRUCT_SIZE as usize;
+        args.transfer_manager = self.inner.as_ptr();
+        args.buffer_index = index;
+        args.data = staging.bytes.as_ptr().cast();
+        args.offset = destination_offset;
+        args.transfer_size = transfer_size;
+        args.is_last_transfer = is_last;
+        let error = unsafe {
+            (self
+                .client
+                .state
+                .plugin
+                .async_transfer_manager_transfer_data_fn()?)(&mut args)
+        };
+        self.client.state.plugin.into_result(error)?;
+        let event = NonNull::new(args.done_with_h2d_transfer).ok_or(Error::NullResult(
+            "PJRT_AsyncHostToDeviceTransferManager_TransferData",
+        ))?;
+        Ok(OwnedDmaTransfer {
+            event: Some(Event::from_raw(&self.client.state.plugin, event)),
+            _staging: staging,
+            _manager: PhantomData,
         })
     }
 
@@ -1760,13 +1891,43 @@ impl Drop for AsyncTransferManager {
 
 /// Completion whose borrow keeps both the mapped bytes and manager alive.
 pub struct DmaTransfer<'owners> {
-    event: Event,
+    event: Option<Event>,
     _owners: PhantomData<&'owners ()>,
 }
 
 impl DmaTransfer<'_> {
-    pub fn wait(self) -> Result<(), Error> {
-        self.event.wait()
+    pub fn wait(mut self) -> Result<(), Error> {
+        self.event.take().expect("DMA completion event").wait()
+    }
+}
+
+impl Drop for DmaTransfer<'_> {
+    fn drop(&mut self) {
+        if let Some(event) = self.event.take() {
+            let _ = event.wait();
+        }
+    }
+}
+
+pub struct OwnedDmaTransfer<'manager> {
+    event: Option<Event>,
+    _staging: Arc<OwnedDmaBuffer>,
+    _manager: PhantomData<&'manager AsyncTransferManager>,
+}
+
+impl OwnedDmaTransfer<'_> {
+    pub fn wait(mut self) -> Result<(), Error> {
+        self.event.take().expect("DMA completion event").wait()
+    }
+}
+
+impl Drop for OwnedDmaTransfer<'_> {
+    fn drop(&mut self) {
+        // Keep both the mapped lane and its transfer manager alive until PJRT
+        // releases the source, including every early-return path.
+        if let Some(event) = self.event.take() {
+            let _ = event.wait();
+        }
     }
 }
 
@@ -2097,20 +2258,79 @@ impl LoadedExecutable {
         inputs: &[&Buffer],
         device: Option<&Device>,
     ) -> Result<Execution, Error> {
-        for input in inputs {
+        if let Some(device) = device {
+            self.client.require_own_device(device)?;
+        }
+        let execution = self.execute_inner(&[inputs], device)?;
+        let mut outputs = execution.outputs;
+        let mut complete = execution.complete;
+        Ok(Execution {
+            outputs: outputs.pop().expect("one device was submitted"),
+            complete: complete.pop().expect("one device was submitted"),
+        })
+    }
+
+    /// Executes one argument list per addressable device in canonical order.
+    ///
+    /// PJRT's ABI is device-major: every outer entry is one device and every
+    /// inner entry is the complete ordered argument list for that device. This
+    /// method preserves that shape in both directions instead of exposing the
+    /// pointer flattening required by the C record.
+    pub fn execute(&self, inputs: &[&[&Buffer]]) -> Result<MultiDeviceExecution, Error> {
+        self.execute_inner(inputs, None)
+    }
+
+    fn execute_inner(
+        &self,
+        inputs: &[&[&Buffer]],
+        device: Option<&Device>,
+    ) -> Result<MultiDeviceExecution, Error> {
+        if inputs.is_empty() {
+            return Err(Error::InvalidExecutionTopology(
+                "at least one device argument list is required",
+            ));
+        }
+        if device.is_some() && inputs.len() != 1 {
+            return Err(Error::InvalidExecutionTopology(
+                "an explicit execute device accepts exactly one argument list",
+            ));
+        }
+        let argument_count = inputs[0].len();
+        if inputs
+            .iter()
+            .any(|arguments| arguments.len() != argument_count)
+        {
+            return Err(Error::InvalidExecutionTopology(
+                "every device must receive the same number of arguments",
+            ));
+        }
+        for input in inputs.iter().flat_map(|arguments| arguments.iter()) {
             if !Arc::ptr_eq(&self.client.state, &input.client.state) {
                 return Err(Error::ForeignClientObject("buffer"));
             }
         }
-        if let Some(device) = device {
-            self.client.require_own_device(device)?;
-        }
         let output_count = self.executable()?.output_count()?;
-        let argument_pointers: Vec<_> = inputs.iter().map(|buffer| buffer.inner.as_ptr()).collect();
-        let argument_lists = [argument_pointers.as_ptr()];
-        let mut output_pointers = vec![std::ptr::null_mut(); output_count];
-        let output_lists = [output_pointers.as_mut_ptr()];
-        let mut complete_events = [std::ptr::null_mut()];
+        let argument_pointers = inputs
+            .iter()
+            .map(|arguments| {
+                arguments
+                    .iter()
+                    .map(|buffer| buffer.inner.as_ptr())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let argument_lists = argument_pointers
+            .iter()
+            .map(|arguments| arguments.as_ptr())
+            .collect::<Vec<_>>();
+        let mut output_pointers = (0..inputs.len())
+            .map(|_| vec![std::ptr::null_mut(); output_count])
+            .collect::<Vec<_>>();
+        let output_lists = output_pointers
+            .iter_mut()
+            .map(|outputs| outputs.as_mut_ptr())
+            .collect::<Vec<_>>();
+        let mut complete_events = vec![std::ptr::null_mut(); inputs.len()];
         let mut options: sys::PJRT_ExecuteOptions = unsafe { zeroed() };
         options.struct_size = sys::PJRT_ExecuteOptions_STRUCT_SIZE as usize;
         let mut args: sys::PJRT_LoadedExecutable_Execute_Args = unsafe { zeroed() };
@@ -2118,8 +2338,8 @@ impl LoadedExecutable {
         args.executable = self.inner.as_ptr();
         args.options = &mut options;
         args.argument_lists = argument_lists.as_ptr();
-        args.num_devices = 1;
-        args.num_args = inputs.len();
+        args.num_devices = inputs.len();
+        args.num_args = argument_count;
         args.output_lists = output_lists.as_ptr();
         args.device_complete_events = complete_events.as_mut_ptr();
         args.execute_device = device.map_or(std::ptr::null_mut(), |device| device.inner.as_ptr());
@@ -2131,16 +2351,34 @@ impl LoadedExecutable {
         // entry leaks merely because an earlier entry was null.
         let outputs = output_pointers
             .into_iter()
-            .map(|buffer| NonNull::new(buffer).map(|inner| Buffer::from_raw(&self.client, inner)))
+            .map(|device_outputs| {
+                device_outputs
+                    .into_iter()
+                    .map(|buffer| {
+                        NonNull::new(buffer).map(|inner| Buffer::from_raw(&self.client, inner))
+                    })
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
-        let complete = NonNull::new(complete_events[0])
-            .map(|event| Event::from_raw(&self.client.state.plugin, event));
-        if outputs.iter().any(Option::is_none) {
+        let complete = complete_events
+            .into_iter()
+            .map(|event| {
+                NonNull::new(event).map(|event| Event::from_raw(&self.client.state.plugin, event))
+            })
+            .collect::<Vec<_>>();
+        if outputs.iter().flatten().any(Option::is_none) {
             return Err(Error::NullResult("PJRT_LoadedExecutable_Execute output"));
         }
-        let outputs = outputs.into_iter().flatten().collect();
-        let complete = complete.ok_or(Error::NullResult("PJRT_LoadedExecutable_Execute event"))?;
-        Ok(Execution { outputs, complete })
+        if complete.iter().any(Option::is_none) {
+            return Err(Error::NullResult("PJRT_LoadedExecutable_Execute event"));
+        }
+        Ok(MultiDeviceExecution {
+            outputs: outputs
+                .into_iter()
+                .map(|device_outputs| device_outputs.into_iter().flatten().collect())
+                .collect(),
+            complete: complete.into_iter().flatten().collect(),
+        })
     }
 
     pub fn delete(&self) -> Result<(), Error> {
@@ -2177,6 +2415,11 @@ impl Drop for LoadedExecutable {
 pub struct Execution {
     pub outputs: Vec<Buffer>,
     pub complete: Event,
+}
+
+pub struct MultiDeviceExecution {
+    pub outputs: Vec<Vec<Buffer>>,
+    pub complete: Vec<Event>,
 }
 
 impl fmt::Debug for Client {

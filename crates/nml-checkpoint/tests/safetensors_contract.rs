@@ -86,6 +86,74 @@ fn unsupported_subbyte_dtype_is_rejected_before_tensor_loading() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn malformed_extent_duplicate_names_and_escaping_shards_are_rejected() {
+    let root = temporary_directory("malformed");
+    std::fs::create_dir_all(&root).unwrap();
+    let tensor = TensorData {
+        dtype: Dtype::F16,
+        shape: vec![1],
+        bytes: 7u16.to_le_bytes().to_vec(),
+    };
+
+    let truncated = root.join("truncated.safetensors");
+    let mut bytes = safetensors::serialize(BTreeMap::from([("x", &tensor)]), None).unwrap();
+    bytes.pop();
+    std::fs::write(&truncated, bytes).unwrap();
+    assert!(TensorRegistry::from_path(&truncated).is_err());
+
+    let duplicate = root.join("duplicate.safetensors");
+    let header = br#"{"x":{"dtype":"F16","shape":[1],"data_offsets":[0,2]},"x":{"dtype":"F16","shape":[1],"data_offsets":[0,2]}}"#;
+    let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+    bytes.extend_from_slice(header);
+    bytes.extend_from_slice(&tensor.bytes);
+    std::fs::write(&duplicate, bytes).unwrap();
+    assert!(TensorRegistry::from_path(&duplicate).is_err());
+
+    let outside = root.with_extension("outside.safetensors");
+    write_file(&outside, [("x", &tensor)]);
+    let outside_name = outside.file_name().unwrap().to_str().unwrap();
+    let index = format!("{{\"weight_map\":{{\"x\":\"../{outside_name}\"}},\"metadata\":{{}}}}");
+    std::fs::write(root.join("model.safetensors.index.json"), index).unwrap();
+    assert!(TensorRegistry::from_path(&root).is_err());
+
+    std::fs::remove_file(outside).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn primary_names_win_and_multiple_fallback_aliases_are_ambiguous() {
+    let root = temporary_directory("aliases");
+    std::fs::create_dir_all(&root).unwrap();
+    let tensor = TensorData {
+        dtype: Dtype::F16,
+        shape: vec![1],
+        bytes: 9u16.to_le_bytes().to_vec(),
+    };
+    write_file(
+        &root.join("model.safetensors"),
+        [
+            ("primary", &tensor),
+            ("alias_a", &tensor),
+            ("alias_b", &tensor),
+        ],
+    );
+    let registry = TensorRegistry::from_path(&root).unwrap();
+    let shape = Shape::new(DType::F16, &[1]).unwrap();
+    let store = nml_checkpoint::io::TensorStore::new(registry);
+    assert!(
+        store
+            .tensor("primary", shape, &["alias_a", "alias_b"])
+            .is_ok()
+    );
+    assert!(
+        store
+            .tensor("absent", shape, &["alias_a", "alias_b"])
+            .is_err()
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn write_file<'a>(
     path: &std::path::Path,
     tensors: impl IntoIterator<Item = (&'a str, &'a TensorData)>,

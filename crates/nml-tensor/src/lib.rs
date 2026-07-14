@@ -54,6 +54,14 @@ struct AlignedBytes {
     alignment: usize,
 }
 
+// SAFETY: AlignedBytes uniquely owns its allocation. Moving it between
+// threads transfers that ownership, and shared access exposes only &[u8]; all
+// mutation still requires &mut self.
+unsafe impl Send for AlignedBytes {}
+// SAFETY: the allocation has no interior mutability and deallocation requires
+// unique ownership, so concurrent shared reads are sound.
+unsafe impl Sync for AlignedBytes {}
+
 impl AlignedBytes {
     fn zeroed(length: usize, alignment: usize) -> Result<Self, Error> {
         let layout = Layout::from_size_align(length.max(1), alignment)

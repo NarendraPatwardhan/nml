@@ -39,6 +39,7 @@ nml_rust_test(
     rustc_env = {"NML_LINEAR_BACKEND": "cpu"},
     deps = [
         ":nml",
+        "//crates/nml-ir:nml_ir",
         "//crates/nml-types:nml_types",
         "@rust_crates//safetensors",
         "@rust_crates//serde_json",
@@ -58,6 +59,7 @@ nml_rust_test(
     }),
     deps = [
         ":nml",
+        "//crates/nml-ir:nml_ir",
         "//crates/nml-types:nml_types",
         "@rust_crates//safetensors",
         "@rust_crates//serde_json",

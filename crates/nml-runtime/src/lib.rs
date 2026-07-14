@@ -103,28 +103,223 @@ impl Platform {
             shape: slice.shape(),
             sharding,
             backend: self.backend,
+            platform_id: self.client.as_raw_identity(),
+            memory,
+        })
+    }
+
+    /// Streams checkpoint bytes through CUDA's reusable mapped DMA lanes.
+    /// CPU deliberately reads one aligned tensor and uses the ordinary
+    /// immutable-host transfer path.
+    #[doc(hidden)]
+    pub fn upload_checkpoint_from(
+        &self,
+        shape: Shape,
+        sharding: Sharding,
+        memory: Memory,
+        staging_buffers: usize,
+        chunk_bytes: usize,
+        mut read: impl FnMut(usize, &mut [u8]) -> std::io::Result<()>,
+    ) -> Result<Buffer, Error> {
+        if staging_buffers == 0 || chunk_bytes == 0 {
+            return Err(Error::InvalidStaging {
+                buffers: staging_buffers,
+                chunk_bytes,
+            });
+        }
+        sharding.validate(shape)?;
+        let logical_bytes = shape.byte_count().map_err(nml_tensor::Error::from)?;
+        if self.backend == Backend::Cpu || logical_bytes == 0 {
+            let mut slice = Slice::alloc(shape)?;
+            if logical_bytes != 0 {
+                read(0, slice.contiguous_bytes_mut()?).map_err(Error::Io)?;
+            }
+            return self.upload(&slice, sharding, memory);
+        }
+        let devices = self.client.devices().map_err(Error::Pjrt)?;
+        let shard_count = sharding.physical_shard_count(devices.len())?;
+        if sharding.replicated || sharding.partitions.is_empty() {
+            let selected_memories = devices
+                .iter()
+                .take(shard_count)
+                .map(|device| match select_memory(device, memory)? {
+                    Some(memory) => Ok(memory),
+                    None => device.default_memory().map_err(Error::Pjrt),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let managers = selected_memories
+                .iter()
+                .map(|memory| {
+                    self.client
+                        .create_async_transfer_manager(&[shape], memory)
+                        .map_err(Error::Pjrt)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let lane_bytes = chunk_bytes.min(logical_bytes).max(1);
+            let mut lanes = (0..staging_buffers)
+                .map(|_| {
+                    self.client
+                        .owned_dma_buffer(lane_bytes)
+                        .map_err(Error::Pjrt)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut pending = (0..staging_buffers)
+                .map(|_| Vec::<nml_pjrt::OwnedDmaTransfer<'_>>::new())
+                .collect::<Vec<_>>();
+            for (chunk_index, byte_offset) in (0..logical_bytes).step_by(chunk_bytes).enumerate() {
+                let lane = chunk_index % staging_buffers;
+                for transfer in pending[lane].drain(..) {
+                    transfer.wait().map_err(Error::Pjrt)?;
+                }
+                let length = chunk_bytes.min(logical_bytes - byte_offset);
+                let staging =
+                    Arc::get_mut(&mut lanes[lane]).expect("a completed DMA lane has one owner");
+                read(byte_offset, &mut staging.bytes_mut()[..length]).map_err(Error::Io)?;
+                let offset = i64::try_from(byte_offset).map_err(|_| Error::ByteCountOverflow)?;
+                for manager in &managers {
+                    pending[lane].push(
+                        manager
+                            .transfer_owned(
+                                0,
+                                Arc::clone(&lanes[lane]),
+                                length,
+                                offset,
+                                byte_offset + length == logical_bytes,
+                            )
+                            .map_err(Error::Pjrt)?,
+                    );
+                }
+            }
+            for transfer in pending.into_iter().flatten() {
+                transfer.wait().map_err(Error::Pjrt)?;
+            }
+            let shards = managers
+                .iter()
+                .map(|manager| manager.retrieve_buffer(0).map_err(Error::Pjrt))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(Buffer {
+                storage: Arc::new(BufferStorage { shards }),
+                shape,
+                sharding,
+                backend: self.backend,
+                platform_id: self.client.as_raw_identity(),
+                memory,
+            });
+        }
+
+        let shard_shape = sharding.shard_shape(shape)?;
+        let shard_bytes = shard_shape.byte_count().map_err(nml_tensor::Error::from)?;
+        let mut shards = Vec::with_capacity(shard_count);
+        for (index, device) in devices.iter().take(shard_count).enumerate() {
+            let selected_memory = match select_memory(device, memory)? {
+                Some(memory) => memory,
+                None => device.default_memory().map_err(Error::Pjrt)?,
+            };
+            let manager = self
+                .client
+                .create_async_transfer_manager(&[shard_shape], &selected_memory)
+                .map_err(Error::Pjrt)?;
+            let lane_bytes = chunk_bytes.min(shard_bytes).max(1);
+            let mut lanes = (0..staging_buffers)
+                .map(|_| {
+                    self.client
+                        .owned_dma_buffer(lane_bytes)
+                        .map_err(Error::Pjrt)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut pending: Vec<Option<nml_pjrt::OwnedDmaTransfer<'_>>> =
+                (0..staging_buffers).map(|_| None).collect();
+            let ranges = sharding.ranges(shape, index)?;
+            let mut destination_offset = 0usize;
+            let mut transfer_index = 0usize;
+            for_each_shard_span(shape, &ranges, |source_offset, span_length| {
+                let mut consumed = 0usize;
+                while consumed < span_length {
+                    let length = chunk_bytes.min(span_length - consumed);
+                    let lane = transfer_index % staging_buffers;
+                    transfer_index += 1;
+                    if let Some(transfer) = pending[lane].take() {
+                        transfer.wait().map_err(Error::Pjrt)?;
+                    }
+                    let staging =
+                        Arc::get_mut(&mut lanes[lane]).expect("a completed DMA lane has one owner");
+                    read(source_offset + consumed, &mut staging.bytes_mut()[..length])
+                        .map_err(Error::Io)?;
+                    let offset =
+                        i64::try_from(destination_offset).map_err(|_| Error::ByteCountOverflow)?;
+                    destination_offset = destination_offset
+                        .checked_add(length)
+                        .ok_or(Error::ByteCountOverflow)?;
+                    pending[lane] = Some(
+                        manager
+                            .transfer_owned(
+                                0,
+                                Arc::clone(&lanes[lane]),
+                                length,
+                                offset,
+                                destination_offset == shard_bytes,
+                            )
+                            .map_err(Error::Pjrt)?,
+                    );
+                    consumed += length;
+                }
+                Ok(())
+            })?;
+            for transfer in pending.into_iter().flatten() {
+                transfer.wait().map_err(Error::Pjrt)?;
+            }
+            if destination_offset != shard_bytes {
+                return Err(Error::ByteCountOverflow);
+            }
+            shards.push(manager.retrieve_buffer(0).map_err(Error::Pjrt)?);
+        }
+        Ok(Buffer {
+            storage: Arc::new(BufferStorage { shards }),
+            shape,
+            sharding,
+            backend: self.backend,
+            platform_id: self.client.as_raw_identity(),
             memory,
         })
     }
 
     pub fn compile(&self, program: &Program) -> Result<Exe, Error> {
-        let device = self
-            .client
-            .devices()
-            .map_err(Error::Pjrt)?
-            .into_iter()
-            .next()
-            .ok_or(Error::NoDevices)?;
+        let devices = self.client.devices().map_err(Error::Pjrt)?;
+        if devices.is_empty() {
+            return Err(Error::NoDevices);
+        }
         let backend = match self.backend {
             Backend::Cpu => nml_xla::Backend::Cpu,
             Backend::Cuda => nml_xla::Backend::Cuda,
         };
-        let options =
-            nml_xla::CompileOptions::single_device(device.id().map_err(Error::Pjrt)?, backend)
-                .map_err(Error::Xla)?;
+        // A platform is the physical replica mesh.  Tiled partitioning will
+        // add a distinct logical mesh contract; until then every addressable
+        // device executes the same program and receives one buffer shard.
+        let device_ids = devices
+            .iter()
+            .map(|device| device.id().map_err(Error::Pjrt))
+            .collect::<Result<Vec<_>, _>>()?;
+        let replicas = u32::try_from(device_ids.len()).map_err(|_| Error::DeviceCount {
+            required: device_ids.len(),
+            available: u32::MAX as usize,
+        })?;
+        let options = nml_xla::CompileOptions::new(
+            replicas,
+            1,
+            device_ids,
+            nml_xla::Partitioner::Shardy,
+            backend,
+        )
+        .map_err(Error::Xla)?;
         let loaded =
             nml_compiler::compile(&self.client, program, &options).map_err(Error::Compiler)?;
-        Exe::new(self.backend, loaded, program)
+        Exe::new(
+            self.backend,
+            self.client.as_raw_identity(),
+            loaded,
+            program,
+            devices.len(),
+        )
     }
 }
 
@@ -254,6 +449,21 @@ impl Sharding {
         }
     }
 
+    fn shard_shape(&self, shape: Shape) -> Result<Shape, Error> {
+        if self.replicated || self.partitions.is_empty() {
+            return Ok(shape);
+        }
+        let dimensions = shape
+            .dimensions()
+            .iter()
+            .zip(&self.partitions)
+            .map(|(dimension, partitions)| *dimension / *partitions as i64)
+            .collect::<Vec<_>>();
+        Shape::new(shape.dtype(), &dimensions)
+            .map_err(nml_tensor::Error::from)
+            .map_err(Error::Tensor)
+    }
+
     fn ranges(&self, shape: Shape, shard: usize) -> Result<Vec<(usize, i64, i64)>, Error> {
         if self.replicated {
             return Ok(Vec::new());
@@ -283,6 +493,61 @@ impl Sharding {
     }
 }
 
+fn for_each_shard_span(
+    shape: Shape,
+    ranges: &[(usize, i64, i64)],
+    mut visit: impl FnMut(usize, usize) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let rank = shape.rank();
+    let width = shape.dtype().byte_width();
+    if rank == 0 {
+        return visit(0, width);
+    }
+    let dimensions = shape
+        .dimensions()
+        .iter()
+        .map(|dimension| usize::try_from(*dimension).map_err(|_| Error::ByteCountOverflow))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut starts = vec![0usize; rank];
+    let mut lengths = dimensions.clone();
+    for &(axis, start, length) in ranges {
+        starts[axis] = usize::try_from(start).map_err(|_| Error::ByteCountOverflow)?;
+        lengths[axis] = usize::try_from(length).map_err(|_| Error::ByteCountOverflow)?;
+    }
+    if lengths.contains(&0) {
+        return Ok(());
+    }
+    let row_count = lengths[..rank - 1]
+        .iter()
+        .try_fold(1usize, |count, length| {
+            count.checked_mul(*length).ok_or(Error::ByteCountOverflow)
+        })?;
+    let span_length = lengths[rank - 1]
+        .checked_mul(width)
+        .ok_or(Error::ByteCountOverflow)?;
+    for row in 0..row_count {
+        let mut remainder = row;
+        let mut coordinates = starts.clone();
+        for axis in (0..rank - 1).rev() {
+            coordinates[axis] += remainder % lengths[axis];
+            remainder /= lengths[axis];
+        }
+        coordinates[rank - 1] = starts[rank - 1];
+        let linear = coordinates.iter().zip(&dimensions).try_fold(
+            0usize,
+            |linear, (coordinate, dimension)| {
+                linear
+                    .checked_mul(*dimension)
+                    .and_then(|linear| linear.checked_add(*coordinate))
+                    .ok_or(Error::ByteCountOverflow)
+            },
+        )?;
+        let source_offset = linear.checked_mul(width).ok_or(Error::ByteCountOverflow)?;
+        visit(source_offset, span_length)?;
+    }
+    Ok(())
+}
+
 /// One logical, possibly sharded, persistent device tensor.
 #[derive(Clone)]
 pub struct Buffer {
@@ -290,6 +555,7 @@ pub struct Buffer {
     shape: Shape,
     sharding: Sharding,
     backend: Backend,
+    platform_id: usize,
     memory: Memory,
 }
 
@@ -350,6 +616,28 @@ impl Buffer {
         })
     }
 
+    /// Allocates distinct physical storage with the same logical placement.
+    /// Cloning a `Buffer` shares storage; this operation deliberately does not.
+    pub fn copy(&self) -> Result<Self, Error> {
+        let shards = self
+            .storage
+            .shards
+            .iter()
+            .map(|shard| {
+                let memory = shard.memory().map_err(Error::Pjrt)?;
+                shard.copy_to_memory(&memory).map_err(Error::Pjrt)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            storage: Arc::new(BufferStorage { shards }),
+            shape: self.shape,
+            sharding: self.sharding.clone(),
+            backend: self.backend,
+            platform_id: self.platform_id,
+            memory: self.memory,
+        })
+    }
+
     pub fn to_slice(&self) -> Result<Slice<'static>, Error> {
         let mut result = Slice::alloc(self.shape)?;
         if self.sharding.replicated {
@@ -367,7 +655,10 @@ impl Buffer {
         Ok(result)
     }
 
-    pub fn delete(&self) -> Result<(), Error> {
+    pub fn delete(self) -> Result<(), Error> {
+        if !self.is_uniquely_owned() {
+            return Err(Error::DeletionRequiresUniqueOwnership);
+        }
         for shard in &self.storage.shards {
             shard.delete().map_err(Error::Pjrt)?;
         }
@@ -406,9 +697,11 @@ pub type Bufferized<T> = <T as NmlStruct>::Buffers;
 /// A compiled executable with named, reusable argument bindings.
 pub struct Exe {
     backend: Backend,
+    platform_id: usize,
     loaded: LoadedExecutable,
+    device_count: usize,
     inputs: Vec<Binding>,
-    outputs: Vec<(String, Shape)>,
+    outputs: Vec<OutputBinding>,
 }
 
 #[derive(Clone)]
@@ -418,8 +711,21 @@ struct Binding {
     kind: InputKind,
 }
 
+#[derive(Clone)]
+struct OutputBinding {
+    name: String,
+    shape: Shape,
+    alias_input: Option<usize>,
+}
+
 impl Exe {
-    fn new(backend: Backend, loaded: LoadedExecutable, program: &Program) -> Result<Self, Error> {
+    fn new(
+        backend: Backend,
+        platform_id: usize,
+        loaded: LoadedExecutable,
+        program: &Program,
+        device_count: usize,
+    ) -> Result<Self, Error> {
         let inputs = program
             .inputs()
             .map(|(name, shape, kind)| Binding {
@@ -430,11 +736,18 @@ impl Exe {
             .collect();
         let outputs = program
             .outputs()
-            .map(|(name, shape)| (name.to_owned(), shape))
+            .zip(program.output_aliases())
+            .map(|((name, shape), alias_input)| OutputBinding {
+                name: name.to_owned(),
+                shape,
+                alias_input,
+            })
             .collect();
         Ok(Self {
             backend,
+            platform_id,
             loaded,
+            device_count,
             inputs,
             outputs,
         })
@@ -456,7 +769,11 @@ impl Exe {
             });
         }
         Ok(exe::Results {
-            names: self.outputs.iter().map(|(name, _)| name.clone()).collect(),
+            names: self
+                .outputs
+                .iter()
+                .map(|output| output.name.clone())
+                .collect(),
             buffers,
         })
     }
@@ -490,6 +807,12 @@ pub mod exe {
             if buffer.backend != self.executable.backend {
                 return Err(Error::ArgumentPlatform(name.to_owned()));
             }
+            if buffer.platform_id != self.executable.platform_id {
+                return Err(Error::ArgumentPlatform(name.to_owned()));
+            }
+            if self.executable.device_count > 1 && !buffer.sharding.is_replicated() {
+                return Err(Error::ArgumentSharding(name.to_owned()));
+            }
             if self.baked[index] {
                 return Err(Error::BakedArgument(name.to_owned()));
             }
@@ -509,44 +832,124 @@ pub mod exe {
             Ok(self)
         }
 
-        pub fn call(&self) -> Result<Results, Error> {
+        pub fn call(&mut self) -> Result<Results, Error> {
             for (index, binding) in self.executable.inputs.iter().enumerate() {
                 if self.slots[index].is_none() {
                     return Err(Error::MissingArgument(binding.name.clone()));
                 }
             }
-            if self.slots.iter().any(|slot| {
-                slot.as_ref()
-                    .is_some_and(|buffer| buffer.raw_shards().len() != 1)
-            }) {
-                return Err(Error::MultiDeviceExecutionNotYetRepresentable);
+            for (slot, binding) in self.slots.iter().zip(&self.executable.inputs) {
+                let actual = slot.as_ref().expect("checked above").raw_shards().len();
+                if actual != self.executable.device_count {
+                    return Err(Error::ArgumentShardCount {
+                        name: binding.name.clone(),
+                        expected: self.executable.device_count,
+                        actual,
+                    });
+                }
             }
-            let raw = self
-                .slots
+            for output in &self.executable.outputs {
+                if let Some(input) = output.alias_input {
+                    let buffer = self.slots[input].as_ref().expect("checked above");
+                    if !buffer.is_uniquely_owned() {
+                        return Err(Error::DonationRequiresUniqueOwnership(
+                            self.executable.inputs[input].name.clone(),
+                        ));
+                    }
+                    if self.baked[input] {
+                        return Err(Error::ParameterDonation(
+                            self.executable.inputs[input].name.clone(),
+                        ));
+                    }
+                }
+            }
+            let output_shardings = self
+                .executable
+                .outputs
                 .iter()
-                .map(|slot| &slot.as_ref().expect("checked above").raw_shards()[0])
+                .map(|output| {
+                    output.alias_input.map_or_else(
+                        || {
+                            if self.executable.device_count == 1 {
+                                super::Sharding::single()
+                            } else {
+                                super::Sharding::replicated()
+                            }
+                        },
+                        |input| {
+                            self.slots[input]
+                                .as_ref()
+                                .expect("checked above")
+                                .sharding
+                                .clone()
+                        },
+                    )
+                })
                 .collect::<Vec<_>>();
+            let output_memories = self
+                .executable
+                .outputs
+                .iter()
+                .map(|output| {
+                    output.alias_input.map_or(super::Memory::Default, |input| {
+                        self.slots[input].as_ref().expect("checked above").memory
+                    })
+                })
+                .collect::<Vec<_>>();
+            let raw = (0..self.executable.device_count)
+                .map(|device| {
+                    self.slots
+                        .iter()
+                        .map(|slot| &slot.as_ref().expect("checked above").raw_shards()[device])
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let raw_slices = raw.iter().map(Vec::as_slice).collect::<Vec<_>>();
             let execution = self
                 .executable
                 .loaded
-                .execute_one(&raw, None)
+                .execute(&raw_slices)
                 .map_err(Error::Pjrt)?;
-            execution.complete.wait().map_err(Error::Pjrt)?;
-            let buffers = execution
-                .outputs
+            for event in execution.complete {
+                event.wait().map_err(Error::Pjrt)?;
+            }
+            let mut outputs = (0..self.executable.outputs.len())
+                .map(|_| Vec::with_capacity(self.executable.device_count))
+                .collect::<Vec<_>>();
+            for device_outputs in execution.outputs {
+                if device_outputs.len() != outputs.len() {
+                    return Err(Error::ResultCount {
+                        expected: outputs.len(),
+                        actual: device_outputs.len(),
+                    });
+                }
+                for (output, buffer) in outputs.iter_mut().zip(device_outputs) {
+                    output.push(buffer);
+                }
+            }
+            let buffers = outputs
                 .into_iter()
-                .zip(&self.executable.outputs)
-                .map(|(buffer, (_, shape))| Buffer {
-                    storage: std::sync::Arc::new(super::BufferStorage {
-                        shards: vec![buffer],
-                    }),
-                    shape: *shape,
-                    sharding: super::Sharding::tiled(&vec![1; shape.rank()])
-                        .expect("unit sharding is valid"),
+                .zip(
+                    self.executable
+                        .outputs
+                        .iter()
+                        .zip(output_shardings)
+                        .zip(output_memories),
+                )
+                .map(|(shards, ((output, sharding), memory))| Buffer {
+                    storage: std::sync::Arc::new(super::BufferStorage { shards }),
+                    shape: output.shape,
+                    sharding,
                     backend: self.executable.backend,
-                    memory: super::Memory::Default,
+                    platform_id: self.executable.platform_id,
+                    memory,
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            for output in &self.executable.outputs {
+                if let Some(input) = output.alias_input {
+                    self.slots[input] = None;
+                }
+            }
             self.executable.results(buffers)
         }
     }
@@ -577,6 +980,7 @@ pub enum Error {
     Pjrt(nml_pjrt::Error),
     Xla(nml_xla::Error),
     Compiler(nml_compiler::Error),
+    Io(std::io::Error),
     Tensor(nml_tensor::Error),
     InvalidSharding(&'static str),
     ShardingRank {
@@ -598,6 +1002,10 @@ pub enum Error {
     },
     NoDevices,
     ByteCountOverflow,
+    InvalidStaging {
+        buffers: usize,
+        chunk_bytes: usize,
+    },
     UnknownArgument(String),
     MissingArgument(String),
     BakedArgument(String),
@@ -607,11 +1015,19 @@ pub enum Error {
         actual: Shape,
     },
     ArgumentPlatform(String),
+    ArgumentSharding(String),
+    ArgumentShardCount {
+        name: String,
+        expected: usize,
+        actual: usize,
+    },
+    DonationRequiresUniqueOwnership(String),
+    ParameterDonation(String),
+    DeletionRequiresUniqueOwnership,
     ResultCount {
         expected: usize,
         actual: usize,
     },
-    MultiDeviceExecutionNotYetRepresentable,
 }
 
 impl fmt::Display for Error {
@@ -622,21 +1038,81 @@ impl fmt::Display for Error {
             Self::Pjrt(error) => error.fmt(f),
             Self::Xla(error) => error.fmt(f),
             Self::Compiler(error) => error.fmt(f),
+            Self::Io(error) => error.fmt(f),
             Self::Tensor(error) => error.fmt(f),
             Self::InvalidSharding(message) => write!(f, "invalid sharding: {message}"),
-            Self::ShardingRank { expected, actual } => write!(f, "sharding rank {actual} does not match tensor rank {expected}"),
-            Self::UnevenSharding { axis, dimension, partitions } => write!(f, "dimension {axis} of size {dimension} is not divisible by {partitions} partitions"),
-            Self::DeviceCount { required, available } => write!(f, "sharding requires {required} devices, platform exposes {available}"),
-            Self::UnsupportedMemory { requested, platform } => write!(f, "memory {requested:?} is unsupported on {platform}"),
+            Self::ShardingRank { expected, actual } => write!(
+                f,
+                "sharding rank {actual} does not match tensor rank {expected}"
+            ),
+            Self::UnevenSharding {
+                axis,
+                dimension,
+                partitions,
+            } => write!(
+                f,
+                "dimension {axis} of size {dimension} is not divisible by {partitions} partitions"
+            ),
+            Self::DeviceCount {
+                required,
+                available,
+            } => write!(
+                f,
+                "sharding requires {required} devices, platform exposes {available}"
+            ),
+            Self::UnsupportedMemory {
+                requested,
+                platform,
+            } => write!(f, "memory {requested:?} is unsupported on {platform}"),
             Self::NoDevices => f.write_str("platform exposes no devices"),
             Self::ByteCountOverflow => f.write_str("physical buffer byte count overflows usize"),
+            Self::InvalidStaging {
+                buffers,
+                chunk_bytes,
+            } => write!(
+                f,
+                "invalid DMA staging pool: {buffers} buffers of {chunk_bytes} bytes"
+            ),
             Self::UnknownArgument(name) => write!(f, "unknown executable argument {name:?}"),
             Self::MissingArgument(name) => write!(f, "missing executable argument {name:?}"),
             Self::BakedArgument(name) => write!(f, "baked parameter {name:?} cannot be replaced"),
-            Self::ArgumentShape { name, expected, actual } => write!(f, "argument {name:?} shape mismatch: expected {expected:?}, received {actual:?}"),
-            Self::ArgumentPlatform(name) => write!(f, "argument {name:?} belongs to another platform"),
-            Self::ResultCount { expected, actual } => write!(f, "executable returned {actual} results, expected {expected}"),
-            Self::MultiDeviceExecutionNotYetRepresentable => f.write_str("multi-device executable argument flattening requires a multi-device compiled executable"),
+            Self::ArgumentShape {
+                name,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "argument {name:?} shape mismatch: expected {expected:?}, received {actual:?}"
+            ),
+            Self::ArgumentPlatform(name) => {
+                write!(f, "argument {name:?} belongs to another platform")
+            }
+            Self::ArgumentSharding(name) => write!(
+                f,
+                "argument {name:?} is not replicated across the executable's device mesh"
+            ),
+            Self::ArgumentShardCount {
+                name,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "argument {name:?} has {actual} device shards, executable requires {expected}"
+            ),
+            Self::DonationRequiresUniqueOwnership(name) => write!(
+                f,
+                "activation {name:?} must be uniquely owned before donation"
+            ),
+            Self::ParameterDonation(name) => {
+                write!(f, "baked parameter {name:?} cannot be donated")
+            }
+            Self::DeletionRequiresUniqueOwnership => {
+                f.write_str("shared buffer storage cannot be explicitly deleted")
+            }
+            Self::ResultCount { expected, actual } => write!(
+                f,
+                "executable returned {actual} results, expected {expected}"
+            ),
         }
     }
 }

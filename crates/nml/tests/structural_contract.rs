@@ -13,7 +13,11 @@ struct Layer {
 struct Model {
     layers: Vec<Layer>,
     tuple: (nml::Tensor, [nml::Tensor; 2]),
+    boxed: Box<nml::Tensor>,
 }
+
+#[derive(nml::NmlStruct)]
+struct TupleLayer(nml::Tensor, #[nml(skip)] &'static str, nml::Tensor);
 
 #[derive(nml::NmlStruct)]
 enum Choice {
@@ -40,6 +44,7 @@ fn derive_visits_nested_models_in_deterministic_field_order() {
             label: "metadata is stripped",
         }],
         tuple: (tensors[2], [tensors[3], tensors[4]]),
+        boxed: Box::new(tensors[5]),
     };
     assert_eq!(model.layers[0].label, "metadata is stripped");
     let mut paths = Vec::new();
@@ -52,8 +57,15 @@ fn derive_visits_nested_models_in_deterministic_field_order() {
             "model.tuple.0",
             "model.tuple.1.0",
             "model.tuple.1.1",
+            "model.boxed",
         ]
     );
+
+    let tuple = TupleLayer(tensors[0], "metadata is stripped", tensors[1]);
+    assert_eq!(tuple.1, "metadata is stripped");
+    let mut tuple_paths = Vec::new();
+    tuple.visit_tensors("tuple", &mut |path, _| tuple_paths.push(path.to_owned()));
+    assert_eq!(tuple_paths, ["tuple.0", "tuple.2"]);
 
     let variants = [
         Choice::Dense {
@@ -70,4 +82,35 @@ fn derive_visits_nested_models_in_deterministic_field_order() {
         variant.visit_tensors("choice", &mut |_, _| count += 1);
     }
     assert_eq!(count, 3);
+
+    let platform = nml::Platform::cpu().unwrap();
+    let host_bytes = [0; 8];
+    let host = nml::Slice::from_bytes(shape, &host_bytes).unwrap();
+    let shared = platform
+        .upload(&host, nml::Sharding::replicated(), nml::Memory::Default)
+        .unwrap();
+    let buffers = model
+        .bufferize("model", &mut |_, _| Ok::<_, ()>(shared.clone()))
+        .unwrap();
+    let mut buffer_paths = Vec::new();
+    Model::visit_buffers(&buffers, "model", &mut |path, _| {
+        buffer_paths.push(path.to_owned())
+    });
+    assert_eq!(buffer_paths, paths);
+
+    for variant in &variants {
+        let buffers = variant
+            .bufferize("choice", &mut |_, _| Ok::<_, ()>(shared.clone()))
+            .unwrap();
+        let mut visited = 0;
+        Choice::visit_buffers(&buffers, "choice", &mut |_, _| visited += 1);
+        assert_eq!(
+            visited,
+            match variant {
+                Choice::Dense { .. } => 1,
+                Choice::Pair(..) => 2,
+                Choice::Empty => 0,
+            }
+        );
+    }
 }

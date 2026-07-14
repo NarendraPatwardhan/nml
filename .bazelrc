@@ -31,6 +31,17 @@ common:cpu --//platforms:cuda=false
 common:cuda --//platforms:cpu=true
 common:cuda --//platforms:cuda=true
 
+# BuildBuddy is opt-in because unauthenticated/offline development remains a
+# supported workflow.  The bb CLI supplies the user's credential; no account
+# secret belongs in the repository.  Minimal downloads keep LLVM/XLA actions
+# remote while still materializing binaries and runfiles needed by local GPU
+# contracts.
+common:buildbuddy --bes_results_url=https://app.buildbuddy.io/invocation/
+common:buildbuddy --bes_backend=grpcs://remote.buildbuddy.io
+common:buildbuddy --remote_cache=grpcs://remote.buildbuddy.io
+common:buildbuddy --remote_download_minimal
+common:buildbuddy --remote_cache_compression
+
 # Performance is a product property, so optimized builds have a stable spelling.
 # The default remains Bazel's fast development mode; performance gates must opt
 # into this configuration explicitly rather than accidentally benchmarking it.

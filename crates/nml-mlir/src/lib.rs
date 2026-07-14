@@ -419,12 +419,60 @@ impl Context {
         results: &[Type<'context>],
         body: Region<'context>,
     ) -> Result<Operation<'context>, Error> {
+        self.function_with_input_aliases(name, inputs, results, &vec![None; inputs.len()], body)
+    }
+
+    /// Builds a function whose selected arguments may donate storage to an
+    /// output. XLA consumes the same `tf.aliasing_output` argument attribute
+    /// emitted by ZML; keeping it on the function boundary makes donation an
+    /// executable ABI promise rather than an optimizer guess.
+    pub fn function_with_input_aliases<'context>(
+        &'context self,
+        name: &str,
+        inputs: &[Type<'context>],
+        results: &[Type<'context>],
+        input_aliases: &[Option<usize>],
+        body: Region<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        if input_aliases.len() != inputs.len() {
+            return Err(Error::OutOfBounds {
+                object: "function alias input",
+                index: input_aliases.len(),
+                count: inputs.len(),
+            });
+        }
+        if let Some(output) = input_aliases
+            .iter()
+            .flatten()
+            .find(|output| **output >= results.len())
+        {
+            return Err(Error::OutOfBounds {
+                object: "function alias output",
+                index: *output,
+                count: results.len(),
+            });
+        }
         let function_type = self.function_type(inputs, results)?;
+        let mut attributes = vec![
+            self.named_attribute("sym_name", self.string_attribute(name))?,
+            self.named_attribute("function_type", self.type_attribute(function_type)?)?,
+        ];
+        if input_aliases.iter().any(Option::is_some) {
+            let spelling = format!(
+                "[{}]",
+                input_aliases
+                    .iter()
+                    .map(|alias| alias.map_or_else(
+                        || "{}".to_owned(),
+                        |output| format!("{{tf.aliasing_output = {output} : i32}}"),
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            attributes.push(self.named_attribute("arg_attrs", self.parse_attribute(&spelling)?)?);
+        }
         Operation::builder(self, "func.func")
-            .attributes(&[
-                self.named_attribute("sym_name", self.string_attribute(name))?,
-                self.named_attribute("function_type", self.type_attribute(function_type)?)?,
-            ])
+            .attributes(&attributes)
             .region(body)
             .build()
     }

@@ -9,7 +9,7 @@ use nml_mlir::{
     Block, Context, Error as MlirError, Module, Region, StableHloFftType, Value as MlirValue,
 };
 use nml_types::{DType, Layout, Shape, ShapeError};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -79,6 +79,13 @@ pub enum Error {
     NoOutputs,
     DuplicateInputName(String),
     DuplicateOutputName(String),
+    AliasInputIsNotAnActivation(String),
+    AliasShapeMismatch {
+        input: Shape,
+        output: Shape,
+    },
+    DuplicateOutputAlias,
+    DuplicateInputAlias,
     Shape(ShapeError),
     Mlir(MlirError),
 }
@@ -151,6 +158,20 @@ impl fmt::Display for Error {
             Self::NoOutputs => formatter.write_str("program must expose at least one output"),
             Self::DuplicateInputName(name) => write!(formatter, "duplicate input name {name:?}"),
             Self::DuplicateOutputName(name) => write!(formatter, "duplicate output name {name:?}"),
+            Self::AliasInputIsNotAnActivation(name) => write!(
+                formatter,
+                "parameter {name:?} cannot donate storage; only uniquely owned activations may be aliased",
+            ),
+            Self::AliasShapeMismatch { input, output } => write!(
+                formatter,
+                "output alias shape mismatch: input {input:?}, output {output:?}",
+            ),
+            Self::DuplicateOutputAlias => {
+                formatter.write_str("an output may alias only one executable input")
+            }
+            Self::DuplicateInputAlias => {
+                formatter.write_str("an executable input may donate storage to only one output")
+            }
             Self::Shape(error) => error.fmt(formatter),
             Self::Mlir(error) => error.fmt(formatter),
         }
@@ -177,6 +198,7 @@ pub struct ProgramBuilder {
     input_kinds: Vec<InputKind>,
     values: Vec<Value>,
     operations: Vec<Operation>,
+    aliases: HashMap<usize, usize>,
 }
 
 impl ProgramBuilder {
@@ -187,6 +209,7 @@ impl ProgramBuilder {
             input_kinds: Vec::new(),
             values: Vec::new(),
             operations: Vec::new(),
+            aliases: HashMap::new(),
         }
     }
 
@@ -456,6 +479,44 @@ impl ProgramBuilder {
         Ok(result)
     }
 
+    /// Declares that an output consumes an activation's storage.
+    ///
+    /// This follows ZML's `reuseBuffer`: the declaration is carried to XLA as
+    /// `tf.aliasing_output`, while runtime ownership separately ensures that a
+    /// shared buffer or baked parameter can never be donated.
+    pub fn reuse_buffer(&mut self, output: Tensor, input: Tensor) -> Result<Tensor, Error> {
+        self.require_local(output)?;
+        self.require_local(input)?;
+        if output.shape != input.shape {
+            return Err(Error::AliasShapeMismatch {
+                input: input.shape,
+                output: output.shape,
+            });
+        }
+        let input_position = self
+            .inputs
+            .iter()
+            .position(|value| *value == input.value)
+            .ok_or(Error::ForeignTensor)?;
+        if self.input_kinds[input_position] != InputKind::Activation {
+            return Err(Error::AliasInputIsNotAnActivation(
+                self.values[input.value].name.clone(),
+            ));
+        }
+        if self.aliases.contains_key(&output.value) {
+            return Err(Error::DuplicateOutputAlias);
+        }
+        if self
+            .aliases
+            .values()
+            .any(|position| *position == input_position)
+        {
+            return Err(Error::DuplicateInputAlias);
+        }
+        self.aliases.insert(output.value, input_position);
+        Ok(output)
+    }
+
     pub fn finish(self, outputs: &[Tensor]) -> Result<Program, Error> {
         let named = outputs
             .iter()
@@ -489,6 +550,10 @@ impl ProgramBuilder {
         for value in &self.values {
             require_supported_layout(value.shape)?;
         }
+        let output_aliases = outputs
+            .iter()
+            .map(|(_, tensor)| self.aliases.get(&tensor.value).copied())
+            .collect();
         Ok(Program {
             inputs: self.inputs,
             input_kinds: self.input_kinds,
@@ -496,6 +561,7 @@ impl ProgramBuilder {
             operations: self.operations,
             outputs: outputs.iter().map(|(_, tensor)| tensor.value).collect(),
             output_names: outputs.iter().map(|(name, _)| name.clone()).collect(),
+            output_aliases,
         })
     }
 
@@ -620,6 +686,7 @@ pub struct Program {
     operations: Vec<Operation>,
     outputs: Vec<usize>,
     output_names: Vec<String>,
+    output_aliases: Vec<Option<usize>>,
 }
 
 impl Program {
@@ -644,6 +711,10 @@ impl Program {
             .iter()
             .enumerate()
             .map(|(index, value)| (self.output_names[index].as_str(), self.values[*value].shape))
+    }
+
+    pub fn output_aliases(&self) -> impl Iterator<Item = Option<usize>> + '_ {
+        self.output_aliases.iter().copied()
     }
 
     /// Returns MLIR's canonical text for the same owned module sent to XLA.
@@ -779,7 +850,19 @@ impl Program {
         block.append_operation(context.return_operation(&returned)?)?;
         let mut body = Region::new(context)?;
         body.append_block(block)?;
-        let function = context.function("main", &input_types, &result_types, body)?;
+        let mut input_aliases = vec![None; self.inputs.len()];
+        for (output, input) in self.output_aliases.iter().enumerate() {
+            if let Some(input) = input {
+                input_aliases[*input] = Some(output);
+            }
+        }
+        let function = context.function_with_input_aliases(
+            "main",
+            &input_types,
+            &result_types,
+            &input_aliases,
+            body,
+        )?;
         let mut module = context.empty_module()?;
         module.append_operation(function)?;
         module.verify()?;
