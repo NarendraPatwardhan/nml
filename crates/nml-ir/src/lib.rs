@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+mod paged_attention;
+
 use nml_mlir::{
     Attribute as MlirAttribute, Block, Context, Error as MlirError, Module, Region,
     ShardyDimension, StableHloBinary, StableHloComparison, StableHloComparisonType,
@@ -33,6 +35,73 @@ pub struct Tensor {
 impl Tensor {
     pub const fn shape(self) -> Shape {
         self.shape
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AttentionOptions {
+    pub causal: bool,
+    pub sliding_window: Option<usize>,
+    pub scale: Option<f64>,
+}
+
+impl Default for AttentionOptions {
+    fn default() -> Self {
+        Self {
+            causal: true,
+            sliding_window: None,
+            scale: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RopeLayout {
+    Interleaved,
+    Sequential,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RopeScaling {
+    Default,
+    Linear {
+        factor: f64,
+    },
+    Proportional {
+        rotary_fraction: f64,
+    },
+    Llama3 {
+        factor: f64,
+        high_frequency_factor: f64,
+        low_frequency_factor: f64,
+        original_context: usize,
+        truncate: bool,
+    },
+    Yarn {
+        factor: f64,
+        beta_fast: f64,
+        beta_slow: f64,
+        original_context: usize,
+        truncate: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RopeOptions {
+    pub base: f64,
+    pub rotary_dimensions: usize,
+    pub layout: RopeLayout,
+    pub scaling: RopeScaling,
+}
+
+impl RopeOptions {
+    pub const fn new(rotary_dimensions: usize) -> Self {
+        Self {
+            base: 10_000.0,
+            rotary_dimensions,
+            layout: RopeLayout::Interleaved,
+            scaling: RopeScaling::Default,
+        }
     }
 }
 
@@ -91,6 +160,23 @@ pub enum Error {
         operation: &'static str,
         input: usize,
         output: usize,
+    },
+    EmptyOperands(&'static str),
+    InvalidSlice {
+        axis: usize,
+        start: i64,
+        limit: i64,
+        stride: i64,
+        dimension: i64,
+    },
+    InvalidIndexDType(DType),
+    InvalidAttention(&'static str),
+    InvalidRope(&'static str),
+    InvalidNormalization(&'static str),
+    UpdateDimensionTooLarge {
+        axis: usize,
+        input: i64,
+        update: i64,
     },
     Tensor(nml_tensor::Error),
     Sharding(nml_sharding::Error),
@@ -183,6 +269,38 @@ impl fmt::Display for Error {
             } => write!(
                 formatter,
                 "{operation} requires equal element counts, received {input} and {output}",
+            ),
+            Self::EmptyOperands(operation) => {
+                write!(formatter, "{operation} requires at least one operand")
+            }
+            Self::InvalidSlice {
+                axis,
+                start,
+                limit,
+                stride,
+                dimension,
+            } => write!(
+                formatter,
+                "slice axis {axis} has invalid [{start}, {limit}) stride {stride} for dimension {dimension}",
+            ),
+            Self::InvalidIndexDType(dtype) => {
+                write!(
+                    formatter,
+                    "index tensor must contain integers, received {dtype:?}"
+                )
+            }
+            Self::InvalidAttention(message) => write!(formatter, "invalid attention: {message}"),
+            Self::InvalidRope(message) => write!(formatter, "invalid RoPE: {message}"),
+            Self::InvalidNormalization(message) => {
+                write!(formatter, "invalid normalization: {message}")
+            }
+            Self::UpdateDimensionTooLarge {
+                axis,
+                input,
+                update,
+            } => write!(
+                formatter,
+                "dynamic update dimension {axis} is {update}, exceeding input dimension {input}",
             ),
             Self::Tensor(error) => error.fmt(formatter),
             Self::Sharding(error) => error.fmt(formatter),
@@ -619,6 +737,812 @@ impl ProgramBuilder {
         Ok(result)
     }
 
+    pub fn iota(&mut self, shape: Shape, axis: usize) -> Result<Tensor, Error> {
+        require_supported_layout(shape)?;
+        if axis >= shape.rank() {
+            return Err(Error::AxisOutOfBounds {
+                side: "iota",
+                axis,
+                rank: shape.rank(),
+            });
+        }
+        match shape.dtype().class() {
+            DTypeClass::SignedInteger | DTypeClass::UnsignedInteger | DTypeClass::Float => {}
+            _ => {
+                return Err(Error::UnsupportedDType {
+                    operation: "iota",
+                    dtype: shape.dtype(),
+                });
+            }
+        }
+        let result = self.push_value("iota", shape);
+        self.operations.push(Operation::Iota {
+            result: result.value,
+            axis,
+        });
+        Ok(result)
+    }
+
+    pub fn concatenate(&mut self, inputs: &[Tensor], axis: usize) -> Result<Tensor, Error> {
+        let Some(first) = inputs.first().copied() else {
+            return Err(Error::EmptyOperands("concatenate"));
+        };
+        self.require_local(first)?;
+        if axis >= first.shape.rank() {
+            return Err(Error::AxisOutOfBounds {
+                side: "concatenate",
+                axis,
+                rank: first.shape.rank(),
+            });
+        }
+        let mut dimensions = first.shape.dimensions().to_vec();
+        for input in &inputs[1..] {
+            self.require_local(*input)?;
+            if input.shape.dtype() != first.shape.dtype() {
+                return Err(Error::DTypeMismatch {
+                    left: first.shape.dtype(),
+                    right: input.shape.dtype(),
+                });
+            }
+            if input.shape.rank() != first.shape.rank() {
+                return Err(Error::RankMismatch {
+                    operation: "concatenate",
+                    expected: first.shape.rank(),
+                    actual: input.shape.rank(),
+                });
+            }
+            for dimension_axis in 0..first.shape.rank() {
+                if dimension_axis != axis
+                    && input.shape.dimensions()[dimension_axis]
+                        != first.shape.dimensions()[dimension_axis]
+                {
+                    return Err(Error::DimensionMismatch {
+                        left_axis: dimension_axis,
+                        right_axis: dimension_axis,
+                        left: first.shape.dimensions()[dimension_axis],
+                        right: input.shape.dimensions()[dimension_axis],
+                    });
+                }
+            }
+            if input.shape.axis_tags() != first.shape.axis_tags() {
+                return Err(Error::MetadataMismatch {
+                    operation: "concatenate",
+                    field: "axis tags",
+                });
+            }
+            if input.shape.partitions() != first.shape.partitions() {
+                return Err(Error::MetadataMismatch {
+                    operation: "concatenate",
+                    field: "partition metadata",
+                });
+            }
+            dimensions[axis] = dimensions[axis]
+                .checked_add(input.shape.dimensions()[axis])
+                .ok_or(ShapeError::ElementCountOverflow { axis })?;
+        }
+        let shape = Shape::new(first.shape.dtype(), &dimensions)?
+            .with_axis_tags(first.shape.axis_tags())?
+            .with_partitions(first.shape.partitions())?;
+        let result = self.push_value("concatenate", shape);
+        self.operations.push(Operation::Concatenate {
+            inputs: inputs.iter().map(|input| input.value).collect(),
+            result: result.value,
+            axis,
+        });
+        Ok(result)
+    }
+
+    pub fn slice(
+        &mut self,
+        input: Tensor,
+        starts: &[i64],
+        limits: &[i64],
+        strides: &[i64],
+    ) -> Result<Tensor, Error> {
+        self.require_local(input)?;
+        if starts.len() != input.shape.rank()
+            || limits.len() != input.shape.rank()
+            || strides.len() != input.shape.rank()
+        {
+            return Err(Error::AxisCountMismatch);
+        }
+        let mut dimensions = Vec::with_capacity(input.shape.rank());
+        for axis in 0..input.shape.rank() {
+            let (start, limit, stride, dimension) = (
+                starts[axis],
+                limits[axis],
+                strides[axis],
+                input.shape.dimensions()[axis],
+            );
+            if start < 0 || limit < start || limit > dimension || stride <= 0 {
+                return Err(Error::InvalidSlice {
+                    axis,
+                    start,
+                    limit,
+                    stride,
+                    dimension,
+                });
+            }
+            dimensions.push((limit - start + stride - 1) / stride);
+        }
+        let shape = Shape::new(input.shape.dtype(), &dimensions)?
+            .with_axis_tags(input.shape.axis_tags())?
+            .with_partitions(input.shape.partitions())?;
+        let result = self.push_value("slice", shape);
+        self.operations.push(Operation::Slice {
+            input: input.value,
+            result: result.value,
+            starts: starts.to_vec(),
+            limits: limits.to_vec(),
+            strides: strides.to_vec(),
+        });
+        Ok(result)
+    }
+
+    pub fn dynamic_slice(
+        &mut self,
+        input: Tensor,
+        starts: &[Tensor],
+        sizes: &[i64],
+    ) -> Result<Tensor, Error> {
+        self.require_local(input)?;
+        self.validate_dynamic_starts(starts, input.shape.rank())?;
+        if sizes.len() != input.shape.rank() {
+            return Err(Error::AxisCountMismatch);
+        }
+        for (axis, (&size, &dimension)) in sizes.iter().zip(input.shape.dimensions()).enumerate() {
+            if size < 0 || size > dimension {
+                return Err(Error::InvalidSlice {
+                    axis,
+                    start: 0,
+                    limit: size,
+                    stride: 1,
+                    dimension,
+                });
+            }
+        }
+        let shape = Shape::new(input.shape.dtype(), sizes)?
+            .with_axis_tags(input.shape.axis_tags())?
+            .with_partitions(input.shape.partitions())?;
+        let result = self.push_value("dynamic_slice", shape);
+        self.operations.push(Operation::DynamicSlice {
+            input: input.value,
+            starts: starts.iter().map(|start| start.value).collect(),
+            result: result.value,
+            sizes: sizes.to_vec(),
+        });
+        Ok(result)
+    }
+
+    pub fn dynamic_update_slice(
+        &mut self,
+        input: Tensor,
+        update: Tensor,
+        starts: &[Tensor],
+    ) -> Result<Tensor, Error> {
+        self.require_local(input)?;
+        self.require_local(update)?;
+        self.validate_dynamic_starts(starts, input.shape.rank())?;
+        if input.shape.dtype() != update.shape.dtype() {
+            return Err(Error::DTypeMismatch {
+                left: input.shape.dtype(),
+                right: update.shape.dtype(),
+            });
+        }
+        if update.shape.rank() != input.shape.rank() {
+            return Err(Error::RankMismatch {
+                operation: "dynamic_update_slice",
+                expected: input.shape.rank(),
+                actual: update.shape.rank(),
+            });
+        }
+        if update.shape.axis_tags() != input.shape.axis_tags() {
+            return Err(Error::MetadataMismatch {
+                operation: "dynamic_update_slice",
+                field: "axis tags",
+            });
+        }
+        if update.shape.partitions() != input.shape.partitions() {
+            return Err(Error::MetadataMismatch {
+                operation: "dynamic_update_slice",
+                field: "partition metadata",
+            });
+        }
+        for (axis, (&input_dimension, &update_dimension)) in input
+            .shape
+            .dimensions()
+            .iter()
+            .zip(update.shape.dimensions())
+            .enumerate()
+        {
+            if update_dimension > input_dimension {
+                return Err(Error::UpdateDimensionTooLarge {
+                    axis,
+                    input: input_dimension,
+                    update: update_dimension,
+                });
+            }
+        }
+        let result = self.push_value("dynamic_update_slice", input.shape);
+        self.operations.push(Operation::DynamicUpdateSlice {
+            input: input.value,
+            update: update.value,
+            starts: starts.iter().map(|start| start.value).collect(),
+            result: result.value,
+        });
+        Ok(result)
+    }
+
+    /// Gathers scalar indices from one operand axis. Index dimensions precede
+    /// every retained operand dimension in the result.
+    pub fn gather(&mut self, input: Tensor, indices: Tensor, axis: usize) -> Result<Tensor, Error> {
+        self.gather_impl(input, indices, axis, 1, true)
+    }
+
+    /// Gathers fixed-size slices whose starting positions are supplied by an
+    /// integer index tensor. The gathered operand axis is retained.
+    pub fn gather_slices(
+        &mut self,
+        input: Tensor,
+        indices: Tensor,
+        axis: usize,
+        slice_size: i64,
+    ) -> Result<Tensor, Error> {
+        self.gather_impl(input, indices, axis, slice_size, false)
+    }
+
+    fn gather_impl(
+        &mut self,
+        input: Tensor,
+        indices: Tensor,
+        axis: usize,
+        slice_size: i64,
+        collapse_axis: bool,
+    ) -> Result<Tensor, Error> {
+        self.require_local(input)?;
+        self.require_local(indices)?;
+        if axis >= input.shape.rank() {
+            return Err(Error::AxisOutOfBounds {
+                side: "gather",
+                axis,
+                rank: input.shape.rank(),
+            });
+        }
+        require_index_dtype(indices.shape.dtype())?;
+        if slice_size <= 0 || slice_size > input.shape.dimensions()[axis] {
+            return Err(Error::InvalidSlice {
+                axis,
+                start: 0,
+                limit: slice_size,
+                stride: 1,
+                dimension: input.shape.dimensions()[axis],
+            });
+        }
+        let retained_axes = (0..input.shape.rank())
+            .filter(|candidate| !collapse_axis || *candidate != axis)
+            .collect::<Vec<_>>();
+        let dimensions = indices
+            .shape
+            .dimensions()
+            .iter()
+            .copied()
+            .chain(retained_axes.iter().map(|retained| {
+                if *retained == axis {
+                    slice_size
+                } else {
+                    input.shape.dimensions()[*retained]
+                }
+            }))
+            .collect::<Vec<_>>();
+        let tags = indices
+            .shape
+            .axis_tags()
+            .iter()
+            .copied()
+            .chain(
+                retained_axes
+                    .iter()
+                    .map(|retained| input.shape.axis_tags()[*retained]),
+            )
+            .collect::<Vec<_>>();
+        let partitions = indices
+            .shape
+            .partitions()
+            .iter()
+            .copied()
+            .chain(
+                retained_axes
+                    .iter()
+                    .map(|retained| input.shape.partitions()[*retained]),
+            )
+            .collect::<Vec<_>>();
+        let shape = Shape::new(input.shape.dtype(), &dimensions)?
+            .with_axis_tags(&tags)?
+            .with_partitions(&partitions)?;
+        let result = self.push_value("gather", shape);
+        self.operations.push(Operation::Gather {
+            input: input.value,
+            indices: indices.value,
+            result: result.value,
+            axis,
+            slice_size,
+            collapse_axis,
+        });
+        Ok(result)
+    }
+
+    pub fn reduce_sum(&mut self, input: Tensor, axes: &[usize]) -> Result<Tensor, Error> {
+        self.reduce(input, axes, Reduction::Sum)
+    }
+
+    pub fn reduce_max(&mut self, input: Tensor, axes: &[usize]) -> Result<Tensor, Error> {
+        self.reduce(input, axes, Reduction::Maximum)
+    }
+
+    pub fn softmax(&mut self, input: Tensor, axis: usize) -> Result<Tensor, Error> {
+        self.require_float(input, "softmax")?;
+        if axis >= input.shape.rank() {
+            return Err(Error::AxisOutOfBounds {
+                side: "softmax",
+                axis,
+                rank: input.shape.rank(),
+            });
+        }
+        let accumulation = if matches!(input.shape.dtype(), DType::F16 | DType::Bf16) {
+            self.convert(input, DType::F32)?
+        } else {
+            input
+        };
+        let maximum = self.reduce_max(accumulation, &[axis])?;
+        let negative_infinity = self.scalar_for(accumulation.shape.dtype(), f64::NEG_INFINITY)?;
+        let row_has_values = self.greater(maximum, negative_infinity)?;
+        let broadcast_maximum = self.broadcast_reduction(maximum, accumulation.shape, &[axis])?;
+        let shifted = self.subtract(accumulation, broadcast_maximum)?;
+        let exponentials = self.exp(shifted)?;
+        let denominator = self.reduce_sum(exponentials, &[axis])?;
+        let denominator = self.broadcast_reduction(denominator, accumulation.shape, &[axis])?;
+        let normalized = self.divide(exponentials, denominator)?;
+        let normalized = self.convert(normalized, input.shape.dtype())?;
+        let row_has_values =
+            self.broadcast_reduction(row_has_values, input.shape.with_dtype(DType::Bool), &[axis])?;
+        let zero = self.zero_for(input.shape.dtype())?;
+        self.select(row_has_values, normalized, zero)
+    }
+
+    pub fn rms_norm(
+        &mut self,
+        input: Tensor,
+        weight: Option<Tensor>,
+        axis: usize,
+        epsilon: f64,
+    ) -> Result<Tensor, Error> {
+        self.require_float(input, "rms_norm")?;
+        if axis >= input.shape.rank() {
+            return Err(Error::AxisOutOfBounds {
+                side: "rms_norm",
+                axis,
+                rank: input.shape.rank(),
+            });
+        }
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(Error::InvalidNormalization(
+                "epsilon must be finite and positive",
+            ));
+        }
+        let accumulation = if matches!(input.shape.dtype(), DType::F16 | DType::Bf16) {
+            self.convert(input, DType::F32)?
+        } else {
+            input
+        };
+        let square = self.multiply(accumulation, accumulation)?;
+        let sum = self.reduce_sum(square, &[axis])?;
+        let count = self.scalar_for(
+            accumulation.shape.dtype(),
+            input.shape.dimensions()[axis] as f64,
+        )?;
+        let mean = self.divide(sum, count)?;
+        let epsilon = self.scalar_for(accumulation.shape.dtype(), epsilon)?;
+        let variance = self.add(mean, epsilon)?;
+        let inverse = self.rsqrt(variance)?;
+        let inverse = self.broadcast_reduction(inverse, accumulation.shape, &[axis])?;
+        let normalized = self.multiply(accumulation, inverse)?;
+        let normalized = self.convert(normalized, input.shape.dtype())?;
+        let Some(weight) = weight else {
+            return Ok(normalized);
+        };
+        self.require_local(weight)?;
+        self.require_rank(weight, "rms_norm weight", 1)?;
+        if weight.shape.dtype() != input.shape.dtype() {
+            return Err(Error::DTypeMismatch {
+                left: input.shape.dtype(),
+                right: weight.shape.dtype(),
+            });
+        }
+        if weight.shape.dimensions()[0] != input.shape.dimensions()[axis] {
+            return Err(Error::DimensionMismatch {
+                left_axis: 0,
+                right_axis: axis,
+                left: weight.shape.dimensions()[0],
+                right: input.shape.dimensions()[axis],
+            });
+        }
+        let weight = self.broadcast_in_dim(weight, input.shape, &[axis])?;
+        self.multiply(normalized, weight)
+    }
+
+    /// Applies rotary position embeddings to `[batch, sequence, heads, head_dim]`.
+    pub fn rope(
+        &mut self,
+        input: Tensor,
+        positions: Tensor,
+        options: RopeOptions,
+    ) -> Result<Tensor, Error> {
+        self.require_float(input, "rope")?;
+        self.require_rank(input, "rope input", 4)?;
+        self.require_local(positions)?;
+        self.require_rank(positions, "rope positions", 2)?;
+        require_index_dtype(positions.shape.dtype())?;
+        if input.shape.dimensions()[0..2] != positions.shape.dimensions()[..] {
+            return Err(Error::InvalidRope(
+                "position dimensions must match batch and sequence",
+            ));
+        }
+        if options.rotary_dimensions == 0
+            || options.rotary_dimensions % 2 != 0
+            || options.rotary_dimensions > input.shape.dimensions()[3] as usize
+        {
+            return Err(Error::InvalidRope(
+                "rotary width must be positive, even, and no larger than head_dim",
+            ));
+        }
+        if !options.base.is_finite() || options.base <= 0.0 {
+            return Err(Error::InvalidRope("base must be finite and positive"));
+        }
+
+        let [batch, sequence, heads, head_dim] = input.shape.dimensions() else {
+            unreachable!("rank was checked")
+        };
+        let rotary = options.rotary_dimensions as i64;
+        let half = rotary / 2;
+        let frequencies = rope_frequencies(options)?;
+        let frequency_shape = Shape::new(DType::F32, &[half])?;
+        let frequency_slice = Slice::from_typed(frequency_shape, &frequencies)?;
+        let frequencies = self.constant(&frequency_slice)?;
+        let positions = self.convert(positions, DType::F32)?;
+        let angle_shape = Shape::new(DType::F32, &[*batch, *sequence, half])?;
+        let positions = self.broadcast_in_dim(positions, angle_shape, &[0, 1])?;
+        let frequencies = self.broadcast_in_dim(frequencies, angle_shape, &[2])?;
+        let angles = self.multiply(positions, frequencies)?;
+        let cosine = self.cos(angles)?;
+        let sine = self.sin(angles)?;
+
+        let input_f32 = self.convert(input, DType::F32)?;
+        let rotary_input = self.slice(
+            input_f32,
+            &[0, 0, 0, 0],
+            &[*batch, *sequence, *heads, rotary],
+            &[1, 1, 1, 1],
+        )?;
+        let pair_shape = Shape::new(DType::F32, &[*batch, *sequence, *heads, half])?;
+        let cosine = self.broadcast_in_dim(cosine, pair_shape, &[0, 1, 3])?;
+        let sine = self.broadcast_in_dim(sine, pair_shape, &[0, 1, 3])?;
+        let (first, second) = match options.layout {
+            RopeLayout::Sequential => {
+                let first = self.slice(
+                    rotary_input,
+                    &[0, 0, 0, 0],
+                    &[*batch, *sequence, *heads, half],
+                    &[1, 1, 1, 1],
+                )?;
+                let second = self.slice(
+                    rotary_input,
+                    &[0, 0, 0, half],
+                    &[*batch, *sequence, *heads, rotary],
+                    &[1, 1, 1, 1],
+                )?;
+                let first_cos = self.multiply(first, cosine)?;
+                let second_sin = self.multiply(second, sine)?;
+                let rotated_first = self.subtract(first_cos, second_sin)?;
+                let second_cos = self.multiply(second, cosine)?;
+                let first_sin = self.multiply(first, sine)?;
+                let rotated_second = self.add(second_cos, first_sin)?;
+                (rotated_first, rotated_second)
+            }
+            RopeLayout::Interleaved => {
+                let even = self.slice(
+                    rotary_input,
+                    &[0, 0, 0, 0],
+                    &[*batch, *sequence, *heads, rotary],
+                    &[1, 1, 1, 2],
+                )?;
+                let odd = self.slice(
+                    rotary_input,
+                    &[0, 0, 0, 1],
+                    &[*batch, *sequence, *heads, rotary],
+                    &[1, 1, 1, 2],
+                )?;
+                let even_cos = self.multiply(even, cosine)?;
+                let odd_sin = self.multiply(odd, sine)?;
+                let rotated_even = self.subtract(even_cos, odd_sin)?;
+                let odd_cos = self.multiply(odd, cosine)?;
+                let even_sin = self.multiply(even, sine)?;
+                let rotated_odd = self.add(odd_cos, even_sin)?;
+                (rotated_even, rotated_odd)
+            }
+        };
+        let rotated = match options.layout {
+            RopeLayout::Sequential => self.concatenate(&[first, second], 3)?,
+            RopeLayout::Interleaved => {
+                let expanded = Shape::new(DType::F32, &[*batch, *sequence, *heads, half, 1])?;
+                let first = self.reshape(first, expanded)?;
+                let second = self.reshape(second, expanded)?;
+                let pairs = self.concatenate(&[first, second], 4)?;
+                self.reshape(
+                    pairs,
+                    Shape::new(DType::F32, &[*batch, *sequence, *heads, rotary])?,
+                )?
+            }
+        };
+        let rotated = if rotary == *head_dim {
+            rotated
+        } else {
+            let tail = self.slice(
+                input_f32,
+                &[0, 0, 0, rotary],
+                &[*batch, *sequence, *heads, *head_dim],
+                &[1, 1, 1, 1],
+            )?;
+            self.concatenate(&[rotated, tail], 3)?
+        };
+        let rotated = self.convert(rotated, input.shape.dtype())?;
+        self.reshape(rotated, input.shape)
+    }
+
+    /// Portable ordinary attention over dense K/V tensors.
+    pub fn attention(
+        &mut self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        query_positions: Tensor,
+        key_positions: Tensor,
+        options: AttentionOptions,
+    ) -> Result<Tensor, Error> {
+        for tensor in [query, key, value] {
+            self.require_float(tensor, "attention")?;
+            self.require_rank(tensor, "attention", 4)?;
+        }
+        self.require_local(query_positions)?;
+        self.require_local(key_positions)?;
+        self.require_rank(query_positions, "query positions", 2)?;
+        self.require_rank(key_positions, "key positions", 2)?;
+        require_index_dtype(query_positions.shape.dtype())?;
+        require_index_dtype(key_positions.shape.dtype())?;
+        if query.shape.dtype() != key.shape.dtype() || query.shape.dtype() != value.shape.dtype() {
+            return Err(Error::InvalidAttention("Q, K, and V dtypes must match"));
+        }
+        if key.shape.dimensions() != value.shape.dimensions() {
+            return Err(Error::InvalidAttention("K and V shapes must match"));
+        }
+        let [batch, query_len, query_heads, head_dim] = query.shape.dimensions() else {
+            unreachable!("rank was checked")
+        };
+        let [key_batch, key_len, kv_heads, key_head_dim] = key.shape.dimensions() else {
+            unreachable!("rank was checked")
+        };
+        if *batch <= 0
+            || *query_len <= 0
+            || *key_len <= 0
+            || *query_heads <= 0
+            || *kv_heads <= 0
+            || *head_dim <= 0
+        {
+            return Err(Error::InvalidAttention(
+                "batch, sequence, head count, and head dimension must be positive",
+            ));
+        }
+        if batch != key_batch || head_dim != key_head_dim {
+            return Err(Error::InvalidAttention(
+                "Q and K/V batch and head dimensions must match",
+            ));
+        }
+        if query_heads % kv_heads != 0 {
+            return Err(Error::InvalidAttention(
+                "query head count must be divisible by KV head count",
+            ));
+        }
+        if query_positions.shape.dimensions() != &[*batch, *query_len]
+            || key_positions.shape.dimensions() != &[*batch, *key_len]
+        {
+            return Err(Error::InvalidAttention(
+                "position tensors must match query and key sequence shapes",
+            ));
+        }
+        if options.sliding_window == Some(0) {
+            return Err(Error::InvalidAttention("sliding window must be nonzero"));
+        }
+        let scale = options
+            .scale
+            .unwrap_or_else(|| 1.0 / (*head_dim as f64).sqrt());
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(Error::InvalidAttention("scale must be finite and positive"));
+        }
+
+        let query_shape = query.shape;
+        let query_dtype = query.shape.dtype();
+        let groups = query_heads / kv_heads;
+        let query = self.convert(query, DType::F32)?;
+        let key = self.convert(key, DType::F32)?;
+        let value = self.convert(value, DType::F32)?;
+        let (kv_head_partition, group_partition) =
+            if matches!(key.shape.partitions()[2], Partition::Sharded(_)) {
+                (key.shape.partitions()[2], Partition::Replicated)
+            } else {
+                (key.shape.partitions()[2], query.shape.partitions()[2])
+            };
+        let grouped_query_shape = Shape::new(
+            DType::F32,
+            &[*batch, *query_len, *kv_heads, groups, *head_dim],
+        )?
+        .with_axis_tags(&[
+            query.shape.axis_tags()[0],
+            query.shape.axis_tags()[1],
+            key.shape.axis_tags()[2],
+            query.shape.axis_tags()[2],
+            query.shape.axis_tags()[3],
+        ])?
+        .with_partitions(&[
+            query.shape.partitions()[0],
+            query.shape.partitions()[1],
+            kv_head_partition,
+            group_partition,
+            query.shape.partitions()[3],
+        ])?;
+        let query = self.reshape(query, grouped_query_shape)?;
+        let query = self.transpose(query, &[0, 2, 3, 1, 4])?;
+        let key = self.transpose(key, &[0, 2, 1, 3])?;
+        let value = self.transpose(value, &[0, 2, 1, 3])?;
+        let mut scores = self.dot_general(query, key, &[0, 1], &[0, 1], &[4], &[3])?;
+        let scale = self.scalar(scale as f32)?;
+        scores = self.multiply(scores, scale)?;
+
+        let mask_shape = scores.shape;
+        let query_positions = self.convert(query_positions, DType::I64)?;
+        let key_positions = self.convert(key_positions, DType::I64)?;
+        let query_positions =
+            self.broadcast_in_dim(query_positions, mask_shape.with_dtype(DType::I64), &[0, 3])?;
+        let key_positions =
+            self.broadcast_in_dim(key_positions, mask_shape.with_dtype(DType::I64), &[0, 4])?;
+        let masked_value = self.scalar(f32::NEG_INFINITY)?;
+        if options.causal {
+            let causal = self.less_equal(key_positions, query_positions)?;
+            scores = self.select(causal, scores, masked_value)?;
+        }
+        if let Some(window) = options.sliding_window {
+            let radius = i64::try_from(window - 1)
+                .map_err(|_| Error::InvalidAttention("sliding window exceeds i64"))?;
+            let radius = self.scalar(radius)?;
+            let lower = self.subtract(query_positions, radius)?;
+            let within_lower = self.greater_equal(key_positions, lower)?;
+            scores = self.select(within_lower, scores, masked_value)?;
+            if !options.causal {
+                let upper = self.add(query_positions, radius)?;
+                let within_upper = self.less_equal(key_positions, upper)?;
+                scores = self.select(within_upper, scores, masked_value)?;
+            }
+        }
+        let weights = self.softmax(scores, 4)?;
+        let output = self.dot_general(weights, value, &[0, 1], &[0, 1], &[4], &[2])?;
+        let output = self.transpose(output, &[0, 3, 1, 2, 4])?;
+        let output = self.reshape(
+            output,
+            Shape::new(DType::F32, &[*batch, *query_len, *query_heads, *head_dim])?,
+        )?;
+        let output = self.convert(output, query_dtype)?;
+        self.reshape(output, query_shape)
+    }
+
+    /// Portable blockwise paged attention. K/V storage is
+    /// `[physical_pages, page_size, kv_heads, head_dim]`; the page table is
+    /// `[batch, logical_pages]` and sequence lengths are `[batch]`.
+    pub fn paged_attention(
+        &mut self,
+        query: Tensor,
+        key_cache: Tensor,
+        value_cache: Tensor,
+        page_table: Tensor,
+        sequence_lengths: Tensor,
+        query_positions: Tensor,
+        options: AttentionOptions,
+    ) -> Result<Tensor, Error> {
+        for tensor in [query, key_cache, value_cache] {
+            self.require_float(tensor, "paged_attention")?;
+            self.require_rank(tensor, "paged_attention", 4)?;
+        }
+        for tensor in [page_table, sequence_lengths, query_positions] {
+            self.require_local(tensor)?;
+            require_index_dtype(tensor.shape.dtype())?;
+        }
+        self.require_rank(page_table, "page table", 2)?;
+        self.require_rank(sequence_lengths, "sequence lengths", 1)?;
+        self.require_rank(query_positions, "query positions", 2)?;
+        if query.shape.dtype() != key_cache.shape.dtype()
+            || query.shape.dtype() != value_cache.shape.dtype()
+        {
+            return Err(Error::InvalidAttention(
+                "query and paged K/V cache dtypes must match",
+            ));
+        }
+        if key_cache.shape.dimensions() != value_cache.shape.dimensions() {
+            return Err(Error::InvalidAttention(
+                "paged K and V cache shapes must match",
+            ));
+        }
+        let [batch, query_len, query_heads, head_dim] = query.shape.dimensions() else {
+            unreachable!("rank was checked")
+        };
+        let [physical_pages, page_size, kv_heads, cache_head_dim] = key_cache.shape.dimensions()
+        else {
+            unreachable!("rank was checked")
+        };
+        if *batch <= 0
+            || *query_len <= 0
+            || *query_heads <= 0
+            || *head_dim <= 0
+            || *physical_pages <= 0
+            || *page_size <= 0
+            || *kv_heads <= 0
+        {
+            return Err(Error::InvalidAttention(
+                "batch, query length, page geometry, head count, and head dimension must be positive",
+            ));
+        }
+        if head_dim != cache_head_dim || query_heads % kv_heads != 0 {
+            return Err(Error::InvalidAttention(
+                "paged query/KV head geometry is incompatible",
+            ));
+        }
+        if page_table.shape.dimensions()[0] != *batch
+            || sequence_lengths.shape.dimensions() != &[*batch]
+            || query_positions.shape.dimensions() != &[*batch, *query_len]
+        {
+            return Err(Error::InvalidAttention(
+                "page table, lengths, and positions must match query batch geometry",
+            ));
+        }
+        if page_table.shape.dimensions()[1] <= 0 {
+            return Err(Error::InvalidAttention(
+                "page table must contain at least one logical page",
+            ));
+        }
+        page_table.shape.dimensions()[1]
+            .checked_mul(*page_size)
+            .ok_or(Error::InvalidAttention(
+                "logical cache capacity exceeds the I64 position domain",
+            ))?;
+        if options.sliding_window == Some(0) {
+            return Err(Error::InvalidAttention("sliding window must be nonzero"));
+        }
+        let scale = options
+            .scale
+            .unwrap_or_else(|| 1.0 / (*head_dim as f64).sqrt());
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(Error::InvalidAttention("scale must be finite and positive"));
+        }
+        let result = self.push_value("paged_attention", query.shape);
+        self.operations.push(Operation::PagedAttention {
+            query: query.value,
+            key_cache: key_cache.value,
+            value_cache: value_cache.value,
+            page_table: page_table.value,
+            sequence_lengths: sequence_lengths.value,
+            query_positions: query_positions.value,
+            result: result.value,
+            options,
+        });
+        Ok(result)
+    }
+
     /// Conventional `[batch, in] * [out, in] + [out]` linear layer.
     pub fn linear(
         &mut self,
@@ -1000,6 +1924,106 @@ impl ProgramBuilder {
         self.unary(input, operation)
     }
 
+    fn reduce(
+        &mut self,
+        input: Tensor,
+        axes: &[usize],
+        reduction: Reduction,
+    ) -> Result<Tensor, Error> {
+        self.require_local(input)?;
+        validate_axes(axes, input.shape.rank(), reduction.name())?;
+        match reduction {
+            Reduction::Sum if input.shape.dtype() == DType::Bool => {
+                return Err(Error::UnsupportedDType {
+                    operation: reduction.name(),
+                    dtype: input.shape.dtype(),
+                });
+            }
+            Reduction::Maximum
+                if !input.shape.dtype().supports_ordering()
+                    || input.shape.dtype() == DType::Bool =>
+            {
+                return Err(Error::UnsupportedDType {
+                    operation: reduction.name(),
+                    dtype: input.shape.dtype(),
+                });
+            }
+            _ => {}
+        }
+        let retained = (0..input.shape.rank())
+            .filter(|axis| !axes.contains(axis))
+            .collect::<Vec<_>>();
+        let dimensions = retained
+            .iter()
+            .map(|axis| input.shape.dimensions()[*axis])
+            .collect::<Vec<_>>();
+        let tags = retained
+            .iter()
+            .map(|axis| input.shape.axis_tags()[*axis])
+            .collect::<Vec<_>>();
+        let partitions = retained
+            .iter()
+            .map(|axis| input.shape.partitions()[*axis])
+            .collect::<Vec<_>>();
+        let shape = Shape::new(input.shape.dtype(), &dimensions)?
+            .with_axis_tags(&tags)?
+            .with_partitions(&partitions)?;
+        let init = match reduction {
+            Reduction::Sum => self.zero_for(input.shape.dtype())?,
+            Reduction::Maximum => self.minimum_for(input.shape.dtype())?,
+        };
+        let result = self.push_value(reduction.name(), shape);
+        self.operations.push(Operation::Reduce {
+            input: input.value,
+            init: init.value,
+            result: result.value,
+            axes: axes.to_vec(),
+            reduction,
+        });
+        Ok(result)
+    }
+
+    fn broadcast_reduction(
+        &mut self,
+        input: Tensor,
+        result_shape: Shape,
+        reduced_axes: &[usize],
+    ) -> Result<Tensor, Error> {
+        let dimensions = (0..result_shape.rank())
+            .filter(|axis| !reduced_axes.contains(axis))
+            .collect::<Vec<_>>();
+        self.broadcast_in_dim(input, result_shape, &dimensions)
+    }
+
+    fn validate_dynamic_starts(&self, starts: &[Tensor], rank: usize) -> Result<(), Error> {
+        if starts.len() != rank {
+            return Err(Error::AxisCountMismatch);
+        }
+        let mut dtype = None;
+        for start in starts {
+            self.require_local(*start)?;
+            if start.shape.rank() != 0 {
+                return Err(Error::RankMismatch {
+                    operation: "dynamic slice start",
+                    expected: 0,
+                    actual: start.shape.rank(),
+                });
+            }
+            require_index_dtype(start.shape.dtype())?;
+            if let Some(dtype) = dtype {
+                if dtype != start.shape.dtype() {
+                    return Err(Error::DTypeMismatch {
+                        left: dtype,
+                        right: start.shape.dtype(),
+                    });
+                }
+            } else {
+                dtype = Some(start.shape.dtype());
+            }
+        }
+        Ok(())
+    }
+
     fn require_float(&self, input: Tensor, operation: &'static str) -> Result<(), Error> {
         self.require_local(input)?;
         if input.shape.dtype().class() == DTypeClass::Float {
@@ -1020,6 +2044,53 @@ impl ProgramBuilder {
             DType::F64 => self.scalar(value),
             _ => Err(Error::UnsupportedDType {
                 operation: "floating-point scalar",
+                dtype,
+            }),
+        }
+    }
+
+    fn zero_for(&mut self, dtype: DType) -> Result<Tensor, Error> {
+        match dtype {
+            DType::Bool => self.scalar(false),
+            DType::I8 => self.scalar(0i8),
+            DType::I16 => self.scalar(0i16),
+            DType::I32 => self.scalar(0i32),
+            DType::I64 => self.scalar(0i64),
+            DType::U8 => self.scalar(0u8),
+            DType::U16 => self.scalar(0u16),
+            DType::U32 => self.scalar(0u32),
+            DType::U64 => self.scalar(0u64),
+            DType::F16 => self.scalar(F16::from_f32(0.0)),
+            DType::Bf16 => self.scalar(BFloat16::from_f32(0.0)),
+            DType::F32 => self.scalar(0.0f32),
+            DType::F64 => self.scalar(0.0f64),
+            DType::C64 => self.scalar(Complex64 {
+                real: 0.0,
+                imaginary: 0.0,
+            }),
+            DType::C128 => self.scalar(Complex128 {
+                real: 0.0,
+                imaginary: 0.0,
+            }),
+        }
+    }
+
+    fn minimum_for(&mut self, dtype: DType) -> Result<Tensor, Error> {
+        match dtype {
+            DType::I8 => self.scalar(i8::MIN),
+            DType::I16 => self.scalar(i16::MIN),
+            DType::I32 => self.scalar(i32::MIN),
+            DType::I64 => self.scalar(i64::MIN),
+            DType::U8 => self.scalar(u8::MIN),
+            DType::U16 => self.scalar(u16::MIN),
+            DType::U32 => self.scalar(u32::MIN),
+            DType::U64 => self.scalar(u64::MIN),
+            DType::F16 => self.scalar(F16::from_f32(f32::NEG_INFINITY)),
+            DType::Bf16 => self.scalar(BFloat16::from_f32(f32::NEG_INFINITY)),
+            DType::F32 => self.scalar(f32::NEG_INFINITY),
+            DType::F64 => self.scalar(f64::NEG_INFINITY),
+            _ => Err(Error::UnsupportedDType {
+                operation: "reduce_max",
                 dtype,
             }),
         }
@@ -1116,9 +2187,127 @@ fn require_supported_layout(shape: Shape) -> Result<(), Error> {
     }
 }
 
+fn require_index_dtype(dtype: DType) -> Result<(), Error> {
+    match dtype.class() {
+        DTypeClass::SignedInteger | DTypeClass::UnsignedInteger => Ok(()),
+        _ => Err(Error::InvalidIndexDType(dtype)),
+    }
+}
+
 impl Default for ProgramBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn rope_frequencies(options: RopeOptions) -> Result<Vec<f32>, Error> {
+    let half = options.rotary_dimensions / 2;
+    let mut frequencies = (0..half)
+        .map(|index| options.base.powf(-(index as f64) / half as f64))
+        .collect::<Vec<_>>();
+    match options.scaling {
+        RopeScaling::Default => {}
+        RopeScaling::Linear { factor } => {
+            if !factor.is_finite() || factor <= 0.0 {
+                return Err(Error::InvalidRope(
+                    "linear scaling factor must be finite and positive",
+                ));
+            }
+            for frequency in &mut frequencies {
+                *frequency /= factor;
+            }
+        }
+        RopeScaling::Proportional { rotary_fraction } => {
+            if !rotary_fraction.is_finite() || !(0.0..=1.0).contains(&rotary_fraction) {
+                return Err(Error::InvalidRope(
+                    "proportional rotary fraction must be between zero and one",
+                ));
+            }
+            let retained = (half as f64 * rotary_fraction).floor() as usize;
+            frequencies[retained..].fill(0.0);
+        }
+        RopeScaling::Llama3 {
+            factor,
+            high_frequency_factor,
+            low_frequency_factor,
+            original_context,
+            truncate,
+        } => {
+            validate_extended_rope(
+                factor,
+                high_frequency_factor,
+                low_frequency_factor,
+                original_context,
+            )?;
+            let context = original_context as f64;
+            let high = high_frequency_factor * std::f64::consts::TAU / context;
+            let low = low_frequency_factor * std::f64::consts::TAU / context;
+            let downscale = factor.recip();
+            for frequency in &mut frequencies {
+                if *frequency < low {
+                    *frequency *= downscale;
+                } else if *frequency <= high {
+                    let mut interpolation = (*frequency - low) / (high - low);
+                    if truncate {
+                        interpolation = interpolation.clamp(0.0, 1.0);
+                    }
+                    *frequency *= interpolation + (1.0 - interpolation) * downscale;
+                }
+            }
+        }
+        RopeScaling::Yarn {
+            factor,
+            beta_fast,
+            beta_slow,
+            original_context,
+            truncate,
+        } => {
+            validate_extended_rope(factor, beta_fast, beta_slow, original_context)?;
+            let context = original_context as f64;
+            let high = beta_fast * std::f64::consts::TAU / context;
+            let low = beta_slow * std::f64::consts::TAU / context;
+            let mut low_index = -high.ln() / options.base.ln() * half as f64;
+            let mut high_index = -low.ln() / options.base.ln() * half as f64;
+            if truncate {
+                low_index = low_index.floor();
+                high_index = high_index.ceil();
+            }
+            if high_index <= low_index {
+                return Err(Error::InvalidRope("Yarn transition interval is empty"));
+            }
+            let downscale = factor.recip();
+            for (index, frequency) in frequencies.iter_mut().enumerate() {
+                if *frequency < low {
+                    *frequency *= downscale;
+                } else if *frequency <= high {
+                    let interpolation = (high_index - index as f64) / (high_index - low_index);
+                    *frequency *= interpolation + (1.0 - interpolation) * downscale;
+                }
+            }
+        }
+    }
+    Ok(frequencies.into_iter().map(|value| value as f32).collect())
+}
+
+fn validate_extended_rope(
+    factor: f64,
+    high: f64,
+    low: f64,
+    original_context: usize,
+) -> Result<(), Error> {
+    if !factor.is_finite()
+        || factor <= 0.0
+        || !high.is_finite()
+        || !low.is_finite()
+        || low <= 0.0
+        || low >= high
+        || original_context == 0
+    {
+        Err(Error::InvalidRope(
+            "extended scaling requires a positive factor/context and ordered frequencies",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -1205,6 +2394,39 @@ impl Program {
         }
 
         for operation in &self.operations {
+            if let Operation::PagedAttention {
+                query,
+                key_cache,
+                value_cache,
+                page_table,
+                sequence_lengths,
+                query_positions,
+                result,
+                options,
+            } = operation
+            {
+                values[*result] = Some(paged_attention::lower(
+                    context,
+                    &mut block,
+                    paged_attention::Inputs {
+                        query: mlir_value(&values, *query),
+                        key_cache: mlir_value(&values, *key_cache),
+                        value_cache: mlir_value(&values, *value_cache),
+                        page_table: mlir_value(&values, *page_table),
+                        sequence_lengths: mlir_value(&values, *sequence_lengths),
+                        query_positions: mlir_value(&values, *query_positions),
+                        query_shape: self.values[*query].shape,
+                        cache_shape: self.values[*key_cache].shape,
+                        page_table_shape: self.values[*page_table].shape,
+                        page_table_dtype: self.values[*page_table].shape.dtype(),
+                        sequence_lengths_dtype: self.values[*sequence_lengths].shape.dtype(),
+                        query_positions_dtype: self.values[*query_positions].shape.dtype(),
+                        result_type: types[*result],
+                        options: *options,
+                    },
+                )?);
+                continue;
+            }
             let (result, result_index) = match operation {
                 Operation::Constant { result, literal } => (
                     context.constant(types[*result], context.parse_attribute(literal)?)?,
@@ -1287,6 +2509,142 @@ impl Program {
                     )?,
                     *result,
                 ),
+                Operation::Iota { result, axis } => {
+                    (context.iota(types[*result], *axis as i64)?, *result)
+                }
+                Operation::Concatenate {
+                    inputs,
+                    result,
+                    axis,
+                } => (
+                    context.concatenate(
+                        &inputs
+                            .iter()
+                            .map(|input| mlir_value(&values, *input))
+                            .collect::<Vec<_>>(),
+                        types[*result],
+                        *axis as i64,
+                    )?,
+                    *result,
+                ),
+                Operation::Slice {
+                    input,
+                    result,
+                    starts,
+                    limits,
+                    strides,
+                } => (
+                    context.slice(
+                        mlir_value(&values, *input),
+                        types[*result],
+                        starts,
+                        limits,
+                        strides,
+                    )?,
+                    *result,
+                ),
+                Operation::DynamicSlice {
+                    input,
+                    starts,
+                    result,
+                    sizes,
+                } => (
+                    context.dynamic_slice(
+                        mlir_value(&values, *input),
+                        &starts
+                            .iter()
+                            .map(|start| mlir_value(&values, *start))
+                            .collect::<Vec<_>>(),
+                        types[*result],
+                        sizes,
+                    )?,
+                    *result,
+                ),
+                Operation::DynamicUpdateSlice {
+                    input,
+                    update,
+                    starts,
+                    result,
+                } => (
+                    context.dynamic_update_slice(
+                        mlir_value(&values, *input),
+                        mlir_value(&values, *update),
+                        &starts
+                            .iter()
+                            .map(|start| mlir_value(&values, *start))
+                            .collect::<Vec<_>>(),
+                        types[*result],
+                    )?,
+                    *result,
+                ),
+                Operation::Gather {
+                    input,
+                    indices,
+                    result,
+                    axis,
+                    slice_size,
+                    collapse_axis,
+                } => {
+                    let input_rank = self.values[*input].shape.rank();
+                    let indices_rank = self.values[*indices].shape.rank();
+                    let retained_rank = input_rank - usize::from(*collapse_axis);
+                    let offset_dims = (indices_rank..indices_rank + retained_rank)
+                        .map(|dimension| dimension as i64)
+                        .collect::<Vec<_>>();
+                    let mut slice_sizes = self.values[*input].shape.dimensions().to_vec();
+                    slice_sizes[*axis] = *slice_size;
+                    let collapsed = collapse_axis.then_some(*axis as i64);
+                    (
+                        context.gather(
+                            mlir_value(&values, *input),
+                            mlir_value(&values, *indices),
+                            types[*result],
+                            &offset_dims,
+                            collapsed.as_slice(),
+                            &[],
+                            &[],
+                            &[*axis as i64],
+                            indices_rank as i64,
+                            &slice_sizes,
+                            false,
+                        )?,
+                        *result,
+                    )
+                }
+                Operation::Reduce {
+                    input,
+                    init,
+                    result,
+                    axes,
+                    reduction,
+                } => {
+                    let scalar_type =
+                        context.ranked_tensor_type(self.values[*input].shape.dtype(), &[])?;
+                    let mut reduction_block = Block::new(context, &[scalar_type, scalar_type])?;
+                    let left = reduction_block.argument(0)?;
+                    let right = reduction_block.argument(1)?;
+                    let combine = match reduction {
+                        Reduction::Sum => context.add(left, right, scalar_type)?,
+                        Reduction::Maximum => {
+                            context.binary(StableHloBinary::Maximum, left, right, scalar_type)?
+                        }
+                    };
+                    let combined = combine.result(0)?;
+                    reduction_block.append_operation(combine)?;
+                    reduction_block.append_operation(context.stablehlo_return(&[combined])?)?;
+                    let mut reduction_body = Region::new(context)?;
+                    reduction_body.append_block(reduction_block)?;
+                    (
+                        context.reduce(
+                            mlir_value(&values, *input),
+                            mlir_value(&values, *init),
+                            types[*result],
+                            &axes_i64(axes),
+                            reduction_body,
+                        )?,
+                        *result,
+                    )
+                }
                 Operation::Complex {
                     real,
                     imaginary,
@@ -1436,6 +2794,9 @@ impl Program {
                         *result,
                     )
                 }
+                Operation::PagedAttention { .. } => {
+                    unreachable!("paged attention is lowered before scalar operations")
+                }
             };
             values[result_index] = Some(result.result(0)?);
             block.append_operation(result)?;
@@ -1524,6 +2885,59 @@ enum Operation {
         input: usize,
         result: usize,
         dimensions: Vec<usize>,
+    },
+    Iota {
+        result: usize,
+        axis: usize,
+    },
+    Concatenate {
+        inputs: Vec<usize>,
+        result: usize,
+        axis: usize,
+    },
+    Slice {
+        input: usize,
+        result: usize,
+        starts: Vec<i64>,
+        limits: Vec<i64>,
+        strides: Vec<i64>,
+    },
+    DynamicSlice {
+        input: usize,
+        starts: Vec<usize>,
+        result: usize,
+        sizes: Vec<i64>,
+    },
+    DynamicUpdateSlice {
+        input: usize,
+        update: usize,
+        starts: Vec<usize>,
+        result: usize,
+    },
+    Gather {
+        input: usize,
+        indices: usize,
+        result: usize,
+        axis: usize,
+        slice_size: i64,
+        collapse_axis: bool,
+    },
+    Reduce {
+        input: usize,
+        init: usize,
+        result: usize,
+        axes: Vec<usize>,
+        reduction: Reduction,
+    },
+    PagedAttention {
+        query: usize,
+        key_cache: usize,
+        value_cache: usize,
+        page_table: usize,
+        sequence_lengths: usize,
+        query_positions: usize,
+        result: usize,
+        options: AttentionOptions,
     },
     Complex {
         real: usize,
@@ -1622,6 +3036,21 @@ enum Unary {
     Sin,
     Cos,
     Logistic,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Reduction {
+    Sum,
+    Maximum,
+}
+
+impl Reduction {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Sum => "reduce_sum",
+            Self::Maximum => "reduce_max",
+        }
+    }
 }
 
 impl Unary {
@@ -1756,22 +3185,22 @@ fn dense_literal(value: &Slice<'_>) -> Result<String, Error> {
         DType::F16 => value
             .items::<F16>()?
             .iter()
-            .map(|value| float_literal(value.to_f32() as f64))
+            .map(|value| float_literal_f16(*value))
             .collect(),
         DType::Bf16 => value
             .items::<BFloat16>()?
             .iter()
-            .map(|value| float_literal(value.to_f32() as f64))
+            .map(|value| float_literal_bf16(*value))
             .collect(),
         DType::F32 => value
             .items::<f32>()?
             .iter()
-            .map(|value| float_literal(*value as f64))
+            .map(|value| float_literal_f32(*value))
             .collect(),
         DType::F64 => value
             .items::<f64>()?
             .iter()
-            .map(|value| float_literal(*value))
+            .map(|value| float_literal_f64(*value))
             .collect(),
         DType::C64 => value
             .items::<Complex64>()?
@@ -1779,8 +3208,8 @@ fn dense_literal(value: &Slice<'_>) -> Result<String, Error> {
             .map(|value| {
                 format!(
                     "({}, {})",
-                    float_literal(value.real as f64),
-                    float_literal(value.imaginary as f64)
+                    float_literal_f32(value.real),
+                    float_literal_f32(value.imaginary)
                 )
             })
             .collect(),
@@ -1790,8 +3219,8 @@ fn dense_literal(value: &Slice<'_>) -> Result<String, Error> {
             .map(|value| {
                 format!(
                     "({}, {})",
-                    float_literal(value.real),
-                    float_literal(value.imaginary)
+                    float_literal_f64(value.real),
+                    float_literal_f64(value.imaginary)
                 )
             })
             .collect(),
@@ -1869,16 +3298,41 @@ fn decimal_elements<T: ToString>(values: &[T]) -> Vec<String> {
     values.iter().map(ToString::to_string).collect()
 }
 
-fn float_literal(value: f64) -> String {
-    if value.is_nan() {
-        "nan".to_owned()
-    } else if value == f64::INFINITY {
-        "inf".to_owned()
-    } else if value == f64::NEG_INFINITY {
-        "-inf".to_owned()
+fn float_literal_f16(value: F16) -> String {
+    if value.to_f32().is_finite() {
+        finite_float_literal(value.to_f32() as f64)
     } else {
-        format!("{value:.17e}")
+        format!("0x{:04X}", value.to_bits())
     }
+}
+
+fn float_literal_bf16(value: BFloat16) -> String {
+    if value.to_f32().is_finite() {
+        finite_float_literal(value.to_f32() as f64)
+    } else {
+        format!("0x{:04X}", value.to_bits())
+    }
+}
+
+fn float_literal_f32(value: f32) -> String {
+    if value.is_finite() {
+        finite_float_literal(value as f64)
+    } else {
+        format!("0x{:08X}", value.to_bits())
+    }
+}
+
+fn float_literal_f64(value: f64) -> String {
+    if value.is_finite() {
+        finite_float_literal(value)
+    } else {
+        format!("0x{:016X}", value.to_bits())
+    }
+}
+
+fn finite_float_literal(value: f64) -> String {
+    debug_assert!(value.is_finite());
+    format!("{value:.17e}")
 }
 
 fn mlir_value<'context>(

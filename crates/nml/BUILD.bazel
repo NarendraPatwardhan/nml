@@ -77,6 +77,48 @@ nml_rust_test(
     ],
 )
 
+nml_rust_test(
+    name = "attention_cpu_contract_test",
+    size = "large",
+    srcs = ["tests/attention_contract.rs"],
+    crate_root = "tests/attention_contract.rs",
+    rustc_env = {"NML_ATTENTION_BACKEND": "cpu"},
+    deps = [
+        ":nml",
+        "//crates/nml-ir:nml_ir",
+        "//crates/nml-tensor:nml_tensor",
+        "//crates/nml-types:nml_types",
+        "@rust_crates//safetensors",
+    ],
+)
+
+nml_rust_test(
+    name = "attention_cuda_contract_test",
+    size = "large",
+    srcs = ["tests/attention_contract.rs"],
+    crate_root = "tests/attention_contract.rs",
+    local = True,
+    rustc_env = {"NML_ATTENTION_BACKEND": "cuda"},
+    tags = [
+        "external",
+        "requires-gpu",
+    ],
+    data = ["//platforms/cuda:runtime"],
+    env = {
+        "NML_CUDA_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime)",
+    },
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": ["@platforms//os:linux"],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":nml",
+        "//crates/nml-ir:nml_ir",
+        "//crates/nml-tensor:nml_tensor",
+        "//crates/nml-types:nml_types",
+        "@rust_crates//safetensors",
+    ],
+)
 
 # As with the low-level runtime contract, this output-only edge lets a remote
 # builder cache the exact test binary while leaving CUDA runtime assembly to
@@ -84,6 +126,13 @@ nml_rust_test(
 filegroup(
     name = "linear_cuda_contract_binary",
     srcs = [":linear_cuda_contract_test"],
+    testonly = True,
+    visibility = ["//:__pkg__"],
+)
+
+filegroup(
+    name = "attention_cuda_contract_binary",
+    srcs = [":attention_cuda_contract_test"],
     testonly = True,
     visibility = ["//:__pkg__"],
 )

@@ -4,7 +4,10 @@ load("//bazel:rust.bzl", "nml_rust_library", "nml_rust_test")
 
 nml_rust_library(
     name = "nml_ir",
-    srcs = ["src/lib.rs"],
+    srcs = [
+        "src/lib.rs",
+        "src/paged_attention.rs",
+    ],
     crate_root = "src/lib.rs",
     deps = [
         "//crates/nml-mlir:nml_mlir",

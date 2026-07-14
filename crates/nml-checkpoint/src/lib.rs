@@ -391,7 +391,7 @@ pub mod safetensors {
     }
 
     fn map_dtype(dtype: ::safetensors::Dtype) -> Result<DType, super::Error> {
-        use ::safetensors::Dtype as S;
+        use safetensors::Dtype as S;
         match dtype {
             S::BOOL => Ok(DType::Bool),
             S::I8 => Ok(DType::I8),
@@ -647,6 +647,194 @@ pub mod io {
                 .borrow_mut()
                 .builder
                 .transpose(input, permutation)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn broadcast_in_dim(
+            &self,
+            input: Tensor,
+            shape: Shape,
+            dimensions: &[usize],
+        ) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .broadcast_in_dim(input, shape, dimensions)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn iota(&self, shape: Shape, axis: usize) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .iota(shape, axis)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn concatenate(&self, inputs: &[Tensor], axis: usize) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .concatenate(inputs, axis)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn slice(
+            &self,
+            input: Tensor,
+            starts: &[i64],
+            limits: &[i64],
+            strides: &[i64],
+        ) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .slice(input, starts, limits, strides)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn dynamic_slice(
+            &self,
+            input: Tensor,
+            starts: &[Tensor],
+            sizes: &[i64],
+        ) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .dynamic_slice(input, starts, sizes)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn dynamic_update_slice(
+            &self,
+            input: Tensor,
+            update: Tensor,
+            starts: &[Tensor],
+        ) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .dynamic_update_slice(input, update, starts)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn gather(
+            &self,
+            input: Tensor,
+            indices: Tensor,
+            axis: usize,
+        ) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .gather(input, indices, axis)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn gather_slices(
+            &self,
+            input: Tensor,
+            indices: Tensor,
+            axis: usize,
+            slice_size: i64,
+        ) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .gather_slices(input, indices, axis, slice_size)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn reduce_sum(&self, input: Tensor, axes: &[usize]) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .reduce_sum(input, axes)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn reduce_max(&self, input: Tensor, axes: &[usize]) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .reduce_max(input, axes)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn softmax(&self, input: Tensor, axis: usize) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .softmax(input, axis)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn rms_norm(
+            &self,
+            input: Tensor,
+            weight: Option<Tensor>,
+            axis: usize,
+            epsilon: f64,
+        ) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .rms_norm(input, weight, axis, epsilon)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn rope(
+            &self,
+            input: Tensor,
+            positions: Tensor,
+            options: nml_ir::RopeOptions,
+        ) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .rope(input, positions, options)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn attention(
+            &self,
+            query: Tensor,
+            key: Tensor,
+            value: Tensor,
+            query_positions: Tensor,
+            key_positions: Tensor,
+            options: nml_ir::AttentionOptions,
+        ) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .attention(query, key, value, query_positions, key_positions, options)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn paged_attention(
+            &self,
+            query: Tensor,
+            key_cache: Tensor,
+            value_cache: Tensor,
+            page_table: Tensor,
+            sequence_lengths: Tensor,
+            query_positions: Tensor,
+            options: nml_ir::AttentionOptions,
+        ) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .paged_attention(
+                    query,
+                    key_cache,
+                    value_cache,
+                    page_table,
+                    sequence_lengths,
+                    query_positions,
+                    options,
+                )
                 .map_err(super::Error::Ir)
         }
 
@@ -1082,8 +1270,8 @@ pub mod io {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use ::safetensors::tensor::{Dtype, View};
         use nml_types::{DType, Shape};
+        use safetensors::tensor::{Dtype, View};
         use std::borrow::Cow;
 
         struct Tied {

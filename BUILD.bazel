@@ -76,6 +76,7 @@ _COMMON_CONTRACTS = [
     "//crates/nml-types:types_contract_test",
     "//crates/nml-xla:compile_options_contract_test",
     "//crates/nml:linear_cpu_contract_test",
+    "//crates/nml:attention_cpu_contract_test",
     "//crates/nml:structural_contract_test",
 ]
 
@@ -83,6 +84,7 @@ _CUDA_RUNTIME_CONTRACTS = [
     "//crates/nml-pjrt-cuda:cuda_package_contract_test",
     "//crates/nml-pjrt-cuda:cuda_runtime_contract_test",
     "//crates/nml:linear_cuda_contract_test",
+    "//crates/nml:attention_cuda_contract_test",
 ]
 
 # These suites encode where a contract can truthfully execute. They do not
@@ -119,6 +121,7 @@ filegroup(
         "//crates/nml-pjrt-cuda:cuda_package_contract_binary",
         "//crates/nml-pjrt-cuda:cuda_runtime_contract_binary",
         "//crates/nml:linear_cuda_contract_binary",
+        "//crates/nml:attention_cuda_contract_binary",
     ],
     testonly = True,
     visibility = ["//visibility:public"],

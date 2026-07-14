@@ -8,3 +8,8 @@ pub use nml_ir::Tensor;
 pub use nml_runtime::{Buffer, Bufferized, Exe, Memory, NmlStruct, Platform, Sharding, exe};
 pub use nml_tensor::Slice;
 pub use nml_types::{AxisTag, DType as DataType, Partition, Shape};
+
+pub mod attention {
+    pub use nml_ir::{AttentionOptions as Options, RopeLayout, RopeOptions, RopeScaling};
+    pub use nml_runtime::{Cache, CacheSpec};
+}

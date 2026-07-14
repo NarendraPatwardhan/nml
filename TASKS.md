@@ -476,6 +476,125 @@ model; compiler implementation records do not become product concepts.
 
 ---
 
+# Milestone 4: portable attention semantics and paged KV state
+
+This milestone ports ZML's real tensor/StableHLO attention foundation and adds
+the portable paged path required by D-032. CPU and CUDA consume the same graph
+semantics. The root API gains only the small attention configuration and cache
+descriptions that a model author must provide; operation records, reduction
+regions, loop state, page traversal, and backend dispatch remain internal.
+
+## 1. Attention prerequisite operations
+
+- [x] Add dimension-aware `iota`, concatenate, static slice, dynamic slice,
+      dynamic update slice, and general gather operations with checked shapes,
+      indices, layouts, logical axes, and partitions.
+- [x] Add generic single-input sum and maximum reductions with correctly typed
+      identities, region ownership, retained non-reduced metadata, and explicit
+      accumulation dtype where required.
+- [x] Add numerically stable softmax and RMS normalization composites, including
+      FP32 accumulation for FP16/BF16 and conversion back to the input dtype.
+- [x] Preserve ZML's explicit broadcasting rules and reject implicit rank
+      expansion, invalid gather dimension numbers, out-of-range static slices,
+      and unsupported reduction dtypes before MLIR emission.
+- [x] Expose the required operations through `TensorStore` without exporting
+      public operation, reduction, or gather-configuration enums at NML's root.
+
+## 2. StableHLO control-flow ownership
+
+- [x] Add RAII builders for `stablehlo.reduce`, `stablehlo.return`,
+      `stablehlo.while`, and loop/reduction regions using the existing owned
+      `Region`, `Block`, `Operation`, and `Value` model.
+- [x] Represent attention loop state without allowing foreign tensors,
+      cross-context values, mismatched result types, or unterminated regions.
+- [x] Carry a bounded runtime loop index and tensor state through
+      `stablehlo.while`; general paged attention must not scale graph size with
+      maximum page count.
+- [x] Pass deterministic text, bytecode, verification, invalid-region, and XLA
+      compilation contracts for reductions and loop-carried tensors.
+
+## 3. RoPE, masks, and ordinary attention
+
+- [x] Implement interleaved and sequential rotary embeddings from position
+      tensors, with configurable base/scaling and checked even rotary width.
+- [x] Implement causal, non-causal, and sliding-window masks from runtime query
+      and key positions, using negative infinity plus ZML-compatible zero output
+      for a completely masked row.
+- [x] Implement scaled dot-product attention with FP32 score/softmax
+      accumulation and input-dtype output.
+- [x] Support MHA, GQA, and MQA without materializing repeated persistent KV
+      heads; validate query-to-KV head divisibility and semantic head axes.
+- [x] Support prefill, single-token decode, and multi-token decode through the
+      same ordinary attention graph.
+
+## 4. Persistent dense and paged KV state
+
+- [x] Define the compact public cache description needed to allocate split K/V
+      storage, page tables, sequence lengths, and compile-time capacity bounds.
+- [x] Allocate dense and paged caches as ordinary persistent `Buffer` values on
+      the selected platform and sharding, with no backend-specific public cache
+      type.
+- [x] Implement append/update graphs for dense and paged K/V storage using
+      dynamic updates, returning aliasable cache outputs rather than allocating
+      replacement storage on every decode step.
+- [x] Validate page size, physical/logical capacity, page identifiers, sequence
+      lengths, batch ownership, dtype, head geometry, platform, and sharding
+      before execution.
+- [x] Support deterministic truncate, rollback, and replay by updating logical
+      lengths/page tables without copying unaffected K/V pages.
+
+## 5. Portable blockwise paged attention
+
+- [x] Traverse logical pages with bounded `stablehlo.while` and gather physical
+      K/V pages directly from the page table.
+- [x] Carry the online-softmax running maximum, rescaled denominator, and value
+      accumulator in FP32 across pages, including fully masked pages without
+      producing NaNs.
+- [x] Apply runtime tail-token, causal, non-causal, and sliding-window masks
+      before page-local reductions.
+- [x] Support MHA, GQA, and MQA head mapping, prefill, single-token decode, and
+      multi-token decode without expanding persistent KV heads.
+- [x] Prove through graph and allocation contracts that the product path does
+      not materialize a contiguous logical KV cache or the complete attention
+      score matrix.
+- [x] Keep the same StableHLO implementation executable on CPU and CUDA as the
+      correctness/performance path and CUDA fallback required by D-032.
+
+## 6. Integrated product contracts
+
+- [x] Compare ordinary and paged attention against independent dense host math
+      for FP32, FP16, and BF16 with dtype-appropriate tolerances.
+- [x] Cover empty context, partially occupied final pages, non-contiguous and
+      shared physical pages, boundary capacities, invalid page identifiers,
+      and invalid sequence lengths.
+- [x] Cover causal and non-causal attention, sliding windows, MHA/GQA/MQA,
+      prefill, single-token decode, and multi-token decode.
+- [x] Execute successive cache updates, repeated decode calls, truncation,
+      rollback, and replay while proving storage identity and unaffected-page
+      contents remain stable.
+- [x] Execute the same checkpoint-backed attention block and cache lifecycle on
+      CPU and real CUDA through the compact public API.
+- [x] Exercise Shardy-compatible head/batch placement without introducing a
+      second attention or cache representation.
+
+## Milestone 4 acceptance
+
+- [x] All tests are permanent product contracts; no probe, smoke, spike, demo,
+      compatibility-only, or temporary target remains.
+- [x] BuildBuddy executes the CPU and CUDA-remote contract suites and compiles
+      the exact CUDA runtime contract binaries without assembling CUDA runtime
+      data remotely.
+- [x] The NVIDIA host executes the cached ordinary/paged attention and cache
+      contracts on the real supported GPU.
+- [ ] The pushed revision's BuildBuddy workflow passes while reusing the remote
+      cache.
+- [x] `git diff --check`
+- [ ] Milestone 4 is complete only when ordinary attention, portable blockwise
+      paged attention, and persistent rollback-capable KV state execute through
+      the compact public API on CPU and CUDA without dense-cache materialization.
+
+---
+
 # Capability ledger
 
 This high-level ledger remains at the end of this file while detailed work is
@@ -495,9 +614,9 @@ themselves complete an item.
 - [ ] Convolution and pooling.
 - [ ] Random-number generation.
 - [ ] Sorting, top-k, and sampling.
-- [ ] Attention, RoPE, and masks.
-- [ ] Persistent KV-cache allocation, updates, paging, truncation, rollback,
-      and replay.
+- [x] Portable ordinary and blockwise paged attention, RoPE, and masks.
+- [x] Persistent KV-cache allocation, page-table updates, paging, truncation,
+      rollback, and replay without a persistent dense KV copy.
 - [ ] CUDA FlashAttention and Triton kernels.
 - [ ] MoE routing and grouped matrix multiplication.
 - [ ] Quantization: W4A16, W8A8, and NVFP4. `DEFERRED` by D-028 until the

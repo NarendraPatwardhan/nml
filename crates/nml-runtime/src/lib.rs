@@ -9,7 +9,7 @@ use nml_ir::{InputKind, Program};
 use nml_pjrt::{Client, Device, LoadedExecutable};
 pub use nml_sharding::Sharding;
 use nml_tensor::Slice;
-use nml_types::Shape;
+use nml_types::{DType, DTypeClass, Shape};
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::fmt;
@@ -373,6 +373,381 @@ pub enum Memory {
     Device,
     HostPinned,
     HostUnpinned,
+}
+
+/// Capacity and tensor geometry for one dense or paged K/V cache.
+///
+/// Constructors keep the layout choice explicit without exporting separate
+/// backend-specific cache types. CUDA and CPU own the same logical state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CacheSpec {
+    dtype: DType,
+    batch: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    layout: CacheLayout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CacheLayout {
+    Dense {
+        capacity: usize,
+    },
+    Paged {
+        physical_pages: usize,
+        logical_pages: usize,
+        page_size: usize,
+    },
+}
+
+impl CacheSpec {
+    pub fn dense(
+        dtype: DType,
+        batch: usize,
+        capacity: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self, Error> {
+        let spec = Self {
+            dtype,
+            batch,
+            kv_heads,
+            head_dim,
+            layout: CacheLayout::Dense { capacity },
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn paged(
+        dtype: DType,
+        batch: usize,
+        physical_pages: usize,
+        logical_pages: usize,
+        page_size: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self, Error> {
+        let spec = Self {
+            dtype,
+            batch,
+            kv_heads,
+            head_dim,
+            layout: CacheLayout::Paged {
+                physical_pages,
+                logical_pages,
+                page_size,
+            },
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    pub const fn dtype(self) -> DType {
+        self.dtype
+    }
+
+    pub const fn batch(self) -> usize {
+        self.batch
+    }
+
+    pub const fn capacity(self) -> usize {
+        match self.layout {
+            CacheLayout::Dense { capacity } => capacity,
+            CacheLayout::Paged {
+                logical_pages,
+                page_size,
+                ..
+            } => logical_pages * page_size,
+        }
+    }
+
+    pub fn key_value_shape(self) -> Result<Shape, Error> {
+        let dimensions = match self.layout {
+            CacheLayout::Dense { capacity } => [
+                to_i64(self.batch)?,
+                to_i64(capacity)?,
+                to_i64(self.kv_heads)?,
+                to_i64(self.head_dim)?,
+            ],
+            CacheLayout::Paged {
+                physical_pages,
+                page_size,
+                ..
+            } => [
+                to_i64(physical_pages)?,
+                to_i64(page_size)?,
+                to_i64(self.kv_heads)?,
+                to_i64(self.head_dim)?,
+            ],
+        };
+        Shape::new(self.dtype, &dimensions)
+            .map_err(nml_tensor::Error::from)
+            .map_err(Into::into)
+    }
+
+    pub fn page_table_shape(self) -> Result<Option<Shape>, Error> {
+        match self.layout {
+            CacheLayout::Dense { .. } => Ok(None),
+            CacheLayout::Paged { logical_pages, .. } => Ok(Some(
+                Shape::new(DType::I64, &[to_i64(self.batch)?, to_i64(logical_pages)?])
+                    .map_err(nml_tensor::Error::from)?,
+            )),
+        }
+    }
+
+    pub fn lengths_shape(self) -> Result<Shape, Error> {
+        Shape::new(DType::I64, &[to_i64(self.batch)?])
+            .map_err(nml_tensor::Error::from)
+            .map_err(Error::Tensor)
+    }
+
+    fn validate(self) -> Result<(), Error> {
+        if self.dtype.class() != DTypeClass::Float {
+            return Err(Error::InvalidCache("cache dtype must be floating point"));
+        }
+        if self.batch == 0 || self.kv_heads == 0 || self.head_dim == 0 {
+            return Err(Error::InvalidCache(
+                "batch, KV heads, and head dimension must be nonzero",
+            ));
+        }
+        match self.layout {
+            CacheLayout::Dense { capacity } if capacity == 0 => {
+                Err(Error::InvalidCache("dense capacity must be nonzero"))
+            }
+            CacheLayout::Paged {
+                physical_pages,
+                logical_pages,
+                page_size,
+            } if physical_pages == 0 || logical_pages == 0 || page_size == 0 => Err(
+                Error::InvalidCache("paged capacities and page size must be nonzero"),
+            ),
+            CacheLayout::Paged {
+                logical_pages,
+                page_size,
+                ..
+            } => {
+                let capacity = logical_pages
+                    .checked_mul(page_size)
+                    .ok_or(Error::InvalidCache("logical capacity overflows usize"))?;
+                to_i64(capacity).map_err(|_| {
+                    Error::InvalidCache("logical capacity exceeds the I64 cache-index domain")
+                })?;
+                Ok(())
+            }
+            CacheLayout::Dense { .. } => Ok(()),
+        }
+    }
+}
+
+/// Persistent K/V device storage plus its small host-owned logical metadata.
+///
+/// `take_storage` and `replace_storage` make XLA donation explicit: a decode
+/// step temporarily removes uniquely-owned K/V buffers, then installs the
+/// aliased outputs without copying unaffected cache contents.
+pub struct Cache {
+    spec: CacheSpec,
+    key: Option<Buffer>,
+    value: Option<Buffer>,
+    page_table: Option<Buffer>,
+    lengths: Buffer,
+    host_page_table: Vec<i64>,
+    host_lengths: Vec<i64>,
+}
+
+impl Cache {
+    pub fn allocate(
+        platform: &Platform,
+        spec: CacheSpec,
+        sharding: Sharding,
+        memory: Memory,
+    ) -> Result<Self, Error> {
+        spec.validate()?;
+        let cache_shape = spec.key_value_shape()?;
+        let key = platform.upload(&Slice::alloc(cache_shape)?, sharding.clone(), memory)?;
+        let value = platform.upload(&Slice::alloc(cache_shape)?, sharding.clone(), memory)?;
+        let host_lengths = vec![0i64; spec.batch];
+        let lengths_shape = spec.lengths_shape()?;
+        let lengths = platform.upload(
+            &Slice::from_typed(lengths_shape, &host_lengths)?,
+            sharding.clone(),
+            memory,
+        )?;
+        let (host_page_table, page_table) = match spec.page_table_shape()? {
+            None => (Vec::new(), None),
+            Some(shape) => {
+                let entries = shape.element_count().map_err(nml_tensor::Error::from)?;
+                let table = vec![-1i64; entries];
+                let buffer =
+                    platform.upload(&Slice::from_typed(shape, &table)?, sharding, memory)?;
+                (table, Some(buffer))
+            }
+        };
+        Ok(Self {
+            spec,
+            key: Some(key),
+            value: Some(value),
+            page_table,
+            lengths,
+            host_page_table,
+            host_lengths,
+        })
+    }
+
+    pub const fn spec(&self) -> CacheSpec {
+        self.spec
+    }
+
+    pub fn key(&self) -> Result<&Buffer, Error> {
+        self.key.as_ref().ok_or(Error::CacheStorageUnavailable)
+    }
+
+    pub fn value(&self) -> Result<&Buffer, Error> {
+        self.value.as_ref().ok_or(Error::CacheStorageUnavailable)
+    }
+
+    pub fn page_table(&self) -> Option<&Buffer> {
+        self.page_table.as_ref()
+    }
+
+    pub const fn lengths(&self) -> &Buffer {
+        &self.lengths
+    }
+
+    pub fn take_storage(&mut self) -> Result<(Buffer, Buffer), Error> {
+        match (self.key.take(), self.value.take()) {
+            (Some(key), Some(value)) => Ok((key, value)),
+            (key, value) => {
+                self.key = key;
+                self.value = value;
+                Err(Error::CacheStorageUnavailable)
+            }
+        }
+    }
+
+    pub fn replace_storage(&mut self, key: Buffer, value: Buffer) -> Result<(), Error> {
+        if self.key.is_some() || self.value.is_some() {
+            return Err(Error::CacheStorageAlreadyInstalled);
+        }
+        let expected = self.spec.key_value_shape()?;
+        if key.shape != expected || value.shape != expected {
+            return Err(Error::InvalidCache(
+                "replacement K/V shape differs from cache spec",
+            ));
+        }
+        if key.backend != self.lengths.backend
+            || value.backend != self.lengths.backend
+            || key.platform_id != self.lengths.platform_id
+            || value.platform_id != self.lengths.platform_id
+        {
+            return Err(Error::InvalidCache(
+                "replacement K/V storage belongs to another platform",
+            ));
+        }
+        if key.sharding != self.lengths.sharding || value.sharding != self.lengths.sharding {
+            return Err(Error::InvalidCache(
+                "replacement K/V storage uses another sharding",
+            ));
+        }
+        self.key = Some(key);
+        self.value = Some(value);
+        Ok(())
+    }
+
+    pub fn assign_page(
+        &mut self,
+        platform: &Platform,
+        batch: usize,
+        logical_page: usize,
+        physical_page: usize,
+    ) -> Result<(), Error> {
+        let CacheLayout::Paged {
+            physical_pages,
+            logical_pages,
+            ..
+        } = self.spec.layout
+        else {
+            return Err(Error::InvalidCache("dense caches have no page table"));
+        };
+        if batch >= self.spec.batch
+            || logical_page >= logical_pages
+            || physical_page >= physical_pages
+        {
+            return Err(Error::InvalidCache(
+                "page assignment is outside cache capacity",
+            ));
+        }
+        self.require_platform(platform)?;
+        let mut host_page_table = self.host_page_table.clone();
+        host_page_table[batch * logical_pages + logical_page] = to_i64(physical_page)?;
+        let shape = self
+            .spec
+            .page_table_shape()?
+            .expect("paged cache has a page table shape");
+        let page_table = platform.upload(
+            &Slice::from_typed(shape, &host_page_table)?,
+            self.lengths.sharding.clone(),
+            self.lengths.memory,
+        )?;
+        self.host_page_table = host_page_table;
+        self.page_table = Some(page_table);
+        Ok(())
+    }
+
+    /// Moves the logical boundary in either direction. Growing is replay and
+    /// is allowed only across pages already assigned to the batch.
+    pub fn truncate(
+        &mut self,
+        platform: &Platform,
+        batch: usize,
+        length: usize,
+    ) -> Result<(), Error> {
+        if batch >= self.spec.batch || length > self.spec.capacity() {
+            return Err(Error::InvalidCache(
+                "sequence length is outside cache capacity",
+            ));
+        }
+        self.require_platform(platform)?;
+        if let CacheLayout::Paged {
+            logical_pages,
+            page_size,
+            ..
+        } = self.spec.layout
+        {
+            let required = length.div_ceil(page_size);
+            let row = &self.host_page_table[batch * logical_pages..(batch + 1) * logical_pages];
+            if row[..required].contains(&-1) {
+                return Err(Error::InvalidCache(
+                    "sequence length reaches an unassigned logical page",
+                ));
+            }
+        }
+        let mut host_lengths = self.host_lengths.clone();
+        host_lengths[batch] = to_i64(length)?;
+        let lengths = platform.upload(
+            &Slice::from_typed(self.spec.lengths_shape()?, &host_lengths)?,
+            self.lengths.sharding.clone(),
+            self.lengths.memory,
+        )?;
+        self.host_lengths = host_lengths;
+        self.lengths = lengths;
+        Ok(())
+    }
+
+    fn require_platform(&self, platform: &Platform) -> Result<(), Error> {
+        if self.lengths.backend != platform.backend
+            || self.lengths.platform_id != platform.client.as_raw_identity()
+        {
+            Err(Error::InvalidCache("cache belongs to another platform"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn to_i64(value: usize) -> Result<i64, Error> {
+    i64::try_from(value).map_err(|_| Error::InvalidCache("cache dimension exceeds i64"))
 }
 
 fn for_each_shard_span(
@@ -872,6 +1247,9 @@ pub enum Error {
         buffers: usize,
         chunk_bytes: usize,
     },
+    InvalidCache(&'static str),
+    CacheStorageUnavailable,
+    CacheStorageAlreadyInstalled,
     UnknownArgument(String),
     MissingArgument(String),
     BakedArgument(String),
@@ -920,6 +1298,11 @@ impl fmt::Display for Error {
                 f,
                 "invalid DMA staging pool: {buffers} buffers of {chunk_bytes} bytes"
             ),
+            Self::InvalidCache(message) => write!(f, "invalid cache: {message}"),
+            Self::CacheStorageUnavailable => {
+                f.write_str("cache K/V storage is temporarily owned by an execution")
+            }
+            Self::CacheStorageAlreadyInstalled => f.write_str("cache already contains K/V storage"),
             Self::UnknownArgument(name) => write!(f, "unknown executable argument {name:?}"),
             Self::MissingArgument(name) => write!(f, "missing executable argument {name:?}"),
             Self::BakedArgument(name) => write!(f, "baked parameter {name:?} cannot be replaced"),

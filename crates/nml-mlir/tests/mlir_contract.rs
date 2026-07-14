@@ -131,6 +131,121 @@ fn stablehlo_constants_are_built_with_owned_operations() {
 }
 
 #[test]
+fn stablehlo_while_owns_typed_regions_and_bytecode() {
+    let context = Context::new();
+    let scalar_i32 = context.ranked_tensor_type(DType::I32, &[]).unwrap();
+    let scalar_bool = context.ranked_tensor_type(DType::Bool, &[]).unwrap();
+
+    let mut condition_block = Block::new(&context, &[scalar_i32]).unwrap();
+    let counter = condition_block.argument(0).unwrap();
+    let limit_literal = context.parse_attribute("dense<4> : tensor<i32>").unwrap();
+    let limit = context.constant(scalar_i32, limit_literal).unwrap();
+    let limit_value = limit.result(0).unwrap();
+    condition_block.append_operation(limit).unwrap();
+    let predicate = context
+        .compare(
+            counter,
+            limit_value,
+            scalar_bool,
+            nml_mlir::StableHloComparison::Lt,
+            nml_mlir::StableHloComparisonType::Signed,
+        )
+        .unwrap();
+    let predicate_value = predicate.result(0).unwrap();
+    condition_block.append_operation(predicate).unwrap();
+    condition_block
+        .append_operation(context.stablehlo_return(&[predicate_value]).unwrap())
+        .unwrap();
+    let mut condition = Region::new(&context).unwrap();
+    condition.append_block(condition_block).unwrap();
+
+    let mut body_block = Block::new(&context, &[scalar_i32]).unwrap();
+    let counter = body_block.argument(0).unwrap();
+    let one_literal = context.parse_attribute("dense<1> : tensor<i32>").unwrap();
+    let one = context.constant(scalar_i32, one_literal).unwrap();
+    let one_value = one.result(0).unwrap();
+    body_block.append_operation(one).unwrap();
+    let incremented = context.add(counter, one_value, scalar_i32).unwrap();
+    let incremented_value = incremented.result(0).unwrap();
+    body_block.append_operation(incremented).unwrap();
+    body_block
+        .append_operation(context.stablehlo_return(&[incremented_value]).unwrap())
+        .unwrap();
+    let mut body = Region::new(&context).unwrap();
+    body.append_block(body_block).unwrap();
+
+    let mut function_block = Block::new(&context, &[]).unwrap();
+    let zero_literal = context.parse_attribute("dense<0> : tensor<i32>").unwrap();
+    let zero = context.constant(scalar_i32, zero_literal).unwrap();
+    let zero_value = zero.result(0).unwrap();
+    function_block.append_operation(zero).unwrap();
+    let loop_operation = context
+        .stablehlo_while(&[zero_value], &[scalar_i32], condition, body)
+        .unwrap();
+    let result = loop_operation.result(0).unwrap();
+    function_block.append_operation(loop_operation).unwrap();
+    function_block
+        .append_operation(context.return_operation(&[result]).unwrap())
+        .unwrap();
+    let mut function_body = Region::new(&context).unwrap();
+    function_body.append_block(function_block).unwrap();
+    let function = context
+        .function("while_contract", &[], &[scalar_i32], function_body)
+        .unwrap();
+    let mut module = context.empty_module().unwrap();
+    module.append_operation(function).unwrap();
+    module.verify().unwrap();
+    let text = module.text();
+    assert!(text.contains("stablehlo.while"));
+    assert!(text.contains("stablehlo.return"));
+    assert!(module.bytecode().unwrap().starts_with(b"ML\xefR"));
+}
+
+#[test]
+fn stablehlo_while_rejects_an_unterminated_owned_region() {
+    let context = Context::new();
+    let scalar_i32 = context.ranked_tensor_type(DType::I32, &[]).unwrap();
+    let scalar_bool = context.ranked_tensor_type(DType::Bool, &[]).unwrap();
+
+    let mut condition_block = Block::new(&context, &[scalar_i32]).unwrap();
+    let true_literal = context.parse_attribute("dense<true> : tensor<i1>").unwrap();
+    let predicate = context.constant(scalar_bool, true_literal).unwrap();
+    let predicate_value = predicate.result(0).unwrap();
+    condition_block.append_operation(predicate).unwrap();
+    condition_block
+        .append_operation(context.stablehlo_return(&[predicate_value]).unwrap())
+        .unwrap();
+    let mut condition = Region::new(&context).unwrap();
+    condition.append_block(condition_block).unwrap();
+
+    let body_block = Block::new(&context, &[scalar_i32]).unwrap();
+    let mut unterminated_body = Region::new(&context).unwrap();
+    unterminated_body.append_block(body_block).unwrap();
+
+    let mut function_block = Block::new(&context, &[]).unwrap();
+    let zero_literal = context.parse_attribute("dense<0> : tensor<i32>").unwrap();
+    let zero = context.constant(scalar_i32, zero_literal).unwrap();
+    let zero_value = zero.result(0).unwrap();
+    function_block.append_operation(zero).unwrap();
+    let loop_operation = context
+        .stablehlo_while(&[zero_value], &[scalar_i32], condition, unterminated_body)
+        .unwrap();
+    let result = loop_operation.result(0).unwrap();
+    function_block.append_operation(loop_operation).unwrap();
+    function_block
+        .append_operation(context.return_operation(&[result]).unwrap())
+        .unwrap();
+    let mut function_body = Region::new(&context).unwrap();
+    function_body.append_block(function_block).unwrap();
+    let function = context
+        .function("invalid_while", &[], &[scalar_i32], function_body)
+        .unwrap();
+    let mut module = context.empty_module().unwrap();
+    module.append_operation(function).unwrap();
+    assert!(matches!(module.verify(), Err(Error::Verification { .. })));
+}
+
+#[test]
 fn shardy_manual_computation_owns_a_verified_local_region() {
     let context = Context::new();
     let global = context.ranked_tensor_type(DType::F32, &[4]).unwrap();

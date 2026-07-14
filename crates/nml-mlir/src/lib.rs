@@ -947,6 +947,184 @@ impl Context {
             .build()
     }
 
+    pub fn iota<'context>(
+        &'context self,
+        result_type: Type<'context>,
+        dimension: i64,
+    ) -> Result<Operation<'context>, Error> {
+        let i64_type = self.dtype(DType::I64)?;
+        Operation::builder(self, "stablehlo.iota")
+            .results(&[result_type])
+            .attributes(&[self.named_attribute(
+                "iota_dimension",
+                self.integer_attribute(i64_type, dimension)?,
+            )?])
+            .build()
+    }
+
+    pub fn concatenate<'context>(
+        &'context self,
+        inputs: &[Value<'context>],
+        result_type: Type<'context>,
+        dimension: i64,
+    ) -> Result<Operation<'context>, Error> {
+        let i64_type = self.dtype(DType::I64)?;
+        Operation::builder(self, "stablehlo.concatenate")
+            .results(&[result_type])
+            .operands(inputs)
+            .attributes(&[
+                self.named_attribute("dimension", self.integer_attribute(i64_type, dimension)?)?
+            ])
+            .build()
+    }
+
+    pub fn slice<'context>(
+        &'context self,
+        input: Value<'context>,
+        result_type: Type<'context>,
+        starts: &[i64],
+        limits: &[i64],
+        strides: &[i64],
+    ) -> Result<Operation<'context>, Error> {
+        Operation::builder(self, "stablehlo.slice")
+            .results(&[result_type])
+            .operands(&[input])
+            .attributes(&[
+                self.named_attribute(
+                    "start_indices",
+                    self.parse_attribute(&dense_i64_array(starts))?,
+                )?,
+                self.named_attribute(
+                    "limit_indices",
+                    self.parse_attribute(&dense_i64_array(limits))?,
+                )?,
+                self.named_attribute("strides", self.parse_attribute(&dense_i64_array(strides))?)?,
+            ])
+            .build()
+    }
+
+    pub fn dynamic_slice<'context>(
+        &'context self,
+        input: Value<'context>,
+        starts: &[Value<'context>],
+        result_type: Type<'context>,
+        sizes: &[i64],
+    ) -> Result<Operation<'context>, Error> {
+        let mut operands = Vec::with_capacity(starts.len() + 1);
+        operands.push(input);
+        operands.extend_from_slice(starts);
+        Operation::builder(self, "stablehlo.dynamic_slice")
+            .results(&[result_type])
+            .operands(&operands)
+            .attributes(&[self.named_attribute(
+                "slice_sizes",
+                self.parse_attribute(&dense_i64_array(sizes))?,
+            )?])
+            .build()
+    }
+
+    pub fn dynamic_update_slice<'context>(
+        &'context self,
+        input: Value<'context>,
+        update: Value<'context>,
+        starts: &[Value<'context>],
+        result_type: Type<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        let mut operands = Vec::with_capacity(starts.len() + 2);
+        operands.extend([input, update]);
+        operands.extend_from_slice(starts);
+        Operation::builder(self, "stablehlo.dynamic_update_slice")
+            .results(&[result_type])
+            .operands(&operands)
+            .build()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather<'context>(
+        &'context self,
+        input: Value<'context>,
+        indices: Value<'context>,
+        result_type: Type<'context>,
+        offset_dims: &[i64],
+        collapsed_slice_dims: &[i64],
+        operand_batching_dims: &[i64],
+        start_indices_batching_dims: &[i64],
+        start_index_map: &[i64],
+        index_vector_dim: i64,
+        slice_sizes: &[i64],
+        indices_are_sorted: bool,
+    ) -> Result<Operation<'context>, Error> {
+        let dimensions = format!(
+            "#stablehlo.gather<offset_dims = {}, collapsed_slice_dims = {}, \
+             operand_batching_dims = {}, start_indices_batching_dims = {}, \
+             start_index_map = {}, index_vector_dim = {}>",
+            i64_array(offset_dims),
+            i64_array(collapsed_slice_dims),
+            i64_array(operand_batching_dims),
+            i64_array(start_indices_batching_dims),
+            i64_array(start_index_map),
+            index_vector_dim,
+        );
+        Operation::builder(self, "stablehlo.gather")
+            .results(&[result_type])
+            .operands(&[input, indices])
+            .attributes(&[
+                self.named_attribute("dimension_numbers", self.parse_attribute(&dimensions)?)?,
+                self.named_attribute(
+                    "slice_sizes",
+                    self.parse_attribute(&dense_i64_array(slice_sizes))?,
+                )?,
+                self.named_attribute(
+                    "indices_are_sorted",
+                    self.parse_attribute(if indices_are_sorted { "true" } else { "false" })?,
+                )?,
+            ])
+            .build()
+    }
+
+    pub fn reduce<'context>(
+        &'context self,
+        input: Value<'context>,
+        init: Value<'context>,
+        result_type: Type<'context>,
+        dimensions: &[i64],
+        body: Region<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        Operation::builder(self, "stablehlo.reduce")
+            .results(&[result_type])
+            .operands(&[input, init])
+            .attributes(&[self.named_attribute(
+                "dimensions",
+                self.parse_attribute(&dense_i64_array(dimensions))?,
+            )?])
+            .region(body)
+            .build()
+    }
+
+    pub fn stablehlo_return<'context>(
+        &'context self,
+        values: &[Value<'context>],
+    ) -> Result<Operation<'context>, Error> {
+        Operation::builder(self, "stablehlo.return")
+            .operands(values)
+            .build()
+    }
+
+    pub fn stablehlo_while<'context>(
+        &'context self,
+        initial: &[Value<'context>],
+        result_types: &[Type<'context>],
+        condition: Region<'context>,
+        body: Region<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        Operation::builder(self, "stablehlo.while")
+            .results(result_types)
+            .operands(initial)
+            .region(condition)
+            .region(body)
+            .build()
+    }
+
     pub fn complex<'context>(
         &'context self,
         real: Value<'context>,
@@ -1685,6 +1863,14 @@ fn string_ref(bytes: &[u8]) -> sys::MlirStringRef {
 
 fn i64_array(values: &[i64]) -> String {
     format!("[{}]", comma_separated_i64(values))
+}
+
+fn dense_i64_array(values: &[i64]) -> String {
+    if values.is_empty() {
+        "array<i64>".to_owned()
+    } else {
+        format!("array<i64: {}>", comma_separated_i64(values))
+    }
 }
 
 fn comma_separated_i64(values: &[i64]) -> String {

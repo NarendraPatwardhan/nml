@@ -57,6 +57,8 @@ axis. Complexity is evidence for a decision, not the decision itself.
 | D-029 | `DECIDED` | NML supports Shardy as its only XLA SPMD partitioner. It does not retain ZML's legacy GSPMD lowering, `mhlo.sharding` encoding, manual-sharding custom-call path, or a public/runtime partitioner selector. The unified NML sharding model will lower through Shardy `sdy` meshes, tensor shardings, constraints, and manual computations. This deliberately departs from the reference snapshot's selectable compatibility path while retaining its default partitioner. |
 | D-030 | `DECIDED` | Functional Shardy placement and the nonlinear graph-operation foundation are implemented before attention. Logical mesh axes use `AxisTag`; tensor dimensions consume them through `Shape` partition metadata; compilation, buffer placement, checkpoint loading, and execution share the same `Sharding` contract. This ordering makes partitioning a normal property of attention-era graphs rather than a retrofit. Explicit collective APIs, multi-host execution, and multi-GPU CUDA validation remain later parity work. |
 | D-031 | `DECIDED` | Verification is split by resource ownership, not by weakening support claims. BuildBuddy remotely executes CPU and CUDA-configured compiler/runtime contracts and remotely builds the exact CUDA contract binaries to populate the authenticated action cache. The multi-gigabyte SHA-pinned CUDA runtime is `data` of its owning executable contracts, not of the reusable loader library; it is assembled only on the NVIDIA host that owns the runtime disk and supported GPU. GPU tests are local, unsandboxed, and non-cacheable; package integrity remains a cacheable host contract and compiled artifacts remain remotely cacheable. NML never treats remote CUDA compilation as CUDA execution evidence, never transfers the complete XLA/LLVM/CUDA runfiles closure with `--remote_download_all`, and never makes a no-GPU hosted runner responsible for a packaged-runtime or device gate. |
+| D-032 | `DECIDED` | Milestone 4 adds portable paged attention as a deliberate NML improvement over the reference ZML snapshot, whose portable `vanilla` path handles ordinary attention but whose paged dispatcher has no CPU/StableHLO backend. NML's product path traverses the page table with bounded `stablehlo.while` control flow and blockwise online softmax, without materializing a contiguous logical KV cache or the complete attention-score matrix. It is the CPU implementation, independent correctness oracle, and CUDA fallback; Milestone 5's FlashAttention and Triton paths remain the preferred CUDA implementations where supported. |
+| D-033 | `DECIDED` | Dense and paged KV caches share one backend-independent public `CacheSpec`/`Cache` contract. K/V tensors, page tables, and sequence lengths remain ordinary persistent `Buffer` values; compiled updates donate uniquely owned K/V inputs and reinstall their aliased outputs. The host owns only logical page assignments and lengths so truncate, rollback, and replay do not copy unaffected K/V storage. Used page identifiers are validated before execution, while inactive trailing page-table slots may remain `-1`; portable lowering substitutes an in-range page before gather and masks every token from those inactive slots. |
 
 An item is `UNDECIDED` only where this document identifies a deliberate NML
 departure that still needs an exact contract. Otherwise D-018 applies the
@@ -1086,21 +1088,46 @@ required tensor operations
   -> prefill and decode graph forms
   -> persistent KV allocation and updates
   -> paged-cache/page-table semantics
+  -> portable blockwise paged attention
 ```
 
 The operation layer grows through the behavior required by the retained ZML
 attention paths: elementwise arithmetic, broadcast, reshape, transpose,
 conversion, gather/slice/update, concatenation, reductions, normalization, and
-softmax. CPU portable attention is both the correctness oracle and a
-performance implementation under D-013; the same StableHLO path also remains
-available to CUDA/XLA.
+softmax. This includes the full prerequisite set already present in the
+reference snapshot: general and slice gathers, static and dynamic slices,
+dynamic updates, generic multi-result reductions and reduction regions,
+selection-based masking, and `stablehlo.while` with loop-carried tensors. NML
+ports all of these operations; bounded unrolling may optimize a genuinely
+small compile-time case, but it is not a substitute for control flow in the
+general paged-attention implementation.
+
+Portable paged attention consumes physical K/V pages and a logical page table
+directly. A bounded `stablehlo.while` traverses valid pages while carrying the
+running score maximum, rescaled exponential sum, and accumulated value output
+required by online softmax. Runtime token counts, valid-page counts, causal
+positions, and sliding-window bounds are tensors inside compile-time maximum
+shapes. Invalid page-table slots and tail tokens are masked before reduction;
+host/runtime validation rejects page identifiers outside the allocated cache.
+The implementation supports MHA, GQA, and MQA head mapping without expanding
+KV heads or assembling a persistent dense cache.
+
+CPU portable ordinary and paged attention are both correctness oracles and
+performance implementations under D-013; the same StableHLO paths remain
+available as CUDA fallbacks. An initial gather-and-flatten formulation may be
+used only as independent reference math in permanent tests. It is not the
+product paged path because materializing the logical KV sequence would discard
+the memory-traffic and working-set properties paging is meant to provide.
 
 Acceptance covers causal and non-causal attention, sliding windows, multiple
 query-to-KV head ratios, prefill, single-token and multi-token decode, and KV
-updates across successive executions. Results and cache contents are compared
-against independent reference math, including boundary page and sequence
-lengths. The cache lifecycle must already support the later checkpoint,
-rollback, truncate, and replay work needed by speculative decoding.
+updates across successive executions. Both ordinary and portable paged results
+and cache contents are compared against independent dense reference math,
+including empty context, partially occupied final pages, non-contiguous page
+tables, boundary page and sequence lengths, and sliding-window boundaries.
+Contracts prove that the product path does not allocate a full logical KV copy
+or full attention matrix. The cache lifecycle must already support the later
+checkpoint, rollback, truncate, and replay work needed by speculative decoding.
 
 #### Milestone 5: CUDA FlashAttention and Triton paged attention
 

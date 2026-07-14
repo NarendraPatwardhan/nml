@@ -1,7 +1,9 @@
-use nml_ir::{Error, FftType, ProgramBuilder};
+use nml_ir::{
+    AttentionOptions, Error, FftType, ProgramBuilder, RopeLayout, RopeOptions, RopeScaling,
+};
 use nml_mlir::Context;
 use nml_tensor::Element;
-use nml_types::{BFloat16, Complex64, Complex128, DType, F16, Layout, Shape};
+use nml_types::{AxisTag, BFloat16, Complex64, Complex128, DType, F16, Layout, Shape};
 
 #[test]
 fn matmul_is_typed_deterministic_and_verified() {
@@ -44,6 +46,10 @@ fn every_canonical_storage_dtype_builds_an_owned_scalar_constant() {
     verify(BFloat16::from_f32(-0.75));
     verify(1.25f32);
     verify(-2.5f64);
+    verify(F16::from_f32(f32::INFINITY));
+    verify(BFloat16::from_f32(f32::NAN));
+    verify(f32::NEG_INFINITY);
+    verify(f64::NAN);
     verify(Complex64 {
         real: 1.0,
         imaginary: -2.0,
@@ -62,6 +68,322 @@ fn invalid_matmul_fails_before_mlir_construction() {
     assert!(matches!(
         builder.matmul(left, right),
         Err(Error::DimensionMismatch { .. })
+    ));
+}
+
+#[test]
+fn attention_primitives_are_typed_and_verify_as_stablehlo() {
+    let mut builder = ProgramBuilder::new();
+    let input = builder.input("input", Shape::new(DType::F32, &[4, 3]).unwrap());
+    let update = builder.input("update", Shape::new(DType::F32, &[1, 3]).unwrap());
+    let indices = builder.input("indices", Shape::new(DType::I32, &[2]).unwrap());
+    let weight = builder.parameter("weight", Shape::new(DType::F32, &[3]).unwrap());
+    let zero = builder.scalar(0i32).unwrap();
+    let one = builder.scalar(1i32).unwrap();
+
+    let prefix = builder.slice(input, &[0, 0], &[2, 3], &[1, 1]).unwrap();
+    let rebuilt = builder.concatenate(&[prefix, prefix], 0).unwrap();
+    assert_eq!(rebuilt.shape().dimensions(), &[4, 3]);
+    let dynamic = builder.dynamic_slice(input, &[one, zero], &[2, 3]).unwrap();
+    let updated = builder
+        .dynamic_update_slice(input, update, &[one, zero])
+        .unwrap();
+    let gathered = builder.gather(input, indices, 0).unwrap();
+    assert_eq!(gathered.shape().dimensions(), &[2, 3]);
+    let positions = builder
+        .iota(Shape::new(DType::I32, &[2, 3]).unwrap(), 1)
+        .unwrap();
+    let sum = builder.reduce_sum(input, &[0]).unwrap();
+    let maximum = builder.reduce_max(input, &[1]).unwrap();
+    let softmax = builder.softmax(input, 1).unwrap();
+    let normalized = builder.rms_norm(input, Some(weight), 1, 1e-5).unwrap();
+
+    let program = builder
+        .finish(&[
+            rebuilt, dynamic, updated, gathered, positions, sum, maximum, softmax, normalized,
+        ])
+        .unwrap();
+    let text = program.stablehlo().unwrap();
+    for operation in [
+        "stablehlo.slice",
+        "stablehlo.concatenate",
+        "stablehlo.dynamic_slice",
+        "stablehlo.dynamic_update_slice",
+        "stablehlo.gather",
+        "stablehlo.iota",
+        "stablehlo.reduce",
+        "stablehlo.exponential",
+        "stablehlo.rsqrt",
+    ] {
+        assert!(text.contains(operation), "missing {operation} in {text}");
+    }
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
+}
+
+#[test]
+fn attention_primitives_reject_invalid_contracts_before_mlir() {
+    let mut builder = ProgramBuilder::new();
+    let input = builder.input("input", Shape::new(DType::F32, &[4, 3]).unwrap());
+    let bad_indices = builder.input("bad_indices", Shape::new(DType::F32, &[2]).unwrap());
+    assert!(matches!(
+        builder.gather(input, bad_indices, 0),
+        Err(Error::InvalidIndexDType(DType::F32))
+    ));
+    assert!(matches!(
+        builder.slice(input, &[0, 0], &[5, 3], &[1, 1]),
+        Err(Error::InvalidSlice { axis: 0, .. })
+    ));
+    assert!(matches!(
+        builder.concatenate(&[], 0),
+        Err(Error::EmptyOperands("concatenate"))
+    ));
+    assert!(matches!(
+        builder.reduce_max(input, &[2]),
+        Err(Error::AxisOutOfBounds { .. })
+    ));
+
+    let tagged = Shape::new(DType::F32, &[4, 3])
+        .unwrap()
+        .with_axis_tags(&[AxisTag::new(91), AxisTag::new(92)])
+        .unwrap();
+    let input = builder.input("tagged_input", tagged);
+    let update = builder.input("untagged_update", Shape::new(DType::F32, &[1, 3]).unwrap());
+    let zero = builder.scalar(0i32).unwrap();
+    assert!(matches!(
+        builder.dynamic_update_slice(input, update, &[zero, zero]),
+        Err(Error::MetadataMismatch {
+            operation: "dynamic_update_slice",
+            field: "axis tags",
+        })
+    ));
+}
+
+#[test]
+fn rope_and_ordinary_attention_are_verified_compositions() {
+    let mut builder = ProgramBuilder::new();
+    let query = builder.input("query", Shape::new(DType::F16, &[2, 3, 4, 8]).unwrap());
+    let key = builder.input("key", Shape::new(DType::F16, &[2, 5, 2, 8]).unwrap());
+    let value = builder.input("value", Shape::new(DType::F16, &[2, 5, 2, 8]).unwrap());
+    let query_positions =
+        builder.input("query_positions", Shape::new(DType::I32, &[2, 3]).unwrap());
+    let key_positions = builder.input("key_positions", Shape::new(DType::I32, &[2, 5]).unwrap());
+    let interleaved = builder
+        .rope(
+            query,
+            query_positions,
+            RopeOptions {
+                base: 10_000.0,
+                rotary_dimensions: 8,
+                layout: RopeLayout::Interleaved,
+                scaling: RopeScaling::Default,
+            },
+        )
+        .unwrap();
+    let sequential = builder
+        .rope(
+            query,
+            query_positions,
+            RopeOptions {
+                base: 500_000.0,
+                rotary_dimensions: 4,
+                layout: RopeLayout::Sequential,
+                scaling: RopeScaling::Linear { factor: 4.0 },
+            },
+        )
+        .unwrap();
+    let attention = builder
+        .attention(
+            interleaved,
+            key,
+            value,
+            query_positions,
+            key_positions,
+            AttentionOptions {
+                causal: true,
+                sliding_window: Some(4),
+                scale: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(attention.shape(), query.shape());
+    let text = builder
+        .finish(&[sequential, attention])
+        .unwrap()
+        .stablehlo()
+        .unwrap();
+    assert!(text.contains("stablehlo.sine"));
+    assert!(text.contains("stablehlo.cosine"));
+    assert!(text.matches("stablehlo.dot_general").count() >= 2);
+    assert!(text.contains("stablehlo.reduce"));
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
+}
+
+#[test]
+fn paged_attention_is_one_bounded_verified_stablehlo_loop() {
+    let mut builder = ProgramBuilder::new();
+    let query = builder.input("query", Shape::new(DType::F16, &[2, 3, 4, 8]).unwrap());
+    let key_cache = builder.input("key_cache", Shape::new(DType::F16, &[7, 4, 2, 8]).unwrap());
+    let value_cache = builder.input(
+        "value_cache",
+        Shape::new(DType::F16, &[7, 4, 2, 8]).unwrap(),
+    );
+    let page_table = builder.input("page_table", Shape::new(DType::I32, &[2, 5]).unwrap());
+    let lengths = builder.input("lengths", Shape::new(DType::I32, &[2]).unwrap());
+    let positions = builder.input("positions", Shape::new(DType::I32, &[2, 3]).unwrap());
+    let output = builder
+        .paged_attention(
+            query,
+            key_cache,
+            value_cache,
+            page_table,
+            lengths,
+            positions,
+            AttentionOptions {
+                causal: true,
+                sliding_window: Some(6),
+                scale: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(output.shape(), query.shape());
+    let text = builder.finish(&[output]).unwrap().stablehlo().unwrap();
+    assert_eq!(text.matches("stablehlo.while").count(), 1, "{text}");
+    assert_eq!(text.matches("\"stablehlo.gather\"").count(), 2, "{text}");
+    assert!(text.matches("stablehlo.reduce").count() >= 2, "{text}");
+    assert!(text.contains("tensor<2x2x2x3x4xf32>"), "{text}");
+    assert!(
+        !text.contains("tensor<2x20x2x8xf32>"),
+        "paged lowering materialized a contiguous logical cache: {text}"
+    );
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
+}
+
+#[test]
+fn ordinary_attention_preserves_shardy_head_and_batch_placement() {
+    use nml_sharding::Sharding;
+    use nml_types::{AxisTag, Partition};
+
+    let data = AxisTag::new(31);
+    let model = AxisTag::new(32);
+    let sequence = AxisTag::new(33);
+    let head_dim = AxisTag::new(34);
+    let query_shape = Shape::new(DType::F32, &[2, 3, 4, 8])
+        .unwrap()
+        .with_axis_tags(&[data, sequence, model, head_dim])
+        .unwrap()
+        .with_partitions(&[
+            Partition::Sharded(data),
+            Partition::Replicated,
+            Partition::Sharded(model),
+            Partition::Replicated,
+        ])
+        .unwrap();
+    let key_shape = Shape::new(DType::F32, &[2, 5, 2, 8])
+        .unwrap()
+        .with_axis_tags(&[data, sequence, model, head_dim])
+        .unwrap()
+        .with_partitions(&[
+            Partition::Sharded(data),
+            Partition::Replicated,
+            Partition::Sharded(model),
+            Partition::Replicated,
+        ])
+        .unwrap();
+    let position_shape = Shape::new(DType::I32, &[2, 3])
+        .unwrap()
+        .with_axis_tags(&[data, sequence])
+        .unwrap()
+        .with_partitions(&[Partition::Sharded(data), Partition::Replicated])
+        .unwrap();
+    let key_position_shape = Shape::new(DType::I32, &[2, 5])
+        .unwrap()
+        .with_axis_tags(&[data, sequence])
+        .unwrap()
+        .with_partitions(&[Partition::Sharded(data), Partition::Replicated])
+        .unwrap();
+    let mut builder = ProgramBuilder::new();
+    let query = builder.input("query", query_shape);
+    let key = builder.input("key", key_shape);
+    let value = builder.input("value", key_shape);
+    let query_positions = builder.input("query_positions", position_shape);
+    let key_positions = builder.input("key_positions", key_position_shape);
+    let output = builder
+        .attention(
+            query,
+            key,
+            value,
+            query_positions,
+            key_positions,
+            AttentionOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(output.shape().partitions(), query_shape.partitions());
+    let program = builder.finish(&[output]).unwrap();
+    let mesh = Sharding::mesh(&[(data, 2), (model, 2)]).unwrap();
+    let text = program.stablehlo_with_sharding(&mesh).unwrap();
+    assert!(text.contains("sdy.mesh"), "{text}");
+    assert!(text.contains("sdy.sharding_constraint"), "{text}");
+}
+
+#[test]
+fn attention_geometry_is_rejected_before_mlir_construction() {
+    let mut builder = ProgramBuilder::new();
+    let query = builder.input("query", Shape::new(DType::F32, &[1, 2, 3, 8]).unwrap());
+    let key = builder.input("key", Shape::new(DType::F32, &[1, 2, 2, 8]).unwrap());
+    let value = builder.input("value", Shape::new(DType::F32, &[1, 2, 2, 8]).unwrap());
+    let positions = builder.input("positions", Shape::new(DType::I32, &[1, 2]).unwrap());
+    assert!(matches!(
+        builder.attention(
+            query,
+            key,
+            value,
+            positions,
+            positions,
+            AttentionOptions::default(),
+        ),
+        Err(Error::InvalidAttention(_))
+    ));
+    assert!(matches!(
+        builder.rope(
+            query,
+            positions,
+            RopeOptions {
+                base: 10_000.0,
+                rotary_dimensions: 7,
+                layout: RopeLayout::Interleaved,
+                scaling: RopeScaling::Default,
+            },
+        ),
+        Err(Error::InvalidRope(_))
+    ));
+
+    let mut zero_heads = ProgramBuilder::new();
+    let query = zero_heads.input("query", Shape::new(DType::F32, &[1, 1, 1, 4]).unwrap());
+    let key = zero_heads.input("key", Shape::new(DType::F32, &[1, 1, 0, 4]).unwrap());
+    let value = zero_heads.input("value", Shape::new(DType::F32, &[1, 1, 0, 4]).unwrap());
+    let positions = zero_heads.input("positions", Shape::new(DType::I32, &[1, 1]).unwrap());
+    assert!(matches!(
+        zero_heads.attention(
+            query,
+            key,
+            value,
+            positions,
+            positions,
+            AttentionOptions::default(),
+        ),
+        Err(Error::InvalidAttention(_))
     ));
 }
 
