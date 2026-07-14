@@ -341,10 +341,10 @@ partial backend remain unchecked.
 - [x] `bazel --output_user_root=../nml-bazel-cache test --config=cuda //...`
 - [x] The CUDA loading, parameterized execution, donation, and alias contracts
       pass on a real supported NVIDIA device.
-- [ ] The pushed revision's BuildBuddy workflow passes while reusing the remote
+- [x] The pushed revision's BuildBuddy workflow passes while reusing the remote
       cache.
 - [x] `git diff --check`
-- [ ] Milestone 2 is complete only when FP16/BF16 safetensors parameters load
+- [x] Milestone 2 is complete only when FP16/BF16 safetensors parameters load
       once into persistent CPU/CUDA buffers, flow through `Bufferized<T>`, and
       execute repeatedly with correct results through the compact ZML-shaped
       public API.
