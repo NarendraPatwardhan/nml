@@ -586,10 +586,10 @@ regions, loop state, page traversal, and backend dispatch remain internal.
       data remotely.
 - [x] The NVIDIA host executes the cached ordinary/paged attention and cache
       contracts on the real supported GPU.
-- [ ] The pushed revision's BuildBuddy workflow passes while reusing the remote
+- [x] The pushed revision's BuildBuddy workflow passes while reusing the remote
       cache.
 - [x] `git diff --check`
-- [ ] Milestone 4 is complete only when ordinary attention, portable blockwise
+- [x] Milestone 4 is complete only when ordinary attention, portable blockwise
       paged attention, and persistent rollback-capable KV state execute through
       the compact public API on CPU and CUDA without dense-cache materialization.
 
