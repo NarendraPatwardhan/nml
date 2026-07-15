@@ -1,5 +1,6 @@
 use nml_mlir::{
-    Block, Context, Error, IndexCastKind, Region, ShardyDimension, stablehlo_current_version,
+    stablehlo_current_version, Block, Context, Error, IndexCastKind, OutputOperandAlias, Region,
+    ShardyDimension, TritonCustomCall,
 };
 use nml_types::DType;
 
@@ -13,11 +14,9 @@ fn canonical_dtypes_and_index_have_distinct_mlir_contracts() {
         );
     }
     assert_eq!(context.index_type().text(), "index");
-    assert!(
-        !DType::ALL
-            .iter()
-            .any(|dtype| dtype.stablehlo_spelling() == "index")
-    );
+    assert!(!DType::ALL
+        .iter()
+        .any(|dtype| dtype.stablehlo_spelling() == "index"));
 }
 
 #[test]
@@ -368,4 +367,220 @@ fn safe_handles_reject_cross_context_composition() {
         first_manager.run(&mut second_module),
         Err(Error::ContextMismatch { .. })
     ));
+}
+
+#[test]
+fn ttir_context_owns_only_the_kernel_dialect_universe() {
+    const KERNEL: &str = r#"
+module {
+  tt.func public @copy(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32}) {
+    %value = tt.load %arg0 : !tt.ptr<f32>
+    tt.store %arg1, %value : !tt.ptr<f32>
+    tt.return
+  }
+}
+"#;
+
+    for _ in 0..8 {
+        let context = Context::new_ttir();
+        let f32_type = context.dtype(DType::F32).unwrap();
+        let pointer = context.triton_pointer_type(f32_type, 1).unwrap();
+        let descriptor = context
+            .triton_tensor_descriptor_type(&[16, 32], f32_type)
+            .unwrap();
+        assert!(pointer.is_triton_pointer());
+        assert_eq!(pointer.text(), "!tt.ptr<f32>");
+        assert!(descriptor.is_triton_tensor_descriptor());
+        assert_eq!(descriptor.text(), "!tt.tensordesc<16x32xf32>");
+        assert_eq!(
+            context.triton_program_dimension(0).unwrap().text(),
+            "0 : i32"
+        );
+        assert_eq!(context.triton_cache_modifier(3).unwrap().text(), "3 : i32");
+        assert_eq!(context.triton_eviction_policy(3).unwrap().text(), "3 : i32");
+        assert_eq!(context.triton_input_precision(2).unwrap().text(), "2 : i32");
+
+        let module = context.parse_module(KERNEL).unwrap();
+        module.verify().unwrap();
+        let text = module.text();
+        assert!(text.contains("tt.func public @copy"), "{text}");
+        assert!(text.contains("tt.load"), "{text}");
+        assert!(text.contains("tt.store"), "{text}");
+    }
+}
+
+#[test]
+fn ttir_pointer_types_reject_foreign_contexts() {
+    let first = Context::new_ttir();
+    let second = Context::new_ttir();
+    let foreign = first.dtype(DType::F32).unwrap();
+    assert!(matches!(
+        second.triton_pointer_type(foreign, 1),
+        Err(Error::ContextMismatch {
+            object: "Triton pointer pointee"
+        })
+    ));
+    assert!(matches!(
+        second.triton_tensor_descriptor_type(&[8], foreign),
+        Err(Error::ContextMismatch {
+            object: "Triton tensor descriptor element"
+        })
+    ));
+    assert!(second.triton_program_dimension(3).is_err());
+    assert!(second.triton_cache_modifier(0).is_err());
+    assert!(second.triton_eviction_policy(4).is_err());
+    assert!(second.triton_input_precision(5).is_err());
+}
+
+#[test]
+fn triton_custom_call_has_xla_typed_ffi_contract() {
+    const KERNEL: &str = r#"module {
+  tt.func public @copy(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>) {
+    %value = tt.load %arg0 : !tt.ptr<f32>
+    tt.store %arg1, %value : !tt.ptr<f32>
+    tt.return
+  }
+}"#;
+
+    let context = Context::new();
+    let tensor = context.ranked_tensor_type(DType::F32, &[4]).unwrap();
+    let mut block = Block::new(&context, &[tensor]).unwrap();
+    let input = block.argument(0).unwrap();
+    let call = context
+        .triton_custom_call(
+            &[input],
+            &[tensor],
+            TritonCustomCall {
+                name: "copy",
+                ir: KERNEL,
+                grid: [1, 1, 1],
+                num_stages: 1,
+                num_warps: 1,
+                operand_layouts: &[&[0]],
+                result_layouts: &[&[0]],
+                output_operand_aliases: &[OutputOperandAlias {
+                    output_index: 0,
+                    operand_index: 0,
+                }],
+            },
+        )
+        .unwrap();
+    let result = call.result(0).unwrap();
+    block.append_operation(call).unwrap();
+    block
+        .append_operation(context.return_operation(&[result]).unwrap())
+        .unwrap();
+    let mut body = Region::new(&context).unwrap();
+    body.append_block(block).unwrap();
+    let function = context
+        .function("triton_custom_call", &[tensor], &[tensor], body)
+        .unwrap();
+    let mut module = context.empty_module().unwrap();
+    module.append_operation(function).unwrap();
+    module.verify().unwrap();
+
+    let text = module.text();
+    assert!(text.contains("__gpu$xla.gpu.triton"), "{text}");
+    assert!(text.contains("#stablehlo.output_operand_alias"), "{text}");
+    assert!(text.contains("grid_x = 1 : i32"), "{text}");
+    assert!(text.contains("operand_layouts"), "{text}");
+    assert!(text.contains("result_layouts"), "{text}");
+}
+
+#[test]
+fn custom_call_layouts_reject_non_tensor_types_safely() {
+    let context = Context::new();
+    let scalar = context.dtype(DType::F32).unwrap();
+    let block = Block::new(&context, &[scalar, scalar, scalar]).unwrap();
+    let query = block.argument(0).unwrap();
+    let key = block.argument(1).unwrap();
+    let value = block.argument(2).unwrap();
+
+    assert!(matches!(
+        context.flash_attention_2_custom_call(
+            query, key, value, scalar, scalar, 1.0, true, -1,
+        ),
+        Err(Error::InvalidOperation { source })
+            if source == "custom-call layouts require ranked tensor types"
+    ));
+}
+
+#[test]
+fn paged_flash_custom_calls_have_narrow_typed_ffi_contracts() {
+    let context = Context::new();
+    let query = context
+        .ranked_tensor_type(DType::F16, &[2, 3, 4, 64])
+        .unwrap();
+    let cache = context
+        .ranked_tensor_type(DType::F16, &[7, 256, 2, 64])
+        .unwrap();
+    let page_table = context.ranked_tensor_type(DType::I32, &[2, 5]).unwrap();
+    let lengths = context.ranked_tensor_type(DType::I32, &[2]).unwrap();
+    let lse = context.ranked_tensor_type(DType::F32, &[2, 4, 3]).unwrap();
+    let argument_types = [query, cache, cache, page_table, lengths];
+    let mut block = Block::new(&context, &argument_types).unwrap();
+    let arguments = (0..argument_types.len())
+        .map(|index| block.argument(index).unwrap())
+        .collect::<Vec<_>>();
+
+    let fa2 = context
+        .paged_flash_attention_2_custom_call(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+            arguments[4],
+            query,
+            lse,
+            0.125,
+            true,
+            32,
+        )
+        .unwrap();
+    assert!(fa2.result(2).is_err());
+    let fa2_output = fa2.result(0).unwrap();
+    block.append_operation(fa2).unwrap();
+
+    let fa3 = context
+        .paged_flash_attention_3_custom_call(
+            arguments[0],
+            arguments[1],
+            arguments[2],
+            arguments[3],
+            arguments[4],
+            query,
+            lse,
+            0.125,
+            true,
+            32,
+        )
+        .unwrap();
+    assert!(fa3.result(2).is_ok());
+    let fa3_output = fa3.result(0).unwrap();
+    block.append_operation(fa3).unwrap();
+    block
+        .append_operation(context.return_operation(&[fa2_output, fa3_output]).unwrap())
+        .unwrap();
+    let mut body = Region::new(&context).unwrap();
+    body.append_block(block).unwrap();
+    let function = context
+        .function(
+            "paged_flash_custom_calls",
+            &argument_types,
+            &[query, query],
+            body,
+        )
+        .unwrap();
+    let mut module = context.empty_module().unwrap();
+    module.append_operation(function).unwrap();
+    module.verify().unwrap();
+
+    let text = module.text();
+    assert!(text.contains("nml.flash_attention_2.paged"), "{text}");
+    assert!(text.contains("nml.flash_attention_3.paged"), "{text}");
+    assert!(text.contains("api_version = 4 : i32"), "{text}");
+    assert!(text.contains("backend_config"), "{text}");
+    assert!(text.contains("scale = 1.250000e-01 : f32"), "{text}");
+    assert!(text.contains("sliding_window = 32 : i32"), "{text}");
+    assert!(text.contains("tensor<1xi32>"), "{text}");
 }

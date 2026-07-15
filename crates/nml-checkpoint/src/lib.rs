@@ -537,6 +537,22 @@ pub mod io {
                 .map_err(super::Error::Ir)
         }
 
+        pub fn power(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .power(left, right)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn remainder(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .remainder(left, right)
+                .map_err(super::Error::Ir)
+        }
+
         pub fn minimum(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
             self.inner
                 .borrow_mut()
@@ -553,11 +569,32 @@ pub mod io {
                 .map_err(super::Error::Ir)
         }
 
+        pub fn clamp(
+            &self,
+            input: Tensor,
+            minimum: Tensor,
+            maximum: Tensor,
+        ) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .clamp(input, minimum, maximum)
+                .map_err(super::Error::Ir)
+        }
+
         pub fn negate(&self, input: Tensor) -> Result<Tensor, super::Error> {
             self.inner
                 .borrow_mut()
                 .builder
                 .negate(input)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn abs(&self, input: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .abs(input)
                 .map_err(super::Error::Ir)
         }
 
@@ -746,6 +783,18 @@ pub mod io {
                 .map_err(super::Error::Ir)
         }
 
+        pub fn token_embedding(
+            &self,
+            weight: Tensor,
+            indices: Tensor,
+        ) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .token_embedding(weight, indices)
+                .map_err(super::Error::Ir)
+        }
+
         pub fn reduce_sum(&self, input: Tensor, axes: &[usize]) -> Result<Tensor, super::Error> {
             self.inner
                 .borrow_mut()
@@ -759,6 +808,38 @@ pub mod io {
                 .borrow_mut()
                 .builder
                 .reduce_max(input, axes)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn reduce_min(&self, input: Tensor, axes: &[usize]) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .reduce_min(input, axes)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn mean(&self, input: Tensor, axes: &[usize]) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .mean(input, axes)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn log_sum_exp(&self, input: Tensor, axes: &[usize]) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .log_sum_exp(input, axes)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn argmax(&self, input: Tensor, axis: usize) -> Result<(Tensor, Tensor), super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .argmax(input, axis)
                 .map_err(super::Error::Ir)
         }
 
@@ -781,6 +862,47 @@ pub mod io {
                 .borrow_mut()
                 .builder
                 .rms_norm(input, weight, axis, epsilon)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn normalize_variance(
+            &self,
+            input: Tensor,
+            axis: usize,
+            epsilon: f64,
+        ) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .normalize_variance(input, axis, epsilon)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn layer_norm(
+            &self,
+            input: Tensor,
+            weight: Option<Tensor>,
+            bias: Option<Tensor>,
+            axis: usize,
+            epsilon: f64,
+        ) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .layer_norm(input, weight, bias, axis, epsilon)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn normalize_l2(
+            &self,
+            input: Tensor,
+            axes: &[usize],
+            epsilon: f64,
+        ) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .normalize_l2(input, axes, epsilon)
                 .map_err(super::Error::Ir)
         }
 
@@ -906,6 +1028,22 @@ pub mod io {
                 .map_err(super::Error::Ir)
         }
 
+        pub fn floor(&self, input: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .floor(input)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn ceil(&self, input: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .ceil(input)
+                .map_err(super::Error::Ir)
+        }
+
         pub fn relu(&self, input: Tensor) -> Result<Tensor, super::Error> {
             self.inner
                 .borrow_mut()
@@ -951,6 +1089,22 @@ pub mod io {
                 .borrow_mut()
                 .builder
                 .quick_gelu(input)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn swiglu(&self, gate: Tensor, value: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .swiglu(gate, value)
+                .map_err(super::Error::Ir)
+        }
+
+        pub fn geglu(&self, gate: Tensor, value: Tensor) -> Result<Tensor, super::Error> {
+            self.inner
+                .borrow_mut()
+                .builder
+                .geglu(gate, value)
                 .map_err(super::Error::Ir)
         }
 

@@ -5,18 +5,20 @@
 
 #![forbid(unsafe_code)]
 
+mod attention_backend;
+mod ordinary_attention;
 mod paged_attention;
 
 use nml_mlir::{
     Attribute as MlirAttribute, Block, Context, Error as MlirError, Module, Region,
     ShardyDimension, StableHloBinary, StableHloComparison, StableHloComparisonType,
-    StableHloFftType, StableHloUnary, Value as MlirValue,
+    StableHloFftType, StableHloUnary, Type as MlirType, Value as MlirValue,
 };
 use nml_sharding::Sharding;
 use nml_tensor::{Element, Slice};
 use nml_types::{
-    AxisTag, BFloat16, Complex64, Complex128, DType, DTypeClass, F16, Layout, Partition, Shape,
-    ShapeError,
+    AxisTag, BFloat16, Complex128, Complex64, DType, DTypeClass, Layout, Partition, Shape,
+    ShapeError, F16,
 };
 use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
@@ -173,6 +175,7 @@ pub enum Error {
     InvalidAttention(&'static str),
     InvalidRope(&'static str),
     InvalidNormalization(&'static str),
+    InvalidReduction(&'static str),
     UpdateDimensionTooLarge {
         axis: usize,
         input: i64,
@@ -294,6 +297,7 @@ impl fmt::Display for Error {
             Self::InvalidNormalization(message) => {
                 write!(formatter, "invalid normalization: {message}")
             }
+            Self::InvalidReduction(message) => write!(formatter, "invalid reduction: {message}"),
             Self::UpdateDimensionTooLarge {
                 axis,
                 input,
@@ -433,12 +437,45 @@ impl ProgramBuilder {
         self.binary(left, right, Binary::Divide)
     }
 
+    pub fn power(&mut self, left: Tensor, right: Tensor) -> Result<Tensor, Error> {
+        self.binary(left, right, Binary::Power)
+    }
+
+    pub fn remainder(&mut self, left: Tensor, right: Tensor) -> Result<Tensor, Error> {
+        self.binary(left, right, Binary::Remainder)
+    }
+
     pub fn minimum(&mut self, left: Tensor, right: Tensor) -> Result<Tensor, Error> {
         self.binary(left, right, Binary::Minimum)
     }
 
     pub fn maximum(&mut self, left: Tensor, right: Tensor) -> Result<Tensor, Error> {
         self.binary(left, right, Binary::Maximum)
+    }
+
+    pub fn clamp(
+        &mut self,
+        input: Tensor,
+        minimum: Tensor,
+        maximum: Tensor,
+    ) -> Result<Tensor, Error> {
+        let (input, minimum, shape) = self.elementwise_operands("clamp", input, minimum)?;
+        let (input, maximum, result_shape) = self.elementwise_operands("clamp", input, maximum)?;
+        require_matching_shape_metadata("clamp", shape, result_shape)?;
+        if !result_shape.dtype().supports_ordering() || result_shape.dtype() == DType::Bool {
+            return Err(Error::UnsupportedDType {
+                operation: "clamp",
+                dtype: result_shape.dtype(),
+            });
+        }
+        let result = self.push_value("clamp", result_shape);
+        self.operations.push(Operation::Clamp {
+            minimum: minimum.value,
+            input: input.value,
+            maximum: maximum.value,
+            result: result.value,
+        });
+        Ok(result)
     }
 
     pub fn negate(&mut self, input: Tensor) -> Result<Tensor, Error> {
@@ -453,6 +490,31 @@ impl ProgramBuilder {
             }
         }
         self.unary(input, Unary::Negate)
+    }
+
+    pub fn abs(&mut self, input: Tensor) -> Result<Tensor, Error> {
+        self.require_local(input)?;
+        let dtype = match input.shape.dtype().class() {
+            DTypeClass::SignedInteger | DTypeClass::Float => input.shape.dtype(),
+            DTypeClass::Complex => match input.shape.dtype() {
+                DType::C64 => DType::F32,
+                DType::C128 => DType::F64,
+                _ => unreachable!("complex class contains only C64 and C128"),
+            },
+            DTypeClass::Boolean | DTypeClass::UnsignedInteger => {
+                return Err(Error::UnsupportedDType {
+                    operation: "abs",
+                    dtype: input.shape.dtype(),
+                });
+            }
+        };
+        let result = self.push_value("abs", input.shape.with_dtype(dtype));
+        self.operations.push(Operation::Unary {
+            input: input.value,
+            result: result.value,
+            operation: Unary::Abs,
+        });
+        Ok(result)
     }
 
     pub fn equal(&mut self, left: Tensor, right: Tensor) -> Result<Tensor, Error> {
@@ -647,6 +709,14 @@ impl ProgramBuilder {
         self.float_unary(input, Unary::Cos)
     }
 
+    pub fn floor(&mut self, input: Tensor) -> Result<Tensor, Error> {
+        self.float_unary(input, Unary::Floor)
+    }
+
+    pub fn ceil(&mut self, input: Tensor) -> Result<Tensor, Error> {
+        self.float_unary(input, Unary::Ceil)
+    }
+
     pub fn sigmoid(&mut self, input: Tensor) -> Result<Tensor, Error> {
         self.float_unary(input, Unary::Logistic)
     }
@@ -696,6 +766,16 @@ impl ProgramBuilder {
         let scaled = self.multiply(scale, input)?;
         let gate = self.sigmoid(scaled)?;
         self.multiply(input, gate)
+    }
+
+    pub fn swiglu(&mut self, gate: Tensor, value: Tensor) -> Result<Tensor, Error> {
+        let gate = self.silu(gate)?;
+        self.multiply(gate, value)
+    }
+
+    pub fn geglu(&mut self, gate: Tensor, value: Tensor) -> Result<Tensor, Error> {
+        let gate = self.gelu(gate)?;
+        self.multiply(gate, value)
     }
 
     pub fn broadcast_in_dim(
@@ -991,6 +1071,15 @@ impl ProgramBuilder {
         self.gather_impl(input, indices, axis, slice_size, false)
     }
 
+    /// Gathers rows from a `[vocabulary, embedding]` weight without imposing a
+    /// model-layer type or a particular checkpoint path.
+    pub fn token_embedding(&mut self, weight: Tensor, indices: Tensor) -> Result<Tensor, Error> {
+        self.require_rank(weight, "token embedding weight", 2)?;
+        self.require_local(indices)?;
+        require_index_dtype(indices.shape.dtype())?;
+        self.gather(weight, indices, 0)
+    }
+
     fn gather_impl(
         &mut self,
         input: Tensor,
@@ -1077,6 +1166,94 @@ impl ProgramBuilder {
 
     pub fn reduce_max(&mut self, input: Tensor, axes: &[usize]) -> Result<Tensor, Error> {
         self.reduce(input, axes, Reduction::Maximum)
+    }
+
+    pub fn reduce_min(&mut self, input: Tensor, axes: &[usize]) -> Result<Tensor, Error> {
+        self.reduce(input, axes, Reduction::Minimum)
+    }
+
+    /// Reduces floating-point axes with F32 accumulation for F16 and BF16.
+    pub fn mean(&mut self, input: Tensor, axes: &[usize]) -> Result<Tensor, Error> {
+        self.require_float(input, "mean")?;
+        validate_axes(axes, input.shape.rank(), "mean")?;
+        let count = axes.iter().try_fold(1i64, |count, axis| {
+            count.checked_mul(input.shape.dimensions()[*axis])
+        });
+        let Some(count) = count else {
+            return Err(Error::InvalidReduction("mean element count overflows i64"));
+        };
+        if count == 0 {
+            return Err(Error::InvalidReduction("mean over an empty dimension"));
+        }
+        let accumulation = self.float_accumulation(input)?;
+        let sum = self.reduce_sum(accumulation, axes)?;
+        let count = self.scalar_for(accumulation.shape.dtype(), count as f64)?;
+        let mean = self.divide(sum, count)?;
+        self.convert(mean, input.shape.dtype())
+    }
+
+    /// Computes a maximum-shifted log-sum-exp and preserves `-inf` for rows
+    /// containing only negative infinity.
+    pub fn log_sum_exp(&mut self, input: Tensor, axes: &[usize]) -> Result<Tensor, Error> {
+        self.require_float(input, "log_sum_exp")?;
+        validate_axes(axes, input.shape.rank(), "log_sum_exp")?;
+        let accumulation = self.float_accumulation(input)?;
+        let maximum = self.reduce_max(accumulation, axes)?;
+        let negative_infinity = self.scalar_for(accumulation.shape.dtype(), f64::NEG_INFINITY)?;
+        let row_has_values = self.greater(maximum, negative_infinity)?;
+        let zero = self.zero_for(accumulation.shape.dtype())?;
+        let safe_maximum = self.select(row_has_values, maximum, zero)?;
+        let broadcast_maximum = self.broadcast_reduction(safe_maximum, accumulation.shape, axes)?;
+        let shifted = self.subtract(accumulation, broadcast_maximum)?;
+        let exponentials = self.exp(shifted)?;
+        let sum = self.reduce_sum(exponentials, axes)?;
+        let logarithm = self.log(sum)?;
+        let result = self.add(logarithm, safe_maximum)?;
+        let result = self.select(row_has_values, result, negative_infinity)?;
+        self.convert(result, input.shape.dtype())
+    }
+
+    /// Returns `(values, indices)` after removing `axis`. Ties select the first
+    /// index and NaNs propagate with their first index, matching ZML.
+    pub fn argmax(&mut self, input: Tensor, axis: usize) -> Result<(Tensor, Tensor), Error> {
+        self.require_local(input)?;
+        validate_axes(&[axis], input.shape.rank(), "argmax")?;
+        if !input.shape.dtype().supports_ordering() || input.shape.dtype() == DType::Bool {
+            return Err(Error::UnsupportedDType {
+                operation: "argmax",
+                dtype: input.shape.dtype(),
+            });
+        }
+        let dimension = input.shape.dimensions()[axis];
+        if dimension == 0 {
+            return Err(Error::InvalidReduction("argmax over an empty dimension"));
+        }
+        let index_dtype = if dimension <= i32::MAX as i64 {
+            DType::I32
+        } else {
+            DType::I64
+        };
+        let indices = self.iota(input.shape.with_dtype(index_dtype), axis)?;
+        let value_init = self.minimum_for(input.shape.dtype())?;
+        let index_init = self.zero_for(index_dtype)?;
+        let value_result = self.push_value(
+            "argmax_value",
+            reduced_shape(input.shape, &[axis], input.shape.dtype())?,
+        );
+        let index_result = self.push_value(
+            "argmax_index",
+            reduced_shape(input.shape, &[axis], index_dtype)?,
+        );
+        self.operations.push(Operation::ArgMax {
+            input: input.value,
+            indices: indices.value,
+            value_init: value_init.value,
+            index_init: index_init.value,
+            value_result: value_result.value,
+            index_result: index_result.value,
+            axis,
+        });
+        Ok((value_result, index_result))
     }
 
     pub fn softmax(&mut self, input: Tensor, axis: usize) -> Result<Tensor, Error> {
@@ -1168,6 +1345,94 @@ impl ProgramBuilder {
         }
         let weight = self.broadcast_in_dim(weight, input.shape, &[axis])?;
         self.multiply(normalized, weight)
+    }
+
+    /// Centers one axis and scales it by the reciprocal standard deviation.
+    pub fn normalize_variance(
+        &mut self,
+        input: Tensor,
+        axis: usize,
+        epsilon: f64,
+    ) -> Result<Tensor, Error> {
+        self.require_float(input, "normalize_variance")?;
+        self.validate_normalization_axis(input, axis, epsilon)?;
+        let accumulation = self.float_accumulation(input)?;
+        let sum = self.reduce_sum(accumulation, &[axis])?;
+        let count = self.scalar_for(
+            accumulation.shape.dtype(),
+            input.shape.dimensions()[axis] as f64,
+        )?;
+        let mean = self.divide(sum, count)?;
+        let mean = self.broadcast_reduction(mean, accumulation.shape, &[axis])?;
+        let centered = self.subtract(accumulation, mean)?;
+        let square = self.multiply(centered, centered)?;
+        let variance = self.reduce_sum(square, &[axis])?;
+        let variance = self.divide(variance, count)?;
+        let epsilon = self.scalar_for(accumulation.shape.dtype(), epsilon)?;
+        let variance = self.add(variance, epsilon)?;
+        let inverse = self.rsqrt(variance)?;
+        let inverse = self.broadcast_reduction(inverse, accumulation.shape, &[axis])?;
+        let normalized = self.multiply(centered, inverse)?;
+        self.convert(normalized, input.shape.dtype())
+    }
+
+    /// Applies variance normalization followed by optional one-dimensional
+    /// scale and bias parameters along `axis`.
+    pub fn layer_norm(
+        &mut self,
+        input: Tensor,
+        weight: Option<Tensor>,
+        bias: Option<Tensor>,
+        axis: usize,
+        epsilon: f64,
+    ) -> Result<Tensor, Error> {
+        let mut output = self.normalize_variance(input, axis, epsilon)?;
+        if let Some(weight) = weight {
+            let weight = self.normalization_parameter(input, weight, axis, "layer_norm weight")?;
+            output = self.multiply(output, weight)?;
+        }
+        if let Some(bias) = bias {
+            let bias = self.normalization_parameter(input, bias, axis, "layer_norm bias")?;
+            output = self.add(output, bias)?;
+        }
+        Ok(output)
+    }
+
+    /// Scales values by the reciprocal L2 norm over arbitrary axes. Keeping
+    /// axes explicit leaves vector, head, and feature normalization available
+    /// without introducing separate public layer types.
+    pub fn normalize_l2(
+        &mut self,
+        input: Tensor,
+        axes: &[usize],
+        epsilon: f64,
+    ) -> Result<Tensor, Error> {
+        self.require_float(input, "normalize_l2")?;
+        validate_axes(axes, input.shape.rank(), "normalize_l2")?;
+        if axes.is_empty() {
+            return Err(Error::InvalidNormalization(
+                "normalization requires at least one axis",
+            ));
+        }
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(Error::InvalidNormalization(
+                "epsilon must be finite and positive",
+            ));
+        }
+        if axes.iter().any(|axis| input.shape.dimensions()[*axis] == 0) {
+            return Err(Error::InvalidNormalization(
+                "normalization dimensions must be nonempty",
+            ));
+        }
+        let accumulation = self.float_accumulation(input)?;
+        let square = self.multiply(accumulation, accumulation)?;
+        let sum = self.reduce_sum(square, axes)?;
+        let epsilon = self.scalar_for(accumulation.shape.dtype(), epsilon)?;
+        let norm = self.add(sum, epsilon)?;
+        let inverse = self.rsqrt(norm)?;
+        let inverse = self.broadcast_reduction(inverse, accumulation.shape, axes)?;
+        let normalized = self.multiply(accumulation, inverse)?;
+        self.convert(normalized, input.shape.dtype())
     }
 
     /// Applies rotary position embeddings to `[batch, sequence, heads, head_dim]`.
@@ -1358,88 +1623,35 @@ impl ProgramBuilder {
                 "position tensors must match query and key sequence shapes",
             ));
         }
-        if options.sliding_window == Some(0) {
-            return Err(Error::InvalidAttention("sliding window must be nonzero"));
+        if options.sliding_window.is_some_and(|window| window <= 0) {
+            return Err(Error::InvalidAttention(
+                "sliding window must be positive when specified",
+            ));
         }
         let scale = options
             .scale
             .unwrap_or_else(|| 1.0 / (*head_dim as f64).sqrt());
-        if !scale.is_finite() || scale <= 0.0 {
-            return Err(Error::InvalidAttention("scale must be finite and positive"));
+        let kernel_scale = scale as f32;
+        if !scale.is_finite() || scale <= 0.0 || !kernel_scale.is_finite() || kernel_scale <= 0.0 {
+            return Err(Error::InvalidAttention(
+                "scale must be representable as positive finite F32",
+            ));
         }
 
-        let query_shape = query.shape;
-        let query_dtype = query.shape.dtype();
-        let groups = query_heads / kv_heads;
-        let query = self.convert(query, DType::F32)?;
-        let key = self.convert(key, DType::F32)?;
-        let value = self.convert(value, DType::F32)?;
-        let (kv_head_partition, group_partition) =
-            if matches!(key.shape.partitions()[2], Partition::Sharded(_)) {
-                (key.shape.partitions()[2], Partition::Replicated)
-            } else {
-                (key.shape.partitions()[2], query.shape.partitions()[2])
-            };
-        let grouped_query_shape = Shape::new(
-            DType::F32,
-            &[*batch, *query_len, *kv_heads, groups, *head_dim],
-        )?
-        .with_axis_tags(&[
-            query.shape.axis_tags()[0],
-            query.shape.axis_tags()[1],
-            key.shape.axis_tags()[2],
-            query.shape.axis_tags()[2],
-            query.shape.axis_tags()[3],
-        ])?
-        .with_partitions(&[
-            query.shape.partitions()[0],
-            query.shape.partitions()[1],
-            kv_head_partition,
-            group_partition,
-            query.shape.partitions()[3],
-        ])?;
-        let query = self.reshape(query, grouped_query_shape)?;
-        let query = self.transpose(query, &[0, 2, 3, 1, 4])?;
-        let key = self.transpose(key, &[0, 2, 1, 3])?;
-        let value = self.transpose(value, &[0, 2, 1, 3])?;
-        let mut scores = self.dot_general(query, key, &[0, 1], &[0, 1], &[4], &[3])?;
-        let scale = self.scalar(scale as f32)?;
-        scores = self.multiply(scores, scale)?;
-
-        let mask_shape = scores.shape;
-        let query_positions = self.convert(query_positions, DType::I64)?;
-        let key_positions = self.convert(key_positions, DType::I64)?;
-        let query_positions =
-            self.broadcast_in_dim(query_positions, mask_shape.with_dtype(DType::I64), &[0, 3])?;
-        let key_positions =
-            self.broadcast_in_dim(key_positions, mask_shape.with_dtype(DType::I64), &[0, 4])?;
-        let masked_value = self.scalar(f32::NEG_INFINITY)?;
-        if options.causal {
-            let causal = self.less_equal(key_positions, query_positions)?;
-            scores = self.select(causal, scores, masked_value)?;
-        }
-        if let Some(window) = options.sliding_window {
-            let radius = i64::try_from(window - 1)
-                .map_err(|_| Error::InvalidAttention("sliding window exceeds i64"))?;
-            let radius = self.scalar(radius)?;
-            let lower = self.subtract(query_positions, radius)?;
-            let within_lower = self.greater_equal(key_positions, lower)?;
-            scores = self.select(within_lower, scores, masked_value)?;
-            if !options.causal {
-                let upper = self.add(query_positions, radius)?;
-                let within_upper = self.less_equal(key_positions, upper)?;
-                scores = self.select(within_upper, scores, masked_value)?;
-            }
-        }
-        let weights = self.softmax(scores, 4)?;
-        let output = self.dot_general(weights, value, &[0, 1], &[0, 1], &[4], &[2])?;
-        let output = self.transpose(output, &[0, 3, 1, 2, 4])?;
-        let output = self.reshape(
-            output,
-            Shape::new(DType::F32, &[*batch, *query_len, *query_heads, *head_dim])?,
-        )?;
-        let output = self.convert(output, query_dtype)?;
-        self.reshape(output, query_shape)
+        let result = self.push_value("attention", query.shape);
+        self.operations.push(Operation::Attention {
+            query: query.value,
+            key: key.value,
+            value: value.value,
+            query_positions: query_positions.value,
+            key_positions: key_positions.value,
+            result: result.value,
+            options: AttentionOptions {
+                scale: Some(scale),
+                ..options
+            },
+        });
+        Ok(result)
     }
 
     /// Portable blockwise paged attention. K/V storage is
@@ -1520,14 +1732,19 @@ impl ProgramBuilder {
             .ok_or(Error::InvalidAttention(
                 "logical cache capacity exceeds the I64 position domain",
             ))?;
-        if options.sliding_window == Some(0) {
-            return Err(Error::InvalidAttention("sliding window must be nonzero"));
+        if options.sliding_window.is_some_and(|window| window <= 0) {
+            return Err(Error::InvalidAttention(
+                "sliding window must be positive when specified",
+            ));
         }
         let scale = options
             .scale
             .unwrap_or_else(|| 1.0 / (*head_dim as f64).sqrt());
-        if !scale.is_finite() || scale <= 0.0 {
-            return Err(Error::InvalidAttention("scale must be finite and positive"));
+        let kernel_scale = scale as f32;
+        if !scale.is_finite() || scale <= 0.0 || !kernel_scale.is_finite() || kernel_scale <= 0.0 {
+            return Err(Error::InvalidAttention(
+                "scale must be representable as positive finite F32",
+            ));
         }
         let result = self.push_value("paged_attention", query.shape);
         self.operations.push(Operation::PagedAttention {
@@ -1538,7 +1755,10 @@ impl ProgramBuilder {
             sequence_lengths: sequence_lengths.value,
             query_positions: query_positions.value,
             result: result.value,
-            options,
+            options: AttentionOptions {
+                scale: Some(scale),
+                ..options
+            },
         });
         Ok(result)
     }
@@ -1840,6 +2060,12 @@ impl ProgramBuilder {
                     });
                 }
             }
+            Binary::Remainder if shape.dtype().class() == DTypeClass::Complex => {
+                return Err(Error::UnsupportedDType {
+                    operation: operation.name(),
+                    dtype: shape.dtype(),
+                });
+            }
             _ if shape.dtype() == DType::Bool => {
                 return Err(Error::UnsupportedDType {
                     operation: operation.name(),
@@ -1939,7 +2165,7 @@ impl ProgramBuilder {
                     dtype: input.shape.dtype(),
                 });
             }
-            Reduction::Maximum
+            Reduction::Maximum | Reduction::Minimum
                 if !input.shape.dtype().supports_ordering()
                     || input.shape.dtype() == DType::Bool =>
             {
@@ -1950,27 +2176,11 @@ impl ProgramBuilder {
             }
             _ => {}
         }
-        let retained = (0..input.shape.rank())
-            .filter(|axis| !axes.contains(axis))
-            .collect::<Vec<_>>();
-        let dimensions = retained
-            .iter()
-            .map(|axis| input.shape.dimensions()[*axis])
-            .collect::<Vec<_>>();
-        let tags = retained
-            .iter()
-            .map(|axis| input.shape.axis_tags()[*axis])
-            .collect::<Vec<_>>();
-        let partitions = retained
-            .iter()
-            .map(|axis| input.shape.partitions()[*axis])
-            .collect::<Vec<_>>();
-        let shape = Shape::new(input.shape.dtype(), &dimensions)?
-            .with_axis_tags(&tags)?
-            .with_partitions(&partitions)?;
+        let shape = reduced_shape(input.shape, axes, input.shape.dtype())?;
         let init = match reduction {
             Reduction::Sum => self.zero_for(input.shape.dtype())?,
             Reduction::Maximum => self.minimum_for(input.shape.dtype())?,
+            Reduction::Minimum => self.maximum_for(input.shape.dtype())?,
         };
         let result = self.push_value(reduction.name(), shape);
         self.operations.push(Operation::Reduce {
@@ -2036,6 +2246,66 @@ impl ProgramBuilder {
         }
     }
 
+    fn float_accumulation(&mut self, input: Tensor) -> Result<Tensor, Error> {
+        if matches!(input.shape.dtype(), DType::F16 | DType::Bf16) {
+            self.convert(input, DType::F32)
+        } else {
+            Ok(input)
+        }
+    }
+
+    fn validate_normalization_axis(
+        &self,
+        input: Tensor,
+        axis: usize,
+        epsilon: f64,
+    ) -> Result<(), Error> {
+        if axis >= input.shape.rank() {
+            return Err(Error::AxisOutOfBounds {
+                side: "normalization",
+                axis,
+                rank: input.shape.rank(),
+            });
+        }
+        if input.shape.dimensions()[axis] == 0 {
+            return Err(Error::InvalidNormalization(
+                "normalization dimension must be nonempty",
+            ));
+        }
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(Error::InvalidNormalization(
+                "epsilon must be finite and positive",
+            ));
+        }
+        Ok(())
+    }
+
+    fn normalization_parameter(
+        &mut self,
+        input: Tensor,
+        parameter: Tensor,
+        axis: usize,
+        operation: &'static str,
+    ) -> Result<Tensor, Error> {
+        self.require_local(parameter)?;
+        self.require_rank(parameter, operation, 1)?;
+        if parameter.shape.dtype() != input.shape.dtype() {
+            return Err(Error::DTypeMismatch {
+                left: input.shape.dtype(),
+                right: parameter.shape.dtype(),
+            });
+        }
+        if parameter.shape.dimensions()[0] != input.shape.dimensions()[axis] {
+            return Err(Error::DimensionMismatch {
+                left_axis: 0,
+                right_axis: axis,
+                left: parameter.shape.dimensions()[0],
+                right: input.shape.dimensions()[axis],
+            });
+        }
+        self.broadcast_in_dim(parameter, input.shape, &[axis])
+    }
+
     fn scalar_for(&mut self, dtype: DType, value: f64) -> Result<Tensor, Error> {
         match dtype {
             DType::F16 => self.scalar(F16::from_f32(value as f32)),
@@ -2091,6 +2361,27 @@ impl ProgramBuilder {
             DType::F64 => self.scalar(f64::NEG_INFINITY),
             _ => Err(Error::UnsupportedDType {
                 operation: "reduce_max",
+                dtype,
+            }),
+        }
+    }
+
+    fn maximum_for(&mut self, dtype: DType) -> Result<Tensor, Error> {
+        match dtype {
+            DType::I8 => self.scalar(i8::MAX),
+            DType::I16 => self.scalar(i16::MAX),
+            DType::I32 => self.scalar(i32::MAX),
+            DType::I64 => self.scalar(i64::MAX),
+            DType::U8 => self.scalar(u8::MAX),
+            DType::U16 => self.scalar(u16::MAX),
+            DType::U32 => self.scalar(u32::MAX),
+            DType::U64 => self.scalar(u64::MAX),
+            DType::F16 => self.scalar(F16::from_f32(f32::INFINITY)),
+            DType::Bf16 => self.scalar(BFloat16::from_f32(f32::INFINITY)),
+            DType::F32 => self.scalar(f32::INFINITY),
+            DType::F64 => self.scalar(f64::INFINITY),
+            _ => Err(Error::UnsupportedDType {
+                operation: "reduce_min",
                 dtype,
             }),
         }
@@ -2369,6 +2660,31 @@ impl Program {
         context: &'context Context,
         sharding: &Sharding,
     ) -> Result<Module<'context>, Error> {
+        self.module_with_sharding_target(context, sharding, None)
+    }
+
+    #[doc(hidden)]
+    pub fn module_with_sharding_cuda<'context>(
+        &self,
+        context: &'context Context,
+        sharding: &Sharding,
+        core_count: usize,
+        capability_major: u16,
+        capability_minor: u16,
+    ) -> Result<Module<'context>, Error> {
+        self.module_with_sharding_target(
+            context,
+            sharding,
+            Some((core_count, capability_major, capability_minor)),
+        )
+    }
+
+    fn module_with_sharding_target<'context>(
+        &self,
+        context: &'context Context,
+        sharding: &Sharding,
+        cuda: Option<(usize, u16, u16)>,
+    ) -> Result<Module<'context>, Error> {
         for value in &self.values {
             sharding.validate_shape(value.shape)?;
         }
@@ -2394,6 +2710,162 @@ impl Program {
         }
 
         for operation in &self.operations {
+            if let Operation::Attention {
+                query,
+                key,
+                value,
+                query_positions,
+                key_positions,
+                result,
+                options,
+            } = operation
+            {
+                let inputs = ordinary_attention::Inputs {
+                    query: mlir_value(&values, *query),
+                    key: mlir_value(&values, *key),
+                    value: mlir_value(&values, *value),
+                    query_positions: mlir_value(&values, *query_positions),
+                    key_positions: mlir_value(&values, *key_positions),
+                    query_shape: self.values[*query].shape,
+                    key_shape: self.values[*key].shape,
+                    query_positions_dtype: self.values[*query_positions].shape.dtype(),
+                    key_positions_dtype: self.values[*key_positions].shape.dtype(),
+                    result_type: types[*result],
+                    options: *options,
+                };
+                let lowered = if let Some((_, major, minor)) = cuda {
+                    ordinary_attention::lower_cuda(context, &mut block, inputs, major, minor)?
+                } else {
+                    ordinary_attention::lower(context, &mut block, inputs)?
+                };
+                values[*result] = Some(constrain_compound_result(
+                    context,
+                    &mut block,
+                    lowered,
+                    types[*result],
+                    sharding,
+                    self.values[*result].shape,
+                )?);
+                continue;
+            }
+            if let Operation::ArgMax {
+                input,
+                indices,
+                value_init,
+                index_init,
+                value_result,
+                index_result,
+                axis,
+            } = operation
+            {
+                let value_dtype = self.values[*input].shape.dtype();
+                let index_dtype = self.values[*indices].shape.dtype();
+                let value_scalar = context.ranked_tensor_type(value_dtype, &[])?;
+                let index_scalar = context.ranked_tensor_type(index_dtype, &[])?;
+                let bool_scalar = context.ranked_tensor_type(DType::Bool, &[])?;
+                let mut reduction_block = Block::new(
+                    context,
+                    &[value_scalar, index_scalar, value_scalar, index_scalar],
+                )?;
+                let left_value = reduction_block.argument(0)?;
+                let left_index = reduction_block.argument(1)?;
+                let right_value = reduction_block.argument(2)?;
+                let right_index = reduction_block.argument(3)?;
+
+                let left_greater = context.compare(
+                    left_value,
+                    right_value,
+                    bool_scalar,
+                    StableHloComparison::Gt,
+                    comparison_type(value_dtype),
+                )?;
+                let left_greater_value = left_greater.result(0)?;
+                reduction_block.append_operation(left_greater)?;
+                let left_nan = context.compare(
+                    left_value,
+                    left_value,
+                    bool_scalar,
+                    StableHloComparison::Ne,
+                    comparison_type(value_dtype),
+                )?;
+                let left_nan_value = left_nan.result(0)?;
+                reduction_block.append_operation(left_nan)?;
+                let left_greater_or_nan = context.binary(
+                    StableHloBinary::Or,
+                    left_greater_value,
+                    left_nan_value,
+                    bool_scalar,
+                )?;
+                let left_greater_or_nan_value = left_greater_or_nan.result(0)?;
+                reduction_block.append_operation(left_greater_or_nan)?;
+
+                let values_equal = context.compare(
+                    left_value,
+                    right_value,
+                    bool_scalar,
+                    StableHloComparison::Eq,
+                    comparison_type(value_dtype),
+                )?;
+                let values_equal_value = values_equal.result(0)?;
+                reduction_block.append_operation(values_equal)?;
+                let left_index_first = context.compare(
+                    left_index,
+                    right_index,
+                    bool_scalar,
+                    StableHloComparison::Lt,
+                    comparison_type(index_dtype),
+                )?;
+                let left_index_first_value = left_index_first.result(0)?;
+                reduction_block.append_operation(left_index_first)?;
+                let equal_and_first = context.binary(
+                    StableHloBinary::And,
+                    values_equal_value,
+                    left_index_first_value,
+                    bool_scalar,
+                )?;
+                let equal_and_first_value = equal_and_first.result(0)?;
+                reduction_block.append_operation(equal_and_first)?;
+                let keep_left_index = context.binary(
+                    StableHloBinary::Or,
+                    left_greater_or_nan_value,
+                    equal_and_first_value,
+                    bool_scalar,
+                )?;
+                let keep_left_index_value = keep_left_index.result(0)?;
+                reduction_block.append_operation(keep_left_index)?;
+
+                let maximum = context.select(
+                    left_greater_or_nan_value,
+                    left_value,
+                    right_value,
+                    value_scalar,
+                )?;
+                let maximum_value = maximum.result(0)?;
+                reduction_block.append_operation(maximum)?;
+                let maximum_index =
+                    context.select(keep_left_index_value, left_index, right_index, index_scalar)?;
+                let maximum_index_value = maximum_index.result(0)?;
+                reduction_block.append_operation(maximum_index)?;
+                reduction_block.append_operation(
+                    context.stablehlo_return(&[maximum_value, maximum_index_value])?,
+                )?;
+                let mut reduction_body = Region::new(context)?;
+                reduction_body.append_block(reduction_block)?;
+                let reduction = context.reduce_many(
+                    &[mlir_value(&values, *input), mlir_value(&values, *indices)],
+                    &[
+                        mlir_value(&values, *value_init),
+                        mlir_value(&values, *index_init),
+                    ],
+                    &[types[*value_result], types[*index_result]],
+                    &[*axis as i64],
+                    reduction_body,
+                )?;
+                values[*value_result] = Some(reduction.result(0)?);
+                values[*index_result] = Some(reduction.result(1)?);
+                block.append_operation(reduction)?;
+                continue;
+            }
             if let Operation::PagedAttention {
                 query,
                 key_cache,
@@ -2405,25 +2877,36 @@ impl Program {
                 options,
             } = operation
             {
-                values[*result] = Some(paged_attention::lower(
+                let inputs = paged_attention::Inputs {
+                    query: mlir_value(&values, *query),
+                    key_cache: mlir_value(&values, *key_cache),
+                    value_cache: mlir_value(&values, *value_cache),
+                    page_table: mlir_value(&values, *page_table),
+                    sequence_lengths: mlir_value(&values, *sequence_lengths),
+                    query_positions: mlir_value(&values, *query_positions),
+                    query_shape: self.values[*query].shape,
+                    cache_shape: self.values[*key_cache].shape,
+                    page_table_shape: self.values[*page_table].shape,
+                    page_table_dtype: self.values[*page_table].shape.dtype(),
+                    sequence_lengths_dtype: self.values[*sequence_lengths].shape.dtype(),
+                    query_positions_dtype: self.values[*query_positions].shape.dtype(),
+                    result_type: types[*result],
+                    options: *options,
+                };
+                let lowered = if let Some((core_count, major, minor)) = cuda {
+                    paged_attention::lower_triton(
+                        context, &mut block, inputs, core_count, major, minor,
+                    )?
+                } else {
+                    paged_attention::lower(context, &mut block, inputs)?
+                };
+                values[*result] = Some(constrain_compound_result(
                     context,
                     &mut block,
-                    paged_attention::Inputs {
-                        query: mlir_value(&values, *query),
-                        key_cache: mlir_value(&values, *key_cache),
-                        value_cache: mlir_value(&values, *value_cache),
-                        page_table: mlir_value(&values, *page_table),
-                        sequence_lengths: mlir_value(&values, *sequence_lengths),
-                        query_positions: mlir_value(&values, *query_positions),
-                        query_shape: self.values[*query].shape,
-                        cache_shape: self.values[*key_cache].shape,
-                        page_table_shape: self.values[*page_table].shape,
-                        page_table_dtype: self.values[*page_table].shape.dtype(),
-                        sequence_lengths_dtype: self.values[*sequence_lengths].shape.dtype(),
-                        query_positions_dtype: self.values[*query_positions].shape.dtype(),
-                        result_type: types[*result],
-                        options: *options,
-                    },
+                    lowered,
+                    types[*result],
+                    sharding,
+                    self.values[*result].shape,
                 )?);
                 continue;
             }
@@ -2494,7 +2977,33 @@ impl Program {
                             mlir_value(&values, *right),
                             types[*result],
                         )?,
+                        Binary::Power => context.binary(
+                            StableHloBinary::Power,
+                            mlir_value(&values, *left),
+                            mlir_value(&values, *right),
+                            types[*result],
+                        )?,
+                        Binary::Remainder => context.binary(
+                            StableHloBinary::Remainder,
+                            mlir_value(&values, *left),
+                            mlir_value(&values, *right),
+                            types[*result],
+                        )?,
                     },
+                    *result,
+                ),
+                Operation::Clamp {
+                    minimum,
+                    input,
+                    maximum,
+                    result,
+                } => (
+                    context.clamp(
+                        mlir_value(&values, *minimum),
+                        mlir_value(&values, *input),
+                        mlir_value(&values, *maximum),
+                        types[*result],
+                    )?,
                     *result,
                 ),
                 Operation::BroadcastInDim {
@@ -2628,6 +3137,9 @@ impl Program {
                         Reduction::Maximum => {
                             context.binary(StableHloBinary::Maximum, left, right, scalar_type)?
                         }
+                        Reduction::Minimum => {
+                            context.binary(StableHloBinary::Minimum, left, right, scalar_type)?
+                        }
                     };
                     let combined = combine.result(0)?;
                     reduction_block.append_operation(combine)?;
@@ -2710,14 +3222,7 @@ impl Program {
                             Comparison::Le => StableHloComparison::Le,
                             Comparison::Lt => StableHloComparison::Lt,
                         },
-                        match input_dtype.class() {
-                            DTypeClass::Float => StableHloComparisonType::Float,
-                            DTypeClass::UnsignedInteger | DTypeClass::Boolean => {
-                                StableHloComparisonType::Unsigned
-                            }
-                            DTypeClass::SignedInteger => StableHloComparisonType::Signed,
-                            DTypeClass::Complex => unreachable!("complex comparisons are rejected"),
-                        },
+                        comparison_type(*input_dtype),
                     )?,
                     *result,
                 ),
@@ -2763,6 +3268,7 @@ impl Program {
                     context.unary_math(
                         match operation {
                             Unary::Negate => StableHloUnary::Negate,
+                            Unary::Abs => StableHloUnary::Abs,
                             Unary::Exp => StableHloUnary::Exponential,
                             Unary::Log => StableHloUnary::Log,
                             Unary::Sqrt => StableHloUnary::Sqrt,
@@ -2771,6 +3277,8 @@ impl Program {
                             Unary::Sin => StableHloUnary::Sine,
                             Unary::Cos => StableHloUnary::Cosine,
                             Unary::Logistic => StableHloUnary::Logistic,
+                            Unary::Floor => StableHloUnary::Floor,
+                            Unary::Ceil => StableHloUnary::Ceil,
                         },
                         mlir_value(&values, *input),
                         types[*result],
@@ -2796,6 +3304,12 @@ impl Program {
                 }
                 Operation::PagedAttention { .. } => {
                     unreachable!("paged attention is lowered before scalar operations")
+                }
+                Operation::Attention { .. } => {
+                    unreachable!("attention is lowered before scalar operations")
+                }
+                Operation::ArgMax { .. } => {
+                    unreachable!("argmax is lowered before single-result operations")
                 }
             };
             values[result_index] = Some(result.result(0)?);
@@ -2881,6 +3395,12 @@ enum Operation {
         result: usize,
         operation: Binary,
     },
+    Clamp {
+        minimum: usize,
+        input: usize,
+        maximum: usize,
+        result: usize,
+    },
     BroadcastInDim {
         input: usize,
         result: usize,
@@ -2928,6 +3448,24 @@ enum Operation {
         result: usize,
         axes: Vec<usize>,
         reduction: Reduction,
+    },
+    ArgMax {
+        input: usize,
+        indices: usize,
+        value_init: usize,
+        index_init: usize,
+        value_result: usize,
+        index_result: usize,
+        axis: usize,
+    },
+    Attention {
+        query: usize,
+        key: usize,
+        value: usize,
+        query_positions: usize,
+        key_positions: usize,
+        result: usize,
+        options: AttentionOptions,
     },
     PagedAttention {
         query: usize,
@@ -3000,6 +3538,8 @@ enum Binary {
     Divide,
     Minimum,
     Maximum,
+    Power,
+    Remainder,
 }
 
 impl Binary {
@@ -3011,6 +3551,8 @@ impl Binary {
             Self::Divide => "divide",
             Self::Minimum => "minimum",
             Self::Maximum => "maximum",
+            Self::Power => "power",
+            Self::Remainder => "remainder",
         }
     }
 }
@@ -3028,6 +3570,7 @@ enum Comparison {
 #[derive(Clone, Copy, Debug)]
 enum Unary {
     Negate,
+    Abs,
     Exp,
     Log,
     Sqrt,
@@ -3036,12 +3579,15 @@ enum Unary {
     Sin,
     Cos,
     Logistic,
+    Floor,
+    Ceil,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum Reduction {
     Sum,
     Maximum,
+    Minimum,
 }
 
 impl Reduction {
@@ -3049,6 +3595,7 @@ impl Reduction {
         match self {
             Self::Sum => "reduce_sum",
             Self::Maximum => "reduce_max",
+            Self::Minimum => "reduce_min",
         }
     }
 }
@@ -3057,6 +3604,7 @@ impl Unary {
     const fn name(self) -> &'static str {
         match self {
             Self::Negate => "negate",
+            Self::Abs => "abs",
             Self::Exp => "exp",
             Self::Log => "log",
             Self::Sqrt => "sqrt",
@@ -3065,6 +3613,8 @@ impl Unary {
             Self::Sin => "sin",
             Self::Cos => "cos",
             Self::Logistic => "sigmoid",
+            Self::Floor => "floor",
+            Self::Ceil => "ceil",
         }
     }
 }
@@ -3109,6 +3659,36 @@ fn validate_axes(axes: &[usize], rank: usize, side: &'static str) -> Result<(), 
         }
     }
     Ok(())
+}
+
+fn reduced_shape(input: Shape, axes: &[usize], dtype: DType) -> Result<Shape, Error> {
+    let retained = (0..input.rank())
+        .filter(|axis| !axes.contains(axis))
+        .collect::<Vec<_>>();
+    let dimensions = retained
+        .iter()
+        .map(|axis| input.dimensions()[*axis])
+        .collect::<Vec<_>>();
+    let tags = retained
+        .iter()
+        .map(|axis| input.axis_tags()[*axis])
+        .collect::<Vec<_>>();
+    let partitions = retained
+        .iter()
+        .map(|axis| input.partitions()[*axis])
+        .collect::<Vec<_>>();
+    Ok(Shape::new(dtype, &dimensions)?
+        .with_axis_tags(&tags)?
+        .with_partitions(&partitions)?)
+}
+
+fn comparison_type(dtype: DType) -> StableHloComparisonType {
+    match dtype.class() {
+        DTypeClass::Float => StableHloComparisonType::Float,
+        DTypeClass::UnsignedInteger | DTypeClass::Boolean => StableHloComparisonType::Unsigned,
+        DTypeClass::SignedInteger => StableHloComparisonType::Signed,
+        DTypeClass::Complex => unreachable!("complex comparisons are rejected before lowering"),
+    }
 }
 
 fn require_unique_names<'a>(
@@ -3288,6 +3868,27 @@ fn tensor_sharding_attribute<'context>(
         &dimensions,
         &replicated,
     )?))
+}
+
+/// Compound operations lower into multiple primitive operations, so their
+/// output placement cannot be attached by the generic one-operation lowering
+/// path. Restore the semantic boundary explicitly and uniformly for every
+/// compound lowering.
+fn constrain_compound_result<'context>(
+    context: &'context Context,
+    block: &mut Block<'context>,
+    value: MlirValue<'context>,
+    type_: MlirType<'context>,
+    sharding: &Sharding,
+    shape: Shape,
+) -> Result<MlirValue<'context>, Error> {
+    let Some(attribute) = tensor_sharding_attribute(context, sharding, shape)? else {
+        return Ok(value);
+    };
+    let constraint = context.sharding_constraint(value, type_, attribute)?;
+    let constrained = constraint.result(0)?;
+    block.append_operation(constraint)?;
+    Ok(constrained)
 }
 
 fn axis_name(tag: AxisTag) -> String {

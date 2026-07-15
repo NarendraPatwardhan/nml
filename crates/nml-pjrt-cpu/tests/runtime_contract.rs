@@ -116,6 +116,7 @@ fn pjrt_objects_retain_client_plugin_and_library_ownership() {
             &program,
             &nml_sharding::Sharding::single(),
             &options,
+            nml_compiler::Target::Cpu,
         )
         .unwrap();
         let left = upload(&client, &left_bytes, left.shape(), &device);
@@ -187,6 +188,7 @@ fn execute_matmul_contract(client: &nml_pjrt::Client, device: &nml_pjrt::Device)
         &program,
         &nml_sharding::Sharding::single(),
         &options,
+        nml_compiler::Target::Cpu,
     )
     .expect("CPU XLA compilation must succeed");
 
@@ -237,6 +239,7 @@ fn execute_complex_contract(client: &nml_pjrt::Client, device: &nml_pjrt::Device
         &program,
         &nml_sharding::Sharding::single(),
         &options,
+        nml_compiler::Target::Cpu,
     )
     .unwrap();
     let real_values = [1.0f32, -2.0, 3.5, 0.25];

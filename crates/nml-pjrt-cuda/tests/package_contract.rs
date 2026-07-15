@@ -2,18 +2,19 @@
 
 use runfiles::Runfiles;
 
-const CUDA_RUNTIME_RLOCATION: &str = env!("NML_CUDA_RUNTIME_CONTRACT_RLOCATION");
+const DISTRIBUTION_RUNTIME_RLOCATION: &str = env!("NML_CUDA_DISTRIBUTION_RUNTIME_RLOCATION");
+const SYSTEM_DRIVER_RUNTIME_RLOCATION: &str = env!("NML_CUDA_SYSTEM_DRIVER_RUNTIME_RLOCATION");
 
 #[test]
-fn packaged_cuda_runtime_contains_every_required_component() {
+fn distribution_runtime_contains_every_required_component() {
     let runfiles = Runfiles::create().expect("Bazel runfiles must initialize");
-    let package = runfiles::rlocation!(runfiles, CUDA_RUNTIME_RLOCATION)
-        .expect("CUDA runtime tree must be present in runfiles");
+    let package = runfiles::rlocation!(runfiles, DISTRIBUTION_RUNTIME_RLOCATION)
+        .expect("CUDA distribution runtime must be present in runfiles");
+
+    assert_common_runtime(&package);
 
     for required in [
         "bin/driver_compatibility",
-        "bin/nvlink",
-        "bin/ptxas",
         "lib/compat/libcuda.so.1",
         "lib/compat/libcudadebugger.so.1",
         "lib/compat/libnvidia-gpucomp.so.590.48.01",
@@ -22,6 +23,33 @@ fn packaged_cuda_runtime_contains_every_required_component() {
         "lib/compat/libnvidia-pkcs11-openssl3.so.590.48.01",
         "lib/compat/libnvidia-ptxjitcompiler.so.1",
         "lib/compat/libnvidia-tileiras.so.590.48.01",
+    ] {
+        assert!(
+            package.join(required).is_file(),
+            "CUDA distribution runtime is missing {required}"
+        );
+    }
+}
+
+#[test]
+fn system_driver_runtime_omits_only_the_forward_compatibility_overlay() {
+    let runfiles = Runfiles::create().expect("Bazel runfiles must initialize");
+    let package = runfiles::rlocation!(runfiles, SYSTEM_DRIVER_RUNTIME_RLOCATION)
+        .expect("CUDA system-driver runtime must be present in runfiles");
+
+    assert_common_runtime(&package);
+    for excluded in ["bin/driver_compatibility", "lib/compat"] {
+        assert!(
+            !package.join(excluded).exists(),
+            "CUDA system-driver runtime unexpectedly contains {excluded}"
+        );
+    }
+}
+
+fn assert_common_runtime(package: &std::path::Path) {
+    for required in [
+        "bin/nvlink",
+        "bin/ptxas",
         "lib/libcublas.so.13",
         "lib/libcublasLt.so.13",
         "lib/libcudart.so.13",
@@ -53,7 +81,7 @@ fn packaged_cuda_runtime_contains_every_required_component() {
     ] {
         assert!(
             package.join(required).is_file(),
-            "CUDA runtime is missing {required}"
+            "CUDA runtime is missing common component {required}"
         );
     }
 }

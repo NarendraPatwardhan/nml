@@ -25,6 +25,7 @@ enum Backend {
 pub struct Platform {
     backend: Backend,
     client: Client,
+    compiler_target: nml_compiler::Target,
 }
 
 impl Platform {
@@ -47,6 +48,7 @@ impl Platform {
         Ok(Self {
             backend: Backend::Cpu,
             client,
+            compiler_target: nml_compiler::Target::Cpu,
         })
     }
 
@@ -60,12 +62,61 @@ impl Platform {
         // SAFETY: the caller upholds the process-wide initialization contract.
         let runtime = unsafe { nml_pjrt_cuda::Runtime::load() }
             .map_err(|error| Error::Platform(error.to_string()))?;
+        #[cfg(nml_cuda)]
+        nml_kernel_flash_attention::register(
+            &runtime
+                .custom_calls()
+                .map_err(|error| Error::Platform(error.to_string()))?,
+        )
+        .map_err(|error| Error::Platform(error.to_string()))?;
         let client = runtime
             .create_client(nml_pjrt_cuda::ClientOptions::default())
             .map_err(|error| Error::Platform(error.to_string()))?;
+        let capabilities = nml_pjrt_cuda::compute_capabilities(&client)
+            .map_err(|error| Error::Platform(error.to_string()))?;
+        let capability = *capabilities.first().ok_or(Error::NoDevices)?;
+        if let Some((index, actual)) = capabilities
+            .iter()
+            .enumerate()
+            .find(|(_, actual)| **actual != capability)
+        {
+            // A single StableHLO module is compiled for every addressable
+            // device. Selecting FA2 from the minimum capability would still
+            // route that custom call onto an SM90 device, where its adapter
+            // correctly rejects the launch. Until compilation is partitioned
+            // per architecture, reject a heterogeneous client up front rather
+            // than producing an executable that fails according to placement.
+            return Err(Error::Platform(format!(
+                "heterogeneous CUDA compute capabilities are unsupported: device 0 is SM{}{} but device {index} is SM{}{}",
+                capability.major, capability.minor, actual.major, actual.minor
+            )));
+        }
+        let mut core_count = usize::MAX;
+        for (index, device) in client.devices().map_err(Error::Pjrt)?.iter().enumerate() {
+            let value = device
+                .int64_attribute("core_count")
+                .map_err(Error::Pjrt)?
+                .ok_or_else(|| {
+                    Error::Platform(format!("CUDA device {index} has no core_count attribute"))
+                })?;
+            let value = usize::try_from(value)
+                .ok()
+                .filter(|value| *value != 0)
+                .ok_or_else(|| {
+                    Error::Platform(format!(
+                        "CUDA device {index} has invalid core_count {value}"
+                    ))
+                })?;
+            core_count = core_count.min(value);
+        }
         Ok(Self {
             backend: Backend::Cuda,
             client,
+            compiler_target: nml_compiler::Target::Cuda {
+                core_count,
+                capability_major: capability.major,
+                capability_minor: capability.minor,
+            },
         })
     }
 
@@ -332,8 +383,14 @@ impl Platform {
         let device_ids = all_device_ids[..execution_count].to_vec();
         let options = nml_xla::CompileOptions::new(replicas, partitions, device_ids, backend)
             .map_err(Error::Xla)?;
-        let loaded = nml_compiler::compile(&self.client, program, &sharding, &options)
-            .map_err(Error::Compiler)?;
+        let loaded = nml_compiler::compile(
+            &self.client,
+            program,
+            &sharding,
+            &options,
+            self.compiler_target,
+        )
+        .map_err(Error::Compiler)?;
         Exe::new(
             self.backend,
             self.client.as_raw_identity(),

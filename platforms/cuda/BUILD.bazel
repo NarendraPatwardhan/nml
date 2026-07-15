@@ -49,6 +49,19 @@ filegroup(
     visibility = ["//crates:__subpackages__"],
 )
 
+# Device contracts run against the same hermetic user-space stack while using
+# the NVIDIA driver already installed on the GPU host. The distributable
+# `runtime` above remains the complete compatibility-capable product package.
+filegroup(
+    name = "runtime_system_driver",
+    srcs = select({
+        "//platforms:is_linux_x86_64": ["@libpjrt_cuda_linux_amd64//:runtime_system_driver"],
+        "//platforms:is_linux_aarch64": ["@libpjrt_cuda_linux_arm64//:runtime_system_driver"],
+        "//conditions:default": [],
+    }),
+    visibility = ["//crates:__subpackages__"],
+)
+
 cc_library(
     name = "nvtx_headers",
     visibility = ["//visibility:public"],

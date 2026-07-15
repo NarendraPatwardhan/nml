@@ -1,0 +1,76 @@
+diff --git a/BUILD b/BUILD
+--- a/BUILD
++++ b/BUILD
+@@ -681,12 +681,14 @@ cc_library(
+             "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/PartitionBuilder.cpp",
+             "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/Partition.cpp",
+         ],
++        allow_empty = True,
+     ),
+     hdrs = glob(
+         [
+             "include/triton/Dialect/TritonGPU/Transforms/WarpSpecialization/*.h",
+             "lib/Dialect/TritonGPU/Transforms/WarpSpecialization/*.h",
+         ],
++        allow_empty = True,
+     ),
+     copts = _no_unused_variable,
+     includes = ["lib/Dialect/TritonGPU/Transforms/WarpSpecialization"],
+@@ -746,6 +748,7 @@ cc_library(
+             "lib/Dialect/TritonGPU/Transforms/*.h",
+             "lib/Dialect/TritonGPU/Transforms/Pipeliner/*.h",
+         ],
++        allow_empty = True,
+         exclude = [
+             "include/triton/Dialect/TritonGPU/Transforms/DescriptorMemoryLayouts.h",
+             "include/triton/Dialect/TritonGPU/Transforms/Utility.h",
+@@ -896,6 +899,7 @@ cc_library(
+             "include/triton/Dialect/TritonNvidiaGPU/Transforms/*.h",
+             "lib/Dialect/TritonNvidiaGPU/Transforms/*.h",
+         ],
++        allow_empty = True,
+         # The file included into TritonDialects target which this target depends on.
+         exclude = [
+             "include/triton/Dialect/TritonNvidiaGPU/Transforms/ClusterBarrierMbarAllocator.h",
+@@ -961,6 +965,7 @@ cc_library(
+             "include/triton/Conversion/TritonToTritonGPU/*.h",
+             "lib/Conversion/TritonToTritonGPU/*.h",
+         ],
++        allow_empty = True,
+         exclude = ["include/triton/Conversion/TritonToTritonGPU/Passes.h"],
+     ),
+     copts = _no_unused_variable,
+@@ -1030,8 +1035,8 @@ cc_library(
+     name = "TritonPTX",
+     srcs = glob([
+         "lib/Target/PTX/*.cpp",
+-    ]),
+-    hdrs = glob(["include/triton/Target/PTX/*.h"]),
++    ], allow_empty = True),
++    hdrs = glob(["include/triton/Target/PTX/*.h"], allow_empty = True),
+     deps = ["@llvm-project//llvm:Support"],
+ )
+
+@@ -1039,8 +1044,8 @@ cc_library(
+     name = "TritonHSACO",
+     srcs = glob([
+         "lib/Target/HSACO/*.cpp",
+-    ]),
+-    hdrs = glob(["include/triton/Target/HSACO/*.h"]),
++    ], allow_empty = True),
++    hdrs = glob(["include/triton/Target/HSACO/*.h"], allow_empty = True),
+     deps = [
+         ":Dump",
+         ":GetEnv",
+diff --git a/third_party/nvidia/BUILD b/third_party/nvidia/BUILD
+--- a/third_party/nvidia/BUILD
++++ b/third_party/nvidia/BUILD
+@@ -108,6 +108,6 @@ cc_library(
+     hdrs = glob([
+         "include/TritonNVIDIAGPUToLLVM/*.h",
+         "include/triton/Conversion/TritonGPUToLLVM/*.h",
+-    ]) + [
++    ], allow_empty = True) + [
+         "lib/TritonNVIDIAGPUToLLVM/DotOpToLLVM/MMAHelpers.h",
+         "lib/TritonNVIDIAGPUToLLVM/TargetInfo.h",
+         "lib/TritonNVIDIAGPUToLLVM/Utility.h",

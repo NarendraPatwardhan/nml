@@ -7,6 +7,7 @@ load("@nml//platforms/cuda:cuda.bzl", "CUDA_COMPAT_FILES")
 patchelf(
     name = "plugin",
     src = "libpjrt_cuda.so",
+    local = True,
     add_needed = ["libnml_cuda.so.0"],
     rename_dynamic_symbols = {"dlopen": "nml_cuda_dlopen"},
     replace_needed = {
@@ -16,61 +17,86 @@ patchelf(
     set_rpath = "$ORIGIN",
 )
 
+_SYSTEM_DRIVER_SRCS = [
+    ":plugin",
+    "@nml//platforms/cuda:dynamic_library_redirector",
+] + select({
+    "@llvm//platforms/config:linux_x86_64": [
+        "@cuda_cudart_linux_x86_64//:cuda_cudart",
+        "@cuda_cupti_linux_x86_64//:cuda_cupti",
+        "@cuda_nvcc_linux_x86_64//:cuda_nvcc",
+        "@libnvvm_linux_x86_64//:libnvvm",
+        "@cuda_nvrtc_linux_x86_64//:cuda_nvrtc",
+        "@cuda_nvtx_linux_x86_64//:cuda_nvtx",
+        "@cudnn_linux_x86_64//:cudnn",
+        "@libnvshmem_linux_x86_64//:libnvshmem",
+        "@libcublas_linux_x86_64//:libcublas",
+        "@libcufft_linux_x86_64//:libcufft",
+        "@libcusolver_linux_x86_64//:libcusolver",
+        "@libcusparse_linux_x86_64//:libcusparse",
+        "@libnvjitlink_linux_x86_64//:libnvjitlink",
+        "@nccl_linux_amd64//:nccl",
+        "@zlib1g_linux_amd64//:zlib1g",
+    ],
+    "@llvm//platforms/config:linux_aarch64": [
+        "@cuda_cudart_linux_sbsa//:cuda_cudart",
+        "@cuda_cupti_linux_sbsa//:cuda_cupti",
+        "@cuda_nvcc_linux_sbsa//:cuda_nvcc",
+        "@libnvvm_linux_sbsa//:libnvvm",
+        "@cuda_nvrtc_linux_sbsa//:cuda_nvrtc",
+        "@cuda_nvtx_linux_sbsa//:cuda_nvtx",
+        "@cudnn_linux_sbsa//:cudnn",
+        "@libnvshmem_linux_sbsa//:libnvshmem",
+        "@libcublas_linux_sbsa//:libcublas",
+        "@libcufft_linux_sbsa//:libcufft",
+        "@libcusolver_linux_sbsa//:libcusolver",
+        "@libcusparse_linux_sbsa//:libcusparse",
+        "@libnvjitlink_linux_sbsa//:libnvjitlink",
+        "@nccl_linux_arm64//:nccl",
+        "@zlib1g_linux_arm64//:zlib1g",
+    ],
+})
+
+_SYSTEM_DRIVER_PREFIXES = {
+    "lib/aarch64-linux-gnu": "lib",
+    "lib/x86_64-linux-gnu": "lib",
+    "plugin": "lib",
+    "nvidia/nccl/lib": "lib",
+    "nvvm/lib64": "lib",
+    "platforms/cuda/dynamic_library_redirector": "lib",
+}
+
+# A current system driver does not need NVIDIA's forward-compatibility overlay.
+# This is a complete PJRT execution runtime, not a reduced kernel build: CUDA,
+# cuDNN, NCCL, NVVM, and every compiler/runtime library remain hermetic.
+copy_to_directory(
+    name = "runtime_system_driver",
+    srcs = _SYSTEM_DRIVER_SRCS,
+    add_directory_to_runfiles = False,
+    include_external_repositories = ["**"],
+    replace_prefixes = _SYSTEM_DRIVER_PREFIXES,
+    visibility = ["//visibility:public"],
+)
+
+# Distribution retains ZML's complete compatibility overlay for hosts whose
+# installed kernel driver is older than the packaged CUDA user-space stack.
 copy_to_directory(
     name = "runtime",
-    srcs = [
-        ":plugin",
+    srcs = _SYSTEM_DRIVER_SRCS + [
         "@nml//platforms/cuda:driver_compatibility",
-        "@nml//platforms/cuda:dynamic_library_redirector",
     ] + select({
         "@llvm//platforms/config:linux_x86_64": [
-            "@cuda_cudart_linux_x86_64//:cuda_cudart",
-            "@cuda_cupti_linux_x86_64//:cuda_cupti",
             "@cuda_compat_linux_x86_64//:cuda_compat",
-            "@cuda_nvcc_linux_x86_64//:cuda_nvcc",
-            "@libnvvm_linux_x86_64//:libnvvm",
-            "@cuda_nvrtc_linux_x86_64//:cuda_nvrtc",
-            "@cuda_nvtx_linux_x86_64//:cuda_nvtx",
-            "@cudnn_linux_x86_64//:cudnn",
-            "@libnvshmem_linux_x86_64//:libnvshmem",
-            "@libcublas_linux_x86_64//:libcublas",
-            "@libcufft_linux_x86_64//:libcufft",
-            "@libcusolver_linux_x86_64//:libcusolver",
-            "@libcusparse_linux_x86_64//:libcusparse",
-            "@libnvjitlink_linux_x86_64//:libnvjitlink",
-            "@nccl_linux_amd64//:nccl",
-            "@zlib1g_linux_amd64//:zlib1g",
         ],
         "@llvm//platforms/config:linux_aarch64": [
-            "@cuda_cudart_linux_sbsa//:cuda_cudart",
-            "@cuda_cupti_linux_sbsa//:cuda_cupti",
             "@cuda_compat_linux_sbsa//:cuda_compat",
-            "@cuda_nvcc_linux_sbsa//:cuda_nvcc",
-            "@libnvvm_linux_sbsa//:libnvvm",
-            "@cuda_nvrtc_linux_sbsa//:cuda_nvrtc",
-            "@cuda_nvtx_linux_sbsa//:cuda_nvtx",
-            "@cudnn_linux_sbsa//:cudnn",
-            "@libnvshmem_linux_sbsa//:libnvshmem",
-            "@libcublas_linux_sbsa//:libcublas",
-            "@libcufft_linux_sbsa//:libcufft",
-            "@libcusolver_linux_sbsa//:libcusolver",
-            "@libcusparse_linux_sbsa//:libcusparse",
-            "@libnvjitlink_linux_sbsa//:libnvjitlink",
-            "@nccl_linux_arm64//:nccl",
-            "@zlib1g_linux_arm64//:zlib1g",
         ],
     }),
     add_directory_to_runfiles = False,
     include_external_repositories = ["**"],
-    replace_prefixes = {
+    replace_prefixes = _SYSTEM_DRIVER_PREFIXES | {
         "compat": "lib/compat",
-        "lib/aarch64-linux-gnu": "lib",
-        "lib/x86_64-linux-gnu": "lib",
-        "plugin": "lib",
-        "nvidia/nccl/lib": "lib",
-        "nvvm/lib64": "lib",
         "platforms/cuda/driver_compatibility": "bin/driver_compatibility",
-        "platforms/cuda/dynamic_library_redirector": "lib",
     } | {
         "{}.patchelf".format(library): "lib/compat"
         for library in CUDA_COMPAT_FILES

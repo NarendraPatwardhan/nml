@@ -39,6 +39,11 @@ def _patchelf_impl(ctx):
         outputs = [output],
         arguments = [ctx.executable._patchelf.path, ctx.file.src.path, output.path],
         command = "\n".join(commands),
+        # Multi-gigabyte NVIDIA ELFs are faster to rewrite beside Bazel's
+        # repository cache than to upload and download through a remote CAS.
+        # Compilation remains remotely executable; only the explicitly marked
+        # deterministic packaging action stays on the coordinator host.
+        execution_requirements = {"no-remote": "1"} if ctx.attr.local else {},
         tools = [ctx.executable._patchelf],
     )
     return [DefaultInfo(files = depset([output]))]
@@ -49,6 +54,7 @@ patchelf = rule(
         "src": attr.label(allow_single_file = True, mandatory = True),
         "soname": attr.string(),
         "add_needed": attr.string_list(),
+        "local": attr.bool(default = False),
         "replace_needed": attr.string_dict(),
         "rename_dynamic_symbols": attr.string_dict(),
         "set_rpath": attr.string(),

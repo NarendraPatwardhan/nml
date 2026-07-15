@@ -1,0 +1,3 @@
+"""Audited compatibility patches for the pinned hermetic LLVM toolchain."""
+
+exports_files(["libstdcxx-static.patch"])

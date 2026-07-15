@@ -1,0 +1,136 @@
+"""Private original-upstream FlashAttention integration boundary."""
+
+load("//bazel:rust.bzl", "nml_rust_library")
+load("@rules_cuda//cuda:defs.bzl", "cuda_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
+cuda_library(
+    name = "fa2_forward_adapter",
+    srcs = ["src/adapter.cu"],
+    hdrs = [
+        "include/nml_flash_attention.h",
+        "src/adapter_common.h",
+    ],
+    alwayslink = True,
+    archs = ["compute_80:sm_80"],
+    copts = [
+        "-O3",
+        "-allow-unsupported-compiler",
+        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "-U__CUDA_NO_HALF2_OPERATORS__",
+        "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "-U__CUDA_NO_HALF_OPERATORS__",
+        "--expt-extended-lambda",
+        "--expt-relaxed-constexpr",
+        "--threads=4",
+        "--use_fast_math",
+    ],
+    includes = ["include"],
+    deps = [
+        "@cuda//:libcudacxx",
+        "@flash_attention//:fa2_forward",
+    ],
+    # This target is an archive consumed by a dynamically linked Rust product;
+    # it does not itself link a C++ runtime.
+    features = ["-static_link_cpp_runtimes"],
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": ["@platforms//os:linux"],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    visibility = ["//crates:__subpackages__"],
+)
+
+cuda_library(
+    name = "fa3_forward_adapter",
+    srcs = ["src/adapter_fa3.cu"],
+    hdrs = [
+        "include/nml_flash_attention.h",
+        "src/adapter_common.h",
+    ],
+    alwayslink = True,
+    archs = ["compute_90a:sm_90a"],
+    copts = [
+        "-O3",
+        "-allow-unsupported-compiler",
+        "--ftemplate-backtrace-limit=0",
+        "--expt-extended-lambda",
+        "--expt-relaxed-constexpr",
+        "--threads=2",
+        "--use_fast_math",
+        "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+        "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
+        "-DCUTLASS_ENABLE_GDC_FOR_SM90",
+        "-DNDEBUG",
+    ],
+    features = ["-static_link_cpp_runtimes"],
+    includes = ["include"],
+    deps = [
+        "@cuda//:libcudacxx",
+        "@flash_attention//:fa3_forward",
+    ],
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": ["@platforms//os:linux"],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    visibility = ["//crates:__subpackages__"],
+)
+
+nml_rust_library(
+    name = "nml_kernel_flash_attention",
+    srcs = ["src/lib.rs"],
+    crate_root = "src/lib.rs",
+    deps = [
+        "//crates/nml-pjrt:nml_pjrt",
+        "//crates/nml-pjrt-sys:nml_pjrt_sys",
+    ],
+    link_deps = [
+        ":fa2_forward_adapter",
+        ":fa3_forward_adapter",
+    ],
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": ["@platforms//os:linux"],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    visibility = ["//crates:__subpackages__"],
+)
+
+cc_test(
+    name = "flash_attention_adapter_contract_test",
+    size = "small",
+    srcs = ["tests/adapter_contract.cc"],
+    deps = [
+        ":fa2_forward_adapter",
+        ":fa3_forward_adapter",
+    ],
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": ["@platforms//os:linux"],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
+# This is a device contract, not a synthetic host check: it asks the active
+# CUDA runtime for the installed GPU and proves every unsupported adapter
+# fails at its architecture boundary before it can dereference device buffers.
+cc_test(
+    name = "flash_attention_device_capability_contract_test",
+    size = "small",
+    srcs = ["tests/device_capability_contract.cc"],
+    local = True,
+    tags = [
+        "external",
+        "exclusive",
+        "requires-gpu",
+    ],
+    deps = [
+        ":fa2_forward_adapter",
+        ":fa3_forward_adapter",
+        "@cuda//:cuda_runtime",
+    ],
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": ["@platforms//os:linux"],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    # The repository root packages this executable for remote compilation and
+    # local GPU execution; it is not a general public kernel target.
+    visibility = ["//:__pkg__"],
+)

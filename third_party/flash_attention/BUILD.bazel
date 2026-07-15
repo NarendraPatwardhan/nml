@@ -1,0 +1,7 @@
+"""Audited Bazel ownership for original-upstream FlashAttention sources."""
+
+exports_files([
+    "cutlass.BUILD.bazel",
+    "flash_attention.BUILD.bazel",
+    "remove-pytorch.patch",
+])

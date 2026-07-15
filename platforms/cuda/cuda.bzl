@@ -52,6 +52,7 @@ def _cuda_package_builds():
 patchelf(
     name = {name},
     src = {src},
+    local = True,
     soname = {soname},
     set_rpath = "$ORIGIN",
 )

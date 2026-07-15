@@ -38,6 +38,9 @@ pub enum Error {
     InvalidAttribute {
         source: String,
     },
+    InvalidOperation {
+        source: String,
+    },
     NullObject(&'static str),
     OutOfBounds {
         object: &'static str,
@@ -76,6 +79,9 @@ impl fmt::Display for Error {
             Self::InvalidAttribute { source } => {
                 write!(formatter, "MLIR rejected attribute {source:?}")
             }
+            Self::InvalidOperation { source } => {
+                write!(formatter, "MLIR rejected operation contract: {source}")
+            }
             Self::NullObject(object) => write!(formatter, "MLIR returned a null {object}"),
             Self::OutOfBounds {
                 object,
@@ -102,17 +108,35 @@ pub struct Context {
 
 impl Context {
     pub fn new() -> Self {
+        Self::with_dialects(&[
+            unsafe { sys::mlirGetDialectHandle__arith__() },
+            unsafe { sys::mlirGetDialectHandle__func__() },
+            unsafe { sys::mlirGetDialectHandle__stablehlo__() },
+            unsafe { sys::mlirGetDialectHandle__sdy__() },
+        ])
+    }
+
+    /// Creates the isolated compiler context used while authoring one TTIR
+    /// kernel.  TTIR never enters the long-lived StableHLO model context: the
+    /// verified textual module is the only value crossing that boundary.
+    pub fn new_ttir() -> Self {
+        Self::with_dialects(&[
+            unsafe { sys::mlirGetDialectHandle__arith__() },
+            unsafe { sys::mlirGetDialectHandle__cf__() },
+            unsafe { sys::mlirGetDialectHandle__func__() },
+            unsafe { sys::mlirGetDialectHandle__math__() },
+            unsafe { sys::mlirGetDialectHandle__scf__() },
+            unsafe { sys::mlirGetDialectHandle__tt__() },
+        ])
+    }
+
+    fn with_dialects(handles: &[sys::MlirDialectHandle]) -> Self {
         // SAFETY: creation returns an independently owned context.
         let raw = unsafe { sys::mlirContextCreate() };
         // Reject unknown operations. A misspelled StableHLO operation must be
         // a construction error, not deferred until XLA compilation.
         unsafe { sys::mlirContextSetAllowUnregisteredDialects(raw, false) };
-        for handle in [
-            unsafe { sys::mlirGetDialectHandle__arith__() },
-            unsafe { sys::mlirGetDialectHandle__func__() },
-            unsafe { sys::mlirGetDialectHandle__stablehlo__() },
-            unsafe { sys::mlirGetDialectHandle__sdy__() },
-        ] {
+        for &handle in handles {
             // SAFETY: every handle is process-static and the context is live.
             unsafe {
                 sys::mlirDialectHandleRegisterDialect(handle, raw);
@@ -122,6 +146,109 @@ impl Context {
         Self {
             raw,
             _not_send_or_sync: PhantomData,
+        }
+    }
+
+    pub fn parse_type(&self, source: &str) -> Result<Type<'_>, Error> {
+        let raw = unsafe { sys::mlirTypeParseGet(self.raw, string_ref(source.as_bytes())) };
+        if raw.ptr.is_null() {
+            Err(Error::InvalidOperation {
+                source: format!("MLIR rejected type {source:?}"),
+            })
+        } else {
+            Ok(Type {
+                raw,
+                context_id: self.context_id(),
+                _context: PhantomData,
+            })
+        }
+    }
+
+    pub fn triton_pointer_type<'context>(
+        &'context self,
+        pointee: Type<'context>,
+        address_space: i32,
+    ) -> Result<Type<'context>, Error> {
+        self.require_context(pointee.context_id, "Triton pointer pointee")?;
+        let raw = unsafe { sys::nml_mlir_triton_pointer_type(pointee.raw, address_space) };
+        if raw.ptr.is_null() {
+            Err(Error::NullObject("Triton pointer type"))
+        } else {
+            Ok(Type {
+                raw,
+                context_id: self.context_id(),
+                _context: PhantomData,
+            })
+        }
+    }
+
+    pub fn triton_tensor_descriptor_type<'context>(
+        &'context self,
+        shape: &[i64],
+        element: Type<'context>,
+    ) -> Result<Type<'context>, Error> {
+        self.require_context(element.context_id, "Triton tensor descriptor element")?;
+        let raw = unsafe {
+            sys::nml_mlir_triton_tensor_descriptor_type(
+                shape.len() as isize,
+                shape.as_ptr(),
+                element.raw,
+            )
+        };
+        if raw.ptr.is_null() {
+            Err(Error::NullObject("Triton tensor descriptor type"))
+        } else {
+            Ok(Type {
+                raw,
+                context_id: self.context_id(),
+                _context: PhantomData,
+            })
+        }
+    }
+
+    pub fn triton_program_dimension(&self, axis: u8) -> Result<Attribute<'_>, Error> {
+        if axis > 2 {
+            return Err(Error::InvalidOperation {
+                source: format!("Triton program dimension {axis} is outside x/y/z"),
+            });
+        }
+        Ok(self.triton_attribute(unsafe {
+            sys::nml_mlir_triton_program_dimension(self.raw, i32::from(axis))
+        }))
+    }
+
+    pub fn triton_cache_modifier(&self, value: i32) -> Result<Attribute<'_>, Error> {
+        if !(1..=7).contains(&value) {
+            return Err(Error::InvalidOperation {
+                source: format!("invalid Triton cache modifier {value}"),
+            });
+        }
+        Ok(self.triton_attribute(unsafe { sys::nml_mlir_triton_cache_modifier(self.raw, value) }))
+    }
+
+    pub fn triton_eviction_policy(&self, value: i32) -> Result<Attribute<'_>, Error> {
+        if !(1..=3).contains(&value) {
+            return Err(Error::InvalidOperation {
+                source: format!("invalid Triton eviction policy {value}"),
+            });
+        }
+        Ok(self.triton_attribute(unsafe { sys::nml_mlir_triton_eviction_policy(self.raw, value) }))
+    }
+
+    pub fn triton_input_precision(&self, value: i32) -> Result<Attribute<'_>, Error> {
+        if !(0..=4).contains(&value) {
+            return Err(Error::InvalidOperation {
+                source: format!("invalid Triton input precision {value}"),
+            });
+        }
+        Ok(self.triton_attribute(unsafe { sys::nml_mlir_triton_input_precision(self.raw, value) }))
+    }
+
+    fn triton_attribute(&self, raw: sys::MlirAttribute) -> Attribute<'_> {
+        Attribute {
+            raw,
+            context_id: self.context_id(),
+            _context: PhantomData,
         }
     }
 
@@ -273,6 +400,50 @@ impl Context {
         }
     }
 
+    pub fn bool_attribute(&self, value: bool) -> Attribute<'_> {
+        Attribute {
+            raw: unsafe { sys::mlirBoolAttrGet(self.raw, i32::from(value)) },
+            context_id: self.context_id(),
+            _context: PhantomData,
+        }
+    }
+
+    pub fn array_attribute<'context>(
+        &'context self,
+        values: &[Attribute<'context>],
+    ) -> Result<Attribute<'context>, Error> {
+        self.require_contexts(
+            values.iter().map(|value| value.context_id),
+            "array attribute value",
+        )?;
+        let raw_values = values.iter().map(|value| value.raw).collect::<Vec<_>>();
+        Ok(Attribute {
+            raw: unsafe {
+                sys::mlirArrayAttrGet(self.raw, raw_values.len() as isize, raw_values.as_ptr())
+            },
+            context_id: self.context_id(),
+            _context: PhantomData,
+        })
+    }
+
+    pub fn dictionary_attribute<'context>(
+        &'context self,
+        values: &[NamedAttribute<'context>],
+    ) -> Result<Attribute<'context>, Error> {
+        self.require_contexts(
+            values.iter().map(|value| value.context_id),
+            "dictionary attribute value",
+        )?;
+        let raw_values = values.iter().map(|value| value.raw).collect::<Vec<_>>();
+        Ok(Attribute {
+            raw: unsafe {
+                sys::mlirDictionaryAttrGet(self.raw, raw_values.len() as isize, raw_values.as_ptr())
+            },
+            context_id: self.context_id(),
+            _context: PhantomData,
+        })
+    }
+
     pub fn type_attribute<'context>(
         &'context self,
         value: Type<'context>,
@@ -296,6 +467,39 @@ impl Context {
             context_id: self.context_id(),
             _context: PhantomData,
         })
+    }
+
+    pub fn dense_index_attribute<'context>(
+        &'context self,
+        values: &[i64],
+    ) -> Result<Attribute<'context>, Error> {
+        let index = self.index_type().0;
+        let dimensions = [values.len() as i64];
+        let tensor = unsafe {
+            sys::mlirRankedTensorTypeGet(
+                1,
+                dimensions.as_ptr(),
+                index.raw,
+                sys::MlirAttribute {
+                    ptr: ptr::null_mut(),
+                },
+            )
+        };
+        if tensor.ptr.is_null() {
+            return Err(Error::NullObject("dense index tensor type"));
+        }
+        let raw = unsafe {
+            sys::mlirDenseElementsAttrInt64Get(tensor, values.len() as isize, values.as_ptr())
+        };
+        if raw.ptr.is_null() {
+            Err(Error::NullObject("dense index attribute"))
+        } else {
+            Ok(Attribute {
+                raw,
+                context_id: self.context_id(),
+                _context: PhantomData,
+            })
+        }
     }
 
     pub fn named_attribute<'context>(
@@ -853,6 +1057,19 @@ impl Context {
             .build()
     }
 
+    pub fn clamp<'context>(
+        &'context self,
+        minimum: Value<'context>,
+        input: Value<'context>,
+        maximum: Value<'context>,
+        result_type: Type<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        Operation::builder(self, "stablehlo.clamp")
+            .results(&[result_type])
+            .operands(&[minimum, input, maximum])
+            .build()
+    }
+
     pub fn compare<'context>(
         &'context self,
         left: Value<'context>,
@@ -1090,9 +1307,36 @@ impl Context {
         dimensions: &[i64],
         body: Region<'context>,
     ) -> Result<Operation<'context>, Error> {
+        self.reduce_many(&[input], &[init], &[result_type], dimensions, body)
+    }
+
+    /// Builds StableHLO's variadic reduction form. Reducer block arguments are
+    /// ordered as every left accumulator followed by every right value, which
+    /// is the contract used by tuple reductions such as argmax.
+    pub fn reduce_many<'context>(
+        &'context self,
+        inputs: &[Value<'context>],
+        inits: &[Value<'context>],
+        result_types: &[Type<'context>],
+        dimensions: &[i64],
+        body: Region<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        if inputs.is_empty() || inputs.len() != inits.len() || inputs.len() != result_types.len() {
+            return Err(Error::InvalidOperation {
+                source: format!(
+                    "stablehlo.reduce requires equal nonzero input, init, and result counts; got {}, {}, and {}",
+                    inputs.len(),
+                    inits.len(),
+                    result_types.len()
+                ),
+            });
+        }
+        let mut operands = Vec::with_capacity(inputs.len() + inits.len());
+        operands.extend_from_slice(inputs);
+        operands.extend_from_slice(inits);
         Operation::builder(self, "stablehlo.reduce")
-            .results(&[result_type])
-            .operands(&[input, init])
+            .results(result_types)
+            .operands(&operands)
             .attributes(&[self.named_attribute(
                 "dimensions",
                 self.parse_attribute(&dense_i64_array(dimensions))?,
@@ -1122,6 +1366,288 @@ impl Context {
             .operands(initial)
             .region(condition)
             .region(body)
+            .build()
+    }
+
+    pub fn stablehlo_case<'context>(
+        &'context self,
+        branch_index: Value<'context>,
+        result_types: &[Type<'context>],
+        branches: Vec<Region<'context>>,
+    ) -> Result<Operation<'context>, Error> {
+        if branches.is_empty() {
+            return Err(Error::InvalidOperation {
+                source: "stablehlo.case requires at least one branch".to_owned(),
+            });
+        }
+        let mut builder = Operation::builder(self, "stablehlo.case")
+            .results(result_types)
+            .operands(&[branch_index]);
+        for branch in branches {
+            builder = builder.region(branch);
+        }
+        builder.build()
+    }
+
+    /// Builds NML's typed-FFI FlashAttention forward call.  The semantic
+    /// decision remains in `nml-ir`; this narrow builder owns only the exact
+    /// StableHLO ABI consumed by the process-lifetime handler.
+    pub fn flash_attention_2_custom_call<'context>(
+        &'context self,
+        query: Value<'context>,
+        key: Value<'context>,
+        value: Value<'context>,
+        output_type: Type<'context>,
+        lse_type: Type<'context>,
+        scale: f32,
+        causal: bool,
+        sliding_window: i32,
+    ) -> Result<Operation<'context>, Error> {
+        self.flash_attention_custom_call(
+            "nml.flash_attention_2.forward",
+            false,
+            &[query, key, value],
+            output_type,
+            lse_type,
+            scale,
+            causal,
+            sliding_window,
+        )
+    }
+
+    pub fn flash_attention_3_custom_call<'context>(
+        &'context self,
+        query: Value<'context>,
+        key: Value<'context>,
+        value: Value<'context>,
+        output_type: Type<'context>,
+        lse_type: Type<'context>,
+        scale: f32,
+        causal: bool,
+        sliding_window: i32,
+    ) -> Result<Operation<'context>, Error> {
+        self.flash_attention_custom_call(
+            "nml.flash_attention_3.forward",
+            true,
+            &[query, key, value],
+            output_type,
+            lse_type,
+            scale,
+            causal,
+            sliding_window,
+        )
+    }
+
+    pub fn paged_flash_attention_2_custom_call<'context>(
+        &'context self,
+        query: Value<'context>,
+        key_cache: Value<'context>,
+        value_cache: Value<'context>,
+        page_table: Value<'context>,
+        sequence_lengths: Value<'context>,
+        output_type: Type<'context>,
+        lse_type: Type<'context>,
+        scale: f32,
+        causal: bool,
+        sliding_window: i32,
+    ) -> Result<Operation<'context>, Error> {
+        self.flash_attention_custom_call(
+            "nml.flash_attention_2.paged",
+            false,
+            &[query, key_cache, value_cache, page_table, sequence_lengths],
+            output_type,
+            lse_type,
+            scale,
+            causal,
+            sliding_window,
+        )
+    }
+
+    pub fn paged_flash_attention_3_custom_call<'context>(
+        &'context self,
+        query: Value<'context>,
+        key_cache: Value<'context>,
+        value_cache: Value<'context>,
+        page_table: Value<'context>,
+        sequence_lengths: Value<'context>,
+        output_type: Type<'context>,
+        lse_type: Type<'context>,
+        scale: f32,
+        causal: bool,
+        sliding_window: i32,
+    ) -> Result<Operation<'context>, Error> {
+        self.flash_attention_custom_call(
+            "nml.flash_attention_3.paged",
+            true,
+            &[query, key_cache, value_cache, page_table, sequence_lengths],
+            output_type,
+            lse_type,
+            scale,
+            causal,
+            sliding_window,
+        )
+    }
+
+    fn flash_attention_custom_call<'context>(
+        &'context self,
+        target: &'static str,
+        scheduler_workspace: bool,
+        operands: &[Value<'context>],
+        output_type: Type<'context>,
+        lse_type: Type<'context>,
+        scale: f32,
+        causal: bool,
+        sliding_window: i32,
+    ) -> Result<Operation<'context>, Error> {
+        if !scale.is_finite() || scale <= 0.0 || sliding_window == 0 || sliding_window < -1 {
+            return Err(Error::InvalidOperation {
+                source: "invalid FlashAttention scale or sliding-window attribute".to_owned(),
+            });
+        }
+        let i32_type = self.dtype(DType::I32)?;
+        let backend_config = self.dictionary_attribute(&[
+            self.named_attribute(
+                "scale",
+                self.parse_attribute(&format!("{scale:.9e} : f32"))?,
+            )?,
+            self.named_attribute("causal", self.bool_attribute(causal))?,
+            self.named_attribute(
+                "sliding_window",
+                self.integer_attribute(i32_type, i64::from(sliding_window))?,
+            )?,
+        ])?;
+        let operand_layouts = operands
+            .iter()
+            .map(|operand| row_major_layout_for_type(operand.type_()))
+            .map(|layout| self.dense_index_attribute(&layout?))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut result_types = vec![output_type, lse_type];
+        if scheduler_workspace {
+            result_types.push(self.ranked_tensor_type(DType::I32, &[1])?);
+        }
+        let result_layouts = result_types
+            .iter()
+            .map(|type_| row_major_layout_for_type(*type_))
+            .map(|layout| self.dense_index_attribute(&layout?))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Operation::builder(self, "stablehlo.custom_call")
+            .results(&result_types)
+            .operands(operands)
+            .attributes(&[
+                self.named_attribute("call_target_name", self.string_attribute(target))?,
+                self.named_attribute("has_side_effect", self.bool_attribute(false))?,
+                self.named_attribute("api_version", self.integer_attribute(i32_type, 4)?)?,
+                self.named_attribute("backend_config", backend_config)?,
+                self.named_attribute("operand_layouts", self.array_attribute(&operand_layouts)?)?,
+                self.named_attribute("result_layouts", self.array_attribute(&result_layouts)?)?,
+                self.named_attribute("output_operand_aliases", self.array_attribute(&[])?)?,
+            ])
+            .build()
+    }
+
+    /// Builds XLA's typed Triton custom call from already verified TTIR.
+    /// Kernel authoring and verification belong to the isolated TTIR context;
+    /// this method only embeds its immutable text in the StableHLO program.
+    pub fn triton_custom_call<'context>(
+        &'context self,
+        operands: &[Value<'context>],
+        result_types: &[Type<'context>],
+        options: TritonCustomCall<'_>,
+    ) -> Result<Operation<'context>, Error> {
+        if options.name.is_empty()
+            || options.ir.is_empty()
+            || options.grid.iter().any(|value| *value <= 0)
+            || options.num_stages <= 0
+            || options.num_warps <= 0
+            || options.operand_layouts.len() != operands.len()
+            || options.result_layouts.len() != result_types.len()
+        {
+            return Err(Error::InvalidOperation {
+                source: "invalid Triton custom-call launch or layout contract".to_owned(),
+            });
+        }
+        for (index, alias) in options.output_operand_aliases.iter().enumerate() {
+            if alias.output_index >= result_types.len()
+                || alias.operand_index >= operands.len()
+                || options.output_operand_aliases[..index]
+                    .iter()
+                    .any(|prior| prior.output_index == alias.output_index)
+            {
+                return Err(Error::InvalidOperation {
+                    source: "invalid or duplicate Triton output/operand alias".to_owned(),
+                });
+            }
+        }
+
+        let i32_type = self.dtype(DType::I32)?;
+        let backend_config = self.dictionary_attribute(&[
+            self.named_attribute("name", self.string_attribute(options.name))?,
+            self.named_attribute("ir", self.string_attribute(options.ir))?,
+            self.named_attribute(
+                "grid_x",
+                self.integer_attribute(i32_type, i64::from(options.grid[0]))?,
+            )?,
+            self.named_attribute(
+                "grid_y",
+                self.integer_attribute(i32_type, i64::from(options.grid[1]))?,
+            )?,
+            self.named_attribute(
+                "grid_z",
+                self.integer_attribute(i32_type, i64::from(options.grid[2]))?,
+            )?,
+            self.named_attribute(
+                "num_stages",
+                self.integer_attribute(i32_type, i64::from(options.num_stages))?,
+            )?,
+            self.named_attribute(
+                "num_warps",
+                self.integer_attribute(i32_type, i64::from(options.num_warps))?,
+            )?,
+        ])?;
+        let operand_layouts = options
+            .operand_layouts
+            .iter()
+            .map(|layout| self.dense_index_attribute(layout))
+            .collect::<Result<Vec<_>, _>>()?;
+        let result_layouts = options
+            .result_layouts
+            .iter()
+            .map(|layout| self.dense_index_attribute(layout))
+            .collect::<Result<Vec<_>, _>>()?;
+        let aliases = options
+            .output_operand_aliases
+            .iter()
+            .map(|alias| {
+                let output_tuple_indices = if result_types.len() == 1 {
+                    String::from("[]")
+                } else {
+                    format!("[{}]", alias.output_index)
+                };
+                self.parse_attribute(&format!(
+                    "#stablehlo.output_operand_alias<output_tuple_indices = \
+                     {output_tuple_indices}, operand_index = {}, \
+                     operand_tuple_indices = []>",
+                    alias.operand_index
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Operation::builder(self, "stablehlo.custom_call")
+            .results(result_types)
+            .operands(operands)
+            .attributes(&[
+                self.named_attribute(
+                    "call_target_name",
+                    self.string_attribute("__gpu$xla.gpu.triton"),
+                )?,
+                self.named_attribute("has_side_effect", self.bool_attribute(false))?,
+                self.named_attribute("api_version", self.integer_attribute(i32_type, 4)?)?,
+                self.named_attribute("backend_config", backend_config)?,
+                self.named_attribute("operand_layouts", self.array_attribute(&operand_layouts)?)?,
+                self.named_attribute("result_layouts", self.array_attribute(&result_layouts)?)?,
+                self.named_attribute("output_operand_aliases", self.array_attribute(&aliases)?)?,
+            ])
             .build()
     }
 
@@ -1186,12 +1712,34 @@ impl Context {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutputOperandAlias {
+    pub output_index: usize,
+    pub operand_index: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TritonCustomCall<'a> {
+    pub name: &'a str,
+    pub ir: &'a str,
+    pub grid: [i32; 3],
+    pub num_stages: i32,
+    pub num_warps: i32,
+    pub operand_layouts: &'a [&'a [i64]],
+    pub result_layouts: &'a [&'a [i64]],
+    pub output_operand_aliases: &'a [OutputOperandAlias],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StableHloBinary {
     Subtract,
     Multiply,
     Divide,
     Minimum,
     Maximum,
+    Power,
+    Remainder,
+    And,
+    Or,
 }
 
 impl StableHloBinary {
@@ -1202,6 +1750,10 @@ impl StableHloBinary {
             Self::Divide => "stablehlo.divide",
             Self::Minimum => "stablehlo.minimum",
             Self::Maximum => "stablehlo.maximum",
+            Self::Power => "stablehlo.power",
+            Self::Remainder => "stablehlo.remainder",
+            Self::And => "stablehlo.and",
+            Self::Or => "stablehlo.or",
         }
     }
 }
@@ -1209,6 +1761,7 @@ impl StableHloBinary {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StableHloUnary {
     Negate,
+    Abs,
     Exponential,
     Log,
     Sqrt,
@@ -1217,12 +1770,15 @@ pub enum StableHloUnary {
     Sine,
     Cosine,
     Logistic,
+    Floor,
+    Ceil,
 }
 
 impl StableHloUnary {
     const fn name(self) -> &'static str {
         match self {
             Self::Negate => "stablehlo.negate",
+            Self::Abs => "stablehlo.abs",
             Self::Exponential => "stablehlo.exponential",
             Self::Log => "stablehlo.log",
             Self::Sqrt => "stablehlo.sqrt",
@@ -1231,6 +1787,8 @@ impl StableHloUnary {
             Self::Sine => "stablehlo.sine",
             Self::Cosine => "stablehlo.cosine",
             Self::Logistic => "stablehlo.logistic",
+            Self::Floor => "stablehlo.floor",
+            Self::Ceil => "stablehlo.ceil",
         }
     }
 }
@@ -1744,7 +2302,7 @@ pub struct Value<'context> {
     _context: PhantomData<&'context Context>,
 }
 
-impl Value<'_> {
+impl<'context> Value<'context> {
     pub fn text(self) -> String {
         let mut bytes = Vec::new();
         unsafe {
@@ -1755,6 +2313,14 @@ impl Value<'_> {
             )
         };
         String::from_utf8(bytes).expect("MLIR value text is UTF-8")
+    }
+
+    pub fn type_(self) -> Type<'context> {
+        Type {
+            raw: unsafe { sys::mlirValueGetType(self.raw) },
+            context_id: self.context_id,
+            _context: PhantomData,
+        }
     }
 }
 
@@ -1805,6 +2371,26 @@ impl Type<'_> {
         };
         String::from_utf8(bytes).expect("MLIR type text is UTF-8")
     }
+
+    pub fn is_triton_pointer(self) -> bool {
+        unsafe { sys::nml_mlir_type_is_triton_pointer(self.raw) }
+    }
+
+    pub fn is_triton_tensor_descriptor(self) -> bool {
+        unsafe { sys::nml_mlir_type_is_triton_tensor_descriptor(self.raw) }
+    }
+}
+
+fn row_major_layout_for_type(type_: Type<'_>) -> Result<Vec<i64>, Error> {
+    // `mlirShapedTypeGetRank` requires a ranked shaped type. Keep that C API
+    // precondition inside this safe wrapper rather than imposing it on callers.
+    if !unsafe { sys::mlirTypeIsARankedTensor(type_.raw) } {
+        return Err(Error::InvalidOperation {
+            source: "custom-call layouts require ranked tensor types".to_owned(),
+        });
+    }
+    let rank = unsafe { sys::mlirShapedTypeGetRank(type_.raw) } as i64;
+    Ok((0..rank).rev().collect())
 }
 
 /// Compiler-only MLIR index type. It intentionally has no conversion to

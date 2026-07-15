@@ -44,8 +44,17 @@ bazel_dep(name = "with_cfg.bzl", version = "0.14.4")
 bazel_dep(name = "bazel_skylib", version = "1.9.0")
 bazel_dep(name = "bazel_lib", version = "3.2.2")
 bazel_dep(name = "llvm", version = "0.8.9")
+single_version_override(
+    module_name = "llvm",
+    patch_strip = 1,
+    patches = ["//third_party/llvm:libstdcxx-static.patch"],
+    version = "0.8.9",
+)
 bazel_dep(name = "patchelf", version = "0.18.0.bcr.1")
 bazel_dep(name = "rules_cc", version = "0.2.19")
+# FlashAttention is compiled from original upstream CUDA sources. rules_cuda
+# supplies the hermetic nvcc action model; it does not select an NML backend.
+bazel_dep(name = "rules_cuda", version = "0.3.0")
 bazel_dep(name = "tar.bzl", version = "0.10.4")
 
 # Keep this at the current rules_rust release when deliberately updating the
@@ -100,6 +109,55 @@ use_repo(rust, "rust_toolchains")
 # Register only the toolchains created by the declaration above. In particular,
 # do not register rules_rust's implicit stable-plus-nightly defaults.
 register_toolchains("@rust_toolchains//:all")
+
+# Test execution follows the native OS/architecture but must not inherit
+# target-only ABI constraints from CUDA's hermetic C++ platform. Without these
+# toolchains Bazel 9 either rejects CUDA-configured tests or executes all build
+# tools under the CUDA target platform, contaminating host links.
+register_toolchains(
+    "//bazel:linux_aarch64_test_toolchain",
+    "//bazel:linux_x86_64_test_toolchain",
+    "//bazel:macos_aarch64_test_toolchain",
+)
+
+# Keep CUDA compilation hermetic and independently cacheable from the PJRT
+# runtime package.  The two versions are intentionally independent: pinned
+# FlashAttention 2.8.3 treats CUDA 12.8 as its native Hopper source toolchain,
+# while the ZML-derived PJRT package owns its CUDA 13.1 execution closure.  A
+# newer driver can execute the older cubins; forcing FA3 through CUDA 13.1's
+# ptxas instead produces an internal compiler failure for its head-dimension
+# 256 WGMMA kernels.
+cuda_compiler = use_extension("@rules_cuda//cuda:extensions.bzl", "toolchain")
+cuda_compiler.redist_json(
+    name = "cuda_compiler_redist",
+    version = "12.8.0",
+)
+# The repository name remains `cuda` because rules_cuda's own module registers
+# toolchains through that canonical apparent name. The root module replaces the
+# local-toolkit declaration with these digest-addressed redistributables.
+cuda_compiler.toolkit(name = "cuda")
+use_repo(cuda_compiler, "cuda")
+
+# Original source archives are pinned independently. FlashAttention's release
+# archive does not contain git submodules, so its exact CUTLASS gitlink is a
+# second explicit repository rather than an ambient checkout or system input.
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+http_archive(
+    name = "flash_attention",
+    build_file = "//third_party/flash_attention:flash_attention.BUILD.bazel",
+    patch_strip = 1,
+    patches = ["//third_party/flash_attention:remove-pytorch.patch"],
+    sha256 = "61cd5e91507ad7f04dc7c207d8bc8bfb1e43b56b806e51febbc27faeaee208ba",
+    strip_prefix = "flash-attention-2.8.3",
+    urls = ["https://github.com/Dao-AILab/flash-attention/archive/refs/tags/v2.8.3.tar.gz"],
+)
+http_archive(
+    name = "flash_attention_cutlass",
+    build_file = "//third_party/flash_attention:cutlass.BUILD.bazel",
+    sha256 = "f2a3a9df5e6f010c8b02716aa2644a6f071827fafa606fac5f5241cab6a1ab56",
+    strip_prefix = "cutlass-dc4817921edda44a549197ff3a9dcf5df0636e7b",
+    urls = ["https://github.com/NVIDIA/cutlass/archive/dc4817921edda44a549197ff3a9dcf5df0636e7b.tar.gz"],
+)
 
 # Product Rust dependencies are declared directly in Bzlmod. NML has no Cargo
 # workspace and therefore no second dependency graph or generated lockfile to

@@ -1,10 +1,44 @@
 """Repository-local rules that encode NML build policy."""
 
+load(":test_toolchain.bzl", "empty_test_toolchain")
+
 exports_files(
     [
         "http_deb_archive.bzl",
         "patchelf.bzl",
         "rust.bzl",
+        "test_toolchain.bzl",
     ],
     visibility = ["//visibility:public"],
 )
+
+# Bazel 9 normally projects every target-platform constraint onto test
+# execution. CUDA's hermetic libc/libstdc++ constraints describe the binary we
+# build, not the worker that launches it. These native host toolchains preserve
+# the required OS/CPU identity while keeping build-only ABI constraints out of
+# execution-platform selection.
+empty_test_toolchain(name = "native_test_runner")
+
+[
+    toolchain(
+        name = name,
+        exec_compatible_with = constraints,
+        target_compatible_with = constraints,
+        toolchain = ":native_test_runner",
+        toolchain_type = "@bazel_tools//tools/test:default_test_toolchain_type",
+    )
+    for name, constraints in {
+        "linux_x86_64_test_toolchain": [
+            "@platforms//cpu:x86_64",
+            "@platforms//os:linux",
+        ],
+        "linux_aarch64_test_toolchain": [
+            "@platforms//cpu:aarch64",
+            "@platforms//os:linux",
+        ],
+        "macos_aarch64_test_toolchain": [
+            "@platforms//cpu:aarch64",
+            "@platforms//os:macos",
+        ],
+    }.items()
+]

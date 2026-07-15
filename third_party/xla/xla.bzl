@@ -14,7 +14,8 @@ load("@xla//third_party/llvm:workspace.bzl", llvm = "repo")
 load("@xla//third_party/py/ml_dtypes:workspace.bzl", ml_dtypes = "repo")
 load("@xla//third_party/shardy:workspace.bzl", shardy = "repo")
 load("@xla//third_party/stablehlo:workspace.bzl", stablehlo = "repo")
-load("@xla//third_party/triton:workspace.bzl", triton = "repo")
+load("@xla//third_party/triton:common/series.bzl", "common_patch_list")
+load("@xla//third_party/triton:oss_only/series.bzl", "oss_only_patch_list")
 
 _BZL_HELPERS = """\
 always_newer_than = lambda wanted_ver, if_true, if_false = []: if_true
@@ -201,7 +202,20 @@ def _xla_dependencies_impl(module_ctx):
     llvm("llvm-raw")
     stablehlo()
     shardy()
-    triton()
+    # XLA's pinned Triton BUILD describes WarpSpecialization sources which are
+    # absent at the pinned upstream commit.  Bazel rejects both empty globs
+    # while merely loading the package, even though NML only needs the core
+    # dialect target here.  Permit emptiness on those two exact globs instead
+    # of disabling empty-glob validation repository-wide.
+    tf_http_archive(
+        name = "triton",
+        sha256 = "09023b4bd7ecea41d6681ab0b9c18b5ea77e87413724b8c2283f481517111f13",
+        strip_prefix = "triton-c05aa65087a9a1a6b8a08fdbb474aba834d5cddf",
+        urls = tf_mirror_urls("https://github.com/triton-lang/triton/archive/c05aa65087a9a1a6b8a08fdbb474aba834d5cddf.tar.gz"),
+        patch_file = common_patch_list + oss_only_patch_list + [
+            "@nml//third_party/triton:warp-specialization-empty-globs.patch",
+        ],
+    )
     farmhash()
     highwayhash()
     hwloc()

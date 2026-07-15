@@ -3,7 +3,7 @@ use nml_ir::{
 };
 use nml_mlir::Context;
 use nml_tensor::Element;
-use nml_types::{AxisTag, BFloat16, Complex64, Complex128, DType, F16, Layout, Shape};
+use nml_types::{AxisTag, BFloat16, Complex128, Complex64, DType, Layout, Shape, F16};
 
 #[test]
 fn matmul_is_typed_deterministic_and_verified() {
@@ -163,6 +163,150 @@ fn attention_primitives_reject_invalid_contracts_before_mlir() {
 }
 
 #[test]
+fn model_enabling_operations_are_typed_and_verify_as_stablehlo() {
+    let mut builder = ProgramBuilder::new();
+    let shape = Shape::new(DType::F32, &[2, 4]).unwrap();
+    let input = builder.input("input", shape);
+    let gate = builder.input("gate", shape);
+    let one = builder.scalar(1.0f32).unwrap();
+    let two = builder.scalar(2.0f32).unwrap();
+    let low = builder.scalar(-1.0f32).unwrap();
+    let high = builder.scalar(1.0f32).unwrap();
+    let absolute = builder.abs(input).unwrap();
+    let positive = builder.add(absolute, one).unwrap();
+    let power = builder.power(positive, two).unwrap();
+    let remainder = builder.remainder(input, two).unwrap();
+    let clamped = builder.clamp(input, low, high).unwrap();
+    let floor = builder.floor(input).unwrap();
+    let ceil = builder.ceil(input).unwrap();
+    let minimum = builder.reduce_min(input, &[1]).unwrap();
+    let mean = builder.mean(input, &[1]).unwrap();
+    let log_sum_exp = builder.log_sum_exp(input, &[1]).unwrap();
+    let normalized = builder.normalize_variance(input, 1, 1e-5).unwrap();
+    let l2 = builder.normalize_l2(input, &[1], 1e-12).unwrap();
+    let norm_weight = builder.parameter("norm_weight", Shape::new(DType::F32, &[4]).unwrap());
+    let norm_bias = builder.parameter("norm_bias", Shape::new(DType::F32, &[4]).unwrap());
+    let layer_norm = builder
+        .layer_norm(input, Some(norm_weight), Some(norm_bias), 1, 1e-5)
+        .unwrap();
+    let swiglu = builder.swiglu(gate, input).unwrap();
+    let geglu = builder.geglu(gate, input).unwrap();
+
+    let embedding_weight =
+        builder.parameter("embedding_weight", Shape::new(DType::F32, &[5, 4]).unwrap());
+    let token_ids = builder.input("token_ids", Shape::new(DType::I32, &[2, 3]).unwrap());
+    let embedding = builder
+        .token_embedding(embedding_weight, token_ids)
+        .unwrap();
+    assert_eq!(embedding.shape().dimensions(), &[2, 3, 4]);
+
+    let scores = builder.input("scores", Shape::new(DType::F32, &[2, 5]).unwrap());
+    let (maxima, indices) = builder.argmax(scores, 1).unwrap();
+    assert_eq!(maxima.shape().dimensions(), &[2]);
+    assert_eq!(indices.shape().dimensions(), &[2]);
+    assert_eq!(indices.shape().dtype(), DType::I32);
+
+    let complex = builder.input("complex", Shape::new(DType::C64, &[2]).unwrap());
+    let magnitude = builder.abs(complex).unwrap();
+    assert_eq!(magnitude.shape().dtype(), DType::F32);
+
+    let program = builder
+        .finish(&[
+            power,
+            remainder,
+            clamped,
+            floor,
+            ceil,
+            minimum,
+            mean,
+            log_sum_exp,
+            normalized,
+            l2,
+            layer_norm,
+            swiglu,
+            geglu,
+            embedding,
+            maxima,
+            indices,
+            magnitude,
+        ])
+        .unwrap();
+    let text = program.stablehlo().unwrap();
+    for operation in [
+        "stablehlo.abs",
+        "stablehlo.power",
+        "stablehlo.remainder",
+        "stablehlo.clamp",
+        "stablehlo.floor",
+        "stablehlo.ceil",
+        "stablehlo.gather",
+        "stablehlo.reduce",
+    ] {
+        assert!(text.contains(operation), "missing {operation} in {text}");
+    }
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
+}
+
+#[test]
+fn model_enabling_operations_reject_invalid_contracts_before_mlir() {
+    let mut builder = ProgramBuilder::new();
+    let floats = builder.input("floats", Shape::new(DType::F32, &[2, 4]).unwrap());
+    let bools = builder.input("bools", Shape::new(DType::Bool, &[2, 4]).unwrap());
+    let bad_weight = builder.input("bad_weight", Shape::new(DType::F32, &[5]).unwrap());
+    let good_weight = builder.input("good_weight", Shape::new(DType::F32, &[5, 4]).unwrap());
+    let bad_ids = builder.input("bad_ids", Shape::new(DType::F32, &[2]).unwrap());
+    assert!(matches!(
+        builder.abs(bools),
+        Err(Error::UnsupportedDType {
+            operation: "abs",
+            dtype: DType::Bool,
+        })
+    ));
+    assert!(matches!(
+        builder.token_embedding(bad_weight, bad_ids),
+        Err(Error::RankMismatch { .. })
+    ));
+    assert!(matches!(
+        builder.token_embedding(good_weight, bad_ids),
+        Err(Error::InvalidIndexDType(DType::F32))
+    ));
+    assert!(matches!(
+        builder.layer_norm(floats, None, None, 2, 1e-5),
+        Err(Error::AxisOutOfBounds { .. })
+    ));
+    assert!(matches!(
+        builder.normalize_l2(floats, &[1], 0.0),
+        Err(Error::InvalidNormalization(_))
+    ));
+    assert!(matches!(
+        builder.normalize_l2(floats, &[], 1e-5),
+        Err(Error::InvalidNormalization(_))
+    ));
+    assert!(matches!(
+        builder.argmax(floats, 2),
+        Err(Error::AxisOutOfBounds { .. })
+    ));
+    assert!(matches!(
+        builder.argmax(bools, 1),
+        Err(Error::UnsupportedDType {
+            operation: "argmax",
+            dtype: DType::Bool,
+        })
+    ));
+
+    let huge = builder.input(
+        "huge",
+        Shape::new(DType::F32, &[i32::MAX as i64 + 1]).unwrap(),
+    );
+    let (_, indices) = builder.argmax(huge, 0).unwrap();
+    assert_eq!(indices.shape().dtype(), DType::I64);
+}
+
+#[test]
 fn rope_and_ordinary_attention_are_verified_compositions() {
     let mut builder = ProgramBuilder::new();
     let query = builder.input("query", Shape::new(DType::F16, &[2, 3, 4, 8]).unwrap());
@@ -271,6 +415,271 @@ fn paged_attention_is_one_bounded_verified_stablehlo_loop() {
 }
 
 #[test]
+fn cuda_paged_attention_lowers_complete_typed_triton_artifacts() {
+    use nml_sharding::Sharding;
+
+    fn lower(query_len: i64) -> String {
+        let mut builder = ProgramBuilder::new();
+        let query = builder.input(
+            "query",
+            Shape::new(DType::F16, &[2, query_len, 4, 64]).unwrap(),
+        );
+        let key_cache = builder.input(
+            "key_cache",
+            Shape::new(DType::F16, &[7, 16, 2, 64]).unwrap(),
+        );
+        let value_cache = builder.input(
+            "value_cache",
+            Shape::new(DType::F16, &[7, 16, 2, 64]).unwrap(),
+        );
+        let page_table = builder.input("page_table", Shape::new(DType::I32, &[2, 5]).unwrap());
+        let lengths = builder.input("lengths", Shape::new(DType::I32, &[2]).unwrap());
+        let positions = builder.input(
+            "positions",
+            Shape::new(DType::I32, &[2, query_len]).unwrap(),
+        );
+        let output = builder
+            .paged_attention(
+                query,
+                key_cache,
+                value_cache,
+                page_table,
+                lengths,
+                positions,
+                AttentionOptions {
+                    causal: true,
+                    sliding_window: Some(32),
+                    scale: None,
+                },
+            )
+            .unwrap();
+        let program = builder.finish(&[output]).unwrap();
+        let context = Context::new();
+        let module = program
+            .module_with_sharding_cuda(&context, &Sharding::single(), 30, 8, 0)
+            .unwrap();
+        module.verify().unwrap();
+        let text = module.text();
+        assert!(!module
+            .portable_artifact(&nml_mlir::stablehlo_current_version())
+            .unwrap()
+            .is_empty());
+        text
+    }
+
+    let prefill = lower(3);
+    assert_eq!(
+        prefill.matches("__gpu$xla.gpu.triton").count(),
+        1,
+        "{prefill}"
+    );
+    assert!(prefill.contains("paged_attention_2d"), "{prefill}");
+    assert!(!prefill.contains("stablehlo.while"), "{prefill}");
+
+    let decode = lower(1);
+    assert_eq!(
+        decode.matches("__gpu$xla.gpu.triton").count(),
+        2,
+        "{decode}"
+    );
+    assert!(decode.contains("paged_attention_3d"), "{decode}");
+    assert!(
+        decode.contains("paged_attention_segment_reduction"),
+        "{decode}"
+    );
+    assert!(decode.contains("tensor<2x4x16x64xf32>"), "{decode}");
+    assert!(!decode.contains("stablehlo.while"), "{decode}");
+}
+
+#[test]
+fn cuda_paged_attention_selects_only_upstream_supported_flash_variants() {
+    use nml_sharding::Sharding;
+
+    fn lower_with_options(
+        page_size: i64,
+        dtype: DType,
+        capability: (u16, u16),
+        options: AttentionOptions,
+    ) -> String {
+        let mut builder = ProgramBuilder::new();
+        let query = builder.input("query", Shape::new(dtype, &[2, 3, 4, 64]).unwrap());
+        let key_cache = builder.input(
+            "key_cache",
+            Shape::new(dtype, &[7, page_size, 2, 64]).unwrap(),
+        );
+        let value_cache = builder.input(
+            "value_cache",
+            Shape::new(dtype, &[7, page_size, 2, 64]).unwrap(),
+        );
+        let page_table = builder.input("page_table", Shape::new(DType::I32, &[2, 5]).unwrap());
+        let lengths = builder.input("lengths", Shape::new(DType::I32, &[2]).unwrap());
+        let positions = builder.input("positions", Shape::new(DType::I32, &[2, 3]).unwrap());
+        let output = builder
+            .paged_attention(
+                query,
+                key_cache,
+                value_cache,
+                page_table,
+                lengths,
+                positions,
+                options,
+            )
+            .unwrap();
+        let program = builder.finish(&[output]).unwrap();
+        let context = Context::new();
+        let module = program
+            .module_with_sharding_cuda(
+                &context,
+                &Sharding::single(),
+                80,
+                capability.0,
+                capability.1,
+            )
+            .unwrap();
+        module.verify().unwrap();
+        module.text()
+    }
+
+    fn lower(page_size: i64, dtype: DType, capability: (u16, u16)) -> String {
+        lower_with_options(
+            page_size,
+            dtype,
+            capability,
+            AttentionOptions {
+                causal: true,
+                sliding_window: Some(32),
+                scale: None,
+            },
+        )
+    }
+
+    let sm75 = lower(256, DType::F16, (7, 5));
+    assert!(!sm75.contains("nml.flash_attention_2.paged"), "{sm75}");
+    assert!(!sm75.contains("__gpu$xla.gpu.triton"), "{sm75}");
+    assert!(sm75.contains("stablehlo.while"), "{sm75}");
+
+    // Original upstream FA2 paged KV requires a page size divisible by 256.
+    let sm80_small_page = lower(16, DType::F16, (8, 0));
+    assert!(sm80_small_page.contains("__gpu$xla.gpu.triton"));
+    assert!(!sm80_small_page.contains("nml.flash_attention_2.paged"));
+    assert!(!sm80_small_page.contains("stablehlo.case"));
+
+    let sm80 = lower(256, DType::Bf16, (8, 9));
+    assert!(sm80.contains("nml.flash_attention_2.paged"), "{sm80}");
+    assert!(sm80.contains("__gpu$xla.gpu.triton"), "{sm80}");
+    assert!(sm80.contains("stablehlo.case"), "{sm80}");
+    assert!(sm80.contains("tensor<2x4x3xf32>"), "{sm80}");
+
+    let sm80_unmasked = lower_with_options(
+        256,
+        DType::F16,
+        (8, 0),
+        AttentionOptions {
+            causal: false,
+            sliding_window: None,
+            scale: None,
+        },
+    );
+    assert!(
+        sm80_unmasked.contains("nml.flash_attention_2.paged"),
+        "{sm80_unmasked}"
+    );
+    assert!(!sm80_unmasked.contains("stablehlo.case"), "{sm80_unmasked}");
+    assert!(
+        !sm80_unmasked.contains("__gpu$xla.gpu.triton"),
+        "{sm80_unmasked}"
+    );
+
+    // FA3 accepts the ordinary page sizes used by NML, but only exact SM90.
+    let sm90 = lower(16, DType::F16, (9, 0));
+    assert!(sm90.contains("nml.flash_attention_3.paged"), "{sm90}");
+    assert!(!sm90.contains("nml.flash_attention_2.paged"), "{sm90}");
+    assert!(sm90.contains("stablehlo.case"), "{sm90}");
+    assert!(sm90.contains("tensor<1xi32>"), "{sm90}");
+
+    let unbuilt_sm91 = lower(16, DType::F16, (9, 1));
+    assert!(!unbuilt_sm91.contains("nml.flash_attention_3.paged"));
+    assert!(unbuilt_sm91.contains("stablehlo.while"), "{unbuilt_sm91}");
+
+    let unsupported_dtype = lower(256, DType::F32, (8, 0));
+    assert!(!unsupported_dtype.contains("nml.flash_attention_2.paged"));
+    assert!(unsupported_dtype.contains("__gpu$xla.gpu.triton"));
+    assert!(!unsupported_dtype.contains("stablehlo.case"));
+}
+
+#[test]
+fn cuda_dense_attention_selects_flash_version_inside_its_exact_capability_contract() {
+    use nml_sharding::Sharding;
+
+    fn lower(capability_major: u16, dtype: DType) -> String {
+        let mut builder = ProgramBuilder::new();
+        let query = builder.input("query", Shape::new(dtype, &[2, 3, 4, 64]).unwrap());
+        let key = builder.input("key", Shape::new(dtype, &[2, 5, 2, 64]).unwrap());
+        let value = builder.input("value", Shape::new(dtype, &[2, 5, 2, 64]).unwrap());
+        let query_positions =
+            builder.input("query_positions", Shape::new(DType::I32, &[2, 3]).unwrap());
+        let key_positions =
+            builder.input("key_positions", Shape::new(DType::I32, &[2, 5]).unwrap());
+        let output = builder
+            .attention(
+                query,
+                key,
+                value,
+                query_positions,
+                key_positions,
+                AttentionOptions {
+                    causal: true,
+                    sliding_window: Some(4),
+                    scale: None,
+                },
+            )
+            .unwrap();
+        let program = builder.finish(&[output]).unwrap();
+        let context = Context::new();
+        let module = program
+            .module_with_sharding_cuda(&context, &Sharding::single(), 80, capability_major, 0)
+            .unwrap();
+        module.verify().unwrap();
+        module.text()
+    }
+
+    let sm75 = lower(7, DType::F16);
+    assert!(!sm75.contains("nml.flash_attention_2.forward"), "{sm75}");
+    assert!(!sm75.contains("nml.flash_attention_3.forward"), "{sm75}");
+    assert!(!sm75.contains("stablehlo.case"), "{sm75}");
+
+    let sm80 = lower(8, DType::F16);
+    assert!(sm80.contains("nml.flash_attention_2.forward"), "{sm80}");
+    assert!(sm80.contains("stablehlo.case"), "{sm80}");
+    assert!(sm80.contains("sliding_window = 4 : i32"), "{sm80}");
+    assert!(sm80.contains("tensor<2x4x3xf32>"), "{sm80}");
+
+    let unsupported_dtype = lower(8, DType::F32);
+    assert!(
+        !unsupported_dtype.contains("nml.flash_attention_2.forward"),
+        "{unsupported_dtype}"
+    );
+    assert!(
+        !unsupported_dtype.contains("nml.flash_attention_3.forward"),
+        "{unsupported_dtype}"
+    );
+
+    // Hopper uses its distinct upstream ABI and is never mislabeled as FA2.
+    let sm90 = lower(9, DType::F16);
+    assert!(!sm90.contains("nml.flash_attention_2.forward"), "{sm90}");
+    assert!(sm90.contains("nml.flash_attention_3.forward"), "{sm90}");
+    assert!(sm90.contains("stablehlo.case"), "{sm90}");
+    assert!(sm90.contains("tensor<1xi32>"), "{sm90}");
+
+    let unbuilt_future_architecture = lower(10, DType::F16);
+    assert!(
+        !unbuilt_future_architecture.contains("nml.flash_attention_2.forward")
+            && !unbuilt_future_architecture.contains("nml.flash_attention_3.forward"),
+        "{unbuilt_future_architecture}"
+    );
+}
+
+#[test]
 fn ordinary_attention_preserves_shardy_head_and_batch_placement() {
     use nml_sharding::Sharding;
     use nml_types::{AxisTag, Partition};
@@ -338,6 +747,84 @@ fn ordinary_attention_preserves_shardy_head_and_batch_placement() {
 }
 
 #[test]
+fn paged_attention_preserves_shardy_head_and_batch_placement() {
+    use nml_sharding::Sharding;
+    use nml_types::{AxisTag, Partition};
+
+    let data = AxisTag::new(41);
+    let model = AxisTag::new(42);
+    let sequence = AxisTag::new(43);
+    let page = AxisTag::new(44);
+    let head_dim = AxisTag::new(45);
+    let query_shape = Shape::new(DType::F32, &[2, 3, 4, 8])
+        .unwrap()
+        .with_axis_tags(&[data, sequence, model, head_dim])
+        .unwrap()
+        .with_partitions(&[
+            Partition::Sharded(data),
+            Partition::Replicated,
+            Partition::Sharded(model),
+            Partition::Replicated,
+        ])
+        .unwrap();
+    let cache_shape = Shape::new(DType::F32, &[4, 2, 2, 8])
+        .unwrap()
+        .with_axis_tags(&[page, sequence, model, head_dim])
+        .unwrap()
+        .with_partitions(&[
+            Partition::Replicated,
+            Partition::Replicated,
+            Partition::Sharded(model),
+            Partition::Replicated,
+        ])
+        .unwrap();
+    let page_table_shape = Shape::new(DType::I32, &[2, 2])
+        .unwrap()
+        .with_axis_tags(&[data, page])
+        .unwrap()
+        .with_partitions(&[Partition::Sharded(data), Partition::Replicated])
+        .unwrap();
+    let length_shape = Shape::new(DType::I32, &[2])
+        .unwrap()
+        .with_axis_tags(&[data])
+        .unwrap()
+        .with_partitions(&[Partition::Sharded(data)])
+        .unwrap();
+    let position_shape = Shape::new(DType::I32, &[2, 3])
+        .unwrap()
+        .with_axis_tags(&[data, sequence])
+        .unwrap()
+        .with_partitions(&[Partition::Sharded(data), Partition::Replicated])
+        .unwrap();
+
+    let mut builder = ProgramBuilder::new();
+    let query = builder.input("query", query_shape);
+    let key_cache = builder.input("key_cache", cache_shape);
+    let value_cache = builder.input("value_cache", cache_shape);
+    let page_table = builder.input("page_table", page_table_shape);
+    let sequence_lengths = builder.input("sequence_lengths", length_shape);
+    let query_positions = builder.input("query_positions", position_shape);
+    let output = builder
+        .paged_attention(
+            query,
+            key_cache,
+            value_cache,
+            page_table,
+            sequence_lengths,
+            query_positions,
+            AttentionOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(output.shape().partitions(), query_shape.partitions());
+
+    let program = builder.finish(&[output]).unwrap();
+    let mesh = Sharding::mesh(&[(data, 2), (model, 2)]).unwrap();
+    let text = program.stablehlo_with_sharding(&mesh).unwrap();
+    assert!(text.contains("sdy.mesh"), "{text}");
+    assert!(text.contains("sdy.sharding_constraint"), "{text}");
+}
+
+#[test]
 fn attention_geometry_is_rejected_before_mlir_construction() {
     let mut builder = ProgramBuilder::new();
     let query = builder.input("query", Shape::new(DType::F32, &[1, 2, 3, 8]).unwrap());
@@ -382,6 +869,70 @@ fn attention_geometry_is_rejected_before_mlir_construction() {
             positions,
             positions,
             AttentionOptions::default(),
+        ),
+        Err(Error::InvalidAttention(_))
+    ));
+
+    let mut invalid_scale = ProgramBuilder::new();
+    let query = invalid_scale.input("query", Shape::new(DType::F32, &[1, 1, 1, 4]).unwrap());
+    let key = invalid_scale.input("key", Shape::new(DType::F32, &[1, 1, 1, 4]).unwrap());
+    let value = invalid_scale.input("value", Shape::new(DType::F32, &[1, 1, 1, 4]).unwrap());
+    let positions = invalid_scale.input("positions", Shape::new(DType::I32, &[1, 1]).unwrap());
+    assert!(matches!(
+        invalid_scale.attention(
+            query,
+            key,
+            value,
+            positions,
+            positions,
+            AttentionOptions {
+                scale: Some(f64::MAX),
+                ..AttentionOptions::default()
+            },
+        ),
+        Err(Error::InvalidAttention(_))
+    ));
+
+    let mut invalid_window = ProgramBuilder::new();
+    let query = invalid_window.input("query", Shape::new(DType::F32, &[1, 1, 2, 4]).unwrap());
+    let key = invalid_window.input("key", Shape::new(DType::F32, &[1, 1, 1, 4]).unwrap());
+    let value = invalid_window.input("value", Shape::new(DType::F32, &[1, 1, 1, 4]).unwrap());
+    let positions = invalid_window.input("positions", Shape::new(DType::I32, &[1, 1]).unwrap());
+    assert!(matches!(
+        invalid_window.attention(
+            query,
+            key,
+            value,
+            positions,
+            positions,
+            AttentionOptions {
+                sliding_window: Some(0),
+                ..AttentionOptions::default()
+            },
+        ),
+        Err(Error::InvalidAttention(_))
+    ));
+
+    let key_cache =
+        invalid_window.input("key_cache", Shape::new(DType::F32, &[2, 16, 1, 4]).unwrap());
+    let value_cache = invalid_window.input(
+        "value_cache",
+        Shape::new(DType::F32, &[2, 16, 1, 4]).unwrap(),
+    );
+    let page_table = invalid_window.input("page_table", Shape::new(DType::I32, &[1, 1]).unwrap());
+    let lengths = invalid_window.input("lengths", Shape::new(DType::I32, &[1]).unwrap());
+    assert!(matches!(
+        invalid_window.paged_attention(
+            query,
+            key_cache,
+            value_cache,
+            page_table,
+            lengths,
+            positions,
+            AttentionOptions {
+                sliding_window: Some(0),
+                ..AttentionOptions::default()
+            },
         ),
         Err(Error::InvalidAttention(_))
     ));

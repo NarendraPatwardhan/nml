@@ -384,6 +384,13 @@ type GpuRegisterCustomCallFn =
     unsafe extern "C" fn(*mut sys::PJRT_Gpu_Register_Custom_Call_Args) -> *mut sys::PJRT_Error;
 
 impl GpuCustomCalls {
+    /// Stable identity of the loaded PJRT API table that owns this extension.
+    /// Custom-call registries use it to make initialization idempotent per
+    /// plugin rather than accidentally process-global.
+    pub fn plugin_identity(&self) -> usize {
+        self.plugin.api.as_ptr() as usize
+    }
+
     /// Registers a process-lifetime custom-call target with XLA's GPU backend.
     ///
     /// # Safety
@@ -1497,34 +1504,7 @@ impl Device {
     }
 
     pub fn string_attribute(&self, requested_name: &str) -> Result<Option<String>, Error> {
-        let description = self.description()?;
-
-        // SAFETY: zero is valid for the output attributes pointer/count.
-        let mut attributes_args: sys::PJRT_DeviceDescription_Attributes_Args = unsafe { zeroed() };
-        attributes_args.struct_size =
-            sys::PJRT_DeviceDescription_Attributes_Args_STRUCT_SIZE as usize;
-        attributes_args.device_description = description.as_ptr();
-        // SAFETY: function pointer is available and description/args are live.
-        let error = unsafe {
-            (self
-                .client
-                .state
-                .plugin
-                .device_description_attributes_fn()?)(&mut attributes_args)
-        };
-        self.client.state.plugin.into_result(error)?;
-        if attributes_args.num_attributes != 0 && attributes_args.attributes.is_null() {
-            return Err(Error::NullResult("PJRT_DeviceDescription_Attributes"));
-        }
-        if attributes_args.num_attributes == 0 {
-            return Ok(None);
-        }
-
-        // SAFETY: PJRT guarantees num_attributes client-owned entries.
-        let attributes = unsafe {
-            std::slice::from_raw_parts(attributes_args.attributes, attributes_args.num_attributes)
-        };
-        for attribute in attributes {
+        for attribute in self.attributes()? {
             let name = copy_bytes(attribute.name, attribute.name_size)?;
             if name != requested_name.as_bytes() {
                 continue;
@@ -1538,6 +1518,47 @@ impl Device {
             return Ok(Some(String::from_utf8_lossy(&bytes).into_owned()));
         }
         Ok(None)
+    }
+
+    pub fn int64_attribute(&self, requested_name: &str) -> Result<Option<i64>, Error> {
+        for attribute in self.attributes()? {
+            let name = copy_bytes(attribute.name, attribute.name_size)?;
+            if name != requested_name.as_bytes() {
+                continue;
+            }
+            if attribute.type_ != sys::PJRT_NamedValue_Type_PJRT_NamedValue_kInt64 {
+                return Ok(None);
+            }
+            // SAFETY: the discriminant above selects the scalar i64 union member.
+            return Ok(Some(unsafe { attribute.__bindgen_anon_1.int64_value }));
+        }
+        Ok(None)
+    }
+
+    fn attributes(&self) -> Result<&[sys::PJRT_NamedValue], Error> {
+        let description = self.description()?;
+        // SAFETY: zero is valid for the output attributes pointer/count.
+        let mut args: sys::PJRT_DeviceDescription_Attributes_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_DeviceDescription_Attributes_Args_STRUCT_SIZE as usize;
+        args.device_description = description.as_ptr();
+        // SAFETY: function pointer is available and description/args are live.
+        let error = unsafe {
+            (self
+                .client
+                .state
+                .plugin
+                .device_description_attributes_fn()?)(&mut args)
+        };
+        self.client.state.plugin.into_result(error)?;
+        if args.num_attributes != 0 && args.attributes.is_null() {
+            return Err(Error::NullResult("PJRT_DeviceDescription_Attributes"));
+        }
+        if args.num_attributes == 0 {
+            return Ok(&[]);
+        }
+        // SAFETY: PJRT guarantees client-owned entries that remain live with
+        // the device description retained by this client.
+        Ok(unsafe { std::slice::from_raw_parts(args.attributes, args.num_attributes) })
     }
 
     pub fn default_memory(&self) -> Result<Memory, Error> {

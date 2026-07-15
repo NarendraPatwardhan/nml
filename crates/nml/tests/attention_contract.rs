@@ -61,6 +61,9 @@ fn ordinary_and_portable_paged_attention_execute_the_same_semantics() {
     empty_paged_context_returns_zero(&platform);
     cache_update_rollback_and_replay_preserve_persistent_storage(&platform);
     checkpoint_backed_attention_block_executes(&platform);
+    if env!("NML_ATTENTION_BACKEND") == "cuda" {
+        accelerated_cuda_attention_matches_dense_reference(&platform);
+    }
 }
 
 fn fully_masked_ordinary_attention_returns_zero(platform: &nml::Platform) {
@@ -99,6 +102,500 @@ fn fully_masked_ordinary_attention_returns_zero(platform: &nml::Platform) {
             .unwrap(),
     );
     assert!(output.iter().all(|value| *value == 0.0), "{output:?}");
+}
+
+/// Exercises the exact public API shapes that select FA2/FA3 and both Triton
+/// launch families on compatible devices. The same contract deliberately runs
+/// through the portable CUDA fallback on the repository's SM75 host; moving
+/// the unchanged binary to SM8x or SM90 changes only the private lowering.
+fn accelerated_cuda_attention_matches_dense_reference(platform: &nml::Platform) {
+    execute_accelerated_dense(
+        platform,
+        DType::F16,
+        AttentionOptions {
+            causal: true,
+            sliding_window: Some(4),
+            scale: None,
+        },
+    );
+    execute_accelerated_dense(
+        platform,
+        DType::Bf16,
+        AttentionOptions {
+            causal: false,
+            sliding_window: None,
+            scale: Some(0.17),
+        },
+    );
+
+    for dtype in [DType::F16, DType::Bf16] {
+        // Six query heads over two KV heads deliberately covers a non-power-of-
+        // two GQA ratio. Page 16 selects Triton on SM8x and upstream FA3 on
+        // SM90; prefill and decode select the 2D and split-K Triton families.
+        execute_accelerated_paged(
+            platform,
+            dtype,
+            16,
+            3,
+            AttentionOptions {
+                causal: true,
+                sliding_window: Some(4),
+                scale: None,
+            },
+        );
+        execute_accelerated_paged(
+            platform,
+            dtype,
+            16,
+            1,
+            AttentionOptions {
+                causal: false,
+                sliding_window: Some(8),
+                scale: Some(0.13),
+            },
+        );
+
+        // Original-upstream FA2's paged path requires pages divisible by 256.
+        // This pair therefore executes FA2 on SM8x and FA3 on SM90 without a
+        // second cache representation or a test-only backend selector.
+        execute_accelerated_paged(
+            platform,
+            dtype,
+            256,
+            3,
+            AttentionOptions {
+                causal: true,
+                sliding_window: None,
+                scale: None,
+            },
+        );
+        execute_accelerated_paged(
+            platform,
+            dtype,
+            256,
+            1,
+            AttentionOptions {
+                causal: false,
+                sliding_window: None,
+                scale: None,
+            },
+        );
+    }
+
+    // F32 is outside upstream FlashAttention's retained ABI and consequently
+    // keeps both Triton launch families observable on SM90 as well as SM8x.
+    for query_length in [3, 1] {
+        execute_accelerated_paged(
+            platform,
+            DType::F32,
+            16,
+            query_length,
+            AttentionOptions {
+                causal: true,
+                sliding_window: Some(6),
+                scale: None,
+            },
+        );
+    }
+}
+
+fn execute_accelerated_dense(platform: &nml::Platform, dtype: DType, options: AttentionOptions) {
+    const BATCHES: usize = 2;
+    const QUERY_LENGTH: usize = 3;
+    const KEY_LENGTH: usize = 7;
+    const QUERY_HEADS: usize = 6;
+    const KV_HEADS: usize = 2;
+    const HEAD_DIMENSION: usize = 64;
+
+    let query = generated_values(BATCHES * QUERY_LENGTH * QUERY_HEADS * HEAD_DIMENSION, 3);
+    let key = generated_values(BATCHES * KEY_LENGTH * KV_HEADS * HEAD_DIMENSION, 11);
+    let value = generated_values(BATCHES * KEY_LENGTH * KV_HEADS * HEAD_DIMENSION, 23);
+    let query = round_values(dtype, &query);
+    let key = round_values(dtype, &key);
+    let value = round_values(dtype, &value);
+    let query_positions = (0..BATCHES)
+        .flat_map(|_| (KEY_LENGTH - QUERY_LENGTH..KEY_LENGTH).map(|value| value as i32))
+        .collect::<Vec<_>>();
+    let key_positions = (0..BATCHES)
+        .flat_map(|_| (0..KEY_LENGTH).map(|value| value as i32))
+        .collect::<Vec<_>>();
+    let lengths = vec![KEY_LENGTH; BATCHES];
+    let expected = reference_attention_geometry(
+        &query,
+        &key,
+        &value,
+        &query_positions,
+        &lengths,
+        BATCHES,
+        QUERY_LENGTH,
+        KEY_LENGTH,
+        QUERY_HEADS,
+        KV_HEADS,
+        HEAD_DIMENSION,
+        options,
+    );
+
+    let mut builder = ProgramBuilder::new();
+    let query_shape = Shape::new(
+        dtype,
+        &[
+            BATCHES as i64,
+            QUERY_LENGTH as i64,
+            QUERY_HEADS as i64,
+            HEAD_DIMENSION as i64,
+        ],
+    )
+    .unwrap();
+    let key_shape = Shape::new(
+        dtype,
+        &[
+            BATCHES as i64,
+            KEY_LENGTH as i64,
+            KV_HEADS as i64,
+            HEAD_DIMENSION as i64,
+        ],
+    )
+    .unwrap();
+    let query_tensor = builder.input("accelerated_query", query_shape);
+    let key_tensor = builder.input("accelerated_key", key_shape);
+    let value_tensor = builder.input("accelerated_value", key_shape);
+    let query_position_tensor = builder.input(
+        "accelerated_query_positions",
+        Shape::new(DType::I32, &[BATCHES as i64, QUERY_LENGTH as i64]).unwrap(),
+    );
+    let key_position_tensor = builder.input(
+        "accelerated_key_positions",
+        Shape::new(DType::I32, &[BATCHES as i64, KEY_LENGTH as i64]).unwrap(),
+    );
+    let output = builder
+        .attention(
+            query_tensor,
+            key_tensor,
+            value_tensor,
+            query_position_tensor,
+            key_position_tensor,
+            options,
+        )
+        .unwrap();
+    let program = builder
+        .finish_named(&[("output".to_owned(), output)])
+        .unwrap();
+    let executable = platform.compile(&program, nml::Sharding::single()).unwrap();
+    let mut args = executable.args();
+    set_float(
+        platform,
+        &mut args,
+        "accelerated_query",
+        query_shape,
+        &query,
+    );
+    set_float(platform, &mut args, "accelerated_key", key_shape, &key);
+    set_float(platform, &mut args, "accelerated_value", key_shape, &value);
+    set_i32(
+        platform,
+        &mut args,
+        "accelerated_query_positions",
+        &[BATCHES as i64, QUERY_LENGTH as i64],
+        &query_positions,
+    );
+    set_i32(
+        platform,
+        &mut args,
+        "accelerated_key_positions",
+        &[BATCHES as i64, KEY_LENGTH as i64],
+        &key_positions,
+    );
+    for _ in 0..2 {
+        let actual = decode(
+            args.call()
+                .unwrap()
+                .get("output")
+                .unwrap()
+                .to_slice()
+                .unwrap(),
+        );
+        assert_close(&actual, &expected, accelerated_tolerance(dtype));
+    }
+}
+
+fn execute_accelerated_paged(
+    platform: &nml::Platform,
+    dtype: DType,
+    page_size: usize,
+    query_length: usize,
+    options: AttentionOptions,
+) {
+    const BATCHES: usize = 2;
+    const QUERY_HEADS: usize = 6;
+    const KV_HEADS: usize = 2;
+    const HEAD_DIMENSION: usize = 64;
+    const PHYSICAL_PAGES: usize = 4;
+    const LOGICAL_PAGES: usize = 2;
+
+    let lengths = [page_size + 3, page_size + 1];
+    let logical_capacity = page_size * LOGICAL_PAGES;
+    let query = round_values(
+        dtype,
+        &generated_values(
+            BATCHES * query_length * QUERY_HEADS * HEAD_DIMENSION,
+            page_size + query_length,
+        ),
+    );
+    // The two sequences intentionally share their first physical page. Their
+    // logical KV values are therefore equal by token and differ only through
+    // the batch-specific query, which makes sharing independently checkable.
+    let logical_key = round_values(
+        dtype,
+        &generated_values(logical_capacity * KV_HEADS * HEAD_DIMENSION, 31),
+    );
+    let logical_value = round_values(
+        dtype,
+        &generated_values(logical_capacity * KV_HEADS * HEAD_DIMENSION, 47),
+    );
+    let mut dense_key = Vec::with_capacity(BATCHES * logical_key.len());
+    let mut dense_value = Vec::with_capacity(BATCHES * logical_value.len());
+    for _ in 0..BATCHES {
+        dense_key.extend_from_slice(&logical_key);
+        dense_value.extend_from_slice(&logical_value);
+    }
+    let query_positions = lengths
+        .iter()
+        .flat_map(|length| (*length - query_length..*length).map(|position| position as i32))
+        .collect::<Vec<_>>();
+    let expected = reference_attention_geometry(
+        &query,
+        &dense_key,
+        &dense_value,
+        &query_positions,
+        &lengths,
+        BATCHES,
+        query_length,
+        logical_capacity,
+        QUERY_HEADS,
+        KV_HEADS,
+        HEAD_DIMENSION,
+        options,
+    );
+
+    let token_width = KV_HEADS * HEAD_DIMENSION;
+    let mut key_cache = vec![91.0; PHYSICAL_PAGES * page_size * token_width];
+    let mut value_cache = vec![-73.0; PHYSICAL_PAGES * page_size * token_width];
+    let copy_page = |source: &[f32], target: &mut [f32], logical: usize, physical: usize| {
+        let width = page_size * token_width;
+        target[physical * width..(physical + 1) * width]
+            .copy_from_slice(&source[logical * width..(logical + 1) * width]);
+    };
+    copy_page(&logical_key, &mut key_cache, 0, 2);
+    copy_page(&logical_value, &mut value_cache, 0, 2);
+    copy_page(&logical_key, &mut key_cache, 1, 0);
+    copy_page(&logical_value, &mut value_cache, 1, 0);
+    copy_page(&logical_key, &mut key_cache, 1, 3);
+    copy_page(&logical_value, &mut value_cache, 1, 3);
+    let page_table = [2, 0, 2, 3];
+
+    let mut builder = ProgramBuilder::new();
+    let query_shape = Shape::new(
+        dtype,
+        &[
+            BATCHES as i64,
+            query_length as i64,
+            QUERY_HEADS as i64,
+            HEAD_DIMENSION as i64,
+        ],
+    )
+    .unwrap();
+    let cache_shape = Shape::new(
+        dtype,
+        &[
+            PHYSICAL_PAGES as i64,
+            page_size as i64,
+            KV_HEADS as i64,
+            HEAD_DIMENSION as i64,
+        ],
+    )
+    .unwrap();
+    let query_tensor = builder.input("accelerated_query", query_shape);
+    let key_tensor = builder.input("accelerated_key_cache", cache_shape);
+    let value_tensor = builder.input("accelerated_value_cache", cache_shape);
+    let table_tensor = builder.input(
+        "accelerated_page_table",
+        Shape::new(DType::I32, &[BATCHES as i64, LOGICAL_PAGES as i64]).unwrap(),
+    );
+    let length_tensor = builder.input(
+        "accelerated_sequence_lengths",
+        Shape::new(DType::I32, &[BATCHES as i64]).unwrap(),
+    );
+    let position_tensor = builder.input(
+        "accelerated_query_positions",
+        Shape::new(DType::I32, &[BATCHES as i64, query_length as i64]).unwrap(),
+    );
+    let output = builder
+        .paged_attention(
+            query_tensor,
+            key_tensor,
+            value_tensor,
+            table_tensor,
+            length_tensor,
+            position_tensor,
+            options,
+        )
+        .unwrap();
+    let program = builder
+        .finish_named(&[("output".to_owned(), output)])
+        .unwrap();
+    let executable = platform.compile(&program, nml::Sharding::single()).unwrap();
+    let mut args = executable.args();
+    set_float(
+        platform,
+        &mut args,
+        "accelerated_query",
+        query_shape,
+        &query,
+    );
+    set_float(
+        platform,
+        &mut args,
+        "accelerated_key_cache",
+        cache_shape,
+        &key_cache,
+    );
+    set_float(
+        platform,
+        &mut args,
+        "accelerated_value_cache",
+        cache_shape,
+        &value_cache,
+    );
+    set_i32(
+        platform,
+        &mut args,
+        "accelerated_page_table",
+        &[BATCHES as i64, LOGICAL_PAGES as i64],
+        &page_table,
+    );
+    set_i32(
+        platform,
+        &mut args,
+        "accelerated_sequence_lengths",
+        &[BATCHES as i64],
+        &lengths.map(|length| length as i32),
+    );
+    set_i32(
+        platform,
+        &mut args,
+        "accelerated_query_positions",
+        &[BATCHES as i64, query_length as i64],
+        &query_positions,
+    );
+    for _ in 0..2 {
+        let actual = decode(
+            args.call()
+                .unwrap()
+                .get("output")
+                .unwrap()
+                .to_slice()
+                .unwrap(),
+        );
+        assert_close(&actual, &expected, accelerated_tolerance(dtype));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reference_attention_geometry(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    query_positions: &[i32],
+    key_lengths: &[usize],
+    batches: usize,
+    query_length: usize,
+    key_capacity: usize,
+    query_heads: usize,
+    key_value_heads: usize,
+    head_dimension: usize,
+    options: AttentionOptions,
+) -> Vec<f32> {
+    let mut output = vec![0.0; batches * query_length * query_heads * head_dimension];
+    let scale = options
+        .scale
+        .unwrap_or_else(|| 1.0 / (head_dimension as f64).sqrt()) as f32;
+    let queries_per_kv = query_heads / key_value_heads;
+    for batch in 0..batches {
+        for query_index in 0..query_length {
+            let query_position = query_positions[batch * query_length + query_index];
+            for query_head in 0..query_heads {
+                let key_value_head = query_head / queries_per_kv;
+                let mut scores = Vec::with_capacity(key_lengths[batch]);
+                for key_index in 0..key_lengths[batch] {
+                    let key_position = key_index as i32;
+                    let distance = (key_position - query_position).unsigned_abs();
+                    let valid = (!options.causal || key_position <= query_position)
+                        && options
+                            .sliding_window
+                            .is_none_or(|window| distance < window as u32);
+                    if !valid {
+                        scores.push(f32::NEG_INFINITY);
+                        continue;
+                    }
+                    let query_offset = ((batch * query_length + query_index) * query_heads
+                        + query_head)
+                        * head_dimension;
+                    let key_offset = ((batch * key_capacity + key_index) * key_value_heads
+                        + key_value_head)
+                        * head_dimension;
+                    let score = (0..head_dimension)
+                        .map(|dimension| {
+                            query[query_offset + dimension] * key[key_offset + dimension]
+                        })
+                        .sum::<f32>()
+                        * scale;
+                    scores.push(score);
+                }
+                let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                if maximum == f32::NEG_INFINITY {
+                    continue;
+                }
+                let weights = scores
+                    .iter()
+                    .map(|score| (*score - maximum).exp())
+                    .collect::<Vec<_>>();
+                let denominator = weights.iter().sum::<f32>();
+                let output_offset = ((batch * query_length + query_index) * query_heads
+                    + query_head)
+                    * head_dimension;
+                for dimension in 0..head_dimension {
+                    output[output_offset + dimension] = weights
+                        .iter()
+                        .enumerate()
+                        .map(|(key_index, weight)| {
+                            let value_offset = ((batch * key_capacity + key_index)
+                                * key_value_heads
+                                + key_value_head)
+                                * head_dimension;
+                            weight * value[value_offset + dimension]
+                        })
+                        .sum::<f32>()
+                        / denominator;
+                }
+            }
+        }
+    }
+    output
+}
+
+fn generated_values(length: usize, phase: usize) -> Vec<f32> {
+    (0..length)
+        .map(|index| (((index * 17 + phase) % 61) as f32 - 30.0) / 31.0)
+        .collect()
+}
+
+fn accelerated_tolerance(dtype: DType) -> f32 {
+    match dtype {
+        DType::F32 => 1e-2,
+        DType::F16 => 8e-3,
+        DType::Bf16 => 4e-2,
+        _ => unreachable!(),
+    }
 }
 
 fn rotary_embeddings_execute_both_layouts(platform: &nml::Platform) {
@@ -535,7 +1032,10 @@ fn cache_update_rollback_and_replay_preserve_persistent_storage(platform: &nml::
     let value_cache = builder.input("value_cache", cache_shape);
     let page_table = builder.input("page_table", spec.page_table_shape().unwrap().unwrap());
     let lengths = builder.input("sequence_lengths", spec.lengths_shape().unwrap());
-    let positions = builder.input("query_positions", Shape::new(DType::I64, &[1, 1]).unwrap());
+    // Keep this lifecycle graph inside the optimized CUDA index ABI. It still
+    // uses the portable fallback on SM75; the unchanged binary selects Triton
+    // when the deferred hardware contract is eventually run on SM80/SM90.
+    let positions = builder.input("query_positions", Shape::new(DType::I32, &[1, 1]).unwrap());
     let output = builder
         .paged_attention(
             query,
@@ -564,7 +1064,7 @@ fn cache_update_rollback_and_replay_preserve_persistent_storage(platform: &nml::
     args.set("sequence_lengths", cache.lengths().clone())
         .unwrap();
     set_float(platform, &mut args, "query", query_shape, &[1.0; 8]);
-    set_i64(platform, &mut args, "query_positions", &[1, 1], &[0]);
+    set_i32(platform, &mut args, "query_positions", &[1, 1], &[0]);
     for _ in 0..2 {
         let output = decode(
             args.call()
@@ -795,21 +1295,6 @@ fn set_i32(
     values: &[i32],
 ) {
     let shape = Shape::new(DType::I32, dimensions).unwrap();
-    let slice = nml::Slice::from_typed(shape, values).unwrap();
-    let buffer = platform
-        .upload(&slice, nml::Sharding::single(), nml::Memory::Default)
-        .unwrap();
-    args.set(name, buffer).unwrap();
-}
-
-fn set_i64(
-    platform: &nml::Platform,
-    args: &mut nml::exe::Arguments<'_>,
-    name: &str,
-    dimensions: &[i64],
-    values: &[i64],
-) {
-    let shape = Shape::new(DType::I64, dimensions).unwrap();
     let slice = nml::Slice::from_typed(shape, values).unwrap();
     let buffer = platform
         .upload(&slice, nml::Sharding::single(), nml::Memory::Default)

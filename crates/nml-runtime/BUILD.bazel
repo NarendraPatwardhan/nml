@@ -6,6 +6,13 @@ nml_rust_library(
     name = "nml_runtime",
     srcs = ["src/lib.rs"],
     crate_root = "src/lib.rs",
+    rustc_flags = select({
+        "//platforms:cuda.enabled": [
+            "--cfg=nml_cuda",
+            "--check-cfg=cfg(nml_cuda)",
+        ],
+        "//conditions:default": ["--check-cfg=cfg(nml_cuda)"],
+    }),
     deps = [
         "//crates/nml-compiler:nml_compiler",
         "//crates/nml-ir:nml_ir",
@@ -17,6 +24,11 @@ nml_rust_library(
         "//crates/nml-xla:nml_xla",
     ] + select({
         "@platforms//os:linux": ["//crates/nml-pjrt-cuda:nml_pjrt_cuda"],
+        "//conditions:default": [],
+    }) + select({
+        "//platforms:cuda.enabled": [
+            "//crates/nml-kernel-flash-attention:nml_kernel_flash_attention",
+        ],
         "//conditions:default": [],
     }),
     visibility = ["//crates:__subpackages__"],

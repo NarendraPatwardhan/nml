@@ -30,15 +30,36 @@ common:cpu --//platforms:cpu=true
 common:cpu --//platforms:cuda=false
 common:cuda --//platforms:cpu=true
 common:cuda --//platforms:cuda=true
+common:cuda --@rules_cuda//cuda:enable=true
+# The ordinary CUDA contract runs on the repository's Linux x86-64 executor.
+# DGX Spark-class hosts use the sibling configuration below; both choose the
+# hermetic libstdc++ CUDA host environment declared in //platforms.
+common:cuda --platforms=//platforms:linux_x86_64_cuda
+common:cuda_linux_aarch64 --config=cuda
+common:cuda_linux_aarch64 --platforms=//platforms:linux_aarch64_cuda
 
 # BuildBuddy is opt-in because unauthenticated/offline development remains a
 # supported workflow.  The bb CLI supplies the user's credential; no account
-# secret belongs in the repository.  Minimal downloads keep LLVM/XLA actions
-# remote while still materializing binaries and runfiles needed by local GPU
-# contracts.
+# secret belongs in the repository.  The remote runner is only the Bazel
+# coordinator: remote execution fans hermetic compile actions out across RBE
+# workers instead of serializing CUDA's specialization matrix on one VM.
+# Minimal downloads still materialize only binaries and runfiles needed by
+# local GPU contracts.
 common:buildbuddy --bes_results_url=https://app.buildbuddy.io/invocation/
 common:buildbuddy --bes_backend=grpcs://remote.buildbuddy.io
 common:buildbuddy --remote_cache=grpcs://remote.buildbuddy.io
+common:buildbuddy --remote_executor=grpcs://remote.buildbuddy.io
+# BuildBuddy's coordinator image and its default RBE image have different
+# glibc floors. Pin every remote action to one public execution image so a
+# helper built on one worker can never be replayed on an older worker. This
+# property participates in the action key; changing it is a deliberate cache
+# epoch change.
+common:buildbuddy --remote_default_exec_properties=container-image=docker://docker.io/library/ubuntu@sha256:8feb4d8ca5354def3d8fce243717141ce31e2c428701f6682bd2fafe15388214
+# Bazel otherwise derives its concurrency from the coordinator VM, leaving
+# BuildBuddy's personal RBE allocation idle during wide CUDA specialization
+# phases. This bounds outstanding actions; each worker still receives one
+# hermetic action with its normal declared resources.
+common:buildbuddy --jobs=80
 common:buildbuddy --remote_download_minimal
 common:buildbuddy --remote_cache_compression
 

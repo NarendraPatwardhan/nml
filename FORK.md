@@ -52,13 +52,18 @@ axis. Complexity is evidence for a decision, not the decision itself.
 | D-024 | `DECIDED` | NML's initial compiler graph pins OpenXLA/XLA commit `41370d1124c74d7b93a207136a636d8c631cbed9`, matching the ZML reference integration. PJRT headers, XLA schemas, LLVM/MLIR, StableHLO, and Shardy are resolved through this graph rather than independent drifting source pins. |
 | D-025 | `DECIDED` | NML does not consume ZML's source forks of LLVM, Zig, XLA, `rules_ml_toolchain`, or other external projects. Compiler sources come from the original OpenXLA repository and its upstream-pinned dependency graph; Rust/Bazel dependencies come from their upstream registries; NVIDIA and system runtime packages come from their original distributors. Two deliberate ZML-derived inputs remain acceptable under D-010 and D-014: NML carries the audited `cuda-root-path-local-defines.patch` locally against upstream OpenXLA, and SHA-256-pinned CPU/CUDA plugin binaries are downloaded from `zml/pjrt-artifacts`. The latter is a ZML-hosted packaging dependency, not a source-fork dependency. Any future dependency on ZML-hosted forked source requires a new explicit decision. |
 | D-026 | `DECIDED` | After the first typed CPU/CUDA execution milestone, NML implements the parameter/buffer/checkpoint substrate, the Shardy-native nonlinear graph foundation recorded by D-030, and then ZML's CPU/CUDA-relevant attention architecture. This includes portable attention semantics, CUDA FlashAttention, paged KV-cache behavior, and the Triton machinery required by ZML's default CUDA paged-attention path. NML then reaches kernel and capability parity with ZML for the retained CPU/CUDA scope before entering NML-specific territory. |
-| D-027 | `DECIDED` | BuildBuddy was explicitly added after D-019. Repository configuration exposes an opt-in `--config=buildbuddy` remote cache/results profile without storing credentials; the authenticated `bb` CLI supplies the user's key. Remote Bazel commands may request runner resources, but the free hosted runner's effective disk limit remains authoritative: requesting 20 GB did not prevent exhaustion while materializing the complete CUDA runfiles tree. This changes build placement only, not the hermetic runtime graph or acceptance requirements. |
+| D-027 | `DECIDED` | BuildBuddy was explicitly added after D-019. Repository configuration exposes an opt-in `--config=buildbuddy` results, cache, and remote-execution profile without storing credentials; the authenticated `bb` CLI supplies the user's key. Normal dirty-tree development keeps Bazel's coordinator local and sends hermetic compile/link actions to RBE; `bb remote` is reserved for a clean pushed revision because mirroring a large changing workspace is not part of compilation. The profile allows up to 80 outstanding actions so CUDA specialization can consume the personal RBE concurrency instead of inheriting the coordinator's CPU count. Every RBE action runs in the repository-pinned Ubuntu 20.04 image because BuildBuddy's coordinator and default worker images have different glibc floors; the container property is part of the action key and prevents a native build helper cached on a newer worker from failing on an older one. Multi-gigabyte NVIDIA ELF rewrite actions carry `no-remote`: compiling their producers stays remote, while deterministic `patchelf` packaging runs beside the local repository cache and avoids pointless CAS upload/download stalls. This changes build placement only, not the hermetic runtime graph or acceptance requirements. |
 | D-028 | `DECIDED` | The W4A16 milestone and its existing product requirements are preserved but `DEFERRED`. W4A16, W8A8, NVFP4, and other NML-specific work do not begin merely because the attention stack is complete. First, NML must achieve an audited kernel-and-capability parity gate against ZML for CPU and CUDA, within the accelerator, host, dtype, dependency, and repository-surface decisions already recorded here. Deferred quantization work resumes only after that gate passes and the owner explicitly schedules it. |
 | D-029 | `DECIDED` | NML supports Shardy as its only XLA SPMD partitioner. It does not retain ZML's legacy GSPMD lowering, `mhlo.sharding` encoding, manual-sharding custom-call path, or a public/runtime partitioner selector. The unified NML sharding model will lower through Shardy `sdy` meshes, tensor shardings, constraints, and manual computations. This deliberately departs from the reference snapshot's selectable compatibility path while retaining its default partitioner. |
 | D-030 | `DECIDED` | Functional Shardy placement and the nonlinear graph-operation foundation are implemented before attention. Logical mesh axes use `AxisTag`; tensor dimensions consume them through `Shape` partition metadata; compilation, buffer placement, checkpoint loading, and execution share the same `Sharding` contract. This ordering makes partitioning a normal property of attention-era graphs rather than a retrofit. Explicit collective APIs, multi-host execution, and multi-GPU CUDA validation remain later parity work. |
-| D-031 | `DECIDED` | Verification is split by resource ownership, not by weakening support claims. BuildBuddy remotely executes CPU and CUDA-configured compiler/runtime contracts and remotely builds the exact CUDA contract binaries to populate the authenticated action cache. The multi-gigabyte SHA-pinned CUDA runtime is `data` of its owning executable contracts, not of the reusable loader library; it is assembled only on the NVIDIA host that owns the runtime disk and supported GPU. GPU tests are local, unsandboxed, and non-cacheable; package integrity remains a cacheable host contract and compiled artifacts remain remotely cacheable. NML never treats remote CUDA compilation as CUDA execution evidence, never transfers the complete XLA/LLVM/CUDA runfiles closure with `--remote_download_all`, and never makes a no-GPU hosted runner responsible for a packaged-runtime or device gate. |
+| D-031 | `DECIDED` | Verification is split by resource ownership, not by weakening support claims. BuildBuddy remotely executes hermetic CPU/CUDA compile actions, builds the exact CUDA contract binaries, and runs the hermetic GPU-independent package-integrity contract in the authenticated action cache. The complete SHA-pinned distribution runtime retains ZML's forward-compatibility driver overlay. Real device contracts use a second assembly of the same PJRT plugin and hermetic CUDA/cuDNN/NCCL/NVVM user-space libraries that intentionally omits only that overlay and uses the host's installed NVIDIA driver; this prevents hundreds of megabytes of unused driver-compatibility ELFs from entering every developer device run without weakening the distributable package. Runtime trees are `data` of owning executable contracts, never of the reusable loader library. GPU tests alone are local, unsandboxed, non-cacheable, and `exclusive` because one physical accelerator and its XLA initialization state are a singleton execution resource. NML never treats remote CUDA compilation as CUDA execution evidence and never transfers the complete distribution closure to the developer host merely to inspect hermetic file presence. |
 | D-032 | `DECIDED` | Milestone 4 adds portable paged attention as a deliberate NML improvement over the reference ZML snapshot, whose portable `vanilla` path handles ordinary attention but whose paged dispatcher has no CPU/StableHLO backend. NML's product path traverses the page table with bounded `stablehlo.while` control flow and blockwise online softmax, without materializing a contiguous logical KV cache or the complete attention-score matrix. It is the CPU implementation, independent correctness oracle, and CUDA fallback; Milestone 5's FlashAttention and Triton paths remain the preferred CUDA implementations where supported. |
 | D-033 | `DECIDED` | Dense and paged KV caches share one backend-independent public `CacheSpec`/`Cache` contract. K/V tensors, page tables, and sequence lengths remain ordinary persistent `Buffer` values; compiled updates donate uniquely owned K/V inputs and reinstall their aliased outputs. The host owns only logical page assignments and lengths so truncate, rollback, and replay do not copy unaffected K/V storage. Used page identifiers are validated before execution, while inactive trailing page-table slots may remain `-1`; portable lowering substitutes an in-range page before gather and masks every token from those inactive slots. |
+| D-034 | `DECIDED` | Capability dispatch follows the compiler and kernel actually built, not CUDA's general device floor. NML retains SM75 for portable XLA/CUDA, but the pinned XLA Triton compiler rejects pre-Ampere devices and original-upstream FlashAttention 2 requires SM80+. NML's retained optimized envelope is Triton on SM8x/SM90, FA2 on SM80-SM89, and FA3 on exact SM90; it does not compile an unreachable FA2 SM90 duplicate. Automatic dispatch uses portable CUDA outside that envelope, while an explicitly selected unsupported kernel must fail before launch with a capability diagnostic. Every device in one CUDA PJRT client must report the same compute capability because one compiled graph contains one backend choice; heterogeneous capabilities fail during platform creation rather than producing a placement-dependent FA2/FA3 launch failure. The local SM75 contract is portable-CUDA and negative-capability evidence, not Triton or FlashAttention execution evidence. |
+| D-035 | `DECIDED` | CUDA source compilation uses rules_cuda with NML's hermetic Clang and the hermetic GCC 13.4 libstdc++ headers selected by the CUDA target platform. Because rules_rust links native C++ dependencies through the toolchain's static runtime, NML carries a narrow audited patch to hermetic LLVM 0.8.9 that builds a real `libstdc++.a` from the same pinned GCC source graph. CUDA archive-only rules disable unnecessary C++ runtime linkage. System compilers, system libstdc++, and a shared-library masquerading as a static archive are prohibited. |
+| D-036 | `DECIDED` | CUDA source-compiler and CUDA runtime versions are independent hermetic contracts. The ZML-derived PJRT/runtime package remains CUDA 13.1, while original-upstream FlashAttention 2.8.3 is compiled with its supported CUDA 12.8 toolchain; forcing its FA3 WGMMA templates through CUDA 13.1 `ptxas` causes an internal compiler failure and is not an upstream-supported upgrade. FA2 emits upstream's single SM80 cubin, which remains executable throughout SM80-SM89, instead of recompiling every template into redundant SM86 and SM89 cubins. This changes neither NML's runtime capability envelope nor XLA's CUDA compiler. |
+| D-037 | `DECIDED` | Bazel target platforms describe the binary being built; execution platforms describe the machine running a build or test action. Bazel 9's implicit test toolchain otherwise projects CUDA target-only libc/libstdc++ constraints onto test execution, either making tests unresolvable or contaminating host tools with the target C++ runtime. NML registers narrow native test toolchains for Linux x86-64, Linux AArch64, and macOS AArch64 that match target and executor OS/CPU while leaving CUDA ABI constraints on the target. CUDA is never made an execution-platform identity merely to make a test analyzable. |
+| D-038 | `DECIDED` | Milestone 5 implementation and all hardware-independent acceptance gates are completed without pretending the local SM75 can validate Ampere or Hopper kernels. The permanent CUDA attention contract is compiled and linked with the exact FA2 SM80, FA3 SM90a, and Triton paths on every CUDA build; its SM80/SM90 execution is explicitly `DEFERRED` until compatible RunPod machines are rented. Deferred execution is validation debt, not permission to omit, weaken, replace, or conditionally compile the product kernels or their numerical/lifecycle test matrix. |
 
 An item is `UNDECIDED` only where this document identifies a deliberate NML
 departure that still needs an exact contract. Otherwise D-018 applies the
@@ -696,14 +701,14 @@ but a quant mode cannot be marked supported based only on parsing, enum
 plumbing, or compilation.
 
 CUDA package integrity and CUDA device execution are separate permanent
-contracts, but both are owned by the CUDA runtime host. Package integrity is
-hermetic and cacheable; it nevertheless needs the same multi-gigabyte runtime
-tree as device execution, so sending it to a small hosted executor is wasteful
-and can exceed that executor's disk. Device execution runs locally without
-test-result caching because the physical GPU, driver, and `/dev/nvidiactl` are
-host state outside Bazel's declared file inputs; sandboxing or reusing a result
-from different hardware would make the support claim invalid. CUDA compiler
-artifacts remain normally remotely cached.
+contracts with different owners. Package integrity is hermetic, cacheable, and
+runs on BuildBuddy beside the already remote runtime tree; downloading that
+multi-gigabyte tree to the developer laptop merely to inspect file presence is
+prohibited. Device execution runs locally without test-result caching because
+the physical GPU, driver, and `/dev/nvidiactl` are host state outside Bazel's
+declared file inputs; sandboxing or reusing a result from different hardware
+would make the support claim invalid. CUDA compiler artifacts remain normally
+remotely cached.
 
 D-031 turns that distinction into the permanent verification topology. Root
 test suites classify contracts by the resource that can truthfully execute
@@ -725,11 +730,15 @@ evidence that device code ran.
        runtime runfiles
 
 //:cuda_contract_binaries
-    -> BuildBuddy builds the exact Rust test executables and populates the
-       authenticated cache without assembling their runtime data
+    -> BuildBuddy builds the exact GPU-device test executables and populates
+       the authenticated cache without assembling their runtime data
 
-//:cuda_runtime_contracts
-    -> the NVIDIA host assembles the pinned CUDA runtime and checks its package
+//:cuda_package_contracts
+    -> BuildBuddy assembles and checks both hermetic runtime products,
+       including the distribution's NVIDIA forward-compatibility overlay
+
+//:cuda_device_contracts
+    -> the NVIDIA host assembles the hermetic system-driver runtime
        -> the same host executes the device contracts locally, outside
           sandboxes, with device-test result caching disabled
 ```
@@ -737,34 +746,74 @@ evidence that device code ran.
 The ordinary command sequence is therefore:
 
 ```text
-bb remote test --config=cpu //:cpu_contracts
-bb remote test --config=cuda //:cuda_remote_contracts
-bb remote build --config=cuda //:cuda_contract_binaries
-bb test --config=buildbuddy --config=cuda //:cuda_runtime_contracts
+bb test --config=buildbuddy --config=cpu //:cpu_contracts
+bb test --config=buildbuddy --config=cuda //:cuda_remote_contracts
+bb build --config=buildbuddy --config=cuda //:cuda_contract_binaries
+bb test --config=buildbuddy --config=cuda --cache_test_results=no //:cuda_device_contracts
+bb test --config=buildbuddy --config=cuda //:cuda_package_contracts
 ```
 
-The final command is intentionally narrow. It downloads the cached contract
-binaries, materializes their explicitly owned CUDA runfiles on the machine
-with sufficient disk, and runs them where `/dev/nvidiactl`, the driver, and the
-selected GPU are real host state. The reusable CUDA loader library does not
-carry `//platforms/cuda:runtime` as transitive data: each product executable
-that can initialize CUDA must declare the runtime and its runfiles locator at
-the executable boundary. This keeps CPU and remote CUDA compiler consumers
-free of an accidental multi-gigabyte closure while making missing packaging a
-Bazel graph error at the owner.
+The authenticated `bb` CLI supplies the account credential while the
+`buildbuddy` profile enables the action cache and RBE. Bazel remains on the
+developer host for a dirty-tree build; only hermetic actions are scheduled on
+BuildBuddy workers. This distinction matters for FlashAttention. Its
+independent CUDA translation units are naturally parallel Bazel actions, and
+RBE distributes them without changing the archive, ABI, or runtime package.
+`bb remote` remains valid for a clean pushed revision but is not the ordinary
+way to mirror uncommitted source.
 
-`bb remote test --config=cuda //...` is not a valid device gate because the
-hosted runner has no GPU. It is also not a valid cold-cache package gate: a
-free runner may be unable to materialize the complete CUDA runtime after old
-CAS blobs expire. `--remote_download_all` is likewise absent because the
-complete XLA/LLVM/CUDA transitive runfiles tree exceeds the runner's usable
-disk and transfers thousands of irrelevant intermediate outputs. Lost remote
-runtime blobs are repaired by the CUDA host's ordinary SHA-pinned repository
-fetch and local package assembly, not by making compiler contracts inherit the
-package.
+The profile sets `--jobs=80` deliberately. Bazel's default is derived from the
+coordinator machine and can leave most of the personal RBE allocation unused;
+the explicit bound lets the wide FA2/FA3 translation-unit graph occupy the
+remote workers while keeping each compilation as an independent cache entry.
+
+The profile also fixes the remote-action execution image. BuildBuddy's hosted
+coordinator is not itself the action platform, and its native helper outputs
+must not be shared with an older default RBE image. `container-image` therefore
+belongs in `remote_default_exec_properties`, where it participates in Bazel's
+action key; it is not an ambient runner choice or a developer machine
+dependency.
+
+Pinned ZML does not perform that source build at all: it downloads a release
+archive from `zml/flash-attention` containing `libflashattn.so`. NML deliberately
+builds original Dao-AILab source under D-025, so a cold build has real template
+compilation work that ZML's ordinary build does not. The retained source graph
+still follows upstream's economical code-generation boundary: FA2 produces one
+SM80 cubin for the compatible SM8x family, and FA3 produces SM90a. RBE fans the
+translation units out; CUDA's internal compilation of one translation unit
+remains one cacheable action.
+
+The final two commands intentionally distinguish device execution from
+distribution integrity. Device contracts download cached executables and
+materialize `runtime_system_driver`: the same pinned PJRT plugin and hermetic
+CUDA, cuDNN, NCCL, NVVM, and compiler libraries as the distribution, without
+the forward-compatibility driver overlay that a current NVIDIA host does not
+use. The package contract separately assembles `runtime`, including that
+overlay, and verifies its complete layout. The reusable CUDA loader library
+does not carry either runtime as transitive data: each product executable that
+can initialize CUDA declares its runtime and runfiles locator at the executable
+boundary. This keeps CPU and remote CUDA compiler consumers free of an
+accidental multi-gigabyte closure while making missing packaging a Bazel graph
+error at the owner.
+
+Large NVIDIA shared objects are a poor remote-action boundary for `patchelf`:
+the computation takes seconds but CAS transfer can stall for minutes. Those
+explicit packaging actions therefore use Bazel's `no-remote` execution
+requirement. Their CUDA/PJRT producers remain remotely built and cached; only
+the deterministic copy-and-rewrite runs locally beside the repository cache.
+This is a permanent packaging topology, not an ad hoc retry rule.
+
+`bb remote test --config=buildbuddy --config=cuda //...` is not a valid device
+gate because the hosted runner has no GPU. The named package contract is valid
+there because it is a hermetic file-closure check and declares the complete
+runtime as data. `--remote_download_all` remains absent because the complete
+XLA/LLVM/CUDA transitive runfiles tree would transfer thousands of irrelevant
+intermediate outputs. Lost remote blobs are repaired by ordinary SHA-pinned
+repository fetches and the narrow local packaging actions described above,
+not by making compiler contracts inherit the package.
 
 The suites are partitions of permanent product contracts, not reduced checks.
-A CUDA support claim requires the remote configured suite, runtime package
+A CUDA support claim requires the remote configured suite, full runtime package
 contract, and device contracts; remote compilation alone remains insufficient.
 Release-wide `//...` runs may still be used on a sufficiently provisioned GPU
 host, but they are not the developer-loop mechanism for moving a
@@ -1150,9 +1199,25 @@ upstream FlashAttention source and audited Bazel packaging
 D-025 still applies: ZML's build and loader logic is reference material, but a
 ZML-hosted FlashAttention source fork is not silently introduced. Required
 changes are either obtained from the original upstream project or carried as
-audited local patches. FA2 is validated on supported local hardware. FA3 is not
-called validated until its permanent contract runs on real compatible
-hardware; compilation alone is insufficient.
+audited local patches. Per D-038, original-upstream FA2 and FA3 are complete
+product build inputs and their permanent device-polymorphic contract is part of
+the CUDA build, but they are not called hardware-validated until that unchanged
+contract runs on real SM80+ and SM90 hardware respectively. Compilation is a
+mandatory present gate, not a substitute for the explicitly deferred run.
+
+The source compiler follows D-036 rather than inheriting the PJRT runtime's
+version by accident. FlashAttention 2.8.3's Hopper build treats CUDA 12.8 as
+the native toolchain and explicitly prefers its `ptxas`; NML pins that compiler
+through rules_cuda while retaining ZML's CUDA 13.1 PJRT execution closure.
+This is a build-time compatibility boundary, not a second packaged runtime.
+
+The optimized paged paths do not redefine the cache contract. Original
+upstream FA2 is selected only for physical page sizes divisible by 256; other
+SM8x page sizes remain on Triton. FA2/FA3 derive bottom-right query positions
+from sequence lengths, so their branch is guarded at runtime by the canonical
+position relation and arbitrary authored positions remain on Triton. CUDA
+kernel ABIs use I32 logical indices; a statically larger graph remains valid
+and lowers through the portable I64 path rather than truncating geometry.
 
 Triton path:
 
@@ -1160,7 +1225,7 @@ Triton path:
 pinned XLA Triton/TTIR sources
   -> narrow TTIR C bindings
   -> safe Rust Builder, Value, dtype, argument, and control-flow API
-  -> isolated throwaway MLIR context for TTIR emission
+  -> isolated short-lived MLIR context for TTIR emission
   -> typed Kernel input/output/config/launch contract
   -> TTIR-bearing StableHLO custom call
   -> XLA lowering and CUDA execution
@@ -1177,11 +1242,21 @@ warp/stage configuration, and deterministic failure behavior. The oneAPI
 kernel specialization is outside D-002; this does not remove the shared Triton
 behavior used by CUDA.
 
-Acceptance compares portable CPU attention, CUDA FlashAttention, and CUDA
-Triton results for the configurations each backend supports. It exercises
-mixed prefill/decode batches, page-table boundaries, sliding windows, GQA/MQA,
-in-place KV updates, output aliasing, and repeated execution without cache
-reallocation. Kernel capability mismatches are hard diagnostic errors.
+NML preserves the reference launch architecture without inheriting accidental
+semantic narrowing. Non-power-of-two GQA ratios use masked padding inside a
+power-of-two Triton tile, noncausal sliding windows retain NML's symmetric
+portable semantics, and empty split-K sequences reduce to zero without an
+undefined division or NaN. These are private kernel details and add no public
+backend-selection types.
+
+The permanent acceptance binary compares portable CPU attention, CUDA
+FlashAttention, and CUDA Triton results for the configurations each backend
+supports. It exercises prefill and decode, mixed sequence lengths, page-table
+boundaries, sliding windows, GQA/MQA, in-place KV updates, output aliasing, and
+repeated execution without cache reallocation. Kernel capability mismatches
+are hard diagnostic errors. Its portable branch executes on the local SM75;
+its unchanged SM80/SM90 branches remain `DEFERRED` under D-038 and will be run
+on rented RunPod hardware rather than being replaced with compile-only claims.
 
 #### Milestone 6: CPU/CUDA kernel and capability parity with ZML
 

@@ -446,6 +446,12 @@ unsafe fn configure_xla_flags(runtime: &Path) -> Result<(), Error> {
 
 fn use_packaged_driver(runtime: &Path) -> bool {
     let executable = runtime.join("bin/driver_compatibility");
+    // The system-driver runtime intentionally omits the compatibility overlay
+    // and its selector executable. The full distribution contract separately
+    // proves both are present in the compatibility-capable package.
+    if !executable.is_file() {
+        return false;
+    }
     match Command::new(&executable)
         .current_dir(runtime)
         .status()

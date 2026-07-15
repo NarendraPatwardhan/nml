@@ -1,0 +1,148 @@
+"""Forward-only source boundary for original FlashAttention v2.8.3.
+
+The upstream Python extension entrypoints are intentionally absent. NML's
+audited adapter consumes these kernel/header groups directly, so backward,
+PyTorch, ROCm, tests, benchmarks, and packaging never enter the action graph.
+"""
+
+load("@rules_cuda//cuda:defs.bzl", "cuda_library")
+
+package(default_visibility = ["//visibility:public"])
+
+licenses(["notice"])
+
+filegroup(
+    name = "license",
+    srcs = ["LICENSE"],
+)
+
+filegroup(
+    name = "fa2_headers",
+    srcs = glob([
+        "csrc/flash_attn/src/*.cuh",
+        "csrc/flash_attn/src/*.h",
+    ]),
+)
+
+filegroup(
+    name = "fa2_forward_sources",
+    srcs = glob(
+        ["csrc/flash_attn/src/flash_fwd_*.cu"],
+        exclude = ["csrc/flash_attn/src/*bwd*"],
+    ),
+)
+
+cuda_library(
+    name = "fa2_forward",
+    srcs = [
+        ":fa2_forward_sources",
+        ":fa2_headers",
+    ],
+    alwayslink = True,
+    # Upstream builds one SM80 cubin for the whole SM8x family. NVIDIA keeps
+    # cubins compatible within a compute-capability major version, so emitting
+    # the same template again for SM86 and SM89 only triples ptxas work and
+    # artifact size without adding a supported device.
+    archs = ["compute_80:sm_80"],
+    copts = [
+        "-O3",
+        "-allow-unsupported-compiler",
+        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "-U__CUDA_NO_HALF2_OPERATORS__",
+        "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "-U__CUDA_NO_HALF_OPERATORS__",
+        "--expt-extended-lambda",
+        "--expt-relaxed-constexpr",
+        "--threads=4",
+        "--use_fast_math",
+    ],
+    includes = ["csrc/flash_attn/src"],
+    deps = [
+        "@cuda//:libcudacxx",
+        "@flash_attention_cutlass//:headers",
+    ],
+    # This rule produces an archive and performs no final C++ link. Runtime
+    # ownership belongs to the Rust product binary, where rules_rust consumes
+    # NML's real hermetic static libstdc++ target exactly once.
+    features = ["-static_link_cpp_runtimes"],
+)
+
+filegroup(
+    name = "fa3_headers",
+    srcs = glob([
+        "hopper/*.h",
+        "hopper/*.hpp",
+    ]),
+)
+
+# Hopper has a different parameter ABI and scheduler from FA2. Enumerating the
+# retained instantiations makes the boundary auditable: dense plus non-split
+# paged forward, FP16/BF16, equal Q/K/V head dimensions, no FP8, backward,
+# softcap, or PyTorch entrypoints.
+filegroup(
+    name = "fa3_retained_forward_sources",
+    srcs = [
+        "hopper/instantiations/flash_fwd_hdim64_bf16_sm90.cu",
+        "hopper/instantiations/flash_fwd_hdim64_fp16_sm90.cu",
+        "hopper/instantiations/flash_fwd_hdim96_bf16_sm90.cu",
+        "hopper/instantiations/flash_fwd_hdim96_fp16_sm90.cu",
+        "hopper/instantiations/flash_fwd_hdim128_bf16_sm90.cu",
+        "hopper/instantiations/flash_fwd_hdim128_fp16_sm90.cu",
+        "hopper/instantiations/flash_fwd_hdim192_bf16_sm90.cu",
+        "hopper/instantiations/flash_fwd_hdim192_fp16_sm90.cu",
+        "hopper/instantiations/flash_fwd_hdim256_bf16_sm90.cu",
+        "hopper/instantiations/flash_fwd_hdim256_fp16_sm90.cu",
+        "hopper/instantiations/flash_fwd_hdim64_bf16_paged_sm90.cu",
+        "hopper/instantiations/flash_fwd_hdim64_fp16_paged_sm90.cu",
+        "hopper/instantiations/flash_fwd_hdim96_bf16_paged_sm90.cu",
+        "hopper/instantiations/flash_fwd_hdim96_fp16_paged_sm90.cu",
+        "hopper/instantiations/flash_fwd_hdim128_bf16_paged_sm90.cu",
+        "hopper/instantiations/flash_fwd_hdim128_fp16_paged_sm90.cu",
+        "hopper/instantiations/flash_fwd_hdim192_bf16_paged_sm90.cu",
+        "hopper/instantiations/flash_fwd_hdim192_fp16_paged_sm90.cu",
+        "hopper/instantiations/flash_fwd_hdim256_bf16_paged_sm90.cu",
+        "hopper/instantiations/flash_fwd_hdim256_fp16_paged_sm90.cu",
+    ],
+)
+
+cuda_library(
+    name = "fa3_forward",
+    srcs = [
+        ":fa3_retained_forward_sources",
+        ":fa3_headers",
+        # Every upstream FA3 forward launch contains the varlen scheduler
+        # branch, even when the request leaves its dynamic pointer null. Keep
+        # the defining translation unit in the archive so the retained paged
+        # instantiations form a complete native link closure.
+        "hopper/flash_prepare_scheduler.cu",
+    ],
+    alwayslink = True,
+    archs = ["compute_90a:sm_90a"],
+    copts = [
+        "-O3",
+        "-allow-unsupported-compiler",
+        "--ftemplate-backtrace-limit=0",
+        "--expt-extended-lambda",
+        "--expt-relaxed-constexpr",
+        "--threads=2",
+        "--use_fast_math",
+        "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED",
+        "-DCUTLASS_DEBUG_TRACE_LEVEL=0",
+        "-DCUTLASS_ENABLE_GDC_FOR_SM90",
+        "-DNDEBUG",
+    ],
+    defines = [
+        "FLASHATTENTION_DISABLE_BACKWARD",
+        "FLASHATTENTION_DISABLE_FP8",
+        # NML retains non-split forward instantiations and always dispatches
+        # with num_splits=1. Removing the unused combine branch makes that ABI
+        # decision explicit instead of leaving unresolved split machinery.
+        "FLASHATTENTION_DISABLE_SPLIT",
+    ],
+    features = ["-static_link_cpp_runtimes"],
+    includes = ["hopper"],
+    deps = [
+        "@cuda//:libcudacxx",
+        "@flash_attention_cutlass//:headers",
+    ],
+)

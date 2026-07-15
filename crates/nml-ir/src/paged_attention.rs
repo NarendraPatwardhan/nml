@@ -4,7 +4,13 @@
 //! avoids exposing StableHLO control-flow details through NML's model-authoring
 //! API, while the emitted graph still uses ordinary, portable StableHLO.
 
-use crate::{AttentionOptions, Error};
+use crate::{attention_backend, AttentionOptions, Error};
+use nml_kernel_triton::{
+    build_paged_attention_2d, build_paged_attention_3d, build_segment_reduction,
+    select_attention_launch, AttentionGeometry, AttentionLaunch, DType as KernelDType,
+    KernelLaunch, KernelSpec, PagedAttention2dConfig, PagedAttention3dConfig,
+    SegmentReductionConfig, TensorSpec,
+};
 use nml_mlir::{
     Block, Context, Operation, Region, StableHloBinary, StableHloComparison,
     StableHloComparisonType, StableHloUnary, Type, Value,
@@ -26,6 +32,678 @@ pub(crate) struct Inputs<'context> {
     pub query_positions_dtype: DType,
     pub result_type: Type<'context>,
     pub options: AttentionOptions,
+}
+
+/// Lowers the retained CUDA path to XLA's typed Triton custom call. Dtypes or
+/// architectures outside the retained kernel envelope deliberately use the
+/// portable implementation, so target selection never changes model meaning.
+pub(crate) fn lower_triton<'context>(
+    context: &'context Context,
+    block: &mut Block<'context>,
+    inputs: Inputs<'context>,
+    core_count: usize,
+    capability_major: u16,
+    capability_minor: u16,
+) -> Result<Value<'context>, Error> {
+    let query_dtype = inputs.query_shape.dtype();
+    let head_dimension = inputs.query_shape.dimensions()[3];
+    let page_size = inputs.cache_shape.dimensions()[1];
+    let backend = attention_backend::paged(
+        query_dtype,
+        head_dimension,
+        page_size,
+        capability_major,
+        capability_minor,
+    );
+    // Both retained CUDA ABIs use I32 logical indices. Static geometries
+    // outside that envelope remain valid NML graphs and therefore use the
+    // I64 portable path instead of truncating a dimension in a kernel call.
+    if backend != attention_backend::Backend::Portable && !cuda_index_geometry_supported(&inputs) {
+        return lower(context, block, inputs);
+    }
+    match backend {
+        attention_backend::Backend::Portable => return lower(context, block, inputs),
+        attention_backend::Backend::CudaTriton => {}
+        attention_backend::Backend::CudaFlash2 => {
+            return lower_flash_or_triton(context, block, inputs, core_count, FlashVersion::Two);
+        }
+        attention_backend::Backend::CudaFlash3 => {
+            return lower_flash_or_triton(context, block, inputs, core_count, FlashVersion::Three);
+        }
+    }
+
+    lower_triton_kernel(context, block, inputs, core_count)
+}
+
+fn cuda_index_geometry_supported(inputs: &Inputs<'_>) -> bool {
+    let fits_i32 = |value: i64| i32::try_from(value).is_ok();
+    let dimensions_fit = inputs
+        .query_shape
+        .dimensions()
+        .iter()
+        .chain(inputs.cache_shape.dimensions())
+        .chain(inputs.page_table_shape.dimensions())
+        .copied()
+        .all(fits_i32);
+    let [batch, query_length, query_heads, head_dimension] = inputs.query_shape.dimensions() else {
+        return false;
+    };
+    let kv_heads = inputs.cache_shape.dimensions()[2];
+    let page_size = inputs.cache_shape.dimensions()[1];
+    let logical_pages = inputs.page_table_shape.dimensions()[1];
+    let token_count = batch.checked_mul(*query_length);
+    let starts_length = batch.checked_add(1);
+    let padded_fits_i32 = |value: i64| {
+        u64::try_from(value)
+            .ok()
+            .and_then(u64::checked_next_power_of_two)
+            .and_then(|padded| i32::try_from(padded).ok())
+            .is_some()
+    };
+    let head_group = query_heads.checked_div(kv_heads);
+    dimensions_fit
+        && token_count.is_some_and(fits_i32)
+        && starts_length.is_some_and(fits_i32)
+        && head_group.is_some_and(padded_fits_i32)
+        && padded_fits_i32(*head_dimension)
+        && padded_fits_i32(page_size)
+        && logical_pages.checked_mul(page_size).is_some_and(fits_i32)
+        && inputs
+            .options
+            .sliding_window
+            .is_none_or(|window| i32::try_from(window).is_ok())
+}
+
+fn lower_triton_kernel<'context>(
+    context: &'context Context,
+    block: &mut Block<'context>,
+    inputs: Inputs<'context>,
+    core_count: usize,
+) -> Result<Value<'context>, Error> {
+    let query_dtype = inputs.query_shape.dtype();
+    let [batch, query_len, query_heads, head_dim] = *inputs.query_shape.dimensions() else {
+        unreachable!("paged-attention query rank is validated when authored")
+    };
+    let [_, page_size, kv_heads, _] = *inputs.cache_shape.dimensions() else {
+        unreachable!("paged-attention cache rank is validated when authored")
+    };
+    let logical_pages = inputs.page_table_shape.dimensions()[1];
+    let num_tokens = checked_product(batch, query_len, "CUDA attention token count")?;
+    let geometry = AttentionGeometry {
+        core_count,
+        all_decode: query_len == 1,
+        num_tokens: positive_usize(num_tokens, "CUDA attention token count")?,
+        num_query_heads: positive_usize(query_heads, "CUDA attention query-head count")?,
+        num_kv_heads: positive_usize(kv_heads, "CUDA attention KV-head count")?,
+        head_dim: positive_usize(head_dim, "CUDA attention head dimension")?,
+        batch_size: positive_usize(batch, "CUDA attention batch size")?,
+        page_size: positive_usize(page_size, "CUDA attention page size")?,
+        max_query_length: positive_usize(query_len, "CUDA attention query length")?,
+    };
+    let launch = select_attention_launch(geometry)
+        .map_err(|_| Error::InvalidAttention("CUDA attention launch geometry is invalid"))?;
+    let kernel_dtype = kernel_dtype(query_dtype)?;
+    let queries_per_kv = query_heads / kv_heads;
+    let padded_head_size =
+        geometry
+            .head_dim
+            .checked_next_power_of_two()
+            .ok_or(Error::InvalidAttention(
+                "CUDA attention head padding overflows",
+            ))?;
+    let padded_head_size = kernel_i64(padded_head_size, "CUDA attention head padding")?;
+    let sliding_window = inputs
+        .options
+        .sliding_window
+        .map(|window| {
+            i32::try_from(window)
+                .map(i64::from)
+                .map_err(|_| Error::InvalidAttention("CUDA attention window is too large"))
+        })
+        .transpose()?;
+    let scale = inputs
+        .options
+        .scale
+        .unwrap_or_else(|| 1.0 / (head_dim as f64).sqrt());
+
+    let index_i32 = |shape: &[i64]| context.ranked_tensor_type(DType::I32, shape);
+    let page_table_type = index_i32(&[batch, logical_pages])?;
+    let lengths_type = index_i32(&[batch])?;
+    let positions_type = index_i32(&[batch, query_len])?;
+    let page_table = convert_if_needed(
+        context,
+        block,
+        inputs.page_table,
+        inputs.page_table_dtype,
+        DType::I32,
+        page_table_type,
+    )?;
+    let sequence_lengths = convert_if_needed(
+        context,
+        block,
+        inputs.sequence_lengths,
+        inputs.sequence_lengths_dtype,
+        DType::I32,
+        lengths_type,
+    )?;
+    let query_positions = convert_if_needed(
+        context,
+        block,
+        inputs.query_positions,
+        inputs.query_positions_dtype,
+        DType::I32,
+        positions_type,
+    )?;
+
+    let scalar_f32 = context.ranked_tensor_type(DType::F32, &[])?;
+    let scalar_i64 = context.ranked_tensor_type(DType::I64, &[])?;
+    let scalar_i32 = context.ranked_tensor_type(DType::I32, &[])?;
+    let starts_type = context.ranked_tensor_type(DType::I32, &[batch + 1])?;
+    let scale = constant(context, block, scalar_f32, &format!("{scale:.17e}"))?;
+    let block_table_stride = constant(context, block, scalar_i64, &logical_pages.to_string())?;
+    let query_stride_0 = checked_product(query_heads, head_dim, "CUDA query stride")?;
+    let query_stride_1 = head_dim;
+    let cache_stride_0 = checked_product(
+        page_size,
+        checked_product(kv_heads, head_dim, "CUDA cache stride")?,
+        "CUDA cache stride",
+    )?;
+    let cache_stride_1 = checked_product(kv_heads, head_dim, "CUDA cache stride")?;
+    let cache_stride_2 = head_dim;
+    let query_stride_0 = constant(context, block, scalar_i64, &query_stride_0.to_string())?;
+    let query_stride_1 = constant(context, block, scalar_i64, &query_stride_1.to_string())?;
+    let output_stride_0 = query_stride_0;
+    let output_stride_1 = query_stride_1;
+    let key_stride_0 = constant(context, block, scalar_i64, &cache_stride_0.to_string())?;
+    let key_stride_1 = constant(context, block, scalar_i64, &cache_stride_1.to_string())?;
+    let key_stride_2 = constant(context, block, scalar_i64, &cache_stride_2.to_string())?;
+    let value_stride_0 = key_stride_0;
+    let value_stride_1 = key_stride_1;
+    let value_stride_2 = key_stride_2;
+    let starts = (0..=batch)
+        .map(|sequence| checked_product(sequence, query_len, "CUDA query starts"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let starts_literal = format!(
+        "[{}]",
+        starts
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let query_starts = constant(context, block, starts_type, &starts_literal)?;
+    let sequence_count = constant(context, block, scalar_i32, &batch.to_string())?;
+
+    let common_config = |block_m: usize,
+                         block_q: usize,
+                         tile_size: usize|
+     -> Result<PagedAttention2dConfig, Error> {
+        Ok(PagedAttention2dConfig {
+            dtype: kernel_dtype,
+            num_query_heads: query_heads,
+            queries_per_kv,
+            page_size,
+            tile_size: kernel_i64(tile_size, "CUDA attention tile size")?,
+            head_size: head_dim,
+            padded_head_size,
+            block_q: kernel_i64(block_q, "CUDA attention query block")?,
+            block_m: kernel_i64(block_m, "CUDA attention row block")?,
+            sliding_window,
+            causal: inputs.options.causal,
+        })
+    };
+    let tensor = |dtype, shape: &[i64]| TensorSpec::new(dtype, shape).map_err(kernel_error);
+    let scalar = |dtype| tensor(dtype, &[]);
+    let query_spec = tensor(kernel_dtype, &[batch, query_len, query_heads, head_dim])?;
+    let cache_spec = tensor(kernel_dtype, inputs.cache_shape.dimensions())?;
+    let page_table_spec = tensor(KernelDType::I32, &[batch, logical_pages])?;
+    let lengths_spec = tensor(KernelDType::I32, &[batch])?;
+    let positions_spec = tensor(KernelDType::I32, &[batch, query_len])?;
+    let starts_spec = tensor(KernelDType::I32, &[batch + 1])?;
+
+    let base_operands = vec![
+        inputs.query,
+        inputs.key_cache,
+        inputs.value_cache,
+        page_table,
+        sequence_lengths,
+        query_positions,
+        scale,
+        block_table_stride,
+        query_stride_0,
+        query_stride_1,
+    ];
+    let cache_operands = [
+        key_stride_0,
+        key_stride_1,
+        key_stride_2,
+        value_stride_0,
+        value_stride_1,
+        value_stride_2,
+    ];
+    let base_specs = vec![
+        query_spec.clone(),
+        cache_spec.clone(),
+        cache_spec.clone(),
+        page_table_spec,
+        lengths_spec.clone(),
+        positions_spec,
+        scalar(KernelDType::F32)?,
+        scalar(KernelDType::I64)?,
+        scalar(KernelDType::I64)?,
+        scalar(KernelDType::I64)?,
+    ];
+
+    match launch {
+        AttentionLaunch::TwoDimensional {
+            block_m,
+            block_q,
+            tile_size,
+            grid,
+            warps,
+            stages,
+            ..
+        } => {
+            let config = common_config(block_m, block_q, tile_size)?;
+            let ir = build_paged_attention_2d(config).map_err(kernel_error)?;
+            let mut operands = base_operands;
+            operands.extend([output_stride_0, output_stride_1]);
+            operands.extend(cache_operands);
+            operands.extend([query_starts, sequence_count]);
+            let mut specs = base_specs;
+            specs.extend([scalar(KernelDType::I64)?, scalar(KernelDType::I64)?]);
+            specs.extend(
+                (0..6)
+                    .map(|_| scalar(KernelDType::I64))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            specs.extend([starts_spec, scalar(KernelDType::I32)?]);
+            let specification =
+                KernelSpec::new("paged_attention_2d", ir, specs, vec![query_spec], vec![])
+                    .map_err(kernel_error)?;
+            append_kernel(
+                context,
+                block,
+                specification,
+                &operands,
+                kernel_launch(grid, warps, stages)?,
+            )
+        }
+        AttentionLaunch::SplitK {
+            block_m,
+            block_q,
+            tile_size,
+            segments,
+            attention_grid,
+            attention_warps,
+            attention_stages,
+            reduction_grid,
+            reduction_warps,
+            reduction_stages,
+            ..
+        } => {
+            let config = common_config(block_m, block_q, tile_size)?;
+            let ir = build_paged_attention_3d(PagedAttention3dConfig {
+                attention: config,
+                segments: kernel_i64(segments, "CUDA attention segment count")?,
+            })
+            .map_err(kernel_error)?;
+            let mut operands = base_operands;
+            operands.extend(cache_operands);
+            operands.extend([query_starts, sequence_count]);
+            let mut specs = base_specs;
+            specs.extend(
+                (0..6)
+                    .map(|_| scalar(KernelDType::I64))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            specs.extend([starts_spec.clone(), scalar(KernelDType::I32)?]);
+            let segments_i64 = kernel_i64(segments, "CUDA attention segment count")?;
+            let segment_values_spec = tensor(
+                KernelDType::F32,
+                &[num_tokens, query_heads, segments_i64, padded_head_size],
+            )?;
+            let segment_statistics_spec =
+                tensor(KernelDType::F32, &[num_tokens, query_heads, segments_i64])?;
+            let specification = KernelSpec::new(
+                "paged_attention_3d",
+                ir,
+                specs,
+                vec![
+                    segment_values_spec.clone(),
+                    segment_statistics_spec.clone(),
+                    segment_statistics_spec.clone(),
+                ],
+                vec![],
+            )
+            .map_err(kernel_error)?;
+            let operation = specification
+                .lower(
+                    context,
+                    &operands,
+                    kernel_launch(attention_grid, attention_warps, attention_stages)?,
+                )
+                .map_err(kernel_error)?;
+            let segment_values = operation.result(0)?;
+            let segment_maxima = operation.result(1)?;
+            let segment_sums = operation.result(2)?;
+            block.append_operation(operation)?;
+
+            let reduction_ir = build_segment_reduction(SegmentReductionConfig {
+                output_dtype: kernel_dtype,
+                num_query_heads: query_heads,
+                segments: segments_i64,
+                tile_size: kernel_i64(tile_size, "CUDA attention tile size")?,
+                head_size: head_dim,
+                padded_head_size,
+                block_q: kernel_i64(block_q, "CUDA attention query block")?,
+            })
+            .map_err(kernel_error)?;
+            let reduction_operands = [
+                segment_values,
+                segment_maxima,
+                segment_sums,
+                sequence_lengths,
+                sequence_count,
+                output_stride_0,
+                output_stride_1,
+                query_starts,
+            ];
+            let reduction_specs = vec![
+                segment_values_spec,
+                segment_statistics_spec.clone(),
+                segment_statistics_spec,
+                lengths_spec,
+                scalar(KernelDType::I32)?,
+                scalar(KernelDType::I64)?,
+                scalar(KernelDType::I64)?,
+                starts_spec,
+            ];
+            let reduction = KernelSpec::new(
+                "paged_attention_segment_reduction",
+                reduction_ir,
+                reduction_specs,
+                vec![query_spec],
+                vec![],
+            )
+            .map_err(kernel_error)?;
+            append_kernel(
+                context,
+                block,
+                reduction,
+                &reduction_operands,
+                kernel_launch(reduction_grid, reduction_warps, reduction_stages)?,
+            )
+        }
+    }
+}
+
+fn append_kernel<'context>(
+    context: &'context Context,
+    block: &mut Block<'context>,
+    specification: KernelSpec,
+    operands: &[Value<'context>],
+    launch: KernelLaunch,
+) -> Result<Value<'context>, Error> {
+    let operation = specification
+        .lower(context, operands, launch)
+        .map_err(kernel_error)?;
+    append_value(block, operation).map_err(Into::into)
+}
+
+#[derive(Clone, Copy)]
+enum FlashVersion {
+    Two,
+    Three,
+}
+
+fn lower_flash_or_triton<'context>(
+    context: &'context Context,
+    block: &mut Block<'context>,
+    inputs: Inputs<'context>,
+    core_count: usize,
+    version: FlashVersion,
+) -> Result<Value<'context>, Error> {
+    if !inputs.options.causal && inputs.options.sliding_window.is_none() {
+        return append_paged_flash(context, block, &inputs, version);
+    }
+    // Upstream paged FlashAttention derives query positions by bottom-right
+    // alignment against each sequence length. NML permits arbitrary positions,
+    // so the upstream branch is selected at execution time only when that
+    // implicit convention exactly matches the authored position tensor.
+    let predicate = canonical_flash_positions(context, block, &inputs)?;
+    let branch_index_type = context.ranked_tensor_type(DType::I32, &[])?;
+    let branch_index = append_value(block, context.convert(predicate, branch_index_type)?)?;
+
+    let mut triton_block = Block::new(context, &[])?;
+    let triton = lower_triton_kernel(
+        context,
+        &mut triton_block,
+        clone_inputs(&inputs),
+        core_count,
+    )?;
+    triton_block.append_operation(context.stablehlo_return(&[triton])?)?;
+    let mut triton_region = Region::new(context)?;
+    triton_region.append_block(triton_block)?;
+
+    let mut flash_block = Block::new(context, &[])?;
+    let flash = append_paged_flash(context, &mut flash_block, &inputs, version)?;
+    flash_block.append_operation(context.stablehlo_return(&[flash])?)?;
+    let mut flash_region = Region::new(context)?;
+    flash_region.append_block(flash_block)?;
+
+    let case = context.stablehlo_case(
+        branch_index,
+        &[inputs.result_type],
+        vec![triton_region, flash_region],
+    )?;
+    let result = case.result(0)?;
+    block.append_operation(case)?;
+    Ok(result)
+}
+
+fn append_paged_flash<'context>(
+    context: &'context Context,
+    block: &mut Block<'context>,
+    inputs: &Inputs<'context>,
+    version: FlashVersion,
+) -> Result<Value<'context>, Error> {
+    let [batch, query_length, query_heads, head_dimension] = inputs.query_shape.dimensions() else {
+        unreachable!()
+    };
+    let logical_pages = inputs.page_table_shape.dimensions()[1];
+    let page_table_type = context.ranked_tensor_type(DType::I32, &[*batch, logical_pages])?;
+    let lengths_type = context.ranked_tensor_type(DType::I32, &[*batch])?;
+    let page_table = convert_if_needed(
+        context,
+        block,
+        inputs.page_table,
+        inputs.page_table_dtype,
+        DType::I32,
+        page_table_type,
+    )?;
+    let sequence_lengths = convert_if_needed(
+        context,
+        block,
+        inputs.sequence_lengths,
+        inputs.sequence_lengths_dtype,
+        DType::I32,
+        lengths_type,
+    )?;
+    let scale = inputs
+        .options
+        .scale
+        .unwrap_or_else(|| 1.0 / (*head_dimension as f64).sqrt()) as f32;
+    let sliding_window = inputs
+        .options
+        .sliding_window
+        .map(|window| {
+            i32::try_from(window).map_err(|_| Error::InvalidAttention("sliding window exceeds I32"))
+        })
+        .transpose()?
+        .unwrap_or(-1);
+    let lse_type =
+        context.ranked_tensor_type(DType::F32, &[*batch, *query_heads, *query_length])?;
+    let call = match version {
+        FlashVersion::Two => context.paged_flash_attention_2_custom_call(
+            inputs.query,
+            inputs.key_cache,
+            inputs.value_cache,
+            page_table,
+            sequence_lengths,
+            inputs.result_type,
+            lse_type,
+            scale,
+            inputs.options.causal,
+            sliding_window,
+        )?,
+        FlashVersion::Three => context.paged_flash_attention_3_custom_call(
+            inputs.query,
+            inputs.key_cache,
+            inputs.value_cache,
+            page_table,
+            sequence_lengths,
+            inputs.result_type,
+            lse_type,
+            scale,
+            inputs.options.causal,
+            sliding_window,
+        )?,
+    };
+    let output = call.result(0)?;
+    block.append_operation(call)?;
+    Ok(output)
+}
+
+fn canonical_flash_positions<'context>(
+    context: &'context Context,
+    block: &mut Block<'context>,
+    inputs: &Inputs<'context>,
+) -> Result<Value<'context>, Error> {
+    let [batch, query_length, _, _] = inputs.query_shape.dimensions() else {
+        unreachable!()
+    };
+    let lengths_type = context.ranked_tensor_type(DType::I64, &[*batch])?;
+    let positions_type = context.ranked_tensor_type(DType::I64, &[*batch, *query_length])?;
+    let lengths = convert_if_needed(
+        context,
+        block,
+        inputs.sequence_lengths,
+        inputs.sequence_lengths_dtype,
+        DType::I64,
+        lengths_type,
+    )?;
+    let positions = convert_if_needed(
+        context,
+        block,
+        inputs.query_positions,
+        inputs.query_positions_dtype,
+        DType::I64,
+        positions_type,
+    )?;
+    let lengths = append_value(
+        block,
+        context.broadcast_in_dim(lengths, positions_type, &[0])?,
+    )?;
+    let scalar_i64 = context.ranked_tensor_type(DType::I64, &[])?;
+    let query_length_value = splat(
+        context,
+        block,
+        scalar_i64,
+        positions_type,
+        &query_length.to_string(),
+    )?;
+    let start = append_value(
+        block,
+        context.binary(
+            StableHloBinary::Subtract,
+            lengths,
+            query_length_value,
+            positions_type,
+        )?,
+    )?;
+    let offsets = append_value(block, context.iota(positions_type, 1)?)?;
+    let expected = append_value(block, context.add(start, offsets, positions_type)?)?;
+    let matches = append_value(
+        block,
+        context.compare(
+            positions,
+            expected,
+            context.ranked_tensor_type(DType::Bool, &[*batch, *query_length])?,
+            StableHloComparison::Eq,
+            StableHloComparisonType::Signed,
+        )?,
+    )?;
+    reduce_bool_and(context, block, matches, &[0, 1])
+}
+
+fn clone_inputs<'context>(inputs: &Inputs<'context>) -> Inputs<'context> {
+    Inputs {
+        query: inputs.query,
+        key_cache: inputs.key_cache,
+        value_cache: inputs.value_cache,
+        page_table: inputs.page_table,
+        sequence_lengths: inputs.sequence_lengths,
+        query_positions: inputs.query_positions,
+        query_shape: inputs.query_shape,
+        cache_shape: inputs.cache_shape,
+        page_table_shape: inputs.page_table_shape,
+        page_table_dtype: inputs.page_table_dtype,
+        sequence_lengths_dtype: inputs.sequence_lengths_dtype,
+        query_positions_dtype: inputs.query_positions_dtype,
+        result_type: inputs.result_type,
+        options: inputs.options,
+    }
+}
+
+fn kernel_launch(grid: [usize; 3], warps: usize, stages: usize) -> Result<KernelLaunch, Error> {
+    Ok(KernelLaunch {
+        grid: [
+            kernel_i32(grid[0], "CUDA launch grid")?,
+            kernel_i32(grid[1], "CUDA launch grid")?,
+            kernel_i32(grid[2], "CUDA launch grid")?,
+        ],
+        warps: kernel_i32(warps, "CUDA launch warp count")?,
+        stages: kernel_i32(stages, "CUDA launch stage count")?,
+    })
+}
+
+fn kernel_dtype(dtype: DType) -> Result<KernelDType, Error> {
+    match dtype {
+        DType::F16 => Ok(KernelDType::F16),
+        DType::Bf16 => Ok(KernelDType::Bf16),
+        DType::F32 => Ok(KernelDType::F32),
+        _ => Err(Error::InvalidAttention(
+            "CUDA Triton attention requires F16, BF16, or F32",
+        )),
+    }
+}
+
+fn positive_usize(value: i64, message: &'static str) -> Result<usize, Error> {
+    usize::try_from(value)
+        .ok()
+        .filter(|value| *value != 0)
+        .ok_or(Error::InvalidAttention(message))
+}
+
+fn kernel_i64(value: usize, message: &'static str) -> Result<i64, Error> {
+    i64::try_from(value).map_err(|_| Error::InvalidAttention(message))
+}
+
+fn kernel_i32(value: usize, message: &'static str) -> Result<i32, Error> {
+    i32::try_from(value).map_err(|_| Error::InvalidAttention(message))
+}
+
+fn checked_product(left: i64, right: i64, message: &'static str) -> Result<i64, Error> {
+    left.checked_mul(right)
+        .ok_or(Error::InvalidAttention(message))
+}
+
+fn kernel_error(error: nml_kernel_triton::Error) -> Error {
+    match error {
+        nml_kernel_triton::Error::Mlir(error) => Error::Mlir(error),
+        _ => Error::InvalidAttention("CUDA Triton kernel construction failed"),
+    }
 }
 
 /// Emits one bounded page traversal. The loop carries immutable operands
@@ -292,18 +970,8 @@ fn body_region<'context>(
     let state = (0..state_types.len())
         .map(|index| block.argument(index))
         .collect::<Result<Vec<_>, _>>()?;
-    let [
-        counter,
-        old_max,
-        old_sum,
-        old_accumulator,
-        query,
-        key_cache,
-        value_cache,
-        page_table,
-        lengths,
-        query_positions,
-    ] = state.as_slice()
+    let [counter, old_max, old_sum, old_accumulator, query, key_cache, value_cache, page_table, lengths, query_positions] =
+        state.as_slice()
     else {
         unreachable!("portable paged-attention loop state is fixed")
     };
@@ -760,6 +1428,30 @@ fn reduce<'context>(
     append_value(
         block,
         context.reduce(input, init, result_type, dimensions, body)?,
+    )
+    .map_err(Into::into)
+}
+
+fn reduce_bool_and<'context>(
+    context: &'context Context,
+    block: &mut Block<'context>,
+    input: Value<'context>,
+    dimensions: &[i64],
+) -> Result<Value<'context>, Error> {
+    let scalar = context.ranked_tensor_type(DType::Bool, &[])?;
+    let init = constant(context, block, scalar, "true")?;
+    let mut reduction_block = Block::new(context, &[scalar, scalar])?;
+    let left = reduction_block.argument(0)?;
+    let right = reduction_block.argument(1)?;
+    let operation = context.binary(StableHloBinary::And, left, right, scalar)?;
+    let result = operation.result(0)?;
+    reduction_block.append_operation(operation)?;
+    reduction_block.append_operation(context.stablehlo_return(&[result])?)?;
+    let mut body = Region::new(context)?;
+    body.append_block(reduction_block)?;
+    append_value(
+        block,
+        context.reduce(input, init, scalar, dimensions, body)?,
     )
     .map_err(Into::into)
 }

@@ -9,14 +9,38 @@ use nml_pjrt::{Client, LoadedExecutable, StableHloVersion};
 use std::error::Error as StdError;
 use std::fmt;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Target {
+    Cpu,
+    Cuda {
+        core_count: usize,
+        capability_major: u16,
+        capability_minor: u16,
+    },
+}
+
 pub fn compile(
     client: &Client,
     program: &nml_ir::Program,
     sharding: &nml_sharding::Sharding,
     options: &nml_xla::CompileOptions,
+    target: Target,
 ) -> Result<LoadedExecutable, Error> {
     let context = nml_mlir::Context::new();
-    let module = program.module_with_sharding(&context, sharding)?;
+    let module = match target {
+        Target::Cpu => program.module_with_sharding(&context, sharding)?,
+        Target::Cuda {
+            core_count,
+            capability_major,
+            capability_minor,
+        } => program.module_with_sharding_cuda(
+            &context,
+            sharding,
+            core_count,
+            capability_major,
+            capability_minor,
+        )?,
+    };
     let version = negotiate_stablehlo_version(client.stablehlo_version()?)?;
     let artifact = module.portable_artifact(&version)?;
     let options = options.serialize()?;

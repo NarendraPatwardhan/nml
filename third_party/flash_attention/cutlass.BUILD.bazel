@@ -1,0 +1,19 @@
+"""Header-only CUTLASS revision recorded by FlashAttention v2.8.3."""
+
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+licenses(["notice"])
+
+cc_library(
+    name = "headers",
+    hdrs = glob([
+        "include/**",
+        "tools/util/include/**",
+    ]),
+    includes = [
+        "include",
+        "tools/util/include",
+    ],
+)

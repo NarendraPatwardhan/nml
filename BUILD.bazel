@@ -67,6 +67,7 @@ _COMMON_CONTRACTS = [
     "//crates/nml-checkpoint:safetensors_contract_test",
     "//crates/nml-compiler:compiler_contract_test",
     "//crates/nml-ir:ir_contract_test",
+    "//crates/nml-kernel-triton:triton_kernel_contract_test",
     "//crates/nml-mlir:mlir_contract_test",
     "//crates/nml-pjrt-cpu:cpu_runtime_contract_test",
     "//crates/nml-platform:host_contract_test",
@@ -77,14 +78,24 @@ _COMMON_CONTRACTS = [
     "//crates/nml-xla:compile_options_contract_test",
     "//crates/nml:linear_cpu_contract_test",
     "//crates/nml:attention_cpu_contract_test",
+    "//crates/nml:neural_ops_cpu_contract_test",
     "//crates/nml:structural_contract_test",
 ]
 
-_CUDA_RUNTIME_CONTRACTS = [
-    "//crates/nml-pjrt-cuda:cuda_package_contract_test",
+_CUDA_DEVICE_CONTRACTS = [
+    "//crates/nml-kernel-flash-attention:flash_attention_device_capability_contract_test",
     "//crates/nml-pjrt-cuda:cuda_runtime_contract_test",
     "//crates/nml:linear_cuda_contract_test",
     "//crates/nml:attention_cuda_contract_test",
+    "//crates/nml:neural_ops_cuda_contract_test",
+]
+
+_CUDA_PACKAGE_CONTRACTS = [
+    "//crates/nml-pjrt-cuda:cuda_package_contract_test",
+]
+
+_CUDA_REMOTE_CONTRACTS = [
+    "//crates/nml-kernel-flash-attention:flash_attention_adapter_contract_test",
 ]
 
 # These suites encode where a contract can truthfully execute. They do not
@@ -100,28 +111,42 @@ test_suite(
 
 test_suite(
     name = "cuda_remote_contracts",
-    tests = _COMMON_CONTRACTS,
+    tests = _COMMON_CONTRACTS + _CUDA_REMOTE_CONTRACTS,
+    visibility = ["//visibility:public"],
+)
+
+test_suite(
+    name = "cuda_device_contracts",
+    tests = _CUDA_DEVICE_CONTRACTS,
+    visibility = ["//visibility:public"],
+)
+
+test_suite(
+    name = "cuda_package_contracts",
+    tests = _CUDA_PACKAGE_CONTRACTS,
     visibility = ["//visibility:public"],
 )
 
 test_suite(
     name = "cuda_runtime_contracts",
-    tests = _CUDA_RUNTIME_CONTRACTS,
+    tests = _CUDA_PACKAGE_CONTRACTS + _CUDA_DEVICE_CONTRACTS,
     visibility = ["//visibility:public"],
 )
 
 # `filegroup` deliberately propagates test executables rather than their
 # runfiles. A remote builder can therefore populate every code-generation and
 # linker action needed by the NVIDIA host without copying the CUDA runtime into
-# the hosted runner. The host assembles that SHA-pinned runtime exactly once
-# when it executes `cuda_runtime_contracts`.
+# the hosted runner. The host assembles the SHA-pinned system-driver runtime
+# when it executes `cuda_device_contracts`; distribution integrity remains the
+# independent `cuda_package_contracts` gate.
 filegroup(
     name = "cuda_contract_binaries",
     srcs = [
-        "//crates/nml-pjrt-cuda:cuda_package_contract_binary",
+        "//crates/nml-kernel-flash-attention:flash_attention_device_capability_contract_test",
         "//crates/nml-pjrt-cuda:cuda_runtime_contract_binary",
         "//crates/nml:linear_cuda_contract_binary",
         "//crates/nml:attention_cuda_contract_binary",
+        "//crates/nml:neural_ops_cuda_contract_binary",
     ],
     testonly = True,
     visibility = ["//visibility:public"],
@@ -131,7 +156,7 @@ filegroup(
 # Resource-aware development and CI use the three suites above per D-031.
 test_suite(
     name = "tests",
-    tests = _COMMON_CONTRACTS + _CUDA_RUNTIME_CONTRACTS + [
+    tests = _COMMON_CONTRACTS + _CUDA_REMOTE_CONTRACTS + _CUDA_PACKAGE_CONTRACTS + _CUDA_DEVICE_CONTRACTS + [
         "//crates/nml-pjrt-cpu:cpu_disabled_contract_test",
         "//crates/nml-pjrt-cuda:cuda_disabled_contract_test",
     ],

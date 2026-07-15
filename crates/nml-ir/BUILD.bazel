@@ -5,11 +5,14 @@ load("//bazel:rust.bzl", "nml_rust_library", "nml_rust_test")
 nml_rust_library(
     name = "nml_ir",
     srcs = [
+        "src/attention_backend.rs",
         "src/lib.rs",
+        "src/ordinary_attention.rs",
         "src/paged_attention.rs",
     ],
     crate_root = "src/lib.rs",
     deps = [
+        "//crates/nml-kernel-triton:nml_kernel_triton",
         "//crates/nml-mlir:nml_mlir",
         "//crates/nml-sharding:nml_sharding",
         "//crates/nml-tensor:nml_tensor",

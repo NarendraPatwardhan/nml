@@ -6,15 +6,22 @@ load("@rules_rust_bindgen//:defs.bzl", "rust_bindgen")
 
 cc_library(
     name = "mlir_c_api",
-    srcs = ["src/support.c"],
+    srcs = [
+        "src/support.c",
+        "src/triton.cc",
+    ],
     hdrs = ["include/nml_mlir.h"],
     includes = ["include"],
     deps = [
         "@llvm-project//mlir:CAPIArith",
+        "@llvm-project//mlir:CAPICF",
         "@llvm-project//mlir:CAPIIR",
+        "@llvm-project//mlir:CAPIMath",
+        "@llvm-project//mlir:CAPISCF",
         "@llvm-project//mlir:CAPITransforms",
         "@shardy//shardy/integrations/c:sdy_capi",
         "@stablehlo//:stablehlo_dialect_capi",
+        "@triton//:TritonDialects",
     ],
 )
 

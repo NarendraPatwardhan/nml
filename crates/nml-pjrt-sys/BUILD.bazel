@@ -1,7 +1,18 @@
 """Generated Rust declarations for the pinned PJRT C ABI."""
 
 load("//bazel:rust.bzl", "nml_rust_library")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_rust_bindgen//:defs.bzl", "rust_bindgen")
+
+cc_library(
+    name = "pjrt_ffi_headers",
+    hdrs = ["include/nml_pjrt.h"],
+    includes = ["include"],
+    deps = [
+        "@xla//xla/ffi/api:c_api",
+        "@xla//xla/pjrt/c:pjrt_c_api_gpu_extension_hdrs",
+    ],
+)
 
 # Keep generation and compilation as separate Bazel edges. The PJRT header is
 # an ABI description, not a C++ library to link into the Rust rlib; spelling
@@ -13,6 +24,8 @@ rust_bindgen(
         "--allowlist-function=GetPjrtApi",
         "--allowlist-type=PJRT_.*",
         "--allowlist-var=PJRT_.*",
+        "--allowlist-type=XLA_FFI_.*",
+        "--allowlist-var=XLA_FFI_.*",
         # C plugins may return enum values added by a newer PJRT minor. Integer
         # constants preserve those values for explicit compatibility handling;
         # a generated Rust enum would make an unknown discriminant undefined
@@ -24,8 +37,8 @@ rust_bindgen(
         # sized Rust placeholders, while all ABI use is correctly by pointer.
         "--no-layout-tests",
     ],
-    cc_lib = "@xla//xla/pjrt/c:pjrt_c_api_gpu_extension_hdrs",
-    header = "@xla//xla/pjrt/c:pjrt_c_api_gpu_extension.h",
+    cc_lib = ":pjrt_ffi_headers",
+    header = "include/nml_pjrt.h",
     # This target describes an ABI; it has no C objects to merge into the Rust
     # archive. Plugin implementations arrive as separately loaded shared libs.
     merge_cc_lib_objects_into_rlib = False,

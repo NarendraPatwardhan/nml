@@ -58,11 +58,12 @@ nml_rust_test(
     # though its compiled binary and CUDA runfiles remain cacheable.
     tags = [
         "external",
+        "exclusive",
         "requires-gpu",
     ],
-    data = ["//platforms/cuda:runtime"],
+    data = ["//platforms/cuda:runtime_system_driver"],
     env = {
-        "NML_CUDA_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime)",
+        "NML_CUDA_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime_system_driver)",
     },
     target_compatible_with = select({
         "//platforms:cuda.enabled": ["@platforms//os:linux"],
@@ -101,11 +102,12 @@ nml_rust_test(
     rustc_env = {"NML_ATTENTION_BACKEND": "cuda"},
     tags = [
         "external",
+        "exclusive",
         "requires-gpu",
     ],
-    data = ["//platforms/cuda:runtime"],
+    data = ["//platforms/cuda:runtime_system_driver"],
     env = {
-        "NML_CUDA_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime)",
+        "NML_CUDA_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime_system_driver)",
     },
     target_compatible_with = select({
         "//platforms:cuda.enabled": ["@platforms//os:linux"],
@@ -117,6 +119,49 @@ nml_rust_test(
         "//crates/nml-tensor:nml_tensor",
         "//crates/nml-types:nml_types",
         "@rust_crates//safetensors",
+    ],
+)
+
+# Model-enabling primitives and composites share one permanent numerical
+# contract across CPU and CUDA. Keeping this separate from a particular model
+# prevents checkpoint architecture choices from defining the tensor API.
+nml_rust_test(
+    name = "neural_ops_cpu_contract_test",
+    size = "large",
+    srcs = ["tests/neural_ops_contract.rs"],
+    crate_root = "tests/neural_ops_contract.rs",
+    rustc_env = {"NML_NEURAL_OPS_BACKEND": "cpu"},
+    deps = [
+        ":nml",
+        "//crates/nml-ir:nml_ir",
+        "//crates/nml-types:nml_types",
+    ],
+)
+
+nml_rust_test(
+    name = "neural_ops_cuda_contract_test",
+    size = "large",
+    srcs = ["tests/neural_ops_contract.rs"],
+    crate_root = "tests/neural_ops_contract.rs",
+    local = True,
+    rustc_env = {"NML_NEURAL_OPS_BACKEND": "cuda"},
+    tags = [
+        "external",
+        "exclusive",
+        "requires-gpu",
+    ],
+    data = ["//platforms/cuda:runtime_system_driver"],
+    env = {
+        "NML_CUDA_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime_system_driver)",
+    },
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": ["@platforms//os:linux"],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":nml",
+        "//crates/nml-ir:nml_ir",
+        "//crates/nml-types:nml_types",
     ],
 )
 
@@ -133,6 +178,13 @@ filegroup(
 filegroup(
     name = "attention_cuda_contract_binary",
     srcs = [":attention_cuda_contract_test"],
+    testonly = True,
+    visibility = ["//:__pkg__"],
+)
+
+filegroup(
+    name = "neural_ops_cuda_contract_binary",
+    srcs = [":neural_ops_cuda_contract_test"],
     testonly = True,
     visibility = ["//:__pkg__"],
 )

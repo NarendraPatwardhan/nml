@@ -28,9 +28,13 @@ nml_rust_test(
     size = "small",
     srcs = ["tests/package_contract.rs"],
     crate_root = "tests/package_contract.rs",
-    data = ["//platforms/cuda:runtime"],
+    data = [
+        "//platforms/cuda:runtime",
+        "//platforms/cuda:runtime_system_driver",
+    ],
     rustc_env = {
-        "NML_CUDA_RUNTIME_CONTRACT_RLOCATION": "$(rlocationpath //platforms/cuda:runtime)",
+        "NML_CUDA_DISTRIBUTION_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime)",
+        "NML_CUDA_SYSTEM_DRIVER_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime_system_driver)",
     },
     deps = [
         ":nml_pjrt_cuda",
@@ -63,16 +67,18 @@ nml_rust_test(
     local = True,
     tags = [
         "external",
+        "exclusive",
         "requires-gpu",
     ],
-    data = ["//platforms/cuda:runtime"],
+    data = ["//platforms/cuda:runtime_system_driver"],
     env = {
-        "NML_CUDA_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime)",
+        "NML_CUDA_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime_system_driver)",
     },
     deps = [
         ":nml_pjrt_cuda",
         "//crates/nml-compiler:nml_compiler",
         "//crates/nml-ir:nml_ir",
+        "//crates/nml-kernel-flash-attention:nml_kernel_flash_attention",
         "//crates/nml-pjrt:nml_pjrt",
         "//crates/nml-sharding:nml_sharding",
         "//crates/nml-tensor:nml_tensor",

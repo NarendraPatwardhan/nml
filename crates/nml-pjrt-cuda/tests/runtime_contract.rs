@@ -18,6 +18,10 @@ fn packaged_cuda_runtime_matches_the_host() {
     let custom_calls = runtime
         .custom_calls()
         .expect("CUDA PJRT must expose GPU custom-call registration");
+    nml_kernel_flash_attention::register(&custom_calls)
+        .expect("CUDA PJRT must register NML's typed FlashAttention handlers");
+    nml_kernel_flash_attention::register(&custom_calls)
+        .expect("FlashAttention registration must be idempotent per plugin");
     let handler = unsafe {
         nml_pjrt::GpuCustomCallHandler::from_address(
             NonNull::new(typed_custom_call_stage as *const () as *mut c_void).unwrap(),
@@ -78,6 +82,7 @@ fn execute_matmul_contract(client: &nml_pjrt::Client, device: &nml_pjrt::Device)
         &program,
         &nml_sharding::Sharding::single(),
         &options,
+        compiler_target(client),
     )
     .expect("CUDA XLA compilation must succeed");
 
@@ -128,6 +133,7 @@ fn execute_complex_contract(client: &nml_pjrt::Client, device: &nml_pjrt::Device
         &program,
         &nml_sharding::Sharding::single(),
         &options,
+        compiler_target(client),
     )
     .unwrap();
     let real_values = [1.0f32, -2.0, 3.5, 0.25];
@@ -160,6 +166,27 @@ fn execute_complex_contract(client: &nml_pjrt::Client, device: &nml_pjrt::Device
         ),
         &imaginary_values,
     );
+}
+
+fn compiler_target(client: &nml_pjrt::Client) -> nml_compiler::Target {
+    let capability = nml_pjrt_cuda::compute_capabilities(client)
+        .unwrap()
+        .into_iter()
+        .min()
+        .unwrap();
+    let core_count = client
+        .devices()
+        .unwrap()
+        .iter()
+        .map(|device| device.int64_attribute("core_count").unwrap().unwrap())
+        .min()
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap();
+    nml_compiler::Target::Cuda {
+        core_count,
+        capability_major: capability.major,
+        capability_minor: capability.minor,
+    }
 }
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {

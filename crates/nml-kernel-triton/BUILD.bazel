@@ -1,0 +1,31 @@
+"""Private typed authoring for XLA's pinned Triton custom-call path."""
+
+load("//bazel:rust.bzl", "nml_rust_library", "nml_rust_test")
+
+nml_rust_library(
+    name = "nml_kernel_triton",
+    srcs = [
+        "src/lib.rs",
+        "src/paged_attention.rs",
+        "src/specification.rs",
+        "src/unified_attention.rs",
+    ],
+    crate_root = "src/lib.rs",
+    deps = [
+        "//crates/nml-mlir:nml_mlir",
+        "//crates/nml-types:nml_types",
+    ],
+    visibility = ["//crates:__subpackages__"],
+)
+
+nml_rust_test(
+    name = "triton_kernel_contract_test",
+    size = "small",
+    srcs = ["tests/kernel_contract.rs"],
+    crate_root = "tests/kernel_contract.rs",
+    deps = [
+        ":nml_kernel_triton",
+        "//crates/nml-mlir:nml_mlir",
+        "//crates/nml-types:nml_types",
+    ],
+)

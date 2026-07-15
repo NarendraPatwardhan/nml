@@ -1,0 +1,243 @@
+diff --git a/csrc/flash_attn/src/flash.h b/csrc/flash_attn/src/flash.h
+index 8ffbb62..2c9c2b9 100644
+--- a/csrc/flash_attn/src/flash.h
++++ b/csrc/flash_attn/src/flash.h
+@@ -7,11 +7,15 @@
+ #include "namespace_config.h"
+
+ #include <cuda.h>
++#include <cstdint>
+ #include <vector>
+
+-#include <ATen/cuda/CUDAGeneratorImpl.h> // For at::Generator and at::PhiloxCudaState
+-
+ namespace FLASH_NAMESPACE {
++struct PhiloxCudaState {
++    uint64_t seed;
++    uint64_t offset;
++};
++
+ constexpr int TOTAL_DIM = 0;
+ constexpr int H_DIM = 1;
+ constexpr int D_DIM = 2;
+@@ -119,7 +123,7 @@ struct Flash_fwd_params : public Qkv_params {
+     float softcap;
+
+     // Random state.
+-    at::PhiloxCudaState philox_args;
++    PhiloxCudaState philox_args;
+
+     // Pointer to the RNG seed (idx 0) and offset (idx 1).
+     uint64_t * rng_state;
+diff --git a/csrc/flash_attn/src/flash_fwd_kernel.h b/csrc/flash_attn/src/flash_fwd_kernel.h
+index d492c87..983a63f 100644
+--- a/csrc/flash_attn/src/flash_fwd_kernel.h
++++ b/csrc/flash_attn/src/flash_fwd_kernel.h
+@@ -5,7 +5,6 @@
+ #pragma once
+
+ #include "namespace_config.h"
+-#include "philox_unpack.cuh" // For at::cuda::philox::unpack
+
+ #include <cute/tensor.hpp>
+
+@@ -66,15 +65,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
+     constexpr int kHeadDim = Kernel_traits::kHeadDim;
+     constexpr int kNWarps = Kernel_traits::kNWarps;
+
+-    auto seed_offset = at::cuda::philox::unpack(params.philox_args);
+-    FLASH_NAMESPACE::Dropout dropout(std::get<0>(seed_offset), std::get<1>(seed_offset), params.p_dropout_in_uint8_t,
++    FLASH_NAMESPACE::Dropout dropout(params.philox_args.seed, params.philox_args.offset, params.p_dropout_in_uint8_t,
+                            bidb, bidh, tidx, params.h);
+
+     // Save seed and offset for backward, before any early exiting. Otherwise the 0-th thread block might
+     // exit early and no one saves the rng states.
+     if (Is_dropout && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0) {
+-        params.rng_state[0] = std::get<0>(seed_offset);
+-        params.rng_state[1] = std::get<1>(seed_offset);
++        params.rng_state[0] = params.philox_args.seed;
++        params.rng_state[1] = params.philox_args.offset;
+     }
+
+     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
+diff --git a/csrc/flash_attn/src/flash_fwd_launch_template.h b/csrc/flash_attn/src/flash_fwd_launch_template.h
+index 934e7b9..d3fc79d 100644
+--- a/csrc/flash_attn/src/flash_fwd_launch_template.h
++++ b/csrc/flash_attn/src/flash_fwd_launch_template.h
+@@ -4,7 +4,7 @@
+
+ #pragma once
+ #include "namespace_config.h"
+-#include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
++#include "nml_cuda_check.h"
+
+ #include "static_switch.h"
+ #include "hardware_info.h"
+@@ -81,7 +81,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+                             // printf("IsEvenMNConst = %d, IsEvenKConst = %d, Is_local = %d, Is_causal = %d, ReturnSoftmaxConst = %d, Is_dropout = %d\n", int(IsEvenMNConst), int(IsEvenKConst), int(Is_local), int(Is_causal), int(ReturnSoftmaxConst), int(Is_dropout));
+                             // auto kernel = &flash_fwd_kernel<Kernel_traits, false, Is_causal, false, true, true, false>;
+                             if (smem_size >= 48 * 1024) {
+-                                C10_CUDA_CHECK(cudaFuncSetAttribute(
++                                NML_CUDA_CHECK(cudaFuncSetAttribute(
+                                     kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                             }
+                             // int ctas_per_sm;
+@@ -89,7 +89,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+                             //     &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
+                             // printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
+                             kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+-                            C10_CUDA_KERNEL_LAUNCH_CHECK();
++                            NML_CUDA_KERNEL_LAUNCH_CHECK();
+                         });
+                     });
+                 });
+@@ -121,11 +121,11 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+                                 // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, true, Split, Append_KV>;
+                                 // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, IsEvenKConst>;
+                                 if (smem_size >= 48 * 1024) {
+-                                    C10_CUDA_CHECK(cudaFuncSetAttribute(
++                                    NML_CUDA_CHECK(cudaFuncSetAttribute(
+                                         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                                 }
+                                 kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+-                                C10_CUDA_KERNEL_LAUNCH_CHECK();
++                                NML_CUDA_KERNEL_LAUNCH_CHECK();
+                             });
+                         });
+                     });
+@@ -155,7 +155,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
+             } else if (params.num_splits <= 128) {
+                 flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 7, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
+             }
+-            C10_CUDA_KERNEL_LAUNCH_CHECK();
++            NML_CUDA_KERNEL_LAUNCH_CHECK();
+         });
+     }
+ }
+@@ -284,7 +284,7 @@ void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
+     status_ = cudaDeviceGetAttribute(
+         &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+     if (status_ != cudaSuccess) {
+-      C10_CUDA_CHECK(status_);
++      NML_CUDA_CHECK(status_);
+     }
+     // printf("max_smem_per_sm = %d, max_smem_per_block = %d\n", max_smem_per_sm, max_smem_per_block);
+     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+diff --git a/csrc/flash_attn/src/hardware_info.h b/csrc/flash_attn/src/hardware_info.h
+index b218a29..d565f25 100644
+--- a/csrc/flash_attn/src/hardware_info.h
++++ b/csrc/flash_attn/src/hardware_info.h
+@@ -6,36 +6,24 @@
+
+ #include <tuple>
+
+-#if !defined(__CUDACC_RTC__)
+-#include "cuda_runtime.h"
+-#endif
+-
+-#define CHECK_CUDA(call)                                                       \
+-  do {                                                                         \
+-    cudaError_t status_ = call;                                                \
+-    if (status_ != cudaSuccess) {                                              \
+-      fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__,          \
+-              cudaGetErrorString(status_));                                    \
+-      exit(1);                                                                 \
+-    }                                                                          \
+-  } while (0)
++#include "nml_cuda_check.h"
+
+
+ inline int get_current_device() {
+     int device;
+-    CHECK_CUDA(cudaGetDevice(&device));
++    NML_CUDA_CHECK(cudaGetDevice(&device));
+     return device;
+ }
+
+ inline std::tuple<int, int> get_compute_capability(int device) {
+     int capability_major, capability_minor;
+-    CHECK_CUDA(cudaDeviceGetAttribute(&capability_major, cudaDevAttrComputeCapabilityMajor, device));
+-    CHECK_CUDA(cudaDeviceGetAttribute(&capability_minor, cudaDevAttrComputeCapabilityMinor, device));
++    NML_CUDA_CHECK(cudaDeviceGetAttribute(&capability_major, cudaDevAttrComputeCapabilityMajor, device));
++    NML_CUDA_CHECK(cudaDeviceGetAttribute(&capability_minor, cudaDevAttrComputeCapabilityMinor, device));
+     return {capability_major, capability_minor};
+ }
+
+ inline int get_num_sm(int device) {
+     int multiprocessor_count;
+-    CHECK_CUDA(cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
++    NML_CUDA_CHECK(cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
+     return multiprocessor_count;
+ }
+diff --git a/csrc/flash_attn/src/nml_cuda_check.h b/csrc/flash_attn/src/nml_cuda_check.h
+new file mode 100644
+index 0000000..4e6f1a9
+--- /dev/null
++++ b/csrc/flash_attn/src/nml_cuda_check.h
+@@ -0,0 +1,29 @@
++#pragma once
++
++#if !defined(__CUDACC_RTC__)
++#include <cuda_runtime.h>
++#endif
++
++#include <stdexcept>
++#include <string>
++
++namespace nml_flash_attention {
++inline void check_cuda(cudaError_t status, const char *expression) {
++    if (status == cudaSuccess) {
++        return;
++    }
++    throw std::runtime_error(
++        std::string(expression) + ": " + cudaGetErrorString(status));
++}
++}  // namespace nml_flash_attention
++
++#define NML_CUDA_CHECK(call)                                                   \
++    do {                                                                       \
++        nml_flash_attention::check_cuda((call), #call);                        \
++    } while (0)
++
++#define NML_CUDA_KERNEL_LAUNCH_CHECK()                                         \
++    do {                                                                       \
++        nml_flash_attention::check_cuda(cudaGetLastError(),                    \
++                                        "CUDA kernel launch");                 \
++    } while (0)
+diff --git a/hopper/cuda_check.h b/hopper/cuda_check.h
+index 1495cbf..127ea23 100644
+--- a/hopper/cuda_check.h
++++ b/hopper/cuda_check.h
+@@ -4,16 +4,22 @@
+
+ #pragma once
+
+-#include <assert.h>
+-#include <stdlib.h>
++#include <stdexcept>
++#include <string>
+
+-#define CHECK_CUDA(call)                        \
+-    do {                                                                                                  \
+-        cudaError_t status_ = call;                                                                       \
+-        if (status_ != cudaSuccess) {                                                                     \
+-            fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__, cudaGetErrorString(status_)); \
+-            exit(1);                                                                                      \
+-        }                                                                                                 \
+-    } while(0)
++namespace nml_flash_attention_hopper {
++inline void check_cuda(cudaError_t status, const char *expression) {
++    if (status == cudaSuccess) {
++        return;
++    }
++    throw std::runtime_error(
++        std::string(expression) + ": " + cudaGetErrorString(status));
++}
++}  // namespace nml_flash_attention_hopper
++
++#define CHECK_CUDA(call)                                                   \
++    do {                                                                   \
++        nml_flash_attention_hopper::check_cuda((call), #call);             \
++    } while (0)
+
+ #define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(cudaGetLastError())

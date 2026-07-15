@@ -455,16 +455,17 @@ model; compiler implementation records do not become product concepts.
 
 - [x] All tests are permanent product contracts; no probe, smoke, spike, demo,
       compatibility-only, or temporary target remains.
-- [x] BuildBuddy executes `bb remote test --config=cpu //:cpu_contracts`.
+- [x] BuildBuddy executes `bb test --config=buildbuddy --config=cpu
+      //:cpu_contracts` with compile actions on RBE.
 - [x] BuildBuddy executes the CUDA-configured contracts that do not own the
-      packaged runtime or a physical device with `bb remote test --config=cuda
-      //:cuda_remote_contracts`.
+      packaged runtime or a physical device with `bb test
+      --config=buildbuddy --config=cuda //:cuda_remote_contracts`.
 - [x] BuildBuddy compiles the exact CUDA contract binaries without assembling
       their runtime data and populates the authenticated action cache with `bb
-      remote build --config=cuda //:cuda_contract_binaries`.
-- [x] The NVIDIA host assembles the pinned runtime package and executes only
-      those cached contracts with `bb test --config=buildbuddy --config=cuda
-      //:cuda_runtime_contracts`.
+      build --config=buildbuddy --config=cuda //:cuda_contract_binaries`.
+- [x] The NVIDIA host assembles the pinned system-driver runtime and executes
+      only those cached contracts with `bb test --config=buildbuddy
+      --config=cuda --cache_test_results=no //:cuda_device_contracts`.
 - [x] The real CUDA contracts pass on a supported NVIDIA device and unsupported
       GPU capabilities remain hard diagnostic errors.
 - [x] The pushed revision's BuildBuddy workflow passes while reusing the remote
@@ -595,6 +596,284 @@ regions, loop state, page traversal, and backend dispatch remain internal.
 
 ---
 
+# Pre-Milestone 5: model-enabling parity closure
+
+This bounded slice closes the inexpensive ZML capabilities that are already
+natural compositions of NML's typed StableHLO substrate. It does not introduce
+a model hierarchy, sampling policy object, backend-specific dispatch, or a
+reference-model package. Operations remain on the existing `ProgramBuilder`
+and `TensorStore` surfaces so later CUDA kernels, richer reductions, and
+sampling strategies can replace or reuse their lowering without changing model
+code.
+
+## 1. Coherent elementwise and reduction tail
+
+- [x] Add typed absolute value, power, remainder, clamp, floor, and ceil with
+      correct scalar broadcasting, complex-result dtype behavior, and
+      pre-emission dtype validation.
+- [x] Add reduction minimum, mean, and numerically stable log-sum-exp while
+      preserving retained axis tags and partition metadata.
+- [x] Extend the narrow MLIR builders only where a distinct StableHLO operation
+      is required; composites remain explicit graph compositions so XLA can
+      fuse them normally.
+- [x] Add deterministic StableHLO and invalid-contract coverage for every new
+      primitive and composite.
+
+## 2. Embedding, normalization, and gated activations
+
+- [x] Add token embedding as the checked rank-two vocabulary gather already
+      used by ZML, accepting any supported integer index tensor without adding
+      a public embedding-layer type.
+- [x] Add variance normalization, LayerNorm, and L2 normalization with F16 and
+      BF16 accumulation in F32, explicit epsilon validation, and optional
+      LayerNorm affine parameters.
+- [x] Add SwiGLU and GeGLU as shape-safe composites of the existing activation
+      and multiplication operations; do not couple gating to a particular
+      projection layout or checkpoint naming scheme.
+- [x] Execute embedding, normalization, and gating numerical contracts for F32,
+      F16, and BF16 on every applicable CPU/CUDA product backend.
+
+## 3. Argmax and compiled greedy selection
+
+- [x] Add an axis-reducing argmax that returns both values and indices, chooses
+      I32 indices unless the reduced dimension requires I64, selects the first
+      index on ties, and propagates the first encountered NaN as ZML does.
+- [x] Represent argmax as a general two-result StableHLO reduction rather than
+      a sampling-specific custom operation, leaving top-k, sorting, and
+      stochastic sampling unconstrained.
+- [x] Expose argmax through `TensorStore`; its index result is the compiled
+      greedy-selection path without adding a premature sampling-policy type.
+- [x] Execute numerical, tie, NaN, dtype, axis, metadata, CPU, and CUDA
+      contracts.
+
+## Acceptance
+
+- [x] `rustfmt` passes for every changed Rust source.
+- [x] BuildBuddy executes `bb test --config=buildbuddy --config=cpu
+      //:cpu_contracts` with compile actions on RBE.
+- [x] BuildBuddy executes `bb test --config=buildbuddy --config=cuda
+      //:cuda_remote_contracts` and builds `//:cuda_contract_binaries`.
+- [x] Applicable real-device CUDA contracts execute locally after their exact
+      binaries have been populated through the remote cache.
+- [x] `git diff --check`
+- [x] The capability ledger is updated only for complete product families; a
+      new operation does not overstate convolution, stochastic sampling,
+      general scatter, or other unfinished ZML parity work.
+
+---
+
+# Milestone 5: CUDA FlashAttention and Triton paged attention
+
+This milestone adds two independent CUDA acceleration mechanisms behind the
+attention semantics completed in Milestone 4.  The portable StableHLO paths
+remain the oracle and CUDA fallback. A kernel is hardware-validated only after
+its numerical result and lifecycle behavior execute on compatible hardware;
+parsing TTIR, compiling a target, or registering a symbol is never presented as
+that validation. D-038 nevertheless lets the implementation milestone close
+with those real-device runs explicitly deferred, provided the complete product
+artifacts and unchanged future execution contracts continue to compile.
+
+The pinned ZML snapshot is the architectural reference.  NML departs where
+Rust needs explicit ownership and where D-025 requires original upstream
+FlashAttention rather than ZML's hosted source fork.  Internal kernel types
+stay crate-private; the public surface remains `nml::attention` plus the
+existing tensor/cache operations.
+
+## 1. Backend contracts and capability policy
+
+- [x] Define one internal attention-backend decision with `Portable`,
+      `CudaTriton`, `CudaFlash2`, and `CudaFlash3` implementations; do not add
+      public per-kernel parameter or metadata families.
+- [x] Read CUDA compute capability from the PJRT device description and make
+      feature support explicit: upstream FA2 requires SM80+, FA3 requires
+      SM90, and the pinned XLA Triton backend decides its own supported CUDA
+      range.  An explicitly requested unsupported backend returns a hard,
+      diagnostic error; automatic selection may use the portable path required
+      by D-032.
+- [x] Keep all shape, dtype, head-ratio, causal/window, layout, page-table, and
+      alias validation above backend dispatch so every implementation receives
+      the same already-validated semantic contract.
+- [x] Record the important reference departure: ZML routes every non-SM90 CUDA
+      device to its hosted FA2 fork, while NML's original-upstream FA2 cannot
+      run on the local SM75 GTX 1660 Ti, and the pinned XLA compiler also
+      rejects Triton below SM80.  SM75 therefore validates the portable CUDA
+      fallback and capability diagnostics; Triton/FA2/FA3 need compatible
+      remote hardware.
+
+## 2. Pinned TTIR ownership and bindings
+
+- [x] Add the Triton dialect from the already pinned XLA dependency graph to
+      NML's MLIR C boundary.  Bind only dialect registration, pointer/tensor
+      descriptor types, and enum attributes actually needed by retained CUDA
+      kernels.
+- [x] Extend `nml-mlir` with safe context-bounded TTIR handles and generic
+      operation construction without exposing raw `Mlir*` objects or allowing
+      TTIR operations in the long-lived StableHLO program context.
+- [x] Create each kernel in an isolated non-threaded MLIR context, register the
+      `tt`, `arith`, `math`, `scf`, and `cf` dialects it needs, verify the
+      finished module, serialize deterministic textual TTIR, and destroy the
+      complete context before ordinary graph compilation continues.
+- [x] Add permanent contracts for pointer/type attributes, invalid ownership,
+      malformed operations, deterministic serialization, verification
+      failures, and repeated context creation/destruction.
+
+## 3. Private Rust Triton kernel substrate
+
+- [x] Implement crate-private `DType`, `Value`, named argument declarations,
+      and a builder covering the arithmetic, pointer, load/store, broadcast,
+      reduction, dot, range, program-id, and structured-control-flow operations
+      used by unified attention.  Dtypes are limited to NML's retained set.
+- [x] Implement typed kernel specifications with ordered named inputs and
+      outputs, explicit result shapes, output/operand aliases, three-dimensional
+      launch grids, warp/stage counts, and deterministic configuration errors.
+- [x] Lower a typed kernel invocation to `stablehlo.custom_call` target
+      `__gpu$xla.gpu.triton` with typed-FFI backend configuration, row-major
+      operand/result layouts, embedded verified TTIR, and validated aliases.
+- [x] Add permanent builder and custom-call contracts that exercise every
+      operation family used by attention, reject cross-context values, malformed
+      TTIR, and bad launch/alias contracts, verify and serialize the exact
+      TTIR-bearing StableHLO artifact, and compile the permanent CUDA contract
+      binary against the pinned PJRT plugin.
+- [ ] `DEFERRED` Run XLA's device-specific compilation of those exact TTIR
+      artifacts on SM80+ hardware. The test binary and its Triton source graph
+      must continue to build before the RunPod execution gate is scheduled.
+
+## 4. Unified Triton paged attention
+
+- [x] Port ZML's CUDA-relevant 2D unified paged-attention kernel, retaining
+      blockwise online softmax, causal and sliding-window masks, MHA/GQA/MQA
+      head mapping, arbitrary valid page tables, padded head dimensions, and
+      FP32 accumulation for FP16/BF16 inputs.
+- [x] Port the split-K 3D attention kernel and segment-reduction kernel with
+      explicit intermediate shapes and no logical-KV or full-score-matrix
+      materialization.
+- [x] Port the CUDA launch-selection policy (2D prefill and sufficiently large
+      decode; 3D split-K otherwise) without the excluded oneAPI specialization.
+      Configuration choices are deterministic functions of validated geometry
+      and CUDA device attributes.
+- [x] Integrate Triton as the preferred CUDA paged-attention implementation
+      while preserving the same cache storage, page table, update, rollback,
+      replay, and portable fallback contracts from Milestone 4.
+- [x] Compile the permanent numerical contract covering prefill, single-token
+      and multi-token decode, mixed sequence lengths, page boundaries, shared
+      and non-contiguous pages, sliding windows, MHA/GQA/MQA, repeated
+      execution, and both 2D and 3D launch paths. The same binary selects the
+      portable fallback on SM75 and the private optimized implementation from
+      the real device capability.
+- [ ] `DEFERRED` Execute that unchanged contract's Triton 2D and split-K paths
+      on rented SM80+ RunPod hardware.
+
+## 5. Original-upstream FlashAttention integration
+
+- [x] Pin an original Dao-AILab FlashAttention revision and its transitive
+      CUTLASS inputs by immutable digest.  Build only forward inference kernels
+      and supported FP16/BF16 head dimensions through Bazel; do not introduce
+      PyTorch, Python packaging, a prebuilt wheel, or ZML's hosted fork.
+- [x] Carry a small audited C ABI adapter as a local NML source file.  It owns
+      no tensors, accepts explicit dimensions/strides/stream, translates to
+      upstream FA2/FA3 parameter records, reports launch/configuration errors,
+      and contains no model or dispatch policy.
+- [x] Implement Rust-side typed XLA FFI handlers and process-lifetime
+      registration through the existing PJRT GPU custom-call extension.
+      Registration is idempotent per loaded plugin and handler code outlives
+      every executable that may call it.
+- [x] Lower ordinary dense attention to FA2 on SM80-SM89 and FA3 on
+      SM90, including causal/sliding-window behavior, GQA/MQA, workspace/result
+      aliases, and deterministic rejection of unsupported dtypes, head sizes,
+      layouts, or compute capabilities.
+- [x] Integrate upstream-supported paged prefill/decode variants only where
+      their semantics cover NML's page-table contract; configurations not
+      covered by upstream remain on Triton rather than acquiring a second cache
+      representation or unaudited downstream patch.
+- [x] Compile and link the unchanged numerical/lifecycle contract with the
+      original-upstream FA2 SM80 and FA3 SM90a products, including every dense
+      and supported paged shape selected by the future hardware runs.
+- [ ] `DEFERRED` Execute FA2 on rented SM80+ RunPod hardware and FA3 on rented
+      SM90 RunPod hardware. Remote compilation remains a required build
+      condition and is not recorded as runtime validation.
+
+## 6. Integrated product and failure contracts
+
+- [x] Keep one device-polymorphic numerical contract that compares portable
+      CPU, portable CUDA, Triton CUDA, and FlashAttention CUDA against
+      independent dense host math for every mutually supported retained dtype
+      and geometry with dtype-appropriate tolerances. CPU and SM75 branches
+      execute now; optimized branches compile now and execute under the D-038
+      deferred hardware gate.
+- [x] Prove in-place cache updates and declared output aliases preserve
+      unaffected pages, rollback/replay state, and repeated-execution behavior
+      without cache reallocation. Keep its I32 index geometry eligible for the
+      future Triton run instead of accidentally validating only the portable
+      fallback.
+- [x] Cover malformed TTIR/backend configuration, cross-context values,
+      duplicate registration, unsupported SM/dtype/head geometry, and
+      upstream adapter argument errors with stable failures. Registration
+      extension absence remains a hard platform-construction error; automatic
+      dispatch may use portable semantics, but no public or test-only backend
+      selector is introduced.
+- [ ] `DEFERRED` Exercise real FA2/FA3/Triton kernel-launch failures and verify
+      their propagated diagnostics on compatible RunPod hardware; a launch
+      failure cannot be manufactured honestly on the local unsupported GPU.
+- [x] Keep CPU and portable CUDA product contracts independent of external
+      FlashAttention packaging so unsupported hosts build and use NML without
+      loading a CUDA attention library. Keep the full distribution runtime and
+      the lighter system-driver runtime under separate package contracts.
+
+## Milestone 5 acceptance
+
+- [x] `rustfmt` passes for every changed Rust source.
+- [x] The authenticated `bb` coordinator executes `bb test
+      --config=buildbuddy --config=cpu //:cpu_contracts` with compile actions
+      distributed through BuildBuddy RBE.
+- [x] The authenticated `bb` coordinator executes `bb test
+      --config=buildbuddy --config=cuda //:cuda_remote_contracts` and builds
+      `//:cuda_contract_binaries` plus the exact FlashAttention/Triton product
+      artifacts without running them on a GPU-less executor.
+- [x] `//:cuda_package_contracts` proves the complete distributable runtime
+      contains the pinned driver-compatibility overlay while the local-device
+      runtime contains the same user-space closure and intentionally omits only
+      that overlay.
+- [x] The local SM75 device executes the portable CUDA runtime, linear,
+      nonlinear, ordinary-attention, and paged-attention contracts. Permanent
+      dispatch contracts prove Triton is excluded below SM80, while the local
+      adapter contract proves explicit FA2/FA3 requests fail before launch
+      with the expected capability diagnostics. Every device contract is an
+      exclusive Bazel test so independent XLA clients never contend for the
+      singleton physical GPU.
+- [ ] `DEFERRED` The unchanged attention contract executes Triton and FA2 on
+      rented SM80+ hardware and FA3 on rented SM90 hardware. These remain
+      explicit hardware-validation gates and are not prerequisites for closing
+      the implementation milestone under D-038.
+- [x] `git diff --check`
+- [x] Milestone 5 implementation is complete when every Triton/FlashAttention
+      product artifact and unchanged future hardware contract compiles through
+      the compact public API, and every hardware-independent numerical,
+      ownership, packaging, lifecycle, and failure gate passes. Real SM80/SM90
+      execution remains visibly deferred rather than being represented as
+      completed validation.
+
+## Deferred RunPod execution procedure
+
+Use the same committed revision and the same `attention_cuda_contract_test`
+binary on both machines; do not add a backend selector or a reduced hardware
+test. On an SM80-SM89 machine it exercises FA2 dense/paged attention plus
+Triton 2D and split-K through the F32/small-page cases. On an exact SM90
+machine it exercises FA3 dense/paged attention plus the same Triton paths.
+
+```text
+nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
+bb build --config=buildbuddy --config=cuda //:cuda_contract_binaries
+bb test --config=buildbuddy --config=cuda --cache_test_results=no \
+  //crates/nml:attention_cuda_contract_test
+```
+
+Record the RunPod GPU model, compute capability, driver, invocation link, and
+numerical result before checking the deferred SM80 or SM90 boxes. A successful
+remote build, an SM75 fallback run, or an adapter capability diagnostic does
+not satisfy either execution gate.
+
+---
+
 # Capability ledger
 
 This high-level ledger remains at the end of this file while detailed work is
@@ -607,13 +886,18 @@ themselves complete an item.
 
 - [x] ReLU, GELU, SiLU, sigmoid, and other activations.
 - [ ] Multiplication, subtraction, division, and the remaining elementwise
-      operation families.
+      operation families. Core arithmetic, ordering, absolute value, power,
+      remainder, clamp, floor, and ceil are complete; logical, bitwise, and
+      other retained ZML elementwise families remain.
 - [x] Reshape and transpose in compiled graphs.
-- [ ] Reductions, normalization, and softmax.
-- [ ] Gather/scatter and embedding lookup.
+- [x] Reductions, normalization, and softmax, including sum/min/max/mean,
+      log-sum-exp, argmax, RMSNorm, LayerNorm, and L2 normalization.
+- [ ] Gather/scatter and embedding lookup. Gather, gather-slices, and token
+      embedding are complete; general scatter remains.
 - [ ] Convolution and pooling.
 - [ ] Random-number generation.
-- [ ] Sorting, top-k, and sampling.
+- [ ] Sorting, top-k, and sampling. Argmax and compiled greedy selection are
+      complete; sorting, top-k, RNG, and stochastic sampling remain.
 - [x] Portable ordinary and blockwise paged attention, RoPE, and masks.
 - [x] Persistent KV-cache allocation, page-table updates, paging, truncation,
       rollback, and replay without a persistent dense KV copy.
