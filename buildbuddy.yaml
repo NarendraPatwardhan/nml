@@ -1,0 +1,40 @@
+# BuildBuddy's workflow runner is the Bazel coordinator, while compile and
+# link actions execute in the separately pinned RBE image from `.bazelrc`.
+# Keeping both environments on Ubuntu 20.04 gives native build tools one glibc
+# floor and prevents an action-cache hit from producing a helper that the
+# coordinator cannot execute.
+actions:
+  - name: "CPU contracts"
+    container_image: "ubuntu-20.04"
+    triggers:
+      push:
+        branches:
+          - "master"
+      pull_request:
+        branches:
+          - "*"
+    steps:
+      # The named suite is the product's CPU correctness and performance gate.
+      # `--config=buildbuddy` is part of the contract: it applies the pinned
+      # remote execution platform instead of sharing unqualified host outputs.
+      - run: "bazel test --config=buildbuddy --config=cpu //:cpu_contracts"
+
+  - name: "CUDA build contracts"
+    container_image: "ubuntu-20.04"
+    triggers:
+      push:
+        branches:
+          - "master"
+      pull_request:
+        branches:
+          - "*"
+    steps:
+      # Build the exact device-test executables into the remote cache, but do
+      # not pretend that a hosted runner without an NVIDIA device executed
+      # them. The developer or rented GPU host owns that separate gate.
+      - run: "bazel build --config=buildbuddy --config=cuda //:cuda_contract_binaries"
+
+      # These CUDA-configured contracts either execute without a GPU or verify
+      # the hermetic plugin/runtime product as files, so BuildBuddy is their
+      # truthful execution venue.
+      - run: "bazel test --config=buildbuddy --config=cuda //:cuda_remote_contracts //:cuda_package_contracts"
