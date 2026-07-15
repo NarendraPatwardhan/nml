@@ -292,10 +292,14 @@ impl Context {
         let raw = unsafe {
             match dtype {
                 DType::Bool => sys::mlirIntegerTypeGet(self.raw, 1),
-                DType::I8 | DType::U8 => sys::mlirIntegerTypeGet(self.raw, 8),
-                DType::I16 | DType::U16 => sys::mlirIntegerTypeGet(self.raw, 16),
-                DType::I32 | DType::U32 => sys::mlirIntegerTypeGet(self.raw, 32),
-                DType::I64 | DType::U64 => sys::mlirIntegerTypeGet(self.raw, 64),
+                DType::I8 => sys::mlirIntegerTypeGet(self.raw, 8),
+                DType::I16 => sys::mlirIntegerTypeGet(self.raw, 16),
+                DType::I32 => sys::mlirIntegerTypeGet(self.raw, 32),
+                DType::I64 => sys::mlirIntegerTypeGet(self.raw, 64),
+                DType::U8 => sys::mlirIntegerTypeUnsignedGet(self.raw, 8),
+                DType::U16 => sys::mlirIntegerTypeUnsignedGet(self.raw, 16),
+                DType::U32 => sys::mlirIntegerTypeUnsignedGet(self.raw, 32),
+                DType::U64 => sys::mlirIntegerTypeUnsignedGet(self.raw, 64),
                 DType::F16 => sys::mlirF16TypeGet(self.raw),
                 DType::Bf16 => sys::mlirBF16TypeGet(self.raw),
                 DType::F32 => sys::mlirF32TypeGet(self.raw),
@@ -403,6 +407,14 @@ impl Context {
     pub fn bool_attribute(&self, value: bool) -> Attribute<'_> {
         Attribute {
             raw: unsafe { sys::mlirBoolAttrGet(self.raw, i32::from(value)) },
+            context_id: self.context_id(),
+            _context: PhantomData,
+        }
+    }
+
+    fn unit_attribute(&self) -> Attribute<'_> {
+        Attribute {
+            raw: unsafe { sys::mlirUnitAttrGet(self.raw) },
             context_id: self.context_id(),
             _context: PhantomData,
         }
@@ -1032,6 +1044,39 @@ impl Context {
             .build()
     }
 
+    pub fn cholesky<'context>(
+        &'context self,
+        input: Value<'context>,
+        result_type: Type<'context>,
+        lower: bool,
+    ) -> Result<Operation<'context>, Error> {
+        Operation::builder(self, "stablehlo.cholesky")
+            .results(&[result_type])
+            .operands(&[input])
+            .attributes(&[self.named_attribute("lower", self.bool_attribute(lower))?])
+            .build()
+    }
+
+    pub fn triangular_solve<'context>(
+        &'context self,
+        coefficient: Value<'context>,
+        right_hand_side: Value<'context>,
+        result_type: Type<'context>,
+        lower: bool,
+    ) -> Result<Operation<'context>, Error> {
+        let transpose = self.parse_attribute("#stablehlo<transpose NO_TRANSPOSE>")?;
+        Operation::builder(self, "stablehlo.triangular_solve")
+            .results(&[result_type])
+            .operands(&[coefficient, right_hand_side])
+            .attributes(&[
+                self.named_attribute("left_side", self.bool_attribute(true))?,
+                self.named_attribute("lower", self.bool_attribute(lower))?,
+                self.named_attribute("unit_diagonal", self.bool_attribute(false))?,
+                self.named_attribute("transpose_a", transpose)?,
+            ])
+            .build()
+    }
+
     pub fn add<'context>(
         &'context self,
         left: Value<'context>,
@@ -1109,6 +1154,38 @@ impl Context {
         result_type: Type<'context>,
     ) -> Result<Operation<'context>, Error> {
         self.unary("stablehlo.convert", input, result_type)
+    }
+
+    pub fn bitcast_convert<'context>(
+        &'context self,
+        input: Value<'context>,
+        result_type: Type<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        self.unary("stablehlo.bitcast_convert", input, result_type)
+    }
+
+    pub fn reduce_precision<'context>(
+        &'context self,
+        input: Value<'context>,
+        result_type: Type<'context>,
+        exponent_bits: i32,
+        mantissa_bits: i32,
+    ) -> Result<Operation<'context>, Error> {
+        let i32_type = self.dtype(DType::I32)?;
+        Operation::builder(self, "stablehlo.reduce_precision")
+            .results(&[result_type])
+            .operands(&[input])
+            .attributes(&[
+                self.named_attribute(
+                    "exponent_bits",
+                    self.integer_attribute(i32_type, i64::from(exponent_bits))?,
+                )?,
+                self.named_attribute(
+                    "mantissa_bits",
+                    self.integer_attribute(i32_type, i64::from(mantissa_bits))?,
+                )?,
+            ])
+            .build()
     }
 
     pub fn reshape<'context>(
@@ -1193,6 +1270,59 @@ impl Context {
                 self.named_attribute("dimension", self.integer_attribute(i64_type, dimension)?)?
             ])
             .build()
+    }
+
+    pub fn pad<'context>(
+        &'context self,
+        input: Value<'context>,
+        padding_value: Value<'context>,
+        result_type: Type<'context>,
+        edge_low: &[i64],
+        edge_high: &[i64],
+        interior: &[i64],
+    ) -> Result<Operation<'context>, Error> {
+        Operation::builder(self, "stablehlo.pad")
+            .results(&[result_type])
+            .operands(&[input, padding_value])
+            .attributes(&[
+                self.named_attribute(
+                    "edge_padding_low",
+                    self.parse_attribute(&dense_i64_array(edge_low))?,
+                )?,
+                self.named_attribute(
+                    "edge_padding_high",
+                    self.parse_attribute(&dense_i64_array(edge_high))?,
+                )?,
+                self.named_attribute(
+                    "interior_padding",
+                    self.parse_attribute(&dense_i64_array(interior))?,
+                )?,
+            ])
+            .build()
+    }
+
+    pub fn reverse<'context>(
+        &'context self,
+        input: Value<'context>,
+        result_type: Type<'context>,
+        dimensions: &[i64],
+    ) -> Result<Operation<'context>, Error> {
+        Operation::builder(self, "stablehlo.reverse")
+            .results(&[result_type])
+            .operands(&[input])
+            .attributes(&[self.named_attribute(
+                "dimensions",
+                self.parse_attribute(&dense_i64_array(dimensions))?,
+            )?])
+            .build()
+    }
+
+    pub fn optimization_barrier<'context>(
+        &'context self,
+        input: Value<'context>,
+        result_type: Type<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        self.unary("stablehlo.optimization_barrier", input, result_type)
     }
 
     pub fn slice<'context>(
@@ -1299,6 +1429,55 @@ impl Context {
             .build()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn scatter<'context>(
+        &'context self,
+        input: Value<'context>,
+        indices: Value<'context>,
+        updates: Value<'context>,
+        result_type: Type<'context>,
+        update_window_dims: &[i64],
+        inserted_window_dims: &[i64],
+        input_batching_dims: &[i64],
+        scatter_indices_batching_dims: &[i64],
+        scatter_dims_to_operand_dims: &[i64],
+        index_vector_dim: i64,
+        indices_are_sorted: bool,
+        unique_indices: bool,
+        update_computation: Region<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        let dimensions = format!(
+            "#stablehlo.scatter<update_window_dims = {}, inserted_window_dims = {}, \
+             input_batching_dims = {}, scatter_indices_batching_dims = {}, \
+             scatter_dims_to_operand_dims = {}, index_vector_dim = {}>",
+            i64_array(update_window_dims),
+            i64_array(inserted_window_dims),
+            i64_array(input_batching_dims),
+            i64_array(scatter_indices_batching_dims),
+            i64_array(scatter_dims_to_operand_dims),
+            index_vector_dim,
+        );
+        Operation::builder(self, "stablehlo.scatter")
+            .results(&[result_type])
+            .operands(&[input, indices, updates])
+            .region(update_computation)
+            .attributes(&[
+                self.named_attribute(
+                    "scatter_dimension_numbers",
+                    self.parse_attribute(&dimensions)?,
+                )?,
+                self.named_attribute(
+                    "indices_are_sorted",
+                    self.parse_attribute(if indices_are_sorted { "true" } else { "false" })?,
+                )?,
+                self.named_attribute(
+                    "unique_indices",
+                    self.parse_attribute(if unique_indices { "true" } else { "false" })?,
+                )?,
+            ])
+            .build()
+    }
+
     pub fn reduce<'context>(
         &'context self,
         input: Value<'context>,
@@ -1345,6 +1524,306 @@ impl Context {
             .build()
     }
 
+    pub fn reduce_window<'context>(
+        &'context self,
+        input: Value<'context>,
+        init: Value<'context>,
+        result_type: Type<'context>,
+        window_dimensions: &[i64],
+        window_strides: &[i64],
+        base_dilations: &[i64],
+        window_dilations: &[i64],
+        padding: &[[i64; 2]],
+        body: Region<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        let rank = window_dimensions.len();
+        if rank == 0
+            || window_strides.len() != rank
+            || base_dilations.len() != rank
+            || window_dilations.len() != rank
+            || padding.len() != rank
+        {
+            return Err(Error::InvalidOperation {
+                source: "stablehlo.reduce_window attributes must have one entry per input axis"
+                    .to_owned(),
+            });
+        }
+        validate_control_region(
+            "stablehlo.reduce_window reducer",
+            &body,
+            &[init.type_(), init.type_()],
+        )?;
+        Operation::builder(self, "stablehlo.reduce_window")
+            .results(&[result_type])
+            .operands(&[input, init])
+            .attributes(&[
+                self.named_attribute(
+                    "window_dimensions",
+                    self.parse_attribute(&dense_i64_array(window_dimensions))?,
+                )?,
+                self.named_attribute(
+                    "window_strides",
+                    self.parse_attribute(&dense_i64_array(window_strides))?,
+                )?,
+                self.named_attribute(
+                    "base_dilations",
+                    self.parse_attribute(&dense_i64_array(base_dilations))?,
+                )?,
+                self.named_attribute(
+                    "window_dilations",
+                    self.parse_attribute(&dense_i64_array(window_dilations))?,
+                )?,
+                self.named_attribute("padding", self.parse_attribute(&dense_i64_pairs(padding))?)?,
+            ])
+            .region(body)
+            .build()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn convolution<'context>(
+        &'context self,
+        lhs: Value<'context>,
+        rhs: Value<'context>,
+        result_type: Type<'context>,
+        window: ConvolutionWindow<'_>,
+        dimensions: ConvolutionDimensionNumbers<'_>,
+        feature_group_count: i64,
+        batch_group_count: i64,
+    ) -> Result<Operation<'context>, Error> {
+        let spatial_rank = window.strides.len();
+        if spatial_rank == 0
+            || window.padding.len() != spatial_rank
+            || window.lhs_dilation.len() != spatial_rank
+            || window.rhs_dilation.len() != spatial_rank
+            || window.reversal.len() != spatial_rank
+            || dimensions.input_spatial.len() != spatial_rank
+            || dimensions.kernel_spatial.len() != spatial_rank
+            || dimensions.output_spatial.len() != spatial_rank
+            || feature_group_count <= 0
+            || batch_group_count <= 0
+        {
+            return Err(Error::InvalidOperation {
+                source: "stablehlo.convolution has inconsistent spatial attributes or group counts"
+                    .to_owned(),
+            });
+        }
+        let dimension_numbers = Attribute {
+            raw: unsafe {
+                sys::stablehloConvDimensionNumbersGet(
+                    self.raw,
+                    dimensions.input_batch,
+                    dimensions.input_feature,
+                    dimensions.input_spatial.len() as isize,
+                    dimensions.input_spatial.as_ptr(),
+                    dimensions.kernel_input_feature,
+                    dimensions.kernel_output_feature,
+                    dimensions.kernel_spatial.len() as isize,
+                    dimensions.kernel_spatial.as_ptr(),
+                    dimensions.output_batch,
+                    dimensions.output_feature,
+                    dimensions.output_spatial.len() as isize,
+                    dimensions.output_spatial.as_ptr(),
+                )
+            },
+            context_id: self.context_id(),
+            _context: PhantomData,
+        };
+        let default_precision = Attribute {
+            raw: unsafe { sys::stablehloPrecisionAttrGet(self.raw, string_ref(b"DEFAULT")) },
+            context_id: self.context_id(),
+            _context: PhantomData,
+        };
+        let precision_config = self.array_attribute(&[default_precision, default_precision])?;
+        Operation::builder(self, "stablehlo.convolution")
+            .results(&[result_type])
+            .operands(&[lhs, rhs])
+            .attributes(&[
+                self.named_attribute(
+                    "window_strides",
+                    self.parse_attribute(&dense_i64_array(window.strides))?,
+                )?,
+                self.named_attribute(
+                    "padding",
+                    self.parse_attribute(&dense_i64_pairs(window.padding))?,
+                )?,
+                self.named_attribute(
+                    "lhs_dilation",
+                    self.parse_attribute(&dense_i64_array(window.lhs_dilation))?,
+                )?,
+                self.named_attribute(
+                    "rhs_dilation",
+                    self.parse_attribute(&dense_i64_array(window.rhs_dilation))?,
+                )?,
+                self.named_attribute(
+                    "window_reversal",
+                    self.parse_attribute(&dense_bool_array(window.reversal))?,
+                )?,
+                self.named_attribute("dimension_numbers", dimension_numbers)?,
+                self.named_attribute(
+                    "feature_group_count",
+                    self.parse_attribute(&format!("{} : i64", feature_group_count))?,
+                )?,
+                self.named_attribute(
+                    "batch_group_count",
+                    self.parse_attribute(&format!("{} : i64", batch_group_count))?,
+                )?,
+                self.named_attribute("precision_config", precision_config)?,
+            ])
+            .build()
+    }
+
+    pub fn sort<'context>(
+        &'context self,
+        inputs: &[Value<'context>],
+        result_types: &[Type<'context>],
+        dimension: i64,
+        is_stable: bool,
+        comparator: Region<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        if inputs.is_empty() || inputs.len() != result_types.len() {
+            return Err(Error::InvalidOperation {
+                source: "stablehlo.sort requires equal nonzero input and result counts".to_owned(),
+            });
+        }
+        let element_types = result_types
+            .iter()
+            .map(|type_| type_.ranked_tensor_scalar_type())
+            .collect::<Result<Vec<_>, _>>()?;
+        let comparator_arguments = element_types
+            .iter()
+            .flat_map(|type_| [*type_, *type_])
+            .collect::<Vec<_>>();
+        validate_control_region(
+            "stablehlo.sort comparator",
+            &comparator,
+            &comparator_arguments,
+        )?;
+        Operation::builder(self, "stablehlo.sort")
+            .results(result_types)
+            .operands(inputs)
+            .attributes(&[
+                self.named_attribute(
+                    "dimension",
+                    self.parse_attribute(&format!("{dimension} : i64"))?,
+                )?,
+                self.named_attribute("is_stable", self.bool_attribute(is_stable))?,
+            ])
+            .region(comparator)
+            .build()
+    }
+
+    pub fn all_reduce<'context>(
+        &'context self,
+        input: Value<'context>,
+        result_type: Type<'context>,
+        replica_groups: &[Vec<i64>],
+        channel_handle: i64,
+        reducer: Region<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        let group_size = replica_groups.first().map(Vec::len).unwrap_or(0);
+        if replica_groups.is_empty()
+            || group_size == 0
+            || replica_groups.iter().any(|group| group.len() != group_size)
+            || replica_groups.iter().flatten().any(|id| *id < 0)
+            || replica_groups
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<HashSet<_>>()
+                .len()
+                != replica_groups.len() * group_size
+            || channel_handle < 0
+        {
+            return Err(Error::InvalidOperation {
+                source: "stablehlo.all_reduce requires unique non-negative device ids and channel"
+                    .to_owned(),
+            });
+        }
+        if input.type_() != result_type {
+            return Err(Error::InvalidOperation {
+                source: "stablehlo.all_reduce must preserve its input type".to_owned(),
+            });
+        }
+        let scalar_type = result_type.ranked_tensor_scalar_type()?;
+        validate_control_region(
+            "stablehlo.all_reduce reducer",
+            &reducer,
+            &[scalar_type, scalar_type],
+        )?;
+        let devices = replica_groups
+            .iter()
+            .map(|group| {
+                format!(
+                    "[{}]",
+                    group
+                        .iter()
+                        .map(i64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let replica_groups = self.parse_attribute(&format!(
+            "dense<[{devices}]> : tensor<{}x{}xi64>",
+            replica_groups.len(),
+            group_size
+        ))?;
+        let channel = Attribute {
+            raw: unsafe { sys::stablehloChannelHandleGet(self.raw, channel_handle, 0) },
+            context_id: self.context_id(),
+            _context: PhantomData,
+        };
+        Operation::builder(self, "stablehlo.all_reduce")
+            .results(&[result_type])
+            .operands(&[input])
+            .attributes(&[
+                self.named_attribute("replica_groups", replica_groups)?,
+                self.named_attribute("channel_handle", channel)?,
+                self.named_attribute("use_global_device_ids", self.unit_attribute())?,
+            ])
+            .region(reducer)
+            .build()
+    }
+
+    pub fn partition_id<'context>(
+        &'context self,
+        result_type: Type<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        if result_type.text() != "tensor<ui32>" {
+            return Err(Error::InvalidOperation {
+                source: "stablehlo.partition_id requires a scalar U32 result".to_owned(),
+            });
+        }
+        Operation::builder(self, "stablehlo.partition_id")
+            .results(&[result_type])
+            .build()
+    }
+
+    pub fn rng_bit_generator<'context>(
+        &'context self,
+        state: Value<'context>,
+        state_type: Type<'context>,
+        output_type: Type<'context>,
+    ) -> Result<Operation<'context>, Error> {
+        if state.type_() != state_type {
+            return Err(Error::InvalidOperation {
+                source: "stablehlo.rng_bit_generator state result must preserve its input type"
+                    .to_owned(),
+            });
+        }
+        let algorithm = Attribute {
+            raw: unsafe { sys::stablehloRngAlgorithmAttrGet(self.raw, string_ref(b"DEFAULT")) },
+            context_id: self.context_id(),
+            _context: PhantomData,
+        };
+        Operation::builder(self, "stablehlo.rng_bit_generator")
+            .results(&[state_type, output_type])
+            .operands(&[state])
+            .attributes(&[self.named_attribute("rng_algorithm", algorithm)?])
+            .build()
+    }
+
     pub fn stablehlo_return<'context>(
         &'context self,
         values: &[Value<'context>],
@@ -1361,6 +1840,36 @@ impl Context {
         condition: Region<'context>,
         body: Region<'context>,
     ) -> Result<Operation<'context>, Error> {
+        if initial.is_empty() || initial.len() != result_types.len() {
+            return Err(Error::InvalidOperation {
+                source: format!(
+                    "stablehlo.while requires equal nonzero initial and result counts; got {} and {}",
+                    initial.len(),
+                    result_types.len()
+                ),
+            });
+        }
+        self.require_contexts(
+            initial.iter().map(|value| value.context_id),
+            "stablehlo.while initial value",
+        )?;
+        self.require_contexts(
+            result_types.iter().map(|type_| type_.context_id),
+            "stablehlo.while result type",
+        )?;
+        for (index, (value, result_type)) in initial.iter().zip(result_types).enumerate() {
+            if value.type_() != *result_type {
+                return Err(Error::InvalidOperation {
+                    source: format!(
+                        "stablehlo.while state {index} changes type from {} to {}",
+                        value.type_().text(),
+                        result_type.text()
+                    ),
+                });
+            }
+        }
+        validate_control_region("stablehlo.while condition", &condition, result_types)?;
+        validate_control_region("stablehlo.while body", &body, result_types)?;
         Operation::builder(self, "stablehlo.while")
             .results(result_types)
             .operands(initial)
@@ -1379,6 +1888,22 @@ impl Context {
             return Err(Error::InvalidOperation {
                 source: "stablehlo.case requires at least one branch".to_owned(),
             });
+        }
+        self.require_context(branch_index.context_id, "stablehlo.case branch index")?;
+        self.require_contexts(
+            result_types.iter().map(|type_| type_.context_id),
+            "stablehlo.case result type",
+        )?;
+        if branch_index.type_().text() != "tensor<i32>" {
+            return Err(Error::InvalidOperation {
+                source: format!(
+                    "stablehlo.case branch index must be tensor<i32>, got {}",
+                    branch_index.type_().text()
+                ),
+            });
+        }
+        for branch in &branches {
+            validate_control_region("stablehlo.case branch", branch, &[])?;
         }
         let mut builder = Operation::builder(self, "stablehlo.case")
             .results(result_types)
@@ -1740,6 +2265,10 @@ pub enum StableHloBinary {
     Remainder,
     And,
     Or,
+    Xor,
+    ShiftLeft,
+    ShiftRightArithmetic,
+    ShiftRightLogical,
 }
 
 impl StableHloBinary {
@@ -1754,6 +2283,10 @@ impl StableHloBinary {
             Self::Remainder => "stablehlo.remainder",
             Self::And => "stablehlo.and",
             Self::Or => "stablehlo.or",
+            Self::Xor => "stablehlo.xor",
+            Self::ShiftLeft => "stablehlo.shift_left",
+            Self::ShiftRightArithmetic => "stablehlo.shift_right_arithmetic",
+            Self::ShiftRightLogical => "stablehlo.shift_right_logical",
         }
     }
 }
@@ -1772,6 +2305,14 @@ pub enum StableHloUnary {
     Logistic,
     Floor,
     Ceil,
+    Not,
+    CountLeadingZeros,
+    IsFinite,
+    PopulationCount,
+    Sign,
+    ExponentialMinusOne,
+    RoundNearestAwayFromZero,
+    RoundNearestEven,
 }
 
 impl StableHloUnary {
@@ -1789,6 +2330,14 @@ impl StableHloUnary {
             Self::Logistic => "stablehlo.logistic",
             Self::Floor => "stablehlo.floor",
             Self::Ceil => "stablehlo.ceil",
+            Self::Not => "stablehlo.not",
+            Self::CountLeadingZeros => "stablehlo.count_leading_zeros",
+            Self::IsFinite => "stablehlo.is_finite",
+            Self::PopulationCount => "stablehlo.popcnt",
+            Self::Sign => "stablehlo.sign",
+            Self::ExponentialMinusOne => "stablehlo.exponential_minus_one",
+            Self::RoundNearestAwayFromZero => "stablehlo.round_nearest_afz",
+            Self::RoundNearestEven => "stablehlo.round_nearest_even",
         }
     }
 }
@@ -1821,6 +2370,29 @@ pub enum StableHloComparisonType {
     Float,
     Signed,
     Unsigned,
+}
+
+/// Internal StableHLO convolution layout. The graph frontend validates these
+/// axes against NML shapes before this low-level representation is constructed.
+pub struct ConvolutionDimensionNumbers<'a> {
+    pub input_batch: i64,
+    pub input_feature: i64,
+    pub input_spatial: &'a [i64],
+    pub kernel_input_feature: i64,
+    pub kernel_output_feature: i64,
+    pub kernel_spatial: &'a [i64],
+    pub output_batch: i64,
+    pub output_feature: i64,
+    pub output_spatial: &'a [i64],
+}
+
+/// Internal StableHLO convolution window attributes.
+pub struct ConvolutionWindow<'a> {
+    pub strides: &'a [i64],
+    pub padding: &'a [[i64; 2]],
+    pub lhs_dilation: &'a [i64],
+    pub rhs_dilation: &'a [i64],
+    pub reversal: &'a [bool],
 }
 
 impl StableHloComparisonType {
@@ -1993,8 +2565,52 @@ impl Drop for PassManager<'_> {
 /// An MLIR region owned by Rust until it is transferred into an operation.
 pub struct Region<'context> {
     raw: Option<sys::MlirRegion>,
+    block_count: usize,
+    entry_argument_types: Option<Vec<Type<'context>>>,
     context_id: usize,
     _context: PhantomData<&'context Context>,
+}
+
+fn validate_control_region(
+    name: &'static str,
+    region: &Region<'_>,
+    expected_arguments: &[Type<'_>],
+) -> Result<(), Error> {
+    if region.block_count != 1 {
+        return Err(Error::InvalidOperation {
+            source: format!(
+                "{name} requires exactly one block, got {}",
+                region.block_count
+            ),
+        });
+    }
+    let actual_arguments = region
+        .entry_argument_types
+        .as_deref()
+        .expect("a nonempty region records its entry block arguments");
+    if actual_arguments.len() != expected_arguments.len()
+        || actual_arguments
+            .iter()
+            .zip(expected_arguments)
+            .any(|(actual, expected)| actual != expected)
+    {
+        return Err(Error::InvalidOperation {
+            source: format!(
+                "{name} entry arguments must match the loop state; got [{}], expected [{}]",
+                actual_arguments
+                    .iter()
+                    .map(|type_| type_.text())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                expected_arguments
+                    .iter()
+                    .map(|type_| type_.text())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        });
+    }
+    Ok(())
 }
 
 impl<'context> Region<'context> {
@@ -2005,6 +2621,8 @@ impl<'context> Region<'context> {
         } else {
             Ok(Self {
                 raw: Some(raw),
+                block_count: 0,
+                entry_argument_types: None,
                 context_id: _context.context_id(),
                 _context: PhantomData,
             })
@@ -2017,6 +2635,10 @@ impl<'context> Region<'context> {
                 object: "region block",
             });
         }
+        if self.block_count == 0 {
+            self.entry_argument_types = Some(block.argument_types.clone());
+        }
+        self.block_count += 1;
         unsafe {
             sys::mlirRegionAppendOwnedBlock(
                 self.raw.expect("region ownership was transferred"),
@@ -2043,6 +2665,7 @@ impl Drop for Region<'_> {
 pub struct Block<'context> {
     raw: Option<sys::MlirBlock>,
     argument_count: usize,
+    argument_types: Vec<Type<'context>>,
     context_id: usize,
     _context: PhantomData<&'context Context>,
 }
@@ -2068,6 +2691,7 @@ impl<'context> Block<'context> {
             Ok(Self {
                 raw: Some(raw),
                 argument_count: arguments.len(),
+                argument_types: arguments.to_vec(),
                 context_id: context.context_id(),
                 _context: PhantomData,
             })
@@ -2359,6 +2983,14 @@ pub struct Type<'context> {
     _context: PhantomData<&'context Context>,
 }
 
+impl PartialEq for Type<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        unsafe { sys::mlirTypeEqual(self.raw, other.raw) }
+    }
+}
+
+impl Eq for Type<'_> {}
+
 impl Type<'_> {
     pub fn text(self) -> String {
         let mut bytes = Vec::new();
@@ -2378,6 +3010,29 @@ impl Type<'_> {
 
     pub fn is_triton_tensor_descriptor(self) -> bool {
         unsafe { sys::nml_mlir_type_is_triton_tensor_descriptor(self.raw) }
+    }
+
+    fn ranked_tensor_scalar_type(self) -> Result<Self, Error> {
+        if !unsafe { sys::mlirTypeIsARankedTensor(self.raw) } {
+            return Err(Error::InvalidOperation {
+                source: "operation requires a ranked tensor result type".to_owned(),
+            });
+        }
+        let element = unsafe { sys::mlirShapedTypeGetElementType(self.raw) };
+        Ok(Self {
+            raw: unsafe {
+                sys::mlirRankedTensorTypeGet(
+                    0,
+                    ptr::null(),
+                    element,
+                    sys::MlirAttribute {
+                        ptr: ptr::null_mut(),
+                    },
+                )
+            },
+            context_id: self.context_id,
+            _context: PhantomData,
+        })
     }
 }
 
@@ -2457,6 +3112,30 @@ fn dense_i64_array(values: &[i64]) -> String {
     } else {
         format!("array<i64: {}>", comma_separated_i64(values))
     }
+}
+
+fn dense_bool_array(values: &[bool]) -> String {
+    if values.is_empty() {
+        "array<i1>".to_owned()
+    } else {
+        format!(
+            "array<i1: {}>",
+            values
+                .iter()
+                .map(bool::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+fn dense_i64_pairs(values: &[[i64; 2]]) -> String {
+    let rows = values
+        .iter()
+        .map(|[low, high]| format!("[{low}, {high}]"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("dense<[{rows}]> : tensor<{}x2xi64>", values.len())
 }
 
 fn comma_separated_i64(values: &[i64]) -> String {

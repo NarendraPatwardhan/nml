@@ -19,6 +19,7 @@
 #include <mlir-c/Transforms.h>
 #include <stablehlo/integrations/c/StablehloDialect.h>
 #include <stablehlo/integrations/c/StablehloDialectApi.h>
+#include <stablehlo/integrations/c/StablehloAttributes.h>
 
 // Triton is part of the XLA-pinned dependency graph.  Its project does not
 // publish a complete C API, so NML owns a deliberately narrow bridge rather

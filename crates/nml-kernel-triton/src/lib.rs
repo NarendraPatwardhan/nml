@@ -13,10 +13,12 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod moe;
 mod paged_attention;
 mod specification;
 mod unified_attention;
 
+pub use moe::{build_grouped_projection, GatedActivation, GroupedProjectionConfig};
 pub use paged_attention::{select_attention_launch, AttentionGeometry, AttentionLaunch};
 pub use specification::{KernelLaunch, KernelSpec, OutputAlias, TensorSpec};
 pub use unified_attention::{
@@ -798,6 +800,10 @@ impl Builder {
         self.float_unary("sqrt", value)
     }
 
+    pub fn tanh(&mut self, value: &Value) -> Result<Value, Error> {
+        self.float_unary("tanh", value)
+    }
+
     pub fn reduce(
         &mut self,
         reduction: Reduction,
@@ -1063,6 +1069,32 @@ impl Builder {
     pub fn full_float(&mut self, shape: &[i64], value: f64, dtype: DType) -> Result<Value, Error> {
         let scalar = self.float(value, dtype)?;
         self.splat(&scalar, shape)
+    }
+
+    pub fn full_float_like(&mut self, value: &Value, fill: f64) -> Result<Value, Error> {
+        self.require_values(&[value])?;
+        let dtype = value.value_type.element();
+        if !dtype.is_float() {
+            return Err(Error::TypeMismatch {
+                operation: "floating fill",
+            });
+        }
+        let scalar = self.float(fill, dtype)?;
+        match &value.value_type {
+            ValueType::Scalar(_) => Ok(scalar),
+            ValueType::Tensor {
+                shape,
+                pointer_address_space: None,
+                ..
+            } => self.splat(&scalar, shape),
+            ValueType::Pointer { .. }
+            | ValueType::Tensor {
+                pointer_address_space: Some(_),
+                ..
+            } => Err(Error::TypeMismatch {
+                operation: "floating fill",
+            }),
+        }
     }
 
     pub fn full_integer(

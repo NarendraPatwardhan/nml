@@ -165,6 +165,48 @@ nml_rust_test(
     ],
 )
 
+nml_rust_test(
+    name = "execution_performance_cpu_contract_test",
+    size = "large",
+    srcs = ["tests/execution_performance_contract.rs"],
+    crate_root = "tests/execution_performance_contract.rs",
+    env = {"RUST_TEST_NOCAPTURE": "1"},
+    rustc_env = {"NML_PERFORMANCE_BACKEND": "cpu"},
+    deps = [
+        ":nml",
+        "//crates/nml-ir:nml_ir",
+        "//crates/nml-types:nml_types",
+    ],
+)
+
+nml_rust_test(
+    name = "execution_performance_cuda_contract_test",
+    size = "large",
+    srcs = ["tests/execution_performance_contract.rs"],
+    crate_root = "tests/execution_performance_contract.rs",
+    local = True,
+    rustc_env = {"NML_PERFORMANCE_BACKEND": "cuda"},
+    tags = [
+        "external",
+        "exclusive",
+        "requires-gpu",
+    ],
+    data = ["//platforms/cuda:runtime_system_driver"],
+    env = {
+        "NML_CUDA_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime_system_driver)",
+        "RUST_TEST_NOCAPTURE": "1",
+    },
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": ["@platforms//os:linux"],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":nml",
+        "//crates/nml-ir:nml_ir",
+        "//crates/nml-types:nml_types",
+    ],
+)
+
 # As with the low-level runtime contract, this output-only edge lets a remote
 # builder cache the exact test binary while leaving CUDA runtime assembly to
 # the host that will execute it.
@@ -185,6 +227,13 @@ filegroup(
 filegroup(
     name = "neural_ops_cuda_contract_binary",
     srcs = [":neural_ops_cuda_contract_test"],
+    testonly = True,
+    visibility = ["//:__pkg__"],
+)
+
+filegroup(
+    name = "execution_performance_cuda_contract_binary",
+    srcs = [":execution_performance_cuda_contract_test"],
     testonly = True,
     visibility = ["//:__pkg__"],
 )

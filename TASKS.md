@@ -596,7 +596,7 @@ regions, loop state, page traversal, and backend dispatch remain internal.
 
 ---
 
-# Pre-Milestone 5: model-enabling parity closure
+# Pre-Milestone 5: model-enabling capability closure
 
 This bounded slice closes the inexpensive ZML capabilities that are already
 natural compositions of NML's typed StableHLO substrate. It does not introduce
@@ -658,7 +658,7 @@ code.
 - [x] `git diff --check`
 - [x] The capability ledger is updated only for complete product families; a
       new operation does not overstate convolution, stochastic sampling,
-      general scatter, or other unfinished ZML parity work.
+      general scatter, or other unfinished substrate work.
 
 ---
 
@@ -874,6 +874,228 @@ not satisfy either execution gate.
 
 ---
 
+# Milestone 6: CPU/CUDA acceleration substrate closure
+
+This milestone closes the general acceleration substrate selected for NML's
+CPU/CUDA products before new quantization work begins. The pinned ZML snapshot
+is read as a rich capability and design reference; it is neither an exact
+specification nor any kind of Bazel input. An NML operation may be a primitive,
+a checked composite, or a private backend specialization, and it may deliberately
+improve on or replace the reference architecture.
+
+The order below is deliberate. It closes the general graph language before
+building higher-level convolution, sampling, distributed, and MoE families on
+top. The capability audit prevents accidental omissions, but NML's recorded
+requirements decide what is selected. Compilation alone does not satisfy a
+numerical or performance obligation for selected capabilities.
+
+## 1. NML capability selection and reference audit
+
+- [x] Maintain one NML-owned capability map organized by product behavior:
+      elementwise, structural, indexing, reduction/window, linear algebra,
+      convolution/spatial, ordering/random/sampling, attention,
+      recurrent/state-space, MoE, distribution, and runtime ownership. The map
+      begins with NML requirements; it is not generated from ZML's API.
+- [x] Use the pinned ZML source only as a read-only audit reference to catch
+      useful ideas or accidental omissions. Record a reference location only
+      where it explains a design decision; never import ZML targets, files,
+      forks, target names, or a one-for-one operation inventory into NML's
+      Bazel graph or acceptance contract.
+- [x] Record NML's selected semantics, supported dtypes and devices, dispatch,
+      alias/workspace ownership, and verification evidence for each selected
+      family. Improvements and broader NML behavior are first-class outcomes,
+      not parity deviations.
+- [x] Give unselected ideas an explicit NML rationale only when they are
+      relevant enough to risk future confusion: deferred or out of scope. NML
+      does not owe every leaf in the reference tree a corresponding entry.
+
+## 2. Primitive, structural, and linear-algebra closure
+
+- [x] Implement boolean/integer AND, OR, XOR, and NOT as typed StableHLO
+      operations without introducing a public operation enum. Preserve scalar
+      broadcasting, axis tags, partitions, dtype rejection, and CPU/CUDA
+      numerical behavior.
+- [x] Implement the retained bit-manipulation and numerical-classification
+      family: bitcast, shifts, leading-zero/population count, finite checks,
+      sign, `expm1`, rounding modes, and reduce-precision semantics. Classify
+      any dtype-specific reference behavior excluded by D-003 explicitly.
+- [x] Complete structural tensor construction and movement: pad, reverse,
+      stack, repeat/stutter, squeeze/axis insertion, split/chunk, outer product,
+      diagonal/triangular construction, rolling, Cartesian products, and
+      optimization barriers. These must retain NML's tag, partition, and
+      physical-layout invariants rather than becoming shape-only helpers.
+- [x] Add the retained higher linear-algebra operations, including triangular
+      solve and Cholesky, with explicit shape/dtype validation and independent
+      host references on CPU and CUDA.
+
+## 3. General indexing, mutation, and control-flow closure
+
+- [x] Generalize gather to the retained multi-axis/batching/offset forms and
+      implement StableHLO scatter with explicit update-computation semantics,
+      sorted/unique promises, out-of-bounds behavior, and tag/partition
+      preservation.
+- [x] Cover slice, dynamic-slice, dynamic-update, gather, and scatter together
+      across scalar and tensor indices, empty updates, repeated indices,
+      negative/out-of-range indices, donation, and repeated execution.
+- [x] Complete reusable StableHLO control-flow ownership needed by retained
+      composites, including multi-value `while` state and any conditional form
+      not already covered by attention. Loop-carried shapes and shardings must
+      be invariant and validated before MLIR construction.
+
+## 4. Windowed reductions, convolution, pooling, and spatial transforms
+
+- [x] Add a typed reduce-window substrate with window dimensions, strides,
+      base/window dilation, padding, and a constrained set of reducer
+      computations. Use it for cumulative sum and pooling where that matches
+      the reference semantics.
+- [x] Implement retained 1D/2D convolution with explicit batch, feature, and
+      spatial dimension numbers; grouped and depthwise forms; stride,
+      dilation, and padding; and FP16/BF16/FP32 accumulation contracts.
+- [x] Implement max-pooling and the retained nearest/linear/bilinear/cubic
+      resize and upsample families as typed composites or StableHLO operations.
+      Coordinate transformation and edge behavior are part of the contract.
+- [x] Establish correctness and performance cases representative of language,
+      vision, and audio workloads on both CPU and CUDA rather than validating
+      only tiny parser examples. The permanent performance contract covers a
+      nonlinear language projection, 1D audio convolution/pooling, and 2D
+      vision convolution/pooling with phase-separated measurements.
+
+## 5. Ordering, random generation, and sampling
+
+- [x] Implement stable and unstable sort over values and associated indices,
+      with an NML-defined total ordering for NaNs and deterministic
+      tie-breaking rules.
+- [x] Build argsort and top-k on the shared sort substrate, including dynamic
+      and bounded-k validation without introducing backend-specific public
+      result types.
+- [x] Implement explicit-state StableHLO random-bit generation and deterministic
+      state threading, then uniform, normal, and Gumbel distributions. Reusing
+      a consumed state must be difficult through the ordinary execution API.
+- [x] Implement greedy, temperature, top-k, top-p, min-p, and combined dynamic
+      token sampling with permanent distribution, determinism, invalid-option,
+      and repeated-state contracts on CPU and CUDA.
+
+## 6. Shardy execution, collectives, and distributed ownership
+
+- [x] Extend the existing Shardy metadata path to real multi-device placement,
+      host-to-local-shard loading, result assembly, and stable device assignment.
+      Real four-device CPU meshes and the local CUDA device use the same
+      ownership path. GSPMD remains excluded by D-029.
+- [x] Implement all-reduce and the retained collective semantics through
+      Shardy-aware graph construction, including replica groups, reduction
+      dtypes, channel ownership, repeated execution, and hard topology errors.
+- [x] Implement manual-computation regions needed by expert parallelism without
+      exposing raw MLIR regions publicly. Global-to-local shapes and shardings
+      are derived only for the manually owned mesh axis and checked at the Rust
+      boundary, preserving independent automatic data-parallel axes.
+- [x] Run real four-device CPU numerical and failure contracts for tiled
+      contractions, explicit collectives, host shard loading/result assembly,
+      and expert-sharded MoE. A one-device mesh or emitted Shardy attribute is
+      not treated as distributed execution evidence.
+- [ ] `DEFERRED` Run the same multi-device ownership and collective contracts on
+      a rented multi-GPU CUDA host. The developer machine has one SM75 device;
+      neither remote compilation nor repeating a value on that device is
+      multi-GPU evidence.
+
+## 7. MoE routing and grouped expert execution
+
+- [x] Implement an independent portable MoE product path: top-k routing,
+      stable token-to-expert grouping, capacity/padding rules, gate/up
+      projection, activation, down projection, router weighting, and output
+      combination.
+- [x] Implement private Rust/Triton grouped expert GEMMs while retaining routing,
+      stable assignment sorting, and block alignment in shared StableHLO. This
+      deliberately reduces the reference kernel surface: CUDA specializes only
+      the projections, launch configuration remains privately owned, and no
+      ZML-hosted source fork enters the build. The K-tile body is one `scf.for`
+      region rather than a model-width-dependent static expansion.
+- [x] Integrate expert sharding through Shardy manual computation and
+      all-reduce. Local expert IDs, empty experts, repeated token assignments,
+      and nonuniform loads have explicit numerical and ownership contracts.
+- [x] Cover the selected optimized BF16/FP16/FP32 MoE capability honestly. The
+      pinned kernel's advertised but rejected FP8/INT8/INT4 modes do not become
+      NML claims and do not pre-empt the deferred NML quantization recipes. All
+      three ordinary dtypes and SiLU/GELU/ReLU gates build verified TTIR and
+      typed SM80 custom calls; CPU and SM75 execute the portable path.
+- [x] Establish CPU and local-SM75 CUDA correctness plus representative
+      routing/GEMM performance gates with compilation and transfer separated
+      from steady execution.
+- [ ] `DEFERRED` Execute the unchanged grouped Triton kernels and hybrid
+      data/expert Shardy region on rented SM80/SM90 multi-GPU hardware. The
+      local SM75 correctly rejects Triton execution and remains accelerated by
+      the XLA CUDA portable graph.
+
+## 8. Remaining neural, runtime, and operational capabilities
+
+- [x] Account for and implement retained recurrent/state-space composites such
+      as Gated DeltaNet only after their primitive dependencies are complete.
+      Stateful step and full-sequence forms agree numerically; the sequence
+      recurrence lowers privately to one `stablehlo.while`, keeping graph size
+      independent of context length.
+- [x] Audit scaled-dot and other specialized numerical paths against D-003 and
+      the deferred quantization boundary, implementing only the retained
+      non-quantized CPU/CUDA semantics during this milestone. The pinned
+      `scaled_dot` is already the typed convert/multiply/dot composition;
+      microscaled `tt.dot_scaled` belongs to deferred W8A8/NVFP4 work.
+- [x] Close applicable memory-kind, donation, alias, executable-argument,
+      checkpoint-loading, and device-topology gaps discovered by the NML
+      capability map and product contracts. Milestone 2's lifecycle contracts
+      remain the shared implementation and now run beside the expanded graph,
+      distributed, and repeated-execution contracts.
+- [x] Add the phase-separated measurement hooks needed for D-013 performance
+      obligations without adding profiler types to the public facade. The
+      permanent harness reports compilation, upload, first execution,
+      steady-state execution, and download independently; full PJRT/XSpace
+      profiling remains its own product surface rather than a prerequisite for
+      honest wall-clock evidence.
+
+## 9. Integrated substrate and performance gate
+
+- [x] Give every non-hardware-deferred applicable leaf a permanent
+      IR-validation, numerical,
+      ownership/lifecycle, failure, and performance contract proportional to
+      its behavior. CPU remains both reference and performance target; CUDA
+      fallback and specialized paths are measured separately.
+- [x] Run the complete CPU contracts, CUDA remote-build/package contracts,
+      exact CUDA binary build, local SM75 device contracts, and real
+      four-device CPU contracts. The final BuildBuddy invocations are recorded
+      under milestone acceptance below.
+- [ ] `DEFERRED` Run the already-built SM80/SM90 attention/MoE specializations
+      and multi-GPU CUDA contracts on matching rented hardware, as required by
+      the repository's hardware-evidence policy.
+- [x] Re-audit the pinned ZML snapshot and NML product requirements after
+      implementation. Resolve accidental omissions in the selected substrate;
+      unselected reference features remain documented choices, not failures.
+
+## Milestone 6 acceptance
+
+- [x] Every capability selected for the NML CPU/CUDA substrate is implemented
+      and verified on available applicable hardware; unavailable SM80/SM90 and
+      multi-GPU execution obligations remain explicit `DEFERRED` contracts.
+      Reference-only ideas never enter the Bazel graph merely for accounting.
+- [x] The compact `nml` facade remains similar in magnitude to ZML's useful
+      public surface; backend, kernel, ABI, launch, and MLIR ownership types stay
+      private. Milestone 6 adds no root-level public type.
+- [x] `rustfmt` and `git diff --check` pass.
+- [x] BuildBuddy passes the CPU and CUDA-remote suites and builds every exact
+      CUDA contract binary; local/rented devices execute the contracts that own
+      their hardware. Final reviewed evidence: CPU
+      `ccab3987-3c74-493b-b03f-f9daba2d2dc1`, CUDA remote/package
+      `3ecbc0c7-a27a-4a7b-95f0-eb4f49c95a56`, exact CUDA binaries
+      `82e3b91f-74d9-4bf5-9704-7ef024311147`, and local SM75
+      `e50e5aa3-56a9-4fe9-a87f-4c77b5a7fcfe`.
+- [x] Representative CPU and CUDA measurements meet the performance obligations
+      recorded under D-013, with compilation and transfer time reported
+      separately from steady-state execution. On the 2026-07-15 baseline, CPU
+      steady-state language/spatial/MoE execution is 0.237/2.099/0.693 ms and
+      local SM75 CUDA is 0.168/0.213/0.223 ms; compilation, upload, first run,
+      and download remain separately printed by the permanent contract.
+- [x] Milestone 6 implementation closes with no accidental gap in the selected
+      substrate. Exact ZML parity is not required. Explicit rented-hardware
+      executions and W4A16 remain deferred until the owner schedules them.
+
+---
+
 # Capability ledger
 
 This high-level ledger remains at the end of this file while detailed work is
@@ -885,25 +1107,32 @@ successful compilation, registered symbols, or an unexecuted kernel do not by
 themselves complete an item.
 
 - [x] ReLU, GELU, SiLU, sigmoid, and other activations.
-- [ ] Multiplication, subtraction, division, and the remaining elementwise
+- [x] Multiplication, subtraction, division, and the selected elementwise
       operation families. Core arithmetic, ordering, absolute value, power,
-      remainder, clamp, floor, and ceil are complete; logical, bitwise, and
-      other retained ZML elementwise families remain.
+      remainder, clamp, floor, ceil, and boolean/integer AND/OR/XOR/NOT are
+      complete. Shifts, bitcasts, leading-zero/population counts, finite/sign
+      classification, `expm1`, rounding, and reduced precision are also
+      complete.
 - [x] Reshape and transpose in compiled graphs.
 - [x] Reductions, normalization, and softmax, including sum/min/max/mean,
       log-sum-exp, argmax, RMSNorm, LayerNorm, and L2 normalization.
-- [ ] Gather/scatter and embedding lookup. Gather, gather-slices, and token
-      embedding are complete; general scatter remains.
-- [ ] Convolution and pooling.
-- [ ] Random-number generation.
-- [ ] Sorting, top-k, and sampling. Argmax and compiled greedy selection are
-      complete; sorting, top-k, RNG, and stochastic sampling remain.
+- [x] Gather/scatter and embedding lookup, including batched ND forms,
+      out-of-bounds behavior, repeated indices, and donation.
+- [x] Convolution, pooling, and nearest/linear/bilinear/cubic resizing.
+- [x] Explicit-state uniform, normal, and Gumbel random-number generation.
+- [x] Stable/unstable sorting, argsort, top-k, greedy and stochastic sampling.
 - [x] Portable ordinary and blockwise paged attention, RoPE, and masks.
 - [x] Persistent KV-cache allocation, page-table updates, paging, truncation,
       rollback, and replay without a persistent dense KV copy.
 - [ ] CUDA FlashAttention and Triton kernels.
-- [ ] MoE routing and grouped matrix multiplication.
+- [ ] MoE routing and grouped matrix multiplication. Portable CPU/SM75 routing
+      and expert execution, expert-sharded four-device CPU execution, and
+      verified SM80+ grouped TTIR are complete; grouped-kernel execution remains
+      `DEFERRED` to rented SM80/SM90 hardware.
 - [ ] Quantization: W4A16, W8A8, and NVFP4. `DEFERRED` by D-028 until the
-      CPU/CUDA ZML parity gate passes and the owner explicitly schedules it.
+      CPU/CUDA substrate-coverage gate passes and the owner explicitly
+      schedules it.
 - [ ] Training or explicitly authored analytic backward graphs.
-- [ ] Real distributed sharding and collectives.
+- [ ] Real distributed sharding and collectives. Four-device CPU placement,
+      tiled contractions, explicit collectives, and expert sharding are real
+      numerical contracts; multi-GPU CUDA execution remains `DEFERRED`.

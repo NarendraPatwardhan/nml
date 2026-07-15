@@ -245,6 +245,77 @@ fn stablehlo_while_rejects_an_unterminated_owned_region() {
 }
 
 #[test]
+fn stablehlo_control_flow_rejects_state_drift_before_mlir_construction() {
+    let context = Context::new();
+    let scalar_i32 = context.ranked_tensor_type(DType::I32, &[]).unwrap();
+    let scalar_f32 = context.ranked_tensor_type(DType::F32, &[]).unwrap();
+    let zero_literal = context.parse_attribute("dense<0> : tensor<i32>").unwrap();
+    let zero = context.constant(scalar_i32, zero_literal).unwrap();
+    let zero_value = zero.result(0).unwrap();
+
+    let mut condition = Region::new(&context).unwrap();
+    condition
+        .append_block(Block::new(&context, &[scalar_f32]).unwrap())
+        .unwrap();
+    let mut body = Region::new(&context).unwrap();
+    body.append_block(Block::new(&context, &[scalar_i32]).unwrap())
+        .unwrap();
+    assert!(matches!(
+        context.stablehlo_while(&[zero_value], &[scalar_i32], condition, body),
+        Err(Error::InvalidOperation { source })
+            if source.contains("condition entry arguments")
+    ));
+
+    let mut empty_condition = Region::new(&context).unwrap();
+    empty_condition
+        .append_block(Block::new(&context, &[scalar_i32]).unwrap())
+        .unwrap();
+    let mut empty_body = Region::new(&context).unwrap();
+    empty_body
+        .append_block(Block::new(&context, &[scalar_i32]).unwrap())
+        .unwrap();
+    assert!(matches!(
+        context.stablehlo_while(
+            &[zero_value],
+            &[scalar_i32, scalar_i32],
+            empty_condition,
+            empty_body,
+        ),
+        Err(Error::InvalidOperation { source }) if source.contains("equal nonzero")
+    ));
+}
+
+#[test]
+fn stablehlo_case_rejects_non_i32_indices_and_capturing_branches() {
+    let context = Context::new();
+    let scalar_i32 = context.ranked_tensor_type(DType::I32, &[]).unwrap();
+    let scalar_i64 = context.ranked_tensor_type(DType::I64, &[]).unwrap();
+    let index_literal = context.parse_attribute("dense<0> : tensor<i64>").unwrap();
+    let index = context.constant(scalar_i64, index_literal).unwrap();
+    let index_value = index.result(0).unwrap();
+    let mut branch = Region::new(&context).unwrap();
+    branch
+        .append_block(Block::new(&context, &[]).unwrap())
+        .unwrap();
+    assert!(matches!(
+        context.stablehlo_case(index_value, &[scalar_i32], vec![branch]),
+        Err(Error::InvalidOperation { source }) if source.contains("tensor<i32>")
+    ));
+
+    let index_literal = context.parse_attribute("dense<0> : tensor<i32>").unwrap();
+    let index = context.constant(scalar_i32, index_literal).unwrap();
+    let index_value = index.result(0).unwrap();
+    let mut capturing_branch = Region::new(&context).unwrap();
+    capturing_branch
+        .append_block(Block::new(&context, &[scalar_i32]).unwrap())
+        .unwrap();
+    assert!(matches!(
+        context.stablehlo_case(index_value, &[scalar_i32], vec![capturing_branch]),
+        Err(Error::InvalidOperation { source }) if source.contains("entry arguments")
+    ));
+}
+
+#[test]
 fn shardy_manual_computation_owns_a_verified_local_region() {
     let context = Context::new();
     let global = context.ranked_tensor_type(DType::F32, &[4]).unwrap();
@@ -298,6 +369,64 @@ fn shardy_manual_computation_owns_a_verified_local_region() {
     assert!(text.contains("manual_axes"));
     assert!(text.contains("axis_1"));
     assert!(text.contains("sdy.return"));
+}
+
+#[test]
+fn partition_identity_and_rectangular_collective_groups_are_typed() {
+    let context = Context::new();
+    let scalar_u32 = context.ranked_tensor_type(DType::U32, &[]).unwrap();
+    let scalar_f32 = context.ranked_tensor_type(DType::F32, &[]).unwrap();
+    let tensor = context.ranked_tensor_type(DType::F32, &[2]).unwrap();
+    let mut function_block = Block::new(&context, &[tensor]).unwrap();
+
+    let partition = context.partition_id(scalar_u32).unwrap();
+    function_block.append_operation(partition).unwrap();
+
+    let mut reducer_block = Block::new(&context, &[scalar_f32; 2]).unwrap();
+    let sum = context
+        .add(
+            reducer_block.argument(0).unwrap(),
+            reducer_block.argument(1).unwrap(),
+            scalar_f32,
+        )
+        .unwrap();
+    let sum_value = sum.result(0).unwrap();
+    reducer_block.append_operation(sum).unwrap();
+    reducer_block
+        .append_operation(context.stablehlo_return(&[sum_value]).unwrap())
+        .unwrap();
+    let mut reducer = Region::new(&context).unwrap();
+    reducer.append_block(reducer_block).unwrap();
+    let reduce = context
+        .all_reduce(
+            function_block.argument(0).unwrap(),
+            tensor,
+            &[vec![0, 2], vec![1, 3]],
+            7,
+            reducer,
+        )
+        .unwrap();
+    let reduced = reduce.result(0).unwrap();
+    function_block.append_operation(reduce).unwrap();
+    function_block
+        .append_operation(context.return_operation(&[reduced]).unwrap())
+        .unwrap();
+    let mut body = Region::new(&context).unwrap();
+    body.append_block(function_block).unwrap();
+    let function = context
+        .function("collective_groups", &[tensor], &[tensor], body)
+        .unwrap();
+    let mut module = context.empty_module().unwrap();
+    module.append_operation(function).unwrap();
+    module.verify().unwrap();
+    let text = module.text();
+    assert!(text.contains("stablehlo.partition_id"), "{text}");
+    assert!(text.contains("dense<[[0, 2], [1, 3]]>"), "{text}");
+
+    assert!(matches!(
+        context.partition_id(context.ranked_tensor_type(DType::I32, &[]).unwrap()),
+        Err(Error::InvalidOperation { .. })
+    ));
 }
 
 #[test]

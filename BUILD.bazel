@@ -79,6 +79,7 @@ _COMMON_CONTRACTS = [
     "//crates/nml:linear_cpu_contract_test",
     "//crates/nml:attention_cpu_contract_test",
     "//crates/nml:neural_ops_cpu_contract_test",
+    "//crates/nml:execution_performance_cpu_contract_test",
     "//crates/nml:structural_contract_test",
 ]
 
@@ -88,6 +89,7 @@ _CUDA_DEVICE_CONTRACTS = [
     "//crates/nml:linear_cuda_contract_test",
     "//crates/nml:attention_cuda_contract_test",
     "//crates/nml:neural_ops_cuda_contract_test",
+    "//crates/nml:execution_performance_cuda_contract_test",
 ]
 
 _CUDA_PACKAGE_CONTRACTS = [
@@ -147,6 +149,7 @@ filegroup(
         "//crates/nml:linear_cuda_contract_binary",
         "//crates/nml:attention_cuda_contract_binary",
         "//crates/nml:neural_ops_cuda_contract_binary",
+        "//crates/nml:execution_performance_cuda_contract_binary",
     ],
     testonly = True,
     visibility = ["//visibility:public"],

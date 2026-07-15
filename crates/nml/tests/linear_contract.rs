@@ -1,6 +1,6 @@
 //! Product contract for persistent FP16/BF16 checkpoint parameters.
 
-use nml_types::{BFloat16, DType, F16, Shape};
+use nml_types::{BFloat16, DType, Shape, F16};
 use safetensors::tensor::{Dtype as SafeDType, View};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -72,6 +72,7 @@ fn persistent_linear_parameters_execute_repeatedly_from_real_checkpoints() {
     if platform.name() == "cpu" {
         tiled_cpu_placement_round_trips(&platform);
         sharded_contraction_executes_with_compiler_communication(&platform);
+        explicit_collectives_execute_across_the_cpu_mesh(&platform);
     }
     tied_parameters_load_once_and_share_storage(&platform);
     truncated_checkpoint_releases_in_flight_transfers(&platform);
@@ -317,6 +318,68 @@ fn sharded_contraction_executes_with_compiler_communication(platform: &nml::Plat
     }
     for (actual, expected) in actual.iter().zip(expected) {
         assert!((actual - expected).abs() <= 1e-4 + 1e-4 * expected.abs());
+    }
+}
+
+fn explicit_collectives_execute_across_the_cpu_mesh(platform: &nml::Platform) {
+    let mesh_axis = nml::AxisTag::new(78);
+    let shape = Shape::new(DType::F32, &[4])
+        .unwrap()
+        .with_partitions(&[nml::Partition::Replicated])
+        .unwrap();
+    let mesh = nml::Sharding::mesh(&[(mesh_axis, platform.device_count().unwrap())]).unwrap();
+    let mut builder = nml_ir::ProgramBuilder::new();
+    let input = builder.input("input", shape);
+    let sum = builder.all_reduce_sum(input).unwrap();
+    let maximum = builder.all_reduce_max(input).unwrap();
+    let minimum = builder.all_reduce_min(input).unwrap();
+    let program = builder
+        .finish_named(&[
+            ("sum".to_owned(), sum),
+            ("maximum".to_owned(), maximum),
+            ("minimum".to_owned(), minimum),
+        ])
+        .unwrap();
+    let executable = platform.compile(&program, mesh.clone()).unwrap();
+    let values = [1.0f32, -2.0, 3.5, 0.25];
+    for _ in 0..2 {
+        let mut arguments = executable.args();
+        let slice = nml::Slice::from_typed(shape, &values).unwrap();
+        arguments
+            .set(
+                "input",
+                platform
+                    .upload(&slice, mesh.clone(), nml::Memory::Default)
+                    .unwrap(),
+            )
+            .unwrap();
+        let results = arguments.call().unwrap();
+        let expected_sum = values
+            .iter()
+            .map(|value| value * platform.device_count().unwrap() as f32)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results
+                .get("sum")
+                .unwrap()
+                .to_slice()
+                .unwrap()
+                .items::<f32>()
+                .unwrap(),
+            expected_sum
+        );
+        for name in ["maximum", "minimum"] {
+            assert_eq!(
+                results
+                    .get(name)
+                    .unwrap()
+                    .to_slice()
+                    .unwrap()
+                    .items::<f32>()
+                    .unwrap(),
+                values
+            );
+        }
     }
 }
 

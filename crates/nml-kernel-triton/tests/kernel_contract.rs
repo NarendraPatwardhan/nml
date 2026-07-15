@@ -1,8 +1,9 @@
 use nml_kernel_triton::{
-    ArgumentKind, AttentionGeometry, AttentionLaunch, Builder, Comparison, DType, Error,
+    build_grouped_projection, build_paged_attention_2d, build_paged_attention_3d,
+    build_segment_reduction, select_attention_launch, ArgumentKind, AttentionGeometry,
+    AttentionLaunch, Builder, Comparison, DType, Error, GatedActivation, GroupedProjectionConfig,
     KernelLaunch, KernelSpec, OutputAlias, PagedAttention2dConfig, PagedAttention3dConfig,
-    Reduction, SegmentReductionConfig, TensorSpec, build_paged_attention_2d,
-    build_paged_attention_3d, build_segment_reduction, select_attention_launch,
+    Reduction, SegmentReductionConfig, TensorSpec,
 };
 use nml_mlir::{Block, Context, Region};
 
@@ -49,6 +50,82 @@ fn named_typed_kernel_is_deterministic_and_verified() {
     assert!(first.contains("tt.load"), "{first}");
     assert!(first.contains("arith.addf"), "{first}");
     assert!(first.contains("tt.store"), "{first}");
+}
+
+#[test]
+fn grouped_expert_projections_are_verified_ttir() {
+    for dtype in [DType::F16, DType::Bf16, DType::F32] {
+        let gate_up = build_grouped_projection(GroupedProjectionConfig {
+            dtype,
+            assignments: 32,
+            input_size: 64,
+            output_size: 128,
+            local_experts: 4,
+            source_row_divisor: 2,
+            block_m: 16,
+            block_n: 32,
+            block_k: 32,
+            gated_activation: None,
+            multiply_routing_weight: false,
+        })
+        .unwrap();
+        assert!(
+            gate_up.contains("tt.func public @moe_grouped_gate_up"),
+            "{gate_up}"
+        );
+        assert!(gate_up.contains("tt.dot"), "{gate_up}");
+        assert!(gate_up.contains("scf.for"), "{gate_up}");
+        assert_eq!(
+            gate_up.matches("tt.dot").count(),
+            1,
+            "the K dimension must not be statically unrolled: {gate_up}"
+        );
+        assert!(gate_up.contains("tt.load"), "{gate_up}");
+        assert!(gate_up.contains("tt.store"), "{gate_up}");
+        assert!(gate_up.contains("arith.maxsi"), "{gate_up}");
+        assert!(
+            gate_up.matches("arith.minsi").count() >= 2,
+            "assignment and expert addresses must both be clamped: {gate_up}"
+        );
+
+        for activation in [
+            GatedActivation::Silu,
+            GatedActivation::Gelu,
+            GatedActivation::Relu,
+        ] {
+            let down = build_grouped_projection(GroupedProjectionConfig {
+                dtype,
+                assignments: 32,
+                input_size: 64,
+                output_size: 64,
+                local_experts: 4,
+                source_row_divisor: 1,
+                block_m: 16,
+                block_n: 32,
+                block_k: 32,
+                gated_activation: Some(activation),
+                multiply_routing_weight: true,
+            })
+            .unwrap();
+            assert!(down.contains("tt.func public @moe_grouped_down"), "{down}");
+            assert!(down.contains("arith.mulf"), "{down}");
+        }
+    }
+
+    assert!(build_grouped_projection(GroupedProjectionConfig {
+        dtype: DType::F64,
+        assignments: 32,
+        input_size: 64,
+        output_size: 64,
+        local_experts: 4,
+        source_row_divisor: 1,
+        block_m: 16,
+        block_n: 32,
+        block_k: 32,
+        gated_activation: None,
+        multiply_routing_weight: false,
+    })
+    .is_err());
 }
 
 #[test]
@@ -528,21 +605,17 @@ fn non_power_of_two_gqa_uses_padded_masked_head_lanes() {
 fn invalid_attention_geometry_never_reaches_ttir() {
     let mut invalid = geometry(false, 4);
     invalid.num_query_heads = 30;
-    assert!(
-        select_attention_launch(invalid)
-            .unwrap_err()
-            .to_string()
-            .contains("not divisible")
-    );
+    assert!(select_attention_launch(invalid)
+        .unwrap_err()
+        .to_string()
+        .contains("not divisible"));
 
     invalid = geometry(false, 4);
     invalid.core_count = 0;
-    assert!(
-        select_attention_launch(invalid)
-            .unwrap_err()
-            .to_string()
-            .contains("core count")
-    );
+    assert!(select_attention_launch(invalid)
+        .unwrap_err()
+        .to_string()
+        .contains("core count"));
 }
 
 #[test]

@@ -227,6 +227,22 @@ impl DType {
         }
     }
 
+    /// Logical element width used by StableHLO's bit-preserving operations.
+    ///
+    /// This differs from [`Self::byte_width`] for predicates: an in-memory
+    /// predicate occupies a byte in NML's host ABI, while StableHLO models it
+    /// as a single-bit `i1` value.
+    pub const fn bit_width(self) -> usize {
+        match self {
+            Self::Bool => 1,
+            Self::I8 | Self::U8 => 8,
+            Self::I16 | Self::U16 | Self::F16 | Self::Bf16 => 16,
+            Self::I32 | Self::U32 | Self::F32 => 32,
+            Self::I64 | Self::U64 | Self::F64 | Self::C64 => 64,
+            Self::C128 => 128,
+        }
+    }
+
     pub const fn alignment(self) -> usize {
         match self {
             Self::Bool | Self::I8 | Self::U8 => 1,
@@ -240,10 +256,14 @@ impl DType {
     pub const fn stablehlo_spelling(self) -> &'static str {
         match self {
             Self::Bool => "i1",
-            Self::I8 | Self::U8 => "i8",
-            Self::I16 | Self::U16 => "i16",
-            Self::I32 | Self::U32 => "i32",
-            Self::I64 | Self::U64 => "i64",
+            Self::I8 => "i8",
+            Self::I16 => "i16",
+            Self::I32 => "i32",
+            Self::I64 => "i64",
+            Self::U8 => "ui8",
+            Self::U16 => "ui16",
+            Self::U32 => "ui32",
+            Self::U64 => "ui64",
             Self::F16 => "f16",
             Self::Bf16 => "bf16",
             Self::F32 => "f32",

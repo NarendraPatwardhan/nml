@@ -7,6 +7,7 @@ nml_rust_library(
     srcs = [
         "src/attention_backend.rs",
         "src/lib.rs",
+        "src/moe_backend.rs",
         "src/ordinary_attention.rs",
         "src/paged_attention.rs",
     ],

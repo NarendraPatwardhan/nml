@@ -1,9 +1,10 @@
 use nml_ir::{
-    AttentionOptions, Error, FftType, ProgramBuilder, RopeLayout, RopeOptions, RopeScaling,
+    AttentionOptions, ConvolutionOptions, Error, FftType, ProgramBuilder, RopeLayout, RopeOptions,
+    RopeScaling,
 };
 use nml_mlir::Context;
 use nml_tensor::Element;
-use nml_types::{AxisTag, BFloat16, Complex128, Complex64, DType, Layout, Shape, F16};
+use nml_types::{AxisTag, BFloat16, Complex128, Complex64, DType, Layout, Partition, Shape, F16};
 
 #[test]
 fn matmul_is_typed_deterministic_and_verified() {
@@ -304,6 +305,714 @@ fn model_enabling_operations_reject_invalid_contracts_before_mlir() {
     );
     let (_, indices) = builder.argmax(huge, 0).unwrap();
     assert_eq!(indices.shape().dtype(), DType::I64);
+}
+
+#[test]
+fn logical_operations_are_typed_broadcasting_stablehlo() {
+    let tagged = Shape::new(DType::I32, &[2, 4])
+        .unwrap()
+        .with_axis_tags(&[AxisTag::new(71), AxisTag::new(72)])
+        .unwrap();
+    let mut builder = ProgramBuilder::new();
+    let left = builder.input("left", tagged);
+    let right = builder.input("right", tagged);
+    let scalar = builder.scalar(0x0fi32).unwrap();
+    let and = builder.logical_and(left, scalar).unwrap();
+    let or = builder.logical_or(left, right).unwrap();
+    let xor = builder.logical_xor(left, right).unwrap();
+    let not = builder.logical_not(left).unwrap();
+    let predicate = builder.less(left, right).unwrap();
+    let predicate_not = builder.logical_not(predicate).unwrap();
+    assert_eq!(and.shape(), tagged);
+    assert_eq!(predicate_not.shape().dtype(), DType::Bool);
+    let floats = builder.input("floats", Shape::new(DType::F32, &[2]).unwrap());
+    assert!(matches!(
+        builder.logical_not(floats),
+        Err(Error::UnsupportedDType {
+            operation: "logical_not",
+            dtype: DType::F32,
+        })
+    ));
+
+    let text = builder
+        .finish(&[and, or, xor, not, predicate_not])
+        .unwrap()
+        .stablehlo()
+        .unwrap();
+    for operation in [
+        "stablehlo.and",
+        "stablehlo.or",
+        "stablehlo.xor",
+        "stablehlo.not",
+    ] {
+        assert!(text.contains(operation), "missing {operation} in {text}");
+    }
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
+}
+
+#[test]
+fn bit_and_precision_primitives_are_typed_verified_stablehlo() {
+    let tagged = Shape::new(DType::I32, &[2, 4])
+        .unwrap()
+        .with_axis_tags(&[AxisTag::new(81), AxisTag::new(82)])
+        .unwrap();
+    let mut builder = ProgramBuilder::new();
+    let integers = builder.input("integers", tagged);
+    let shift_amount = builder.scalar(3i32).unwrap();
+    let shifted_left = builder.shift_left(integers, shift_amount).unwrap();
+    let shifted_arithmetic = builder
+        .shift_right_arithmetic(integers, shift_amount)
+        .unwrap();
+    let shifted_logical = builder.shift_right_logical(integers, shift_amount).unwrap();
+    let leading_zeros = builder.count_leading_zeros(integers).unwrap();
+    let population = builder.population_count(integers).unwrap();
+    let bytes = builder.bitcast(integers, DType::U8).unwrap();
+    assert_eq!(bytes.shape().dimensions(), &[2, 4, 4]);
+    assert_eq!(bytes.shape().axis_tags()[2], AxisTag::UNKNOWN);
+    let reconstructed = builder.bitcast(bytes, DType::I32).unwrap();
+    assert_eq!(reconstructed.shape(), tagged);
+
+    let floats = builder.input("floats", Shape::new(DType::F32, &[2, 4]).unwrap());
+    let finite = builder.is_finite(floats).unwrap();
+    let sign = builder.sign(floats).unwrap();
+    let expm1 = builder.expm1(floats).unwrap();
+    let round_away = builder.round_nearest_away_from_zero(floats).unwrap();
+    let round_even = builder.round_nearest_even(floats).unwrap();
+    let reduced = builder.reduce_precision(floats, 5, 10).unwrap();
+    assert_eq!(finite.shape().dtype(), DType::Bool);
+
+    let text = builder
+        .finish(&[
+            shifted_left,
+            shifted_arithmetic,
+            shifted_logical,
+            leading_zeros,
+            population,
+            reconstructed,
+            finite,
+            sign,
+            expm1,
+            round_away,
+            round_even,
+            reduced,
+        ])
+        .unwrap()
+        .stablehlo()
+        .unwrap();
+    for operation in [
+        "stablehlo.shift_left",
+        "stablehlo.shift_right_arithmetic",
+        "stablehlo.shift_right_logical",
+        "stablehlo.count_leading_zeros",
+        "stablehlo.popcnt",
+        "stablehlo.bitcast_convert",
+        "stablehlo.is_finite",
+        "stablehlo.sign",
+        "stablehlo.exponential_minus_one",
+        "stablehlo.round_nearest_afz",
+        "stablehlo.round_nearest_even",
+        "stablehlo.reduce_precision",
+    ] {
+        assert!(text.contains(operation), "missing {operation} in {text}");
+    }
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
+}
+
+#[test]
+fn bit_and_precision_primitives_reject_ambiguous_contracts() {
+    use nml_types::Partition;
+
+    let mut builder = ProgramBuilder::new();
+    let floats = builder.input("floats", Shape::new(DType::F32, &[2]).unwrap());
+    assert!(matches!(
+        builder.population_count(floats),
+        Err(Error::UnsupportedDType {
+            operation: "population_count",
+            dtype: DType::F32,
+        })
+    ));
+    assert!(matches!(
+        builder.reduce_precision(floats, 0, 10),
+        Err(Error::InvalidPrecision { .. })
+    ));
+
+    let tagged_minor = Shape::new(DType::U8, &[2, 4])
+        .unwrap()
+        .with_axis_tags(&[AxisTag::new(90), AxisTag::new(91)])
+        .unwrap();
+    let tagged_minor = builder.input("tagged_minor", tagged_minor);
+    assert!(matches!(
+        builder.bitcast(tagged_minor, DType::I32),
+        Err(Error::InvalidBitcast(_))
+    ));
+
+    let sharded_minor = Shape::new(DType::U8, &[2, 4])
+        .unwrap()
+        .with_partitions(&[Partition::Unspecified, Partition::Sharded(AxisTag::new(92))])
+        .unwrap();
+    let sharded_minor = builder.input("sharded_minor", sharded_minor);
+    assert!(matches!(
+        builder.bitcast(sharded_minor, DType::I32),
+        Err(Error::InvalidBitcast(_))
+    ));
+}
+
+#[test]
+fn structural_construction_and_movement_are_typed_verified_compositions() {
+    let row = AxisTag::new(101);
+    let column = AxisTag::new(102);
+    let shape = Shape::new(DType::F32, &[2, 3])
+        .unwrap()
+        .with_axis_tags(&[row, column])
+        .unwrap();
+    let mut builder = ProgramBuilder::new();
+    let input = builder.input("input", shape);
+    let padding = builder.scalar(0.0f32).unwrap();
+    let padded = builder
+        .pad(input, padding, &[1, 0], &[0, 1], &[0, 1])
+        .unwrap();
+    assert_eq!(padded.shape().dimensions(), &[3, 6]);
+    assert_eq!(padded.shape().axis_tags(), &[row, column]);
+    let reversed = builder.reverse(input, &[0, 1]).unwrap();
+    let inserted = builder.insert_axis(input, 1, AxisTag::new(103)).unwrap();
+    let squeezed = builder.squeeze(inserted, 1).unwrap();
+    assert_eq!(squeezed.shape(), shape);
+    let stacked = builder
+        .stack(&[input, input], 1, AxisTag::new(104))
+        .unwrap();
+    assert_eq!(stacked.shape().dimensions(), &[2, 2, 3]);
+    let repeated = builder.repeat(input, 1, 2).unwrap();
+    let stuttered = builder.stutter(input, 1, 2).unwrap();
+    assert_eq!(repeated.shape().dimensions(), &[2, 6]);
+    assert_eq!(stuttered.shape().dimensions(), &[2, 6]);
+    let split = builder.split(input, 1, &[1, 2]).unwrap();
+    let chunks = builder.chunks(input, 1, 3).unwrap();
+    assert_eq!(split[0].shape().dimensions(), &[2, 1]);
+    assert_eq!(chunks.len(), 3);
+
+    let left = builder.input("left", Shape::new(DType::F32, &[2]).unwrap());
+    let right = builder.input("right", Shape::new(DType::F32, &[3]).unwrap());
+    let outer = builder.outer(left, right).unwrap();
+    assert_eq!(outer.shape().dimensions(), &[2, 3]);
+    let diagonal = builder
+        .diagonal(right, 0, AxisTag::new(105), AxisTag::new(106))
+        .unwrap();
+    assert_eq!(diagonal.shape().dimensions(), &[3, 3]);
+    let triangular = builder.triangular(input, 0, 1, 0).unwrap();
+    let product = builder.cartesian_product(&[left, right]).unwrap();
+    let product_stacked = builder
+        .cartesian_product_stacked(&[left, right], AxisTag::new(107))
+        .unwrap();
+    assert_eq!(product[0].shape().dimensions(), &[2, 3]);
+    assert_eq!(product_stacked.shape().dimensions(), &[2, 3, 2]);
+    let rolled = builder.roll(input, 1, -1).unwrap();
+    let barrier = builder.optimization_barrier(input).unwrap();
+
+    let mut outputs = vec![
+        padded,
+        reversed,
+        squeezed,
+        stacked,
+        repeated,
+        stuttered,
+        outer,
+        diagonal,
+        triangular,
+        product_stacked,
+        rolled,
+        barrier,
+    ];
+    outputs.extend(split);
+    outputs.extend(chunks);
+    outputs.extend(product);
+    let text = builder.finish(&outputs).unwrap().stablehlo().unwrap();
+    for operation in [
+        "stablehlo.pad",
+        "stablehlo.reverse",
+        "stablehlo.reshape",
+        "stablehlo.broadcast_in_dim",
+        "stablehlo.concatenate",
+        "stablehlo.slice",
+        "stablehlo.dot_general",
+        "stablehlo.iota",
+        "stablehlo.select",
+        "stablehlo.optimization_barrier",
+    ] {
+        assert!(text.contains(operation), "missing {operation} in {text}");
+    }
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
+}
+
+#[test]
+fn structural_compositions_reject_metadata_loss_and_ambiguous_shapes() {
+    use nml_types::Partition;
+
+    let mut builder = ProgramBuilder::new();
+    let input = builder.input("input", Shape::new(DType::F32, &[2, 3]).unwrap());
+    let padding = builder.scalar(0.0f32).unwrap();
+    assert!(matches!(
+        builder.pad(input, padding, &[0], &[0], &[0]),
+        Err(Error::InvalidStructure(_))
+    ));
+    assert!(matches!(
+        builder.squeeze(input, 0),
+        Err(Error::InvalidStructure(_))
+    ));
+    assert!(matches!(
+        builder.split(input, 1, &[1, 1]),
+        Err(Error::InvalidStructure(_))
+    ));
+    assert!(matches!(
+        builder.chunks(input, 1, 2),
+        Err(Error::InvalidStructure(_))
+    ));
+
+    let sharded = Shape::new(DType::F32, &[3])
+        .unwrap()
+        .with_partitions(&[Partition::Sharded(AxisTag::new(108))])
+        .unwrap();
+    let sharded = builder.input("sharded", sharded);
+    assert!(matches!(
+        builder.diagonal(sharded, 0, AxisTag::new(109), AxisTag::new(110)),
+        Err(Error::InvalidStructure(_))
+    ));
+}
+
+#[test]
+fn retained_linear_algebra_is_batched_typed_and_verified() {
+    let mut builder = ProgramBuilder::new();
+    let coefficient = builder.input("coefficient", Shape::new(DType::F32, &[2, 3, 3]).unwrap());
+    let right_hand_side = builder.input(
+        "right_hand_side",
+        Shape::new(DType::F32, &[2, 3, 2]).unwrap(),
+    );
+    let factor = builder.cholesky(coefficient, true).unwrap();
+    let solution = builder
+        .triangular_solve(coefficient, right_hand_side, true)
+        .unwrap();
+    assert_eq!(factor.shape(), coefficient.shape());
+    assert_eq!(solution.shape(), right_hand_side.shape());
+    let text = builder
+        .finish(&[factor, solution])
+        .unwrap()
+        .stablehlo()
+        .unwrap();
+    assert!(text.contains("stablehlo.cholesky"), "{text}");
+    assert!(text.contains("stablehlo.triangular_solve"), "{text}");
+    assert!(text.contains("NO_TRANSPOSE"), "{text}");
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
+
+    let mut builder = ProgramBuilder::new();
+    let nonsquare = builder.input("nonsquare", Shape::new(DType::F32, &[2, 3]).unwrap());
+    assert!(matches!(
+        builder.cholesky(nonsquare, true),
+        Err(Error::InvalidLinearAlgebra(_))
+    ));
+    let integers = builder.input("integers", Shape::new(DType::I32, &[2, 2]).unwrap());
+    assert!(matches!(
+        builder.cholesky(integers, true),
+        Err(Error::UnsupportedDType {
+            operation: "cholesky",
+            dtype: DType::I32,
+        })
+    ));
+}
+
+#[test]
+fn window_convolution_pooling_and_resize_form_one_verified_substrate() {
+    let batch = AxisTag::new(401);
+    let feature = AxisTag::new(402);
+    let height = AxisTag::new(403);
+    let width = AxisTag::new(404);
+    let output_feature = AxisTag::new(405);
+    let input_shape = Shape::new(DType::F32, &[1, 5, 5, 2])
+        .unwrap()
+        .with_axis_tags(&[batch, height, width, feature])
+        .unwrap();
+    let kernel_shape = Shape::new(DType::F32, &[3, 3, 2, 4])
+        .unwrap()
+        .with_axis_tags(&[AxisTag::UNKNOWN, AxisTag::UNKNOWN, feature, output_feature])
+        .unwrap();
+    let mut builder = ProgramBuilder::new();
+    let input = builder.input("image", input_shape);
+    let kernel = builder.input("kernel", kernel_shape);
+    let convolution = builder
+        .convolution(
+            input,
+            kernel,
+            ConvolutionOptions {
+                strides: &[1, 1],
+                padding: &[[1, 1], [1, 1]],
+                input_dilation: &[1, 1],
+                kernel_dilation: &[1, 1],
+                kernel_reversal: &[false, false],
+                input_batch_axis: 0,
+                input_feature_axis: 3,
+                input_spatial_axes: &[1, 2],
+                kernel_input_feature_axis: 2,
+                kernel_output_feature_axis: 3,
+                kernel_spatial_axes: &[0, 1],
+                output_batch_axis: 0,
+                output_feature_axis: 3,
+                output_spatial_axes: &[1, 2],
+                feature_groups: 1,
+                batch_groups: 1,
+            },
+        )
+        .unwrap();
+    assert_eq!(convolution.shape().dimensions(), &[1, 5, 5, 4]);
+    assert_eq!(
+        convolution.shape().axis_tags(),
+        &[batch, height, width, output_feature]
+    );
+
+    let pooled = builder
+        .max_pool2d(input, [1, 2], [2, 2], [2, 2], [[0, 0], [0, 0]])
+        .unwrap();
+    assert_eq!(pooled.shape().dimensions(), &[1, 2, 2, 2]);
+    assert_eq!(pooled.shape().axis_tags(), input_shape.axis_tags());
+    let cumulative = builder.cumulative_sum(input, 2).unwrap();
+    assert_eq!(cumulative.shape(), input_shape);
+    let nearest = builder.resize_nearest(input, 2, 8).unwrap();
+    let linear = builder.resize_linear(input, 2, 3).unwrap();
+    let bilinear = builder.resize_bilinear(input, [1, 2], [3, 4]).unwrap();
+    let cubic = builder.resize_cubic(input, 2, 3).unwrap();
+    let upsampled = builder.upsample_nearest(input, &[2.0]).unwrap();
+    assert_eq!(nearest.shape().dimensions(), &[1, 5, 8, 2]);
+    assert_eq!(linear.shape().dimensions(), &[1, 5, 3, 2]);
+    assert_eq!(bilinear.shape().dimensions(), &[1, 3, 4, 2]);
+    assert_eq!(cubic.shape().dimensions(), &[1, 5, 3, 2]);
+    // The compact convenience treats trailing rank-minus-two dimensions as
+    // spatial. Explicit-axis resize covers layouts such as NHWC.
+    assert_eq!(upsampled.shape().dimensions(), &[1, 5, 10, 4]);
+    for resized in [nearest, linear, bilinear, cubic, upsampled] {
+        assert_eq!(resized.shape().axis_tags(), input_shape.axis_tags());
+    }
+
+    let text = builder
+        .finish(&[
+            convolution,
+            pooled,
+            cumulative,
+            nearest,
+            linear,
+            bilinear,
+            cubic,
+            upsampled,
+        ])
+        .unwrap()
+        .stablehlo()
+        .unwrap();
+    assert!(text.contains("stablehlo.convolution"), "{text}");
+    assert!(text.contains("stablehlo.reduce_window"), "{text}");
+    assert!(text.contains("stablehlo.gather"), "{text}");
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
+}
+
+#[test]
+fn window_convolution_and_resize_reject_invalid_geometry_early() {
+    let mut builder = ProgramBuilder::new();
+    let input = builder.input("input", Shape::new(DType::F32, &[1, 2, 5]).unwrap());
+    let kernel = builder.input("kernel", Shape::new(DType::F32, &[4, 2, 3]).unwrap());
+    assert!(matches!(
+        builder.reduce_window_sum(input, &[1, 1], &[1, 1], &[1, 1], &[1, 1], &[[0, 0]; 2]),
+        Err(Error::InvalidWindow(_))
+    ));
+    assert!(matches!(
+        builder.conv1d(input, kernel, 0, [0, 0], 1, 1, 1),
+        Err(Error::InvalidWindow(_))
+    ));
+    assert!(matches!(
+        builder.resize_nearest(input, 2, 0),
+        Err(Error::InvalidResize(_))
+    ));
+    assert!(matches!(
+        builder.resize_bilinear(input, [2, 2], [4, 4]),
+        Err(Error::InvalidResize(_))
+    ));
+}
+
+#[test]
+fn ordering_and_explicit_random_state_are_typed_verified_graph_operations() {
+    let mut builder = ProgramBuilder::new();
+    let values = builder.input("values", Shape::new(DType::F32, &[2, 5]).unwrap());
+    let state_input = builder.input("state", Shape::new(DType::U64, &[2]).unwrap());
+    let (ascending, ascending_indices) = builder.sort(values, 1, false, true).unwrap();
+    let (descending, descending_indices) = builder.sort(values, 1, true, false).unwrap();
+    let argsorted = builder.argsort(values, 1, true, true).unwrap();
+    let (top_values, top_indices) = builder.top_k(values, 1, 3, true).unwrap();
+    assert_eq!(top_values.shape().dimensions(), &[2, 3]);
+    assert_eq!(top_indices.shape().dimensions(), &[2, 3]);
+
+    let state = builder.random_state(state_input).unwrap();
+    let random_shape = Shape::new(DType::F32, &[2, 5]).unwrap();
+    let (state, uniform) = builder
+        .random_uniform(state, random_shape, -2.0, 3.0)
+        .unwrap();
+    let (state, normal) = builder
+        .random_normal(state, random_shape, 1.0, 2.0)
+        .unwrap();
+    let (state, gumbel) = builder.random_gumbel(state, random_shape).unwrap();
+    let state = builder
+        .reuse_buffer(state.into_tensor(), state_input)
+        .unwrap();
+    let text = builder
+        .finish(&[
+            ascending,
+            ascending_indices,
+            descending,
+            descending_indices,
+            argsorted,
+            top_values,
+            top_indices,
+            uniform,
+            normal,
+            gumbel,
+            state,
+        ])
+        .unwrap()
+        .stablehlo()
+        .unwrap();
+    assert!(text.contains("stablehlo.sort"), "{text}");
+    assert!(text.contains("is_stable = true"), "{text}");
+    assert!(text.contains("is_stable = false"), "{text}");
+    assert!(text.contains("stablehlo.rng_bit_generator"), "{text}");
+    assert!(text.contains("tf.aliasing_output"), "{text}");
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
+}
+
+#[test]
+fn token_sampling_composes_static_and_runtime_controls_with_one_state_chain() {
+    let mut builder = ProgramBuilder::new();
+    let logits = builder.input("logits", Shape::new(DType::F32, &[2, 8]).unwrap());
+    let state_input = builder.input("state", Shape::new(DType::U64, &[2]).unwrap());
+    let runtime_top_k = builder.input("top_k", Shape::new(DType::I32, &[]).unwrap());
+    let runtime_temperature = builder.input("temperature", Shape::new(DType::F32, &[]).unwrap());
+    let runtime_top_p = builder.input("top_p", Shape::new(DType::F32, &[]).unwrap());
+    let runtime_min_p = builder.input("min_p", Shape::new(DType::F32, &[]).unwrap());
+
+    let greedy = builder.greedy_tokens(logits, 1).unwrap();
+    let state = builder.random_state(state_input).unwrap();
+    let (state, static_sample) = builder
+        .sample_tokens(logits, state, 1, 6, 0.8, 0.9, 0.05)
+        .unwrap();
+    let (state, dynamic_sample) = builder
+        .sample_tokens_dynamic(
+            logits,
+            state,
+            1,
+            runtime_top_k,
+            runtime_temperature,
+            runtime_top_p,
+            runtime_min_p,
+            6,
+        )
+        .unwrap();
+    assert_eq!(greedy.shape().dimensions(), &[2]);
+    assert_eq!(static_sample.shape().dimensions(), &[2]);
+    assert_eq!(dynamic_sample.shape().dimensions(), &[2]);
+    let state = builder
+        .reuse_buffer(state.into_tensor(), state_input)
+        .unwrap();
+    let text = builder
+        .finish(&[greedy, static_sample, dynamic_sample, state])
+        .unwrap()
+        .stablehlo()
+        .unwrap();
+    assert!(
+        text.matches("stablehlo.rng_bit_generator").count() >= 2,
+        "{text}"
+    );
+    assert!(text.contains("stablehlo.sort"), "{text}");
+    assert!(text.contains("stablehlo.gather"), "{text}");
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
+}
+
+#[test]
+fn ordering_and_random_generation_reject_invalid_contracts_early() {
+    let mut builder = ProgramBuilder::new();
+    let values = builder.input("values", Shape::new(DType::F32, &[2, 5]).unwrap());
+    assert!(matches!(
+        builder.top_k(values, 1, 0, true),
+        Err(Error::InvalidSort(_))
+    ));
+    assert!(matches!(
+        builder.top_k(values, 1, 6, true),
+        Err(Error::InvalidSort(_))
+    ));
+    let bad_state = builder.input("bad_state", Shape::new(DType::U64, &[1]).unwrap());
+    assert!(matches!(
+        builder.random_state(bad_state),
+        Err(Error::InvalidRandom(_))
+    ));
+    let state_input = builder.input("state", Shape::new(DType::U64, &[2]).unwrap());
+    let state = builder.random_state(state_input).unwrap();
+    assert!(matches!(
+        builder.random_uniform(state, Shape::new(DType::F32, &[4]).unwrap(), 1.0, 1.0),
+        Err(Error::InvalidRandom(_))
+    ));
+
+    let replay_input = builder.input("replay_state", Shape::new(DType::U64, &[2]).unwrap());
+    let first = builder.random_state(replay_input).unwrap();
+    let replay = builder.random_state(replay_input).unwrap();
+    let _ = builder
+        .random_bits(first, Shape::new(DType::U32, &[4]).unwrap())
+        .unwrap();
+    assert!(matches!(
+        builder.random_bits(replay, Shape::new(DType::U32, &[4]).unwrap()),
+        Err(Error::InvalidRandom(
+            "random state has already been consumed"
+        ))
+    ));
+
+    let state_input = builder.input("sample_state", Shape::new(DType::U64, &[2]).unwrap());
+    for (top_k, temperature, top_p, min_p) in [
+        (0, 1.0, 1.0, 0.0),
+        (6, 1.0, 1.0, 0.0),
+        (2, 0.0, 1.0, 0.0),
+        (2, 1.0, 0.0, 0.0),
+        (2, 1.0, 1.0, 1.1),
+    ] {
+        let state = builder.random_state(state_input).unwrap();
+        assert!(matches!(
+            builder.sample_tokens(values, state, 1, top_k, temperature, top_p, min_p),
+            Err(Error::InvalidSampling(_))
+        ));
+    }
+}
+
+#[test]
+fn nd_gather_and_typed_scatter_are_verified_without_public_mlir_configuration() {
+    let mut builder = ProgramBuilder::new();
+    let input = builder.input("input", Shape::new(DType::F32, &[2, 3, 4]).unwrap());
+    let indices = builder.input("indices", Shape::new(DType::I32, &[5, 2]).unwrap());
+    let updates = builder.input("updates", Shape::new(DType::F32, &[5, 3]).unwrap());
+    let batched_indices = builder.input(
+        "batched_indices",
+        Shape::new(DType::I32, &[2, 5, 1]).unwrap(),
+    );
+    let batched_updates = builder.input(
+        "batched_updates",
+        Shape::new(DType::F32, &[2, 5, 4]).unwrap(),
+    );
+    let gathered = builder.gather_nd(input, indices, &[0, 2]).unwrap();
+    assert_eq!(gathered.shape().dimensions(), &[5, 3]);
+    let batched = builder
+        .gather_batched_nd(input, batched_indices, 1, &[1])
+        .unwrap();
+    assert_eq!(batched.shape().dimensions(), &[2, 5, 4]);
+    let updated = builder
+        .scatter_update(input, indices, updates, &[0, 2])
+        .unwrap();
+    let added = builder
+        .scatter_add(input, indices, updates, &[0, 2])
+        .unwrap();
+    let multiplied = builder
+        .scatter_multiply(input, indices, updates, &[0, 2])
+        .unwrap();
+    let minimum = builder
+        .scatter_minimum(input, indices, updates, &[0, 2])
+        .unwrap();
+    let maximum = builder
+        .scatter_maximum(input, indices, updates, &[0, 2])
+        .unwrap();
+    let batched_updated = builder
+        .scatter_update_batched(input, batched_indices, batched_updates, 1, &[1])
+        .unwrap();
+    let batched_added = builder
+        .scatter_add_batched(input, batched_indices, batched_updates, 1, &[1])
+        .unwrap();
+    let promised = builder
+        .scatter_update_with_promises(input, indices, updates, &[0, 2], true, true)
+        .unwrap();
+    for result in [updated, added, multiplied, minimum, maximum] {
+        assert_eq!(result.shape(), input.shape());
+    }
+
+    let text = builder
+        .finish(&[
+            gathered,
+            batched,
+            updated,
+            added,
+            multiplied,
+            minimum,
+            maximum,
+            batched_updated,
+            batched_added,
+            promised,
+        ])
+        .unwrap()
+        .stablehlo()
+        .unwrap();
+    assert!(text.contains("stablehlo.gather"), "{text}");
+    assert_eq!(text.matches("\"stablehlo.scatter\"(").count(), 8, "{text}");
+    assert!(text.contains("indices_are_sorted = true"), "{text}");
+    assert!(text.contains("unique_indices = true"), "{text}");
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
+}
+
+#[test]
+fn nd_indexing_rejects_structural_index_vector_and_update_errors() {
+    use nml_types::Partition;
+
+    let mut builder = ProgramBuilder::new();
+    let input = builder.input("input", Shape::new(DType::F32, &[2, 3, 4]).unwrap());
+    let wrong_width = builder.input("wrong_width", Shape::new(DType::I32, &[5, 1]).unwrap());
+    assert!(matches!(
+        builder.gather_nd(input, wrong_width, &[0, 2]),
+        Err(Error::InvalidIndexing(_))
+    ));
+    let sharded_vector = Shape::new(DType::I32, &[5, 2])
+        .unwrap()
+        .with_partitions(&[
+            Partition::Unspecified,
+            Partition::Sharded(AxisTag::new(301)),
+        ])
+        .unwrap();
+    let sharded_vector = builder.input("sharded_vector", sharded_vector);
+    assert!(matches!(
+        builder.gather_nd(input, sharded_vector, &[0, 2]),
+        Err(Error::InvalidIndexing(_))
+    ));
+    let indices = builder.input("indices", Shape::new(DType::I32, &[5, 2]).unwrap());
+    let wrong_updates = builder.input("wrong_updates", Shape::new(DType::F32, &[5, 4]).unwrap());
+    assert!(matches!(
+        builder.scatter_add(input, indices, wrong_updates, &[0, 2]),
+        Err(Error::ShapeMismatch { .. })
+    ));
 }
 
 #[test]
@@ -1285,4 +1994,285 @@ fn logical_mesh_lowers_shape_partitions_to_shardy() {
             nml_sharding::Error::MissingAxis(tag)
         )) if tag == absent
     ));
+}
+
+#[test]
+fn typed_collectives_use_explicit_shardy_meshes_and_replicated_results() {
+    use nml_sharding::Sharding;
+
+    let mesh_axis = AxisTag::new(211);
+    let shape = Shape::new(DType::F32, &[2, 4]).unwrap();
+    let mut builder = ProgramBuilder::new();
+    let input = builder.input("input", shape);
+    let sum = builder.all_reduce_sum(input).unwrap();
+    let maximum = builder.all_reduce_max(input).unwrap();
+    let minimum = builder.all_reduce_min(input).unwrap();
+    assert!(sum
+        .shape()
+        .partitions()
+        .iter()
+        .all(|partition| *partition == Partition::Replicated));
+    let program = builder.finish(&[sum, maximum, minimum]).unwrap();
+    let mesh = Sharding::mesh(&[(mesh_axis, 2)]).unwrap();
+    let text = program.stablehlo_with_sharding(&mesh).unwrap();
+    assert_eq!(text.matches("stablehlo.all_reduce").count(), 3, "{text}");
+    assert!(text.contains("dense<[[0, 1]]>"), "{text}");
+    assert!(text.contains("use_global_device_ids"), "{text}");
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
+
+    let sharded_shape = shape
+        .with_partitions(&[Partition::Sharded(mesh_axis), Partition::Replicated])
+        .unwrap();
+    let mut invalid = ProgramBuilder::new();
+    let sharded = invalid.input("sharded", sharded_shape);
+    assert!(matches!(
+        invalid.all_reduce_sum(sharded),
+        Err(Error::InvalidCollective(_))
+    ));
+    assert!(matches!(
+        program.stablehlo_with_sharding(&Sharding::replicated()),
+        Err(Error::InvalidCollective(_))
+    ));
+}
+
+#[test]
+fn portable_moe_routing_is_a_typed_backend_independent_graph() {
+    let mut builder = ProgramBuilder::new();
+    let hidden = builder.input("hidden", Shape::new(DType::F32, &[3, 4]).unwrap());
+    let router = builder.input("router", Shape::new(DType::F32, &[3, 3]).unwrap());
+    let gate_up = builder.input("gate_up", Shape::new(DType::F32, &[3, 10, 4]).unwrap());
+    let down = builder.input("down", Shape::new(DType::F32, &[3, 4, 5]).unwrap());
+    let swiglu = builder
+        .moe_swiglu(hidden, router, gate_up, down, 2)
+        .unwrap();
+    let geglu = builder.moe_geglu(hidden, router, gate_up, down, 2).unwrap();
+    let reglu = builder.moe_reglu(hidden, router, gate_up, down, 2).unwrap();
+    assert_eq!(swiglu.shape(), hidden.shape());
+    assert_eq!(geglu.shape(), hidden.shape());
+    assert_eq!(reglu.shape(), hidden.shape());
+    let text = builder
+        .finish(&[swiglu, geglu, reglu])
+        .unwrap()
+        .stablehlo()
+        .unwrap();
+    assert!(text.contains("stablehlo.sort"), "{text}");
+    assert!(text.contains("stablehlo.dot_general"), "{text}");
+    assert!(text.contains("stablehlo.logistic"), "{text}");
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
+
+    let mut invalid = ProgramBuilder::new();
+    let hidden = invalid.input("hidden", Shape::new(DType::F32, &[3, 4]).unwrap());
+    let router = invalid.input("router", Shape::new(DType::F32, &[3, 3]).unwrap());
+    let gate_up = invalid.input("gate_up", Shape::new(DType::F32, &[3, 9, 4]).unwrap());
+    let down = invalid.input("down", Shape::new(DType::F32, &[3, 4, 5]).unwrap());
+    assert!(matches!(
+        invalid.moe_swiglu(hidden, router, gate_up, down, 2),
+        Err(Error::InvalidMoe(_))
+    ));
+}
+
+#[test]
+fn gated_delta_net_step_and_sequence_share_one_typed_recurrence() {
+    let mut builder = ProgramBuilder::new();
+    let queries = builder.input("queries", Shape::new(DType::F32, &[2, 2, 3]).unwrap());
+    let keys = builder.input("keys", Shape::new(DType::F32, &[2, 2, 3]).unwrap());
+    let values = builder.input("values", Shape::new(DType::F32, &[2, 2, 4]).unwrap());
+    let alphas = builder.input("alphas", Shape::new(DType::F32, &[2, 2]).unwrap());
+    let betas = builder.input("betas", Shape::new(DType::F32, &[2, 2]).unwrap());
+    let state = builder.input("state", Shape::new(DType::F32, &[2, 4, 3]).unwrap());
+    let (outputs, final_state) = builder
+        .gated_delta_net(queries, keys, values, alphas, betas, state)
+        .unwrap();
+    assert_eq!(outputs.shape(), values.shape());
+    assert_eq!(final_state.shape(), state.shape());
+    let text = builder
+        .finish(&[outputs, final_state])
+        .unwrap()
+        .stablehlo()
+        .unwrap();
+    assert_eq!(text.matches("stablehlo.while").count(), 1, "{text}");
+    assert_eq!(text.matches("stablehlo.dot_general").count(), 2, "{text}");
+    assert!(text.contains("stablehlo.dynamic_slice"), "{text}");
+    assert!(text.contains("stablehlo.dynamic_update_slice"), "{text}");
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
+
+    // The recurrence is represented once regardless of the static sequence
+    // length; long contexts must not produce proportionally larger graphs.
+    let mut long = ProgramBuilder::new();
+    let queries = long.input("queries", Shape::new(DType::F32, &[64, 2, 3]).unwrap());
+    let keys = long.input("keys", Shape::new(DType::F32, &[64, 2, 3]).unwrap());
+    let values = long.input("values", Shape::new(DType::F32, &[64, 2, 4]).unwrap());
+    let alphas = long.input("alphas", Shape::new(DType::F32, &[64, 2]).unwrap());
+    let betas = long.input("betas", Shape::new(DType::F32, &[64, 2]).unwrap());
+    let state = long.input("state", Shape::new(DType::F32, &[2, 4, 3]).unwrap());
+    let (outputs, final_state) = long
+        .gated_delta_net(queries, keys, values, alphas, betas, state)
+        .unwrap();
+    let long_text = long
+        .finish(&[outputs, final_state])
+        .unwrap()
+        .stablehlo()
+        .unwrap();
+    assert_eq!(long_text.matches("stablehlo.while").count(), 1);
+    assert_eq!(long_text.matches("stablehlo.dot_general").count(), 2);
+
+    let mut invalid = ProgramBuilder::new();
+    let state = invalid.input("state", Shape::new(DType::F32, &[2, 4, 3]).unwrap());
+    let query = invalid.input("query", Shape::new(DType::F32, &[2, 3]).unwrap());
+    let key = invalid.input("key", Shape::new(DType::F32, &[2, 3]).unwrap());
+    let value = invalid.input("value", Shape::new(DType::F32, &[2, 5]).unwrap());
+    let alpha = invalid.input("alpha", Shape::new(DType::F32, &[2]).unwrap());
+    let beta = invalid.input("beta", Shape::new(DType::F32, &[2]).unwrap());
+    assert!(matches!(
+        invalid.gated_delta_net_step(state, query, key, value, alpha, beta),
+        Err(Error::InvalidStateSpace(_))
+    ));
+
+    let mut invalid_metadata = ProgramBuilder::new();
+    let head = AxisTag::new(201);
+    let value_axis = AxisTag::new(202);
+    let key_axis = AxisTag::new(203);
+    let wrong_value_axis = AxisTag::new(204);
+    let state = invalid_metadata.input(
+        "state",
+        Shape::new(DType::F32, &[2, 4, 3])
+            .unwrap()
+            .with_axis_tags(&[head, value_axis, key_axis])
+            .unwrap(),
+    );
+    let query = invalid_metadata.input(
+        "query",
+        Shape::new(DType::F32, &[2, 3])
+            .unwrap()
+            .with_axis_tags(&[head, key_axis])
+            .unwrap(),
+    );
+    let key = invalid_metadata.input("key", query.shape());
+    let value = invalid_metadata.input(
+        "value",
+        Shape::new(DType::F32, &[2, 4])
+            .unwrap()
+            .with_axis_tags(&[head, wrong_value_axis])
+            .unwrap(),
+    );
+    let gate_shape = Shape::new(DType::F32, &[2])
+        .unwrap()
+        .with_axis_tags(&[head])
+        .unwrap();
+    let alpha = invalid_metadata.input("alpha", gate_shape);
+    let beta = invalid_metadata.input("beta", gate_shape);
+    assert!(matches!(
+        invalid_metadata.gated_delta_net_step(state, query, key, value, alpha, beta),
+        Err(Error::InvalidStateSpace(message)) if message.contains("key/value-axis metadata")
+    ));
+}
+
+#[test]
+fn ampere_moe_dispatch_is_private_and_capability_selected() {
+    use nml_sharding::Sharding;
+
+    fn program(dtype: DType) -> nml_ir::Program {
+        let mut builder = ProgramBuilder::new();
+        let hidden = builder.input("hidden", Shape::new(dtype, &[4, 32]).unwrap());
+        let router = builder.input("router", Shape::new(DType::F32, &[4, 4]).unwrap());
+        let gate_up = builder.input("gate_up", Shape::new(dtype, &[4, 64, 32]).unwrap());
+        let down = builder.input("down", Shape::new(dtype, &[4, 32, 32]).unwrap());
+        let output = builder
+            .moe_swiglu(hidden, router, gate_up, down, 2)
+            .unwrap();
+        builder.finish(&[output]).unwrap()
+    }
+
+    let context = Context::new();
+    for dtype in [DType::F16, DType::Bf16, DType::F32] {
+        let cuda = program(dtype)
+            .module_with_sharding_cuda(&context, &Sharding::single(), 108, 8, 0)
+            .unwrap()
+            .text();
+        assert_eq!(cuda.matches("__gpu$xla.gpu.triton").count(), 2, "{cuda}");
+        assert!(cuda.contains("moe_grouped_gate_up"), "{cuda}");
+        assert!(cuda.contains("moe_grouped_down"), "{cuda}");
+    }
+
+    let program = program(DType::F16);
+    let sm75 = program
+        .module_with_sharding_cuda(&context, &Sharding::single(), 24, 7, 5)
+        .unwrap()
+        .text();
+    assert!(!sm75.contains("__gpu$xla.gpu.triton"), "{sm75}");
+    assert!(sm75.contains("stablehlo.dot_general"), "{sm75}");
+
+    let portable = program.stablehlo().unwrap();
+    assert!(!portable.contains("__gpu$xla.gpu.triton"), "{portable}");
+    assert!(portable.contains("stablehlo.dot_general"), "{portable}");
+}
+
+#[test]
+fn expert_parallel_moe_derives_local_shards_inside_private_manual_computation() {
+    use nml_sharding::Sharding;
+
+    let data_axis = AxisTag::new(211);
+    let expert_axis = AxisTag::new(212);
+    let expert_partition = [
+        Partition::Sharded(expert_axis),
+        Partition::Replicated,
+        Partition::Replicated,
+    ];
+    let mut builder = ProgramBuilder::new();
+    let hidden = builder.input(
+        "hidden",
+        Shape::new(DType::F16, &[4, 32])
+            .unwrap()
+            .with_partitions(&[Partition::Sharded(data_axis), Partition::Replicated])
+            .unwrap(),
+    );
+    let router = builder.input(
+        "router",
+        Shape::new(DType::F32, &[4, 4])
+            .unwrap()
+            .with_partitions(&[Partition::Sharded(data_axis), Partition::Replicated])
+            .unwrap(),
+    );
+    let gate_up = builder.input(
+        "gate_up",
+        Shape::new(DType::F16, &[4, 64, 32])
+            .unwrap()
+            .with_partitions(&expert_partition)
+            .unwrap(),
+    );
+    let down = builder.input(
+        "down",
+        Shape::new(DType::F16, &[4, 32, 32])
+            .unwrap()
+            .with_partitions(&expert_partition)
+            .unwrap(),
+    );
+    let output = builder
+        .moe_swiglu(hidden, router, gate_up, down, 2)
+        .unwrap();
+    let program = builder.finish(&[output]).unwrap();
+    let mesh = Sharding::mesh(&[(data_axis, 2), (expert_axis, 2)]).unwrap();
+    let text = program
+        .module_with_sharding_cuda(&Context::new(), &mesh, 108, 8, 0)
+        .unwrap()
+        .text();
+
+    assert!(text.contains("sdy.manual_computation"), "{text}");
+    assert!(text.contains("stablehlo.partition_id"), "{text}");
+    assert_eq!(text.matches("__gpu$xla.gpu.triton").count(), 2, "{text}");
+    assert_eq!(text.matches("stablehlo.all_reduce").count(), 1, "{text}");
+    assert!(text.contains("dense<[[0, 1], [2, 3]]>"), "{text}");
+    assert!(text.contains("tensor<2x64x32xf16>"), "{text}");
 }

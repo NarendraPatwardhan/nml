@@ -1,6 +1,6 @@
 use nml_types::{
-    AxisTag, BFloat16, Complex64, Complex128, DType, DTypeClass, F16, Layout, MAX_RANK, Partition,
-    Shape, ShapeError,
+    AxisTag, BFloat16, Complex128, Complex64, DType, DTypeClass, Layout, Partition, Shape,
+    ShapeError, F16, MAX_RANK,
 };
 use std::mem::{align_of, size_of};
 
@@ -12,10 +12,10 @@ fn canonical_dtype_contract_is_exhaustive() {
         (DType::I16, DTypeClass::SignedInteger, 2, 2, "i16"),
         (DType::I32, DTypeClass::SignedInteger, 4, 4, "i32"),
         (DType::I64, DTypeClass::SignedInteger, 8, 8, "i64"),
-        (DType::U8, DTypeClass::UnsignedInteger, 1, 1, "i8"),
-        (DType::U16, DTypeClass::UnsignedInteger, 2, 2, "i16"),
-        (DType::U32, DTypeClass::UnsignedInteger, 4, 4, "i32"),
-        (DType::U64, DTypeClass::UnsignedInteger, 8, 8, "i64"),
+        (DType::U8, DTypeClass::UnsignedInteger, 1, 1, "ui8"),
+        (DType::U16, DTypeClass::UnsignedInteger, 2, 2, "ui16"),
+        (DType::U32, DTypeClass::UnsignedInteger, 4, 4, "ui32"),
+        (DType::U64, DTypeClass::UnsignedInteger, 8, 8, "ui64"),
         (DType::F16, DTypeClass::Float, 2, 2, "f16"),
         (DType::Bf16, DTypeClass::Float, 2, 2, "bf16"),
         (DType::F32, DTypeClass::Float, 4, 4, "f32"),

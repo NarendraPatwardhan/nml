@@ -6,6 +6,7 @@ nml_rust_library(
     name = "nml_kernel_triton",
     srcs = [
         "src/lib.rs",
+        "src/moe.rs",
         "src/paged_attention.rs",
         "src/specification.rs",
         "src/unified_attention.rs",
