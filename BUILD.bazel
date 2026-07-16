@@ -74,6 +74,7 @@ _COMMON_CONTRACTS = [
     "//crates/nml-runtime:runtime_structure_contract_test",
     "//crates/nml-sharding:sharding_contract_test",
     "//crates/nml-tensor:slice_contract_test",
+    "//crates/nml-tokenizer:tokenizer_contract_test",
     "//crates/nml-types:types_contract_test",
     "//crates/nml-xla:compile_options_contract_test",
     "//crates/nml:linear_cpu_contract_test",
@@ -81,6 +82,7 @@ _COMMON_CONTRACTS = [
     "//crates/nml:neural_ops_cpu_contract_test",
     "//crates/nml:execution_performance_cpu_contract_test",
     "//crates/nml:structural_contract_test",
+    "//products/qwen3:qwen3_contract_test",
 ]
 
 _CUDA_DEVICE_CONTRACTS = [
@@ -135,12 +137,13 @@ test_suite(
     visibility = ["//visibility:public"],
 )
 
-# `filegroup` deliberately propagates test executables rather than their
+# `filegroup` deliberately propagates exact CUDA executables rather than their
 # runfiles. A remote builder can therefore populate every code-generation and
 # linker action needed by the NVIDIA host without copying the CUDA runtime into
 # the hosted runner. The host assembles the SHA-pinned system-driver runtime
 # when it executes `cuda_device_contracts`; distribution integrity remains the
-# independent `cuda_package_contracts` gate.
+# independent `cuda_package_contracts` gate. Product binaries belong here once
+# CUDA compilation is part of their permanent acceptance contract.
 filegroup(
     name = "cuda_contract_binaries",
     srcs = [
@@ -150,6 +153,7 @@ filegroup(
         "//crates/nml:attention_cuda_contract_binary",
         "//crates/nml:neural_ops_cuda_contract_binary",
         "//crates/nml:execution_performance_cuda_contract_binary",
+        "//products/qwen3:qwen3",
     ],
     testonly = True,
     visibility = ["//visibility:public"],

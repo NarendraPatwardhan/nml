@@ -1,0 +1,77 @@
+"""Dense Qwen3 generation product."""
+
+load("//bazel:rust.bzl", "nml_rust_binary", "nml_rust_library", "nml_rust_test")
+
+nml_rust_library(
+    name = "nml_qwen3",
+    srcs = [
+        "src/config.rs",
+        "src/lib.rs",
+        "src/model.rs",
+    ],
+    crate_root = "src/lib.rs",
+    deps = [
+        "//crates/nml:nml",
+        "@rust_crates//serde",
+        "@rust_crates//serde_json",
+    ],
+    visibility = [":__pkg__"],
+)
+
+nml_rust_binary(
+    name = "qwen3",
+    srcs = ["src/main.rs"],
+    crate_root = "src/main.rs",
+    data = select({
+        "//platforms:cuda.enabled": ["//platforms/cuda:runtime_system_driver"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":nml_qwen3",
+        "//crates/nml:nml",
+    ],
+    env = select({
+        "//platforms:cuda.enabled": {
+            "NML_CUDA_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime_system_driver)",
+        },
+        "//conditions:default": {},
+    }),
+    visibility = ["//:__pkg__"],
+)
+
+nml_rust_test(
+    name = "qwen3_contract_test",
+    size = "small",
+    srcs = [
+        "src/config.rs",
+        "src/lib.rs",
+        "src/model.rs",
+    ],
+    crate_root = "src/lib.rs",
+    deps = [
+        "//crates/nml:nml",
+        "@rust_crates//serde",
+        "@rust_crates//serde_json",
+    ],
+)
+
+# The checkpoint is a deliberate ignored local input, so this exact numerical
+# and lifecycle contract is opt-in rather than a wildcard CI target. Run it
+# with --test_env=NML_QWEN3_MODEL=/absolute/path/to/Qwen3-0.6B.
+nml_rust_test(
+    name = "qwen3_bf16_cpu_contract_test",
+    size = "enormous",
+    srcs = ["tests/qwen3_bf16_cpu_contract.rs"],
+    crate_root = "tests/qwen3_bf16_cpu_contract.rs",
+    local = True,
+    tags = [
+        "exclusive",
+        "external",
+        "manual",
+    ],
+    deps = [
+        ":nml_qwen3",
+        "//crates/nml:nml",
+        "@rust_crates//sha2",
+    ],
+)

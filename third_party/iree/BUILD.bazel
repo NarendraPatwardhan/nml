@@ -1,0 +1,9 @@
+"""Audited compatibility patches for the original IREE tokenizer source."""
+
+exports_files(
+    [
+        "fix-added-token-matching.patch",
+        "match-hf-tokenizer.patch",
+        "tokenizer-only.patch",
+    ],
+)

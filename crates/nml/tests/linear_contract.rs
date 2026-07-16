@@ -1,6 +1,6 @@
 //! Product contract for persistent FP16/BF16 checkpoint parameters.
 
-use nml_types::{BFloat16, DType, Shape, F16};
+use nml_types::{BFloat16, DType, F16, Shape};
 use safetensors::tensor::{Dtype as SafeDType, View};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -68,6 +68,7 @@ fn persistent_linear_parameters_execute_repeatedly_from_real_checkpoints() {
     }
     for dtype in [DType::F32, DType::F16, DType::Bf16] {
         algebra_shape_and_activation_graph_executes(&platform, dtype);
+        rank_three_linear_executes(&platform, dtype);
     }
     if platform.name() == "cpu" {
         tiled_cpu_placement_round_trips(&platform);
@@ -77,6 +78,67 @@ fn persistent_linear_parameters_execute_repeatedly_from_real_checkpoints() {
     tied_parameters_load_once_and_share_storage(&platform);
     truncated_checkpoint_releases_in_flight_transfers(&platform);
     activation_donation_aliases_the_output(&platform);
+}
+
+fn rank_three_linear_executes(platform: &nml::Platform, dtype: DType) {
+    const BATCHES: usize = 2;
+    const SEQUENCE: usize = 3;
+    const INPUTS: usize = 4;
+    const OUTPUTS: usize = 5;
+
+    let input_shape = Shape::new(dtype, &[BATCHES as i64, SEQUENCE as i64, INPUTS as i64]).unwrap();
+    let weight_shape = Shape::new(dtype, &[OUTPUTS as i64, INPUTS as i64]).unwrap();
+    let bias_shape = Shape::new(dtype, &[OUTPUTS as i64]).unwrap();
+    let mut builder = nml_ir::ProgramBuilder::new();
+    let input = builder.input("input", input_shape);
+    let weight = builder.input("weight", weight_shape);
+    let bias = builder.input("bias", bias_shape);
+    let output = builder.linear(input, weight, Some(bias)).unwrap();
+    assert_eq!(
+        output.shape().dimensions(),
+        &[BATCHES as i64, SEQUENCE as i64, OUTPUTS as i64]
+    );
+    let program = builder
+        .finish_named(&[("output".to_owned(), output)])
+        .unwrap();
+    let placement = nml::Sharding::single();
+    let executable = platform.compile(&program, placement.clone()).unwrap();
+
+    let input_values = (0..BATCHES * SEQUENCE * INPUTS)
+        .map(|index| (index as f32 - 8.0) / 11.0)
+        .collect::<Vec<_>>();
+    let weight_values = (0..OUTPUTS * INPUTS)
+        .map(|index| (6.0 - index as f32) / 13.0)
+        .collect::<Vec<_>>();
+    let bias_values = [-0.25, 0.0, 0.125, 0.375, -0.5];
+    let expected = reference_layer(
+        &input_values,
+        BATCHES * SEQUENCE,
+        INPUTS,
+        OUTPUTS,
+        &weight_values,
+        &bias_values,
+    );
+
+    let mut arguments = executable.args();
+    for (name, shape, values) in [
+        ("input", input_shape, input_values.as_slice()),
+        ("weight", weight_shape, weight_values.as_slice()),
+        ("bias", bias_shape, bias_values.as_slice()),
+    ] {
+        let bytes = encode(dtype, values);
+        let slice = nml::Slice::from_bytes(shape, &bytes).unwrap();
+        arguments
+            .set(
+                name,
+                platform
+                    .upload(&slice, placement.clone(), nml::Memory::Default)
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+    let results = arguments.call().unwrap();
+    assert_result_close(&results, "output", dtype, &expected);
 }
 
 fn checkpoint_backed_two_layer_mlp(platform: &nml::Platform, dtype: DType) {

@@ -4,7 +4,7 @@ use nml_ir::{
 };
 use nml_mlir::Context;
 use nml_tensor::Element;
-use nml_types::{AxisTag, BFloat16, Complex128, Complex64, DType, Layout, Partition, Shape, F16};
+use nml_types::{AxisTag, BFloat16, Complex64, Complex128, DType, F16, Layout, Partition, Shape};
 
 #[test]
 fn matmul_is_typed_deterministic_and_verified() {
@@ -69,6 +69,66 @@ fn invalid_matmul_fails_before_mlir_construction() {
     assert!(matches!(
         builder.matmul(left, right),
         Err(Error::DimensionMismatch { .. })
+    ));
+}
+
+#[test]
+fn linear_contracts_the_final_activation_axis_at_any_rank() {
+    let mut builder = ProgramBuilder::new();
+    let batch = AxisTag::new(11);
+    let sequence = AxisTag::new(12);
+    let model = AxisTag::new(13);
+    let output = AxisTag::new(14);
+    let input_shape = Shape::new(DType::Bf16, &[2, 3, 4])
+        .unwrap()
+        .with_axis_tags(&[batch, sequence, model])
+        .unwrap()
+        .with_partitions(&[
+            Partition::Sharded(batch),
+            Partition::Unspecified,
+            Partition::Unspecified,
+        ])
+        .unwrap();
+    let weight_shape = Shape::new(DType::Bf16, &[5, 4])
+        .unwrap()
+        .with_axis_tags(&[output, model])
+        .unwrap();
+    let input = builder.input("input", input_shape);
+    let weight = builder.parameter("weight", weight_shape);
+    let bias = builder.parameter("bias", Shape::new(DType::Bf16, &[5]).unwrap());
+    let result = builder.linear(input, weight, Some(bias)).unwrap();
+
+    assert_eq!(result.shape().dimensions(), &[2, 3, 5]);
+    assert_eq!(result.shape().axis_tags(), &[batch, sequence, output]);
+    assert_eq!(
+        result.shape().partitions(),
+        &[
+            Partition::Sharded(batch),
+            Partition::Unspecified,
+            Partition::Unspecified,
+        ]
+    );
+
+    let program = builder.finish(&[result]).unwrap();
+    let mesh = nml_sharding::Sharding::mesh(&[(batch, 2)]).unwrap();
+    let text = program.stablehlo_with_sharding(&mesh).unwrap();
+    assert!(text.contains("contracting_dims = [2] x [1]"), "{text}");
+    assert!(text.contains("dims = [2]"), "{text}");
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
+}
+
+#[test]
+fn linear_rejects_scalar_activations_before_mlir_construction() {
+    let mut builder = ProgramBuilder::new();
+    let scalar = builder.input("scalar", Shape::new(DType::F32, &[]).unwrap());
+    let weight = builder.parameter("weight", Shape::new(DType::F32, &[2, 1]).unwrap());
+    assert!(matches!(
+        builder.linear(scalar, weight, None),
+        Err(Error::InvalidLinearAlgebra(_))
     ));
 }
 
@@ -1169,10 +1229,12 @@ fn cuda_paged_attention_lowers_complete_typed_triton_artifacts() {
             .unwrap();
         module.verify().unwrap();
         let text = module.text();
-        assert!(!module
-            .portable_artifact(&nml_mlir::stablehlo_current_version())
-            .unwrap()
-            .is_empty());
+        assert!(
+            !module
+                .portable_artifact(&nml_mlir::stablehlo_current_version())
+                .unwrap()
+                .is_empty()
+        );
         text
     }
 
@@ -2007,11 +2069,12 @@ fn typed_collectives_use_explicit_shardy_meshes_and_replicated_results() {
     let sum = builder.all_reduce_sum(input).unwrap();
     let maximum = builder.all_reduce_max(input).unwrap();
     let minimum = builder.all_reduce_min(input).unwrap();
-    assert!(sum
-        .shape()
-        .partitions()
-        .iter()
-        .all(|partition| *partition == Partition::Replicated));
+    assert!(
+        sum.shape()
+            .partitions()
+            .iter()
+            .all(|partition| *partition == Partition::Replicated)
+    );
     let program = builder.finish(&[sum, maximum, minimum]).unwrap();
     let mesh = Sharding::mesh(&[(mesh_axis, 2)]).unwrap();
     let text = program.stablehlo_with_sharding(&mesh).unwrap();

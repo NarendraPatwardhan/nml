@@ -46,7 +46,10 @@ filegroup(
         "//platforms:is_linux_aarch64": ["@libpjrt_cuda_linux_arm64//:runtime"],
         "//conditions:default": [],
     }),
-    visibility = ["//crates:__subpackages__"],
+    visibility = [
+        "//crates:__subpackages__",
+        "//products:__subpackages__",
+    ],
 )
 
 # Device contracts run against the same hermetic user-space stack while using
@@ -59,7 +62,10 @@ filegroup(
         "//platforms:is_linux_aarch64": ["@libpjrt_cuda_linux_arm64//:runtime_system_driver"],
         "//conditions:default": [],
     }),
-    visibility = ["//crates:__subpackages__"],
+    visibility = [
+        "//crates:__subpackages__",
+        "//products:__subpackages__",
+    ],
 )
 
 cc_library(

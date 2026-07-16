@@ -1,0 +1,4 @@
+# Unified-diff context lines legitimately contain a one-byte space. Preserve
+# the audited external patches byte-for-byte without weakening whitespace
+# diagnostics for Rust, C, Starlark, Markdown, or any other repository source.
+third_party/iree/*.patch whitespace=-trailing-space

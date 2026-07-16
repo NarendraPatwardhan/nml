@@ -1,0 +1,18 @@
+"""Safe IREE tokenizer ownership and streaming text contracts."""
+
+load("//bazel:rust.bzl", "nml_rust_library", "nml_rust_test")
+
+nml_rust_library(
+    name = "nml_tokenizer",
+    srcs = ["src/lib.rs"],
+    crate_root = "src/lib.rs",
+    deps = ["//crates/nml-tokenizer-sys:nml_tokenizer_sys"],
+    visibility = ["//visibility:public"],
+)
+
+nml_rust_test(
+    name = "tokenizer_contract_test",
+    srcs = ["tests/tokenizer_contract.rs"],
+    crate_root = "tests/tokenizer_contract.rs",
+    deps = [":nml_tokenizer"],
+)

@@ -34,6 +34,13 @@ bazel_dep(name = "rules_license", version = "1.0.0")
 bazel_dep(name = "rules_proto", version = "7.1.0")
 bazel_dep(name = "rules_python", version = "1.9.0")
 bazel_dep(name = "rules_shell", version = "0.6.1")
+# IREE's tokenizer runtime delegates stack-trace support and regular-expression
+# pre-tokenization to these BCR modules. They are direct dependencies because
+# the sparse IREE repository names both repositories from its checked-in BUILD
+# graph; relying on ZML or another transitive module to publish those names
+# would make the tokenizer boundary accidental.
+bazel_dep(name = "libbacktrace", version = "1.0.0-20250926-7939218")
+bazel_dep(name = "pcre2", version = "10.45")
 bazel_dep(name = "zlib-ng", version = "2.3.3", repo_name = "llvm_zlib")
 bazel_dep(name = "zstd", version = "1.5.7.bcr.1", repo_name = "llvm_zstd")
 bazel_dep(name = "with_cfg.bzl", version = "0.14.4")
@@ -142,6 +149,30 @@ use_repo(cuda_compiler, "cuda")
 # archive does not contain git submodules, so its exact CUTLASS gitlink is a
 # second explicit repository rather than an ambient checkout or system input.
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+git_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
+
+# IREE's tokenizer is a small, independently useful runtime component. Follow
+# ZML's sparse source boundary while keeping the dependency on the original
+# repository and applying the audited Hugging Face compatibility corrections
+# locally. Compiler/runtime IREE is deliberately not introduced.
+git_repository(
+    name = "iree",
+    commit = "4d4e97d00f099a21f38eeff26f82a6d9e3643a11",
+    patch_args = ["-p1"],
+    patches = [
+        "//third_party/iree:tokenizer-only.patch",
+        "//third_party/iree:fix-added-token-matching.patch",
+        "//third_party/iree:match-hf-tokenizer.patch",
+    ],
+    remote = "https://github.com/iree-org/iree.git",
+    sparse_checkout_patterns = [
+        "runtime/src/**",
+        "build_tools/bazel/**",
+        "build_tools/third_party/libbacktrace/**",
+        "BUILD.bazel",
+    ],
+)
+
 http_archive(
     name = "flash_attention",
     build_file = "//third_party/flash_attention:flash_attention.BUILD.bazel",
@@ -168,6 +199,7 @@ crate.spec(package = "quote", version = "=1.0.46")
 crate.spec(package = "safetensors", version = "=0.8.0")
 crate.spec(package = "serde", features = ["derive"], version = "=1.0.228")
 crate.spec(package = "serde_json", version = "=1.0.150")
+crate.spec(package = "sha2", version = "=0.10.9")
 crate.spec(package = "syn", features = ["full"], version = "=2.0.118")
 crate.from_specs(
     name = "rust_crates",

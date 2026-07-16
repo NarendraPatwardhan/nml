@@ -19,8 +19,8 @@ use nml_mlir::{
 use nml_sharding::Sharding;
 use nml_tensor::{Element, Slice};
 use nml_types::{
-    AxisTag, BFloat16, Complex128, Complex64, DType, DTypeClass, Layout, Partition, Shape,
-    ShapeError, F16,
+    AxisTag, BFloat16, Complex64, Complex128, DType, DTypeClass, F16, Layout, Partition, Shape,
+    ShapeError,
 };
 use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
@@ -3939,29 +3939,36 @@ impl ProgramBuilder {
         Ok(result)
     }
 
-    /// Conventional `[batch, in] * [out, in] + [out]` linear layer.
+    /// Conventional `[..., in] * [out, in] + [out]` linear layer.
     pub fn linear(
         &mut self,
         input: Tensor,
         weight: Tensor,
         bias: Option<Tensor>,
     ) -> Result<Tensor, Error> {
-        self.require_rank(input, "linear input", 2)?;
+        self.require_local(input)?;
+        if input.shape.rank() == 0 {
+            return Err(Error::InvalidLinearAlgebra(
+                "linear input requires at least one dimension",
+            ));
+        }
         self.require_rank(weight, "linear weight", 2)?;
-        let product = self.dot_general(input, weight, &[], &[], &[1], &[1])?;
+        let input_axis = input.shape.rank() - 1;
+        let product = self.dot_general(input, weight, &[], &[], &[input_axis], &[1])?;
         let Some(bias) = bias else {
             return Ok(product);
         };
         self.require_rank(bias, "linear bias", 1)?;
-        if bias.shape.dimensions()[0] != product.shape.dimensions()[1] {
+        let output_axis = product.shape.rank() - 1;
+        if bias.shape.dimensions()[0] != product.shape.dimensions()[output_axis] {
             return Err(Error::DimensionMismatch {
                 left_axis: 0,
-                right_axis: 1,
+                right_axis: output_axis,
                 left: bias.shape.dimensions()[0],
-                right: product.shape.dimensions()[1],
+                right: product.shape.dimensions()[output_axis],
             });
         }
-        let bias = self.broadcast_in_dim(bias, product.shape, &[1])?;
+        let bias = self.broadcast_in_dim(bias, product.shape, &[output_axis])?;
         self.add(product, bias)
     }
 

@@ -62,8 +62,8 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             fn bufferize<__NmlError>(
                 &self,
                 __prefix: &str,
-                __resolve: &mut impl FnMut(&str, ::nml::Tensor) -> Result<::nml::Buffer, __NmlError>,
-            ) -> Result<Self::Buffers, __NmlError> {
+                __resolve: &mut impl FnMut(&str, ::nml::Tensor) -> ::std::result::Result<::nml::Buffer, __NmlError>,
+            ) -> ::std::result::Result<Self::Buffers, __NmlError> {
                 #bufferize
             }
         }
@@ -587,7 +587,7 @@ fn bufferize_tokens(
             "Vec" => {
                 let nested =
                     bufferize_tokens(quote!(__value), inner, quote!(&__item_path), String::new());
-                quote!({ let __path = #path; (#value).iter().enumerate().map(|(__index, __value)| { let __item_path = if __path.is_empty() { __index.to_string() } else { format!("{}.{__index}", __path) }; Ok(#nested) }).collect::<Result<Vec<_>, __NmlError>>()? })
+                quote!({ let __path = #path; (#value).iter().enumerate().map(|(__index, __value)| { let __item_path = if __path.is_empty() { __index.to_string() } else { format!("{}.{__index}", __path) }; ::std::result::Result::Ok(#nested) }).collect::<::std::result::Result<::std::vec::Vec<_>, __NmlError>>()? })
             }
             "Box" => {
                 let nested = bufferize_tokens(quote!(&**#value), inner, prefix, segment);
@@ -604,7 +604,7 @@ fn bufferize_tokens(
                 quote!(&__item_path),
                 String::new(),
             );
-            quote!({ let __path = #path; let __values = (#value).iter().enumerate().map(|(__index, __value)| { let __item_path = if __path.is_empty() { __index.to_string() } else { format!("{}.{__index}", __path) }; Ok(#nested) }).collect::<Result<Vec<_>, __NmlError>>()?; __values.try_into().ok().expect("bufferized array length matches source") })
+            quote!({ let __path = #path; let __values = (#value).iter().enumerate().map(|(__index, __value)| { let __item_path = if __path.is_empty() { __index.to_string() } else { format!("{}.{__index}", __path) }; ::std::result::Result::Ok(#nested) }).collect::<::std::result::Result<::std::vec::Vec<_>, __NmlError>>()?; __values.try_into().ok().expect("bufferized array length matches source") })
         }
         Type::Tuple(tuple) => {
             let values = tuple.elems.iter().enumerate().map(|(index, field)| {

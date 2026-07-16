@@ -30,6 +30,35 @@ enum Choice {
     Empty,
 }
 
+mod derive_hygiene {
+    // Product crates commonly expose their own one-parameter Result alias. The
+    // derive must bind the standard two-parameter Result explicitly instead of
+    // resolving this alias at its call site.
+    pub type Result<T> = std::result::Result<T, ProductError>;
+
+    #[derive(Debug)]
+    pub struct ProductError;
+
+    #[derive(nml::NmlStruct)]
+    pub struct Model {
+        pub weight: nml::Tensor,
+    }
+}
+
+#[test]
+fn derive_is_independent_of_call_site_result_aliases() {
+    let mut builder = nml_ir::ProgramBuilder::new();
+    let shape = Shape::new(DType::F16, &[1]).unwrap();
+    let model = derive_hygiene::Model {
+        weight: builder.parameter("weight", shape),
+    };
+    let _uses_product_result: derive_hygiene::Result<()> = Ok(());
+    let result = model.bufferize("model", &mut |_, _| {
+        Err::<nml::Buffer, _>(derive_hygiene::ProductError)
+    });
+    assert!(result.is_err());
+}
+
 #[test]
 fn derive_visits_nested_models_in_deterministic_field_order() {
     let mut builder = nml_ir::ProgramBuilder::new();

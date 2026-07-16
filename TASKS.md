@@ -1096,6 +1096,119 @@ numerical or performance obligation for selected capabilities.
 
 ---
 
+# Milestone 7: IREE tokenization and Qwen3-0.6B bf16 generation
+
+This milestone converts the completed acceleration substrate into one real text
+generation product without turning the root facade into a serving framework.
+The official Qwen3 checkpoint, its Hugging Face tokenizer, and the pinned ZML
+implementation are evidence sources. NML owns the Rust model/session design,
+keeps remote model acquisition outside the runtime, and admits no alternate
+Python, Cargo, or ZML dependency graph.
+
+## 1. IREE tokenizer ownership
+
+- [x] Pin IREE commit `4d4e97d00f099a21f38eeff26f82a6d9e3643a11`
+      from the original repository with the tokenizer-only Bazel dependency
+      closure and the Hugging Face compatibility corrections required by the
+      pinned ZML path. Keep patch provenance explicit and do not depend on a
+      ZML repository target or source fork.
+- [x] Add a narrow C bridge that owns IREE tokenizer, encoder, and decoder
+      state, consumes every returned `iree_status_t` exactly once, and exposes
+      only sized byte/token buffers across the Rust ABI.
+- [x] Add one safe Rust `Tokenizer` API with file/byte construction, vocabulary
+      lookup, complete encoding, complete decoding, and incremental token
+      decoding. State reset, partial consumption, resource exhaustion, UTF-8
+      fragments, and destruction must have permanent contracts.
+- [x] Verify a bounded tokenizer fixture and the real pinned Qwen3
+      `tokenizer.json`, including chat special tokens and known token IDs.
+
+## 2. Qwen3 model and checkpoint contract
+
+- [x] Parse and validate the local `config.json`: exact dense Qwen3 architecture,
+      bf16 storage, tied word embeddings, supported activation/RoPE/cache
+      behavior, positive dimensions, GQA divisibility, and checkpoint tensor
+      shapes. Unsupported variants must fail before parameter upload.
+- [x] Declare the checkpoint hierarchy with NML structural derivation and exact
+      Hugging Face names: embedding/final norm, 28 decoder layers, Q/K/V/O
+      projections, Q/K head normalization, two residual norms, and SwiGLU
+      projections. Tied output logits must reuse the embedding buffer rather
+      than allocate or load a duplicate.
+- [x] Generalize the shared linear operation from rank-2 activations to any
+      non-scalar activation whose last axis contracts with `[out, in]`. Preserve
+      tags, partitions, bias broadcasting, validation, StableHLO lowering, and
+      rank-2 behavior; add numerical CPU/CUDA product coverage.
+
+## 3. Compiled prefill and decode architecture
+
+- [x] Implement one backend-neutral Qwen3 block graph with FP32 RMSNorm/RoPE
+      accumulation, Q/K normalization, sequential-half RoPE, causal GQA,
+      SwiGLU, residual connections, final norm, tied vocabulary projection, and
+      greedy token selection.
+- [x] Compile a prompt-length-specific prefill program that consumes token IDs,
+      writes every layer's dense K/V state through declared output aliases, and
+      emits the first token without retaining logits on the host.
+- [x] Compile one static single-token decode program that donates and reinstalls
+      every layer cache, masks unused capacity by absolute key/query position,
+      reuses baked parameters across calls, and emits one token per invocation.
+- [x] Keep model parameters loaded once and shared by both executables. Cache
+      storage, token activations, result ownership, compilation, upload, first
+      execution, steady decode, and download must remain distinguishable.
+
+## 4. Local Qwen3-0.6B product execution
+
+- [x] Add a focused Bazel-built Qwen3 executable accepting a local model
+      directory, prompt, generation bound, and cache capacity. It applies the
+      Qwen3 non-thinking single-user chat template, streams incremental IREE
+      decoding, stops on the configured EOS token, and reports phase timings.
+- [x] Pin official `Qwen/Qwen3-0.6B` revision
+      `c1899de289a04d12100db370d81485cdf75e47ca`; verify the 1,503,300,328-byte
+      bf16 safetensors SHA-256
+      `f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b`
+      and the tokenizer SHA-256
+      `aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4`.
+      The ignored `models/` directory is an input cache, never source.
+- [x] Run real bf16 CPU prefill and multi-token decode on the local machine,
+      capture the prompt/token/output transcript and timings, and verify the
+      generated token sequence against an independent implementation or fixed
+      known-good oracle for the same pinned revision.
+- [x] Review the complete implementation for compact API surface, ownership,
+      failure atomicity, graph size, checkpoint memory, and consistency with
+      the established NML/ZML architecture; remove incidental scaffolding.
+
+The real local contract used the non-thinking prompt for “What is the capital
+of France?”, encoded 19 prompt tokens, and generated token IDs
+`[785, 6722, 315, 9625]`, decoding exactly to `The capital of France`. An
+isolated Hugging Face/PyTorch bf16 run over the same local files produced the
+same prompt bytes, prompt IDs, generated IDs, and text; it was an independent
+oracle only and introduced no repository or runtime dependency. The first
+recorded product run reported 2.668/2.530 seconds for prefill/decode
+compilation, 7.928 seconds for parameter upload, 1.925 seconds for prefill,
+0.376 seconds for the first decode step, and 0.807 seconds for the remaining
+decode steps. The permanent hash-plus-generation contract passed as BuildBuddy
+invocation `f151180c-d7b7-4f4e-9fbf-47d4af2e68c7`.
+
+## Milestone 7 acceptance
+
+- [x] The IREE tokenizer and Qwen3 libraries have permanent unit, integration,
+      ABI, checkpoint, numerical, and lifecycle contracts; no probe, smoke,
+      prototype, or Python runtime dependency is part of the product path.
+- [x] The exact official Qwen3-0.6B bf16 checkpoint generates coherent text on
+      the local CPU through tokenizer -> checkpoint -> StableHLO -> XLA -> PJRT
+      -> persistent KV decode -> tokenizer, with evidence for more than one
+      generated token.
+- [x] Existing CPU contracts pass, BuildBuddy passes the CPU and CUDA-remote
+      gates, exact CUDA binaries build, `rustfmt` passes, and `git diff --check`
+      is clean.
+- [x] The reviewed milestone is committed and pushed only after all applicable
+      gates above are true.
+
+BuildBuddy acceptance evidence: CPU contracts
+`e4664f45-64c4-4d31-a948-a37d5189626c`; exact CUDA binaries, including the
+Qwen3 product, `6dc22d79-6f73-4e55-b0ab-ceac9cebbddc`; and GPU-independent
+CUDA/package contracts `bc42e144-b97b-4a23-8baf-34adf87ef556`.
+
+---
+
 # Capability ledger
 
 This high-level ledger remains at the end of this file while detailed work is
@@ -1124,6 +1237,8 @@ themselves complete an item.
 - [x] Portable ordinary and blockwise paged attention, RoPE, and masks.
 - [x] Persistent KV-cache allocation, page-table updates, paging, truncation,
       rollback, and replay without a persistent dense KV copy.
+- [x] Hugging Face tokenizer-backed dense Qwen3 bf16 generation with compiled
+      prefill, persistent-cache decode, tied embeddings, and greedy sampling.
 - [ ] CUDA FlashAttention and Triton kernels.
 - [ ] MoE routing and grouped matrix multiplication. Portable CPU/SM75 routing
       and expert execution, expert-sharded four-device CPU execution, and

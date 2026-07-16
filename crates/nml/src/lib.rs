@@ -13,3 +13,7 @@ pub mod attention {
     pub use nml_ir::{AttentionOptions as Options, RopeLayout, RopeOptions, RopeScaling};
     pub use nml_runtime::{Cache, CacheSpec};
 }
+
+pub mod tokenizer {
+    pub use nml_tokenizer::{Decoder, Error, Tokenizer};
+}
