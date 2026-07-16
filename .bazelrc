@@ -3,7 +3,7 @@
 # make every target depend on implementation details of XLA, PJRT, or CUDA.
 
 # Keep Bazel's mutable server state and action cache outside the source tree at
-# the single relative location established in FORK.md. Because this is a
+# the single relative location established in SYSTEM.md. Because this is a
 # startup option, it applies equally to local Bazel and BuildBuddy Remote Bazel.
 startup --output_user_root=../nml-bazel-cache
 

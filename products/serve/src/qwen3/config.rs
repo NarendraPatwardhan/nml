@@ -1,3 +1,5 @@
+//! Qwen3 checkpoint configuration.
+
 use serde::Deserialize;
 use std::fmt;
 use std::path::Path;

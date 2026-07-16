@@ -1209,6 +1209,343 @@ CUDA/package contracts `bc42e144-b97b-4a23-8baf-34adf87ef556`.
 
 ---
 
+# Milestone 8: Qwen serving engine
+
+This milestone turns the existing Qwen3 execution product into a long-running,
+Qwen-only serving system. It does not move scheduler, HTTP, tool protocol, or
+Prometheus types into the `nml` facade. NML remains the acceleration substrate;
+`products/serve` owns request policy and composes the substrate into a server.
+
+The execution path is:
+
+```text
+HTTP chat request and stream
+  -> validation, Qwen template, and tokenization
+  -> bounded admission queue
+  -> continuous-batching scheduler on one engine owner
+  -> global physical K/V page arena and prefix index
+  -> bucketed prefill or fixed-capacity batched decode executable
+  -> Shardy/XLA/PJRT CPU or CUDA execution
+  -> sampled tokens, tool-call parser, stream, and Prometheus observations
+```
+
+The Tokio runtime owns sockets, timers, cancellation, bounded channels, and
+response streams. It does not own or concurrently enter PJRT. A dedicated
+engine thread owns `Platform`, parameters, executables, scheduler state, and
+the cache arena. This preserves NML's existing device lifetime rules and keeps
+blocking compilation, transfer, and execution work off Tokio workers.
+
+Every checkbox represents permanent product code and its durable contract. An
+HTTP endpoint that calls the existing batch-one `generate` function once per
+request is not continuous batching. A page-table type without global page
+ownership is not paged serving. Emitted Shardy is not tensor-parallel execution.
+
+## 1. Product boundary and async foundation
+
+- [x] Rename `products/qwen3` to `products/serve`, rename the Bazel library and
+      executable to `nml_serve` and `serve`, and place the existing Qwen3 engine
+      under `nml_serve::qwen3`. Preserve the real Qwen3 BF16 oracle and CUDA
+      product-binary ownership through the new labels.
+- [x] Pin the initial async/serving dependency graph directly through Bzlmod:
+      Tokio 1.52.3, Tokio Util 0.7.18, Axum 0.8.9, Tower 0.5.3,
+      `prometheus-client` 0.25.0, `tracing` 0.1.44, and
+      `tracing-subscriber` 0.3.23. Cargo remains outside the product build and
+      dependencies are attached to Bazel targets only when their owning module
+      lands.
+- [ ] Split the current one-shot generation function into a reusable Qwen model
+      engine and a thin compatibility generation path. Engine construction
+      validates the model, loads parameters once, compiles the configured
+      executable set once, and exposes no network or Tokio type.
+- [ ] Add one Tokio process runtime for HTTP, signals, timers, response streams,
+      and bounded channels. Start one named engine thread that constructs and
+      exclusively owns the NML platform and all PJRT-dependent state.
+- [ ] Define bounded command, completion, token-stream, cancellation, and
+      shutdown messages. A saturated admission channel must reject or await
+      according to explicit policy; it must never grow an unbounded request or
+      token queue.
+- [ ] Make startup and shutdown transactional. Failure after partial model,
+      executable, page, or listener initialization releases every resource;
+      graceful shutdown stops admission, cancels or drains requests according
+      to one deadline, reclaims pages, joins the engine owner, and only then
+      destroys the platform.
+- [ ] Keep CPU and CUDA behind the same serving engine contract. Backend choice,
+      model path, bind address, capacity limits, page geometry, batch limits,
+      compilation buckets, tensor-parallel topology, and shutdown deadline are
+      immutable validated startup configuration.
+
+## 2. Qwen request and protocol contract
+
+- [ ] Implement a deliberately bounded OpenAI-compatible
+      `/v1/chat/completions` subset for Qwen, including non-streaming responses
+      and SSE streaming. Reject unsupported request fields explicitly instead
+      of accepting and ignoring them.
+- [ ] Represent request IDs, ordered chat messages, generation limit, stop
+      conditions, temperature/top-k/top-p parameters, deterministic seed, tool
+      declarations, tool choice, and stream preference as validated product
+      types. Tensor/compiler types do not enter the wire schema.
+- [ ] Enforce configured limits before admission: encoded prompt length, maximum
+      generated tokens, message/tool/schema bytes, number of tools, queue
+      capacity, total resident pages, and per-request deadline.
+- [ ] Return structured error bodies for validation, overload, cancellation,
+      timeout, unsupported Qwen configuration, capacity exhaustion, compilation,
+      and execution failures. Internal paths, device pointers, and checkpoint
+      metadata must not leak into protocol responses.
+- [ ] Stream complete UTF-8 token fragments in order, finish each stream exactly
+      once, and propagate client disconnect into scheduler cancellation without
+      blocking the Axum connection task on engine cleanup.
+- [ ] Add `/health/live`, `/health/ready`, and `/v1/models`. Readiness becomes
+      true only after model validation, parameter loading, required compilation,
+      and cache-arena allocation complete successfully.
+
+## 3. Reusable and batch-shaped Qwen execution
+
+- [ ] Remove batch-one assumptions from Qwen token, position, attention, cache,
+      sampling, and output shapes. A configured maximum slot count is static in
+      each executable while active slots, token positions, sequence lengths,
+      and sampling state are runtime tensors.
+- [ ] Replace request-specific compilation with a finite startup-declared set of
+      prefill chunk/length buckets plus one fixed-capacity decode executable.
+      The request path may select or reuse a bucket but may not compile an
+      unbounded new graph for every prompt length.
+- [ ] Preserve one shared parameter allocation across every prefill/decode
+      executable. Compilation remains ordered before the large persistent
+      checkpoint upload unless measured memory evidence justifies a change.
+- [ ] Add active-slot masks and deterministic inactive-slot semantics so a
+      partially occupied decode batch neither reads unassigned pages nor
+      mutates inactive state. Slot reuse must clear all logical metadata before
+      a new request observes it.
+- [ ] Move greedy and stochastic sampling into the batched graph with one
+      explicit RNG state and generation policy per active request. Fixed seeds
+      must reproduce results independently of which other requests share a
+      scheduler tick.
+- [ ] Return token IDs, finish reasons, and updated RNG/cache state without
+      downloading logits. The scheduler must not retain a vocabulary-sized host
+      tensor per request.
+- [ ] Preserve the pinned Qwen3-0.6B single-request CPU and CUDA oracle through
+      the new engine, then compare mixed-batch results against independent
+      sequential executions for every supported sampling mode.
+
+## 4. Global paged K/V arena
+
+- [ ] Replace per-request dense Qwen caches with one server-owned physical page
+      arena per model/topology. Every layer uses identical logical ownership;
+      request state contains page leases and lengths rather than owning separate
+      full-capacity K/V allocations.
+- [ ] Define checked page geometry and capacity accounting from dtype, layer
+      count, KV heads, head width, page size, physical pages, sharding, and
+      device memory budget. Startup must report the exact persistent parameter,
+      cache, workspace, and reserved memory plan before accepting requests.
+- [ ] Implement page leases with generation-stamped identities so stale request
+      handles cannot free or remap a page that has been returned and reused.
+      Allocation, rollback, cancellation, normal completion, engine error, and
+      shutdown each have one idempotent reclamation path.
+- [ ] Replace per-page full-table uploads with one batched scheduler-tick
+      metadata update for active page tables, lengths, positions, and slot
+      masks. Metadata transfer volume must scale with configured active slots,
+      not with the number of individual page-allocation calls.
+- [ ] Build Qwen prefill and decode through NML's paged-cache update and paged
+      attention semantics. CPU uses portable blockwise attention; compatible
+      CUDA devices dispatch to FA/Triton while SM75 retains the same portable
+      graph meaning.
+- [ ] Support prompt chunks and generated tokens crossing page boundaries,
+      partially occupied final pages, empty context, maximum capacity, slot
+      migration, rollback, and replay without constructing a dense persistent
+      cache or complete attention matrix.
+- [ ] Add allocator invariants and failure-injection contracts proving no double
+      allocation, use-after-free, cross-request visibility, leaked page, or
+      unaccounted K/V allocation after arbitrary admission/cancellation/error
+      sequences.
+
+## 5. Continuous batching scheduler
+
+- [ ] Model each request as an explicit state machine: admitted, waiting for
+      pages, prefill-ready, prefilling, decode-ready, decoding, streaming,
+      finished, cancelled, or failed. Only the engine owner mutates scheduler
+      and page state.
+- [ ] Implement bounded admission using token, page, slot, and queue budgets.
+      Reject work that can never fit; queue temporarily blocked work fairly;
+      reserve enough capacity to make admitted requests progress.
+- [ ] Schedule chunked/bucketed prefill and decode under explicit per-tick token
+      budgets. Long prompts must not indefinitely starve decode or short-prefill
+      requests, and decode traffic must not prevent bounded prefill progress.
+- [ ] Assemble multiple independent active requests into one physical decode
+      invocation and refill vacated slots between ticks without recompilation.
+      A permanent contract must observe at least two requests in the same XLA
+      call; concurrent one-request calls do not satisfy this task.
+- [ ] Make cancellation race-safe at every boundary: queued, page-waiting,
+      in-flight prefill, in-flight decode, token-ready, and stream-disconnected.
+      PJRT calls that cannot be interrupted finish privately, after which their
+      outputs are discarded and all leases reclaimed.
+- [ ] Isolate request-local validation, deadline, stream, and sampling failures.
+      A device-wide execution failure may fail the current physical batch but
+      must leave scheduler/page ownership internally consistent and readiness
+      transition according to declared recovery policy.
+- [ ] Measure queue delay, time to first token, inter-token latency, tokens per
+      second, physical batch occupancy, prefill/decode mix, and page pressure
+      separately. Under concurrent requests, continuous decode must demonstrate
+      a throughput advantage over sequential one-request execution on the same
+      backend and model.
+
+## 6. Prefix caching
+
+- [ ] Define a prefix identity over exact token IDs plus model/checkpoint
+      revision, tokenizer and chat-template revision, RoPE/scaling configuration,
+      dtype/quantization recipe, adapter identity, page geometry, and sharding
+      topology. Text hashes alone are not cache keys.
+- [ ] Index only completely materialized immutable page-aligned prefixes.
+      Partial trailing pages remain request-owned; extension from a shared
+      prefix uses copy-on-write so one request can never mutate another's K/V.
+- [ ] Reference-count shared page leases across live requests and cache entries.
+      Request completion drops its references without evicting a reusable
+      prefix; eviction removes index ownership and frees pages only when the last
+      live reference is gone.
+- [ ] Implement bounded LRU or equivalent eviction under the same page budget as
+      request admission. The scheduler may evict unreferenced cached prefixes
+      before rejecting a request, but may not evict pages held by active work.
+- [ ] Reuse the longest valid cached prefix, prefill only the uncached suffix,
+      and preserve absolute positions and RoPE semantics. Exact output must
+      match a cache-disabled execution for full hits, partial hits, collisions,
+      extensions, cancellations, and concurrent consumers.
+- [ ] Report hit/miss/partial-hit counts, reused and computed prompt tokens,
+      resident cached pages, eviction count, and prefix lookup time. A permanent
+      performance contract must show reduced prefill execution for a shared
+      prompt rather than counting a metadata lookup as a hit.
+
+## 7. Qwen tensor parallel serving
+
+- [ ] Record one Qwen tensor-parallel partition plan using existing semantic
+      axes: vocabulary/embedding, Q/K/V heads and projections, attention output,
+      gated/up projections, and down projection. Replication and reductions must
+      be explicit where algebra requires them.
+- [ ] Annotate Qwen checkpoint declarations and intermediate shapes so Shardy
+      drives parameter loading, local shard shapes, collectives, and executable
+      placement. The server exposes one logical model and never manually copies
+      a full parameter set to every device unless the plan marks it replicated.
+- [ ] Compile the same paged prefill/decode engine for single-device and tensor-
+      parallel topologies. Page tables and request scheduling remain logical
+      server state; K/V page placement follows the selected model/head sharding.
+- [ ] Execute a four-device CPU tensor-parallel Qwen contract and compare logits,
+      generated IDs, cache contents, and prefix reuse with the single-device
+      oracle. This is the topology-independent correctness gate.
+- [ ] Execute the unchanged contract on rented homogeneous multi-GPU CUDA
+      hardware, including concurrent batches, collectives, cancellation, prefix
+      sharing, and memory accounting. Remote compilation or multiple logical
+      devices on one GPU is not acceptance evidence.
+- [ ] Produce hard startup errors for incompatible device counts, heterogeneous
+      compute capabilities, indivisible model dimensions, unsupported sharding,
+      or insufficient per-device memory before admitting traffic.
+
+## 8. Qwen tool calling
+
+- [ ] Replace the current hard-coded single-user prompt with a versioned Qwen
+      chat-template implementation covering system, user, assistant, and tool
+      result messages. Preserve the existing non-thinking plain-chat oracle.
+- [ ] Validate and serialize tool names, descriptions, JSON schemas, and tool
+      choice into the exact selected Qwen template contract with strict byte,
+      depth, property, and tool-count bounds.
+- [ ] Implement an incremental parser that distinguishes assistant text, tool
+      calls, arguments, finish reason, and malformed/incomplete output across
+      arbitrary tokenizer fragment boundaries. Streaming must never expose a
+      partially parsed structure as a completed call.
+- [ ] Return tool calls to the client; the serving product does not execute user
+      tools. Accept subsequent tool-result messages and support multiple
+      assistant/tool rounds while preserving prefix-cache correctness.
+- [ ] Add fixed Qwen tool-call transcripts for no-tool, forced-tool, automatic
+      tool selection, parallel/multiple calls if supported by the selected
+      template, Unicode arguments, malformed JSON, cancellation, and streamed
+      versus non-streamed equivalence.
+
+## 9. Prometheus metrics and structured tracing
+
+- [ ] Own one `prometheus-client` registry and expose `/metrics` in Prometheus
+      text format without routing through the engine owner. Metric collection
+      may read atomics or bounded snapshots but must not block a PJRT tick.
+- [ ] Export request totals by bounded outcome, active/queued requests, prompt
+      and generated tokens, prefill/decode batch size and occupancy, queue/TTFT/
+      inter-token/request latency histograms, page use/free state, prefix hits
+      and evictions, compilation/load time, execution failures, and cancellation.
+- [ ] Prohibit request IDs, prompt contents, tool names, arbitrary model paths,
+      and other unbounded values from metric labels. Model/backend/topology
+      labels come only from startup-bounded enumerations.
+- [ ] Add structured `tracing` spans that connect HTTP request, admission,
+      scheduler transitions, physical batches, page leases, XLA executions,
+      output streaming, and completion while redacting prompt and tool data by
+      default.
+- [ ] Verify exact metric deltas and terminal gauges after successful, failed,
+      overloaded, cancelled, prefix-hit, and tool-call requests. Encoding
+      `/metrics` concurrently with execution must neither deadlock nor alter
+      generated output.
+
+## 10. Speculative decoding and DFlash
+
+- [ ] Define a scheduler-level speculative interface over draft proposal,
+      target block verification, accepted prefix length, replacement token,
+      sampling/RNG state, and atomic KV commit/rollback. It remains independent
+      of HTTP and a particular draft algorithm.
+- [ ] Implement a conventional Qwen draft/target vertical first using a smaller
+      compatible Qwen checkpoint. Run draft and target as separately owned
+      executables with explicit tokenizer/vocabulary compatibility and no
+      duplicated target parameter buffers.
+- [ ] Verify multiple proposed tokens in one target graph, commit accepted cache
+      state, and roll back rejected suffixes using the existing logical cache
+      semantics. Greedy output must exactly match ordinary target decoding;
+      stochastic output must preserve the declared target distribution and RNG
+      progression.
+- [ ] Record the exact public DFlash algorithm, Qwen-compatible model artifacts,
+      checkpoint metadata, and numerical contract before implementation. DFlash
+      becomes another draft producer behind the same verification/rollback
+      boundary rather than a second serving scheduler.
+- [ ] Integrate Qwen DFlash requests with continuous batching, page admission,
+      prefix sharing, cancellation, tensor parallelism, streaming, and metrics.
+      Draft work receives an explicit budget so low acceptance cannot starve
+      ordinary decode progress.
+- [ ] Measure proposal length, accepted tokens, acceptance ratio, target calls
+      avoided, draft cost, end-to-end latency, and memory overhead. Acceptance
+      requires fewer target decode invocations and improved measured latency or
+      throughput on a declared Qwen workload, not merely identical text.
+
+## 11. Serving resilience and product acceptance
+
+- [ ] Add deterministic scheduler/model tests with controlled Tokio time plus
+      real threaded integration contracts. Tests must cover admission races,
+      disconnects, deadline expiry, channel closure, engine failure, listener
+      failure, signal shutdown, and repeated startup/destruction.
+- [ ] Add a real loopback HTTP contract that starts `serve`, waits for readiness,
+      submits concurrent streaming and non-streaming Qwen requests, observes
+      physical batching and page reuse, cancels traffic, checks metrics, and
+      shuts down with zero active requests and zero leased pages.
+- [ ] Compare every supported server path with direct Qwen execution: ordinary
+      paged serving, prefix hit/miss, tensor-parallel execution, tools, and
+      speculation must preserve their declared numerical/token semantics.
+- [ ] Run CPU contracts through BuildBuddy, build all CUDA server/device
+      binaries remotely, run the SM75 portable serving path locally, and run
+      SM80/SM90 attention plus multi-GPU tensor-parallel contracts on rented
+      hardware. Each venue records only evidence it actually executes.
+- [ ] Establish optimized-build baselines for startup, resident parameter/cache
+      memory, TTFT, inter-token latency, prompt/decode throughput, continuous-
+      batch scaling, prefix reuse, and speculation. Compilation, upload, first
+      execution, and steady execution remain separate measurements.
+- [ ] Review the complete serving product for bounded memory, single-owner PJRT
+      access, failure atomicity, cancellation safety, API compactness, protocol
+      correctness, observability cardinality, and absence of temporary targets
+      before marking the milestone complete.
+
+## Milestone 8 acceptance
+
+- [ ] One long-running `//products/serve:serve` process serves multiple
+      concurrent Qwen requests through real continuous batching and a global
+      paged KV arena on CPU and CUDA.
+- [ ] Prefix caching, Qwen tensor parallelism, tool calling, Prometheus metrics,
+      and Qwen speculative decoding satisfy their numerical, ownership,
+      failure, memory, and performance contracts above.
+- [ ] No server concern expands the compact `nml` facade unless a reusable
+      acceleration primitive is independently justified and reviewed.
+- [ ] All applicable BuildBuddy, local GPU, rented GPU, formatting, and
+      repository checks pass; hardware-deferred evidence is never substituted
+      with compilation.
+
+---
+
 # Capability ledger
 
 This high-level ledger remains at the end of this file while detailed work is
@@ -1239,6 +1576,13 @@ themselves complete an item.
       rollback, and replay without a persistent dense KV copy.
 - [x] Hugging Face tokenizer-backed dense Qwen3 bf16 generation with compiled
       prefill, persistent-cache decode, tied embeddings, and greedy sampling.
+- [ ] Qwen continuous batching with bounded admission, chunked/bucketed
+      prefill, one physical decode batch, cancellation, and streaming.
+- [ ] Server-owned paged KV arena and prefix caching with reference-counted
+      shared pages, copy-on-write extension, eviction, and memory accounting.
+- [ ] Qwen tool calling and Prometheus serving metrics.
+- [ ] Qwen speculative decoding, including DFlash after its exact public Qwen
+      artifact and algorithm contract is recorded.
 - [ ] CUDA FlashAttention and Triton kernels.
 - [ ] MoE routing and grouped matrix multiplication. Portable CPU/SM75 routing
       and expert execution, expert-sharded four-device CPU execution, and

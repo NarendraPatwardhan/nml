@@ -1,4 +1,4 @@
-//! Dense Qwen3 generation on NML's StableHLO/XLA/PJRT substrate.
+//! Qwen3 model execution inside the serving product.
 
 #![forbid(unsafe_code)]
 

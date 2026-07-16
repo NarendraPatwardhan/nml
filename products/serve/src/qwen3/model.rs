@@ -1,4 +1,6 @@
-use crate::{Error, Result, config::Config, nml_result};
+//! Qwen3 graph construction.
+
+use super::{Error, Result, config::Config, nml_result};
 use nml::io::TensorStore;
 use nml::{DataType, NmlStruct, Shape, Tensor};
 

@@ -13,7 +13,7 @@
 /models/
 
 # ZML is a continuously readable reference checkout, not an NML source or build
-# dependency. Its exact revision is recorded in FORK.md instead of vendoring its
+# dependency. Its exact revision is recorded in SYSTEM.md instead of vendoring its
 # Git history into NML.
 /references/
 

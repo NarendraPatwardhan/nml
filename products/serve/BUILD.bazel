@@ -1,13 +1,14 @@
-"""Dense Qwen3 generation product."""
+"""Qwen serving product."""
 
 load("//bazel:rust.bzl", "nml_rust_binary", "nml_rust_library", "nml_rust_test")
 
 nml_rust_library(
-    name = "nml_qwen3",
+    name = "nml_serve",
     srcs = [
-        "src/config.rs",
         "src/lib.rs",
-        "src/model.rs",
+        "src/qwen3.rs",
+        "src/qwen3/config.rs",
+        "src/qwen3/model.rs",
     ],
     crate_root = "src/lib.rs",
     deps = [
@@ -19,7 +20,7 @@ nml_rust_library(
 )
 
 nml_rust_binary(
-    name = "qwen3",
+    name = "serve",
     srcs = ["src/main.rs"],
     crate_root = "src/main.rs",
     data = select({
@@ -27,7 +28,7 @@ nml_rust_binary(
         "//conditions:default": [],
     }),
     deps = [
-        ":nml_qwen3",
+        ":nml_serve",
         "//crates/nml:nml",
     ],
     env = select({
@@ -40,12 +41,13 @@ nml_rust_binary(
 )
 
 nml_rust_test(
-    name = "qwen3_contract_test",
+    name = "serve_contract_test",
     size = "small",
     srcs = [
-        "src/config.rs",
         "src/lib.rs",
-        "src/model.rs",
+        "src/qwen3.rs",
+        "src/qwen3/config.rs",
+        "src/qwen3/model.rs",
     ],
     crate_root = "src/lib.rs",
     deps = [
@@ -70,7 +72,7 @@ nml_rust_test(
         "manual",
     ],
     deps = [
-        ":nml_qwen3",
+        ":nml_serve",
         "//crates/nml:nml",
         "@rust_crates//sha2",
     ],

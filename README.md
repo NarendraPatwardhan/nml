@@ -20,7 +20,7 @@
     <a href="#why-nml">Why NML</a> ·
     <a href="#quickstart">Quickstart</a> ·
     <a href="#current-capability-status">Capability Status</a> ·
-    <a href="./FORK.md">Design Charter</a> ·
+    <a href="./SYSTEM.md">System Architecture</a> ·
     <a href="./TASKS.md">Engineering Ledger</a>
   </p>
 </div>
@@ -56,9 +56,10 @@ convolutional or transformer front end, maintain a paged KV cache, route tokens
 through experts, sample the next token, and reuse the same compiled executable
 with fresh buffers.
 
-NML is currently an acceleration substrate, not a turnkey model-serving CLI.
-Tokenizer integration, model-family packages, chat loops, and server policy are
-application layers that have not yet been added.
+NML is an acceleration substrate, not a turnkey model-serving service. The
+Qwen3 product includes tokenizer, checkpoint, prefill, decode, and generation
+integration; request scheduling, continuous batching, network APIs, and server
+policy remain application concerns outside the substrate.
 
 ## Why NML
 
@@ -245,6 +246,7 @@ the tensor-program API.
 | [`crates/nml-ir`](./crates/nml-ir) | Typed tensor-program construction and StableHLO lowering |
 | [`crates/nml-runtime`](./crates/nml-runtime) | Platforms, persistent buffers, executables, arguments, results, and KV-cache ownership |
 | [`crates/nml-checkpoint`](./crates/nml-checkpoint) | SafeTensors discovery, model declarations, loading, and graph-facing model construction |
+| [`products/serve`](./products/serve) | Qwen model execution and the planned continuous-batching serving control plane |
 
 ## Acknowledgements
 

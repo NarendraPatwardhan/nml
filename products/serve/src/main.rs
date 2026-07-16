@@ -1,4 +1,4 @@
-use nml_qwen3::{GenerationOptions, Timings};
+use nml_serve::qwen3::{GenerationOptions, Timings};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -6,7 +6,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("qwen3: {error}");
+            eprintln!("serve: {error}");
             ExitCode::FAILURE
         }
     }
@@ -26,7 +26,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let mut stdout = std::io::stdout().lock();
-    let report = nml_qwen3::generate(
+    let report = nml_serve::qwen3::generate(
         &platform,
         &GenerationOptions {
             model_directory: cli.model,
@@ -38,13 +38,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     eprintln!();
     eprintln!(
-        "qwen3: {} prompt tokens, {} generated tokens, cache capacity {}",
+        "serve: {} prompt tokens, {} generated tokens, cache capacity {}",
         report.prompt_tokens,
         report.generated_tokens.len(),
         report.cache_capacity
     );
     print_timings(&report.timings);
-    eprintln!("qwen3: token IDs {:?}", report.generated_tokens);
+    eprintln!("serve: token IDs {:?}", report.generated_tokens);
     Ok(())
 }
 
@@ -64,7 +64,7 @@ fn print_timings(timings: &Timings) {
         ("steady decode execution", timings.steady_decode_execution),
         ("decode download", timings.decode_download),
     ] {
-        eprintln!("qwen3: {name:>24}: {:9.3} ms", duration.as_secs_f64() * 1e3);
+        eprintln!("serve: {name:>24}: {:9.3} ms", duration.as_secs_f64() * 1e3);
     }
 }
 
@@ -144,5 +144,5 @@ fn parse_usize(value: &str, option: &str) -> Result<usize, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: qwen3 --model PATH --prompt TEXT [--max-new-tokens N] [--cache-capacity N] [--backend cpu|cuda]"
+    "usage: serve --model PATH --prompt TEXT [--max-new-tokens N] [--cache-capacity N] [--backend cpu|cuda]"
 }

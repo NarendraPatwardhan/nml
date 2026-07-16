@@ -1,4 +1,4 @@
-use nml_qwen3::GenerationOptions;
+use nml_serve::qwen3::GenerationOptions;
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -21,7 +21,7 @@ fn official_qwen3_0_6b_matches_the_pinned_bf16_oracle() {
 
     let platform = nml::Platform::cpu().unwrap();
     let mut text = Vec::new();
-    let report = nml_qwen3::generate(
+    let report = nml_serve::qwen3::generate(
         &platform,
         &GenerationOptions {
             model_directory: model,

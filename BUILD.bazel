@@ -82,7 +82,7 @@ _COMMON_CONTRACTS = [
     "//crates/nml:neural_ops_cpu_contract_test",
     "//crates/nml:execution_performance_cpu_contract_test",
     "//crates/nml:structural_contract_test",
-    "//products/qwen3:qwen3_contract_test",
+    "//products/serve:serve_contract_test",
 ]
 
 _CUDA_DEVICE_CONTRACTS = [
@@ -153,7 +153,7 @@ filegroup(
         "//crates/nml:attention_cuda_contract_binary",
         "//crates/nml:neural_ops_cuda_contract_binary",
         "//crates/nml:execution_performance_cuda_contract_binary",
-        "//products/qwen3:qwen3",
+        "//products/serve:serve",
     ],
     testonly = True,
     visibility = ["//visibility:public"],
