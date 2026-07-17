@@ -132,7 +132,155 @@ GPT-OSS, continuous batching, prefix caching, tool calling, and quantization
 have not run because those product capabilities are not implemented yet. They
 are implementation work below, not missing validation of an existing kernel.
 
-## Current milestone: deployment closure with Qwen retained
+## Current milestone: GPT-OSS 20B NVFP4
+
+[`NVFP4.md`](./NVFP4.md) is the detailed architecture and acceptance contract.
+This is the first priority. Existing APIs are not compatibility constraints:
+dense-only checkpoint, traversal, binding, and bufferization assumptions are
+replaced when they prevent the single coherent parameter system described
+there.
+
+### A. Select and freeze one artifact
+
+- [ ] Audit trustworthy GPT-OSS 20B NVFP4 artifacts by immutable revision,
+  license, source/conversion provenance, actual SafeTensors inventory,
+  configuration, tokenizer/Harmony assets, and independent runtime support.
+- [ ] Select exactly one artifact. Record every file hash and every tensor's
+  physical dtype, shape, byte extent, role, logical mapping, and transpose.
+- [ ] Specify E2M1 nibble order, E4M3 variant, block/global scale algebra,
+  block axis, padding, swizzle, 1D/2D scaling, and higher-precision exceptions.
+- [ ] Pin an independent loader/oracle and permanent decoded-value, layer, and
+  generation fixtures. If no distributed artifact is acceptable, explicitly
+  select one dense source and freeze one deterministic NML conversion recipe;
+  never relabel MXFP4.
+
+### B. Replace the dense-only parameter/storage model
+
+- [x] Separate bounded physical checkpoint records and component storage specs
+  from logical parameter shapes; dense storage now flows through that boundary.
+- [ ] Add private validated packed-E2M1x2 and E4M3-bit storage encodings without
+  adding `DType::NvFp4` or public general FP8 arithmetic.
+- [x] Introduce one logical `Parameter` and runtime `LoadedParameter` boundary;
+  dense parameters use the same one-component representation and binding path.
+- [ ] Add the closed NVFP4 representation whose parameter owns payload, local
+  scales, global factor, and exact artifact-selected metadata.
+- [x] Replace `TensorStore`'s one-record-to-one-`Tensor` assumption and the
+  dense-only `NmlStruct`/`Bufferized` leaf mapping. Keep one structural traversal
+  for dense and quantized parameters and delete superseded compatibility paths.
+- [x] Keep ordinary `Tensor`, `Shape`, `Slice`, and `Buffer` invariants simple.
+  Flatten parameter components only at the private lowering/executable-binding
+  boundary, with deterministic names and checked representation identity.
+- [x] Replace logical-shape checkpoint upload with direct physical-component
+  streaming and retain bounded CPU/CUDA transfer accounting.
+- [ ] Add transactional multi-component cleanup, exact
+  resident/source/prepared accounting, and versioned one-time layout
+  preparation. Prohibit a persistent full BF16/FP16 expansion.
+- [ ] Derive physical payload/scale shards from logical Shardy ranges. Validate
+  block/tile alignment, padding, expert-axis slicing, and component co-sharding
+  before allocation.
+- [x] Port the permanent dense Qwen regression model and all CPU product
+  contracts to the new one-component parameter system; the old path is gone.
+- [x] Re-run the migrated parameter loading/binding and CUDA device contracts
+  on the local SM75 acceptance GPU. The six permanent CUDA contracts passed in
+  BuildBuddy invocation `c76dfa96-28d1-452d-afab-8d49911d3c19`; this is
+  substrate evidence, not a claim that the Qwen product reran in this change.
+
+### C. Establish exact and performant CPU execution
+
+- [ ] Implement exhaustive E2M1 and artifact-selected E4M3 decoding, scale
+  algebra, padding validation, and checked physical extent calculations.
+- [ ] Add semantic parameter-aware embedding, linear, and grouped expert
+  operations. Reject NVFP4 parameters from operations without defined
+  quantized semantics before MLIR construction.
+- [ ] Implement a blockwise CPU oracle that expands only bounded tiles, then an
+  optimized x86-64 path with vectorized unpack/scale and cache-aware
+  contraction. Preserve a portable/AArch64-capable implementation.
+- [ ] Permanently compare embedding, decode GEMV, prefill GEMM, gate/up/down
+  projections, uneven/empty grouped experts, epilogues, and logical shards
+  against an independently decoded F32/F64 oracle.
+- [ ] Record x86-64 CPU memory and performance by phase; a deliberately slow
+  reference alone does not close the CPU product target.
+
+### D. Implement fused pre-Blackwell CUDA execution
+
+- [ ] Replace scattered compute-capability integer checks with one private
+  named capability value used by semantic lowering and structured diagnostics.
+- [ ] Extend the typed Rust TTIR builder only with the pinned Triton surface
+  needed for E2M1/scale handling, packed operations, and `tt.dot_scaled`.
+  Continue to reparse and verify complete TTIR before StableHLO embedding.
+- [ ] Implement SM8x fused W4A16 decode/prefill linear kernels over compact
+  weights, applying local/global scales inside the K tile and accumulating F32.
+- [ ] Implement SM90 fused W4A16 kernels using the pinned compiler's FP4
+  upcast/decomposition and Hopper MMA path. Evaluate FP8-assisted execution
+  only after the W4A16 baseline and retain it only if it is correct and faster.
+- [ ] Implement the SM75 CUDA custom-call path with register/tile-local E2M1
+  decode and Turing half-precision contraction; do not route it through an
+  unproven XLA Triton configuration.
+- [ ] Implement quantized grouped gate/up/down expert projections with uneven
+  routing, empty experts, exact GPT-OSS activation semantics, and expert-axis
+  sharding. Per-expert host loops are not an accepted implementation.
+- [ ] Execute permanent numerical and phase-separated performance contracts on
+  local SM75, rented SM8x, and rented SM90 through normal capability dispatch.
+  A successful compile is not execution evidence.
+
+### E. Implement native Blackwell execution
+
+- [ ] Expose typed `tt.dot_scaled` E2M1/E4M3 construction and prove the pinned
+  XLA/Triton custom-call pipeline compiles a real SM100 kernel.
+- [ ] Implement versioned source-to-native payload/scale packing and swizzling,
+  including native M/N/K/alignment checks and sampled boundary verification.
+- [ ] If native block-scaled MMA requires two FP4 operands, implement explicit
+  transient 1D activation quantization, scale/global-factor computation,
+  rounding, workspace accounting, and an independent CPU oracle. An upcasted
+  weight feeding BF16 MMA remains labeled emulation even on Blackwell.
+- [ ] Implement native ordinary and grouped projection paths. Unsupported
+  native geometries may use the named fused emulation path, never a hidden
+  persistent dense conversion.
+- [ ] Run the unchanged operation contracts on a real SM100+ GPU, compare with
+  the CPU representation oracle, and retain generated-code or profiler evidence
+  that native block-scaled instructions executed.
+
+### F. Complete the GPT-OSS 20B model vertical
+
+- [ ] Parse and validate the exact selected configuration: layer/expert counts,
+  head geometry, attention schedule, context/YaRN parameters, normalization,
+  activation, tokenizer identity, and output-weight policy.
+- [ ] Declare every embedding, attention, router, expert, normalization,
+  attention-sink, and output parameter from the checked representation
+  manifest. Do not guess aliases, alternate names, or transposes.
+- [ ] Build the private model graph from RMSNorm, GQA, RoPE/YaRN,
+  dense/sliding attention, top-k routing, quantized grouped experts, residual,
+  sampling, and Shardy primitives.
+- [ ] Add learned attention-sink denominator bias, exact clamped/residual
+  SwiGLU, and alternating full/128-token-window attention. Optimized attention
+  dispatch is used only when its ABI preserves these semantics.
+- [ ] Validate `o200k_harmony` through the IREE tokenizer boundary and implement
+  versioned Harmony rendering/incremental parsing for roles, channels, tool
+  calls, and tool results.
+- [ ] Compare decoded parameters, representative layer/expert outputs, router
+  choices, final logits, tokens, and fixed prompts with the independent
+  implementation of the exact same artifact.
+- [ ] Execute the complete model without hidden dense weights on capable CUDA
+  hardware and record checkpoint, host, resident, workspace, compile, first-run,
+  prefill, and decode costs separately.
+
+### G. Close sharding and product evidence
+
+- [ ] Define GPT-OSS logical tensor/expert-parallel placement over quantized
+  component shards and prove there is no hidden whole-weight all-gather.
+- [ ] Compare the established four-device CPU topology with the single-device
+  oracle, then run homogeneous multi-GPU CUDA Shardy and collectives.
+- [ ] Make artifact/recipe/prepared-layout identity part of executable,
+  prepared-weight, result, and future prefix-cache keys.
+- [ ] Publish and run one immutable NVFP4 product/device-contract image on the
+  applicable local and rented venues, retaining structured dispatch, memory,
+  correctness, and performance evidence.
+
+## Deferred milestone: deployment closure with Qwen retained
+
+All unchecked work in this section is deferred until the NVFP4 vertical needs
+it directly or reaches its acceptance boundary. Completed OCI/RunPod machinery
+remains the execution substrate for rented NVFP4 hardware.
 
 This milestone ends when one immutable Linux CUDA artifact can be built by
 BuildBuddy, published once, and executed unchanged through the same permanent
@@ -193,10 +341,11 @@ the execution envelope is completed.
   remote model execution needs it. Every mount must be revalidated against the
   exact model manifest; filenames are not artifact identity.
 
-## Next milestone: GPT-OSS 20B BF16
+## Supporting artifact evidence and deferred BF16 product vertical
 
-Qwen remains a permanent regression model. GPT-OSS becomes the default only
-after one exact BF16 artifact is selected and the complete model passes.
+The completed BF16 audit is retained because a dense artifact may be useful as
+an independent oracle or a declared source for deterministic NVFP4 conversion.
+All unchecked BF16 product work is deferred; it does not precede NVFP4.
 
 ### Select and pin one artifact
 
@@ -217,7 +366,7 @@ after one exact BF16 artifact is selected and the complete model passes.
   file, size, hash, role, tensor name, shape, and dtype. Mismatch must fail
   before graph construction or device allocation.
 
-### Implement the checkpoint and model
+### Deferred standalone BF16 checkpoint and model
 
 - [ ] Parse and validate the exact configuration: architecture, layer/expert
   counts, head geometry, attention schedule, context/RoPE parameters,
@@ -248,10 +397,12 @@ after one exact BF16 artifact is selected and the complete model passes.
   structure, and greedy continuation with the independent oracle. A reduced
   model or isolated block does not satisfy end-to-end acceptance.
 
-## Following milestone: serving product
+## Deferred milestone: serving product
 
 Serving stays above the compact `nml` facade. One dedicated engine owner holds
 PJRT state; Tokio owns network and orchestration, never opportunistic PJRT work.
+Unchecked work here resumes after the NVFP4 model vertical unless a bounded
+piece is required to prove its end-to-end execution.
 
 ### Engine and protocol
 
@@ -313,24 +464,16 @@ PJRT state; Tokio owns network and orchestration, never opportunistic PJRT work.
   retain the path only if measured target invocations or latency improve after
   draft cost and memory are included.
 
-## Deferred quantization milestone
+## Deferred independent quantization verticals
 
-This work begins only after the BF16 GPT-OSS serving path is complete.
-
-- [ ] `DEFERRED`: audit trustworthy GPT-OSS 20B NVFP4 artifacts by immutable
-  revision, actual packing/scales, conversion provenance, hardware assumptions,
-  and oracle outputs; select exactly one.
-- [ ] `DEFERRED`: implement that artifact's packed checkpoint storage, scale
-  semantics, layout transforms, accumulation dtype, capability gates, portable
-  dequantized reference, and selected CUDA execution path.
-- [ ] `DEFERRED`: run the complete NVFP4 model through generation, paged serving,
-  continuous batching, tensor parallelism, prefix caching, and Harmony; compare
-  it with both the artifact oracle and NML's BF16 baseline.
-- [ ] `DEFERRED`: measure total checkpoint/resident/workspace memory, upload,
-  compilation, TTFT, latency, throughput, and output deltas before accepting the
-  representation.
-- [ ] `DEFERRED`: W4A16 and W8A8 remain separate future verticals. An NVFP4
-  decision does not imply their packing, kernels, or checkpoint formats.
+- [ ] `DEFERRED`: select an exact W4A16 artifact/workload and independently
+  define signedness, grouping, scale, zero-point, packing, transpose, compute,
+  accumulation, checkpoint, and kernel contracts.
+- [ ] `DEFERRED`: select an exact W8A8 artifact/workload and independently
+  define integer/FP8 values, static/dynamic activation quantization, scale
+  granularity, accumulation, requantization, checkpoint, and kernel contracts.
+- [ ] `DEFERRED`: NVFP4 KV-cache quantization is a separate representation and
+  attention-kernel vertical; weight NVFP4 does not imply it.
 
 ## Capability ledger
 
@@ -357,11 +500,14 @@ pending product family is not implied by the primitives beneath it.
 - [ ] Immutable OCI execution fully closed across BuildBuddy, local NVIDIA, and
   RunPod, including digest-only interfaces and the remaining clean-consumer
   proof.
-- [ ] GPT-OSS 20B BF16 generation with exact checkpoint, sink, clamped/residual
-  SwiGLU, alternating windows, YaRN, tokenizer, and Harmony semantics.
+- [ ] GPT-OSS 20B NVFP4 generation with exact representation, compact CPU and
+  capability-dispatched CUDA execution, sink, clamped/residual SwiGLU,
+  alternating windows, YaRN, tokenizer, Harmony, and grouped expert semantics.
 - [ ] Continuous batching, server-owned paged KV arena, prefix caching, bounded
   streaming/cancellation, tools, and metrics.
 - [ ] Real multi-GPU CUDA Shardy execution and collectives.
 - [ ] Dedicated optimized attention performance and tuning evidence.
-- [ ] `DEFERRED`: NVFP4, W4A16, and W8A8 complete quantized execution verticals.
+- [ ] `DEFERRED`: standalone BF16 GPT-OSS product execution after any BF16
+  artifact has been deliberately selected rather than merely used as an oracle.
+- [ ] `DEFERRED`: W4A16 and W8A8 complete independent execution verticals.
 - [ ] `DEFERRED`: explicitly authored analytic backward/training graphs.

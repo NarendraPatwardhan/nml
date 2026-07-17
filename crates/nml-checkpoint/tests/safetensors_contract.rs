@@ -140,15 +140,15 @@ fn primary_names_win_and_multiple_fallback_aliases_are_ambiguous() {
     );
     let registry = TensorRegistry::from_path(&root).unwrap();
     let shape = Shape::new(DType::F16, &[1]).unwrap();
-    let store = nml_checkpoint::io::TensorStore::new(registry);
+    let parameters = nml_checkpoint::io::ParameterSet::new(registry);
     assert!(
-        store
-            .tensor("primary", shape, &["alias_a", "alias_b"])
+        parameters
+            .dense("primary", shape, &["alias_a", "alias_b"])
             .is_ok()
     );
     assert!(
-        store
-            .tensor("absent", shape, &["alias_a", "alias_b"])
+        parameters
+            .dense("absent", shape, &["alias_a", "alias_b"])
             .is_err()
     );
     std::fs::remove_dir_all(root).unwrap();

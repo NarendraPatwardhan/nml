@@ -158,53 +158,54 @@ being reduced to metadata checks.
 ## A Model Is Ordinary Rust Data
 
 NML derives parameter traversal from the user's model structure. Graph methods
-remain on the tensor store, keeping model types small and backend-independent:
+remain on an independent graph builder, keeping model data reusable across
+prefill, decode, training, and other compiled programs:
 
 ```rust
-#[derive(nml::NmlStruct)]
+#[derive(nml::ParameterTree)]
 struct Linear {
-    weight: nml::Tensor,
-    bias: Option<nml::Tensor>,
+    weight: nml::Parameter,
+    bias: Option<nml::Parameter>,
 }
 
-#[derive(nml::NmlStruct)]
+#[derive(nml::ParameterTree)]
 struct Mlp {
     first: Linear,
     second: Linear,
 }
 
 let registry = nml::safetensors::TensorRegistry::from_path("model").unwrap();
-let store = nml::io::TensorStore::new(registry);
+let parameters = nml::io::ParameterSet::new(registry);
 
-let first_store = store.view("first");
-let second_store = store.view("second");
+let first = parameters.view("first");
+let second = parameters.view("second");
+let shape = nml::Shape::new(nml::DataType::F16, &[4096, 4096]).unwrap();
 let model = Mlp {
     first: Linear {
-        weight: first_store
-            .tensor("weight", nml::Shape::new(nml::DataType::F16, &[4096, 4096]).unwrap(), &[])
-            .unwrap(),
+        weight: first.dense("weight", shape, &[]).unwrap(),
         bias: None,
     },
     second: Linear {
-        weight: second_store
-            .tensor("weight", nml::Shape::new(nml::DataType::F16, &[4096, 4096]).unwrap(), &[])
-            .unwrap(),
+        weight: second.dense("weight", shape, &[]).unwrap(),
         bias: None,
     },
 };
 
-let input = store.activation(
+let mut graph = nml::Graph::new();
+let input = graph.input(
     "input",
     nml::Shape::new(nml::DataType::F16, &[1, 4096]).unwrap(),
 );
-let hidden = store.linear(input, model.first.weight, None).unwrap();
-let hidden = store.gelu(hidden).unwrap();
-let output = store.linear(hidden, model.second.weight, None).unwrap();
+let hidden = graph.linear(input, &model.first.weight, None).unwrap();
+let hidden = graph.gelu(hidden).unwrap();
+let output = graph.linear(hidden, &model.second.weight, None).unwrap();
+let program = graph.finish_named(&[("output".to_owned(), output)]).unwrap();
 ```
 
-The same store loads the declared parameters, finishes the named program, and
-hands it to `Platform::compile`. The resulting executable accepts persistent
-parameter buffers once and fresh activation buffers on each call.
+`ParameterSet` resolves and loads physical checkpoint components; `Graph`
+constructs programs; `Platform` compiles programs and owns persistent buffers.
+The resulting executable validates and binds a loaded parameter's component
+manifest once, then accepts fresh activation buffers on each call.
 
 ## Current Capability Status
 

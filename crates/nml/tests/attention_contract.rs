@@ -6,11 +6,11 @@ use safetensors::tensor::{Dtype as SafeDType, View};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
-#[derive(nml::NmlStruct)]
+#[derive(nml::ParameterTree)]
 struct AttentionProjectors {
-    query: nml::Tensor,
-    key: nml::Tensor,
-    value: nml::Tensor,
+    query: nml::Parameter,
+    key: nml::Parameter,
+    value: nml::Parameter,
 }
 
 struct TensorData {
@@ -695,33 +695,34 @@ fn checkpoint_backed_attention_block_executes(platform: &nml::Platform) {
         .unwrap();
 
         let registry = nml::safetensors::TensorRegistry::from_path(&root).unwrap();
-        let store = nml::io::TensorStore::new(registry);
+        let parameters = nml::io::ParameterSet::new(registry);
         let projectors = AttentionProjectors {
-            query: store
-                .tensor("query", Shape::new(dtype, &[8, 8]).unwrap(), &[])
+            query: parameters
+                .dense("query", Shape::new(dtype, &[8, 8]).unwrap(), &[])
                 .unwrap(),
-            key: store
-                .tensor("key", Shape::new(dtype, &[4, 8]).unwrap(), &[])
+            key: parameters
+                .dense("key", Shape::new(dtype, &[4, 8]).unwrap(), &[])
                 .unwrap(),
-            value: store
-                .tensor("value", Shape::new(dtype, &[4, 8]).unwrap(), &[])
+            value: parameters
+                .dense("value", Shape::new(dtype, &[4, 8]).unwrap(), &[])
                 .unwrap(),
         };
-        let input = store.activation("input", Shape::new(dtype, &[2, 8]).unwrap());
-        let positions = store.activation("positions", Shape::new(DType::I32, &[1, 2]).unwrap());
-        let query = store.linear(input, projectors.query, None).unwrap();
-        let key = store.linear(input, projectors.key, None).unwrap();
-        let value = store.linear(input, projectors.value, None).unwrap();
-        let query = store
+        let mut graph = nml::Graph::new();
+        let input = graph.input("input", Shape::new(dtype, &[2, 8]).unwrap());
+        let positions = graph.input("positions", Shape::new(DType::I32, &[1, 2]).unwrap());
+        let query = graph.linear(input, &projectors.query, None).unwrap();
+        let key = graph.linear(input, &projectors.key, None).unwrap();
+        let value = graph.linear(input, &projectors.value, None).unwrap();
+        let query = graph
             .reshape(query, Shape::new(dtype, &[1, 2, 2, 4]).unwrap())
             .unwrap();
-        let key = store
+        let key = graph
             .reshape(key, Shape::new(dtype, &[1, 2, 1, 4]).unwrap())
             .unwrap();
-        let value = store
+        let value = graph
             .reshape(value, Shape::new(dtype, &[1, 2, 1, 4]).unwrap())
             .unwrap();
-        let output = store
+        let output = graph
             .attention(
                 query,
                 key,
@@ -731,22 +732,24 @@ fn checkpoint_backed_attention_block_executes(platform: &nml::Platform) {
                 AttentionOptions::default(),
             )
             .unwrap();
-        let parameters = store
+        let loaded = parameters
             .load(
                 &projectors,
                 platform,
                 &nml::io::LoadOptions::new(nml::Sharding::single()),
             )
             .unwrap();
-        let program = store.finish(&[("output".to_owned(), output)]).unwrap();
+        let program = graph
+            .finish_named(&[("output".to_owned(), output)])
+            .unwrap();
         let executable = platform.compile(&program, nml::Sharding::single()).unwrap();
         let input_values = (0..16)
             .map(|index| (index as f32 - 5.0) / 6.0)
             .collect::<Vec<_>>();
         let mut args = executable.args();
-        args.set("query", parameters.query).unwrap();
-        args.set("key", parameters.key).unwrap();
-        args.set("value", parameters.value).unwrap();
+        args.set_parameter(&loaded.query).unwrap();
+        args.set_parameter(&loaded.key).unwrap();
+        args.set_parameter(&loaded.value).unwrap();
         args.bake().unwrap();
         set_float(
             platform,

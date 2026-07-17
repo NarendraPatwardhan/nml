@@ -3,8 +3,26 @@ use nml_ir::{
     RopeScaling,
 };
 use nml_mlir::Context;
+use nml_parameter::Parameter;
 use nml_tensor::Element;
 use nml_types::{AxisTag, BFloat16, Complex64, Complex128, DType, F16, Layout, Partition, Shape};
+
+fn parameter(name: &str, shape: Shape) -> Parameter {
+    Parameter::dense(name, name, shape).unwrap()
+}
+
+#[test]
+fn one_component_binding_cannot_alias_distinct_parameter_definitions() {
+    let shape = Shape::new(DType::F32, &[2, 2]).unwrap();
+    let first = Parameter::dense("weight", "first.weight", shape).unwrap();
+    let second = Parameter::dense("weight", "second.weight", shape).unwrap();
+    let mut builder = ProgramBuilder::new();
+    builder.parameter_value(&first).unwrap();
+    assert!(matches!(
+        builder.parameter_value(&second),
+        Err(Error::InvalidParameter(_))
+    ));
+}
 
 #[test]
 fn matmul_is_typed_deterministic_and_verified() {
@@ -94,9 +112,9 @@ fn linear_contracts_the_final_activation_axis_at_any_rank() {
         .with_axis_tags(&[output, model])
         .unwrap();
     let input = builder.input("input", input_shape);
-    let weight = builder.parameter("weight", weight_shape);
-    let bias = builder.parameter("bias", Shape::new(DType::Bf16, &[5]).unwrap());
-    let result = builder.linear(input, weight, Some(bias)).unwrap();
+    let weight = parameter("weight", weight_shape);
+    let bias = parameter("bias", Shape::new(DType::Bf16, &[5]).unwrap());
+    let result = builder.linear(input, &weight, Some(&bias)).unwrap();
 
     assert_eq!(result.shape().dimensions(), &[2, 3, 5]);
     assert_eq!(result.shape().axis_tags(), &[batch, sequence, output]);
@@ -125,9 +143,9 @@ fn linear_contracts_the_final_activation_axis_at_any_rank() {
 fn linear_rejects_scalar_activations_before_mlir_construction() {
     let mut builder = ProgramBuilder::new();
     let scalar = builder.input("scalar", Shape::new(DType::F32, &[]).unwrap());
-    let weight = builder.parameter("weight", Shape::new(DType::F32, &[2, 1]).unwrap());
+    let weight = parameter("weight", Shape::new(DType::F32, &[2, 1]).unwrap());
     assert!(matches!(
-        builder.linear(scalar, weight, None),
+        builder.linear(scalar, &weight, None),
         Err(Error::InvalidLinearAlgebra(_))
     ));
 }
@@ -138,7 +156,8 @@ fn attention_primitives_are_typed_and_verify_as_stablehlo() {
     let input = builder.input("input", Shape::new(DType::F32, &[4, 3]).unwrap());
     let update = builder.input("update", Shape::new(DType::F32, &[1, 3]).unwrap());
     let indices = builder.input("indices", Shape::new(DType::I32, &[2]).unwrap());
-    let weight = builder.parameter("weight", Shape::new(DType::F32, &[3]).unwrap());
+    let weight = parameter("weight", Shape::new(DType::F32, &[3]).unwrap());
+    let weight = builder.parameter_value(&weight).unwrap();
     let zero = builder.scalar(0i32).unwrap();
     let one = builder.scalar(1i32).unwrap();
 
@@ -245,19 +264,20 @@ fn model_enabling_operations_are_typed_and_verify_as_stablehlo() {
     let log_sum_exp = builder.log_sum_exp(input, &[1]).unwrap();
     let normalized = builder.normalize_variance(input, 1, 1e-5).unwrap();
     let l2 = builder.normalize_l2(input, &[1], 1e-12).unwrap();
-    let norm_weight = builder.parameter("norm_weight", Shape::new(DType::F32, &[4]).unwrap());
-    let norm_bias = builder.parameter("norm_bias", Shape::new(DType::F32, &[4]).unwrap());
+    let norm_weight = parameter("norm_weight", Shape::new(DType::F32, &[4]).unwrap());
+    let norm_weight = builder.parameter_value(&norm_weight).unwrap();
+    let norm_bias = parameter("norm_bias", Shape::new(DType::F32, &[4]).unwrap());
+    let norm_bias = builder.parameter_value(&norm_bias).unwrap();
     let layer_norm = builder
         .layer_norm(input, Some(norm_weight), Some(norm_bias), 1, 1e-5)
         .unwrap();
     let swiglu = builder.swiglu(gate, input).unwrap();
     let geglu = builder.geglu(gate, input).unwrap();
 
-    let embedding_weight =
-        builder.parameter("embedding_weight", Shape::new(DType::F32, &[5, 4]).unwrap());
+    let embedding_weight = parameter("embedding_weight", Shape::new(DType::F32, &[5, 4]).unwrap());
     let token_ids = builder.input("token_ids", Shape::new(DType::I32, &[2, 3]).unwrap());
     let embedding = builder
-        .token_embedding(embedding_weight, token_ids)
+        .token_embedding(&embedding_weight, token_ids)
         .unwrap();
     assert_eq!(embedding.shape().dimensions(), &[2, 3, 4]);
 
@@ -317,8 +337,8 @@ fn model_enabling_operations_reject_invalid_contracts_before_mlir() {
     let mut builder = ProgramBuilder::new();
     let floats = builder.input("floats", Shape::new(DType::F32, &[2, 4]).unwrap());
     let bools = builder.input("bools", Shape::new(DType::Bool, &[2, 4]).unwrap());
-    let bad_weight = builder.input("bad_weight", Shape::new(DType::F32, &[5]).unwrap());
-    let good_weight = builder.input("good_weight", Shape::new(DType::F32, &[5, 4]).unwrap());
+    let bad_weight = parameter("bad_weight", Shape::new(DType::F32, &[5]).unwrap());
+    let good_weight = parameter("good_weight", Shape::new(DType::F32, &[5, 4]).unwrap());
     let bad_ids = builder.input("bad_ids", Shape::new(DType::F32, &[2]).unwrap());
     assert!(matches!(
         builder.abs(bools),
@@ -328,11 +348,11 @@ fn model_enabling_operations_reject_invalid_contracts_before_mlir() {
         })
     ));
     assert!(matches!(
-        builder.token_embedding(bad_weight, bad_ids),
+        builder.token_embedding(&bad_weight, bad_ids),
         Err(Error::RankMismatch { .. })
     ));
     assert!(matches!(
-        builder.token_embedding(good_weight, bad_ids),
+        builder.token_embedding(&good_weight, bad_ids),
         Err(Error::InvalidIndexDType(DType::F32))
     ));
     assert!(matches!(
@@ -2140,13 +2160,17 @@ fn portable_moe_routing_is_a_typed_backend_independent_graph() {
     let mut builder = ProgramBuilder::new();
     let hidden = builder.input("hidden", Shape::new(DType::F32, &[3, 4]).unwrap());
     let router = builder.input("router", Shape::new(DType::F32, &[3, 3]).unwrap());
-    let gate_up = builder.input("gate_up", Shape::new(DType::F32, &[3, 10, 4]).unwrap());
-    let down = builder.input("down", Shape::new(DType::F32, &[3, 4, 5]).unwrap());
+    let gate_up = parameter("gate_up", Shape::new(DType::F32, &[3, 10, 4]).unwrap());
+    let down = parameter("down", Shape::new(DType::F32, &[3, 4, 5]).unwrap());
     let swiglu = builder
-        .moe_swiglu(hidden, router, gate_up, down, 2)
+        .moe_swiglu(hidden, router, &gate_up, &down, 2)
         .unwrap();
-    let geglu = builder.moe_geglu(hidden, router, gate_up, down, 2).unwrap();
-    let reglu = builder.moe_reglu(hidden, router, gate_up, down, 2).unwrap();
+    let geglu = builder
+        .moe_geglu(hidden, router, &gate_up, &down, 2)
+        .unwrap();
+    let reglu = builder
+        .moe_reglu(hidden, router, &gate_up, &down, 2)
+        .unwrap();
     assert_eq!(swiglu.shape(), hidden.shape());
     assert_eq!(geglu.shape(), hidden.shape());
     assert_eq!(reglu.shape(), hidden.shape());
@@ -2167,10 +2191,10 @@ fn portable_moe_routing_is_a_typed_backend_independent_graph() {
     let mut invalid = ProgramBuilder::new();
     let hidden = invalid.input("hidden", Shape::new(DType::F32, &[3, 4]).unwrap());
     let router = invalid.input("router", Shape::new(DType::F32, &[3, 3]).unwrap());
-    let gate_up = invalid.input("gate_up", Shape::new(DType::F32, &[3, 9, 4]).unwrap());
-    let down = invalid.input("down", Shape::new(DType::F32, &[3, 4, 5]).unwrap());
+    let gate_up = parameter("gate_up", Shape::new(DType::F32, &[3, 9, 4]).unwrap());
+    let down = parameter("down", Shape::new(DType::F32, &[3, 4, 5]).unwrap());
     assert!(matches!(
-        invalid.moe_swiglu(hidden, router, gate_up, down, 2),
+        invalid.moe_swiglu(hidden, router, &gate_up, &down, 2),
         Err(Error::InvalidMoe(_))
     ));
 }
@@ -2283,10 +2307,10 @@ fn ampere_moe_dispatch_is_private_and_capability_selected() {
         let mut builder = ProgramBuilder::new();
         let hidden = builder.input("hidden", Shape::new(dtype, &[4, 32]).unwrap());
         let router = builder.input("router", Shape::new(DType::F32, &[4, 4]).unwrap());
-        let gate_up = builder.input("gate_up", Shape::new(dtype, &[4, 64, 32]).unwrap());
-        let down = builder.input("down", Shape::new(dtype, &[4, 32, 32]).unwrap());
+        let gate_up = parameter("gate_up", Shape::new(dtype, &[4, 64, 32]).unwrap());
+        let down = parameter("down", Shape::new(dtype, &[4, 32, 32]).unwrap());
         let output = builder
-            .moe_swiglu(hidden, router, gate_up, down, 2)
+            .moe_swiglu(hidden, router, &gate_up, &down, 2)
             .unwrap();
         builder.finish(&[output]).unwrap()
     }
@@ -2341,14 +2365,14 @@ fn expert_parallel_moe_derives_local_shards_inside_private_manual_computation() 
             .with_partitions(&[Partition::Sharded(data_axis), Partition::Replicated])
             .unwrap(),
     );
-    let gate_up = builder.input(
+    let gate_up = parameter(
         "gate_up",
         Shape::new(DType::F16, &[4, 64, 32])
             .unwrap()
             .with_partitions(&expert_partition)
             .unwrap(),
     );
-    let down = builder.input(
+    let down = parameter(
         "down",
         Shape::new(DType::F16, &[4, 32, 32])
             .unwrap()
@@ -2356,7 +2380,7 @@ fn expert_parallel_moe_derives_local_shards_inside_private_manual_computation() 
             .unwrap(),
     );
     let output = builder
-        .moe_swiglu(hidden, router, gate_up, down, 2)
+        .moe_swiglu(hidden, router, &gate_up, &down, 2)
         .unwrap();
     let program = builder.finish(&[output]).unwrap();
     let mesh = Sharding::mesh(&[(data_axis, 2), (expert_axis, 2)]).unwrap();

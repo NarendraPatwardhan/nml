@@ -412,30 +412,24 @@ pub mod safetensors {
     }
 }
 
+/// Checkpoint artifact resolution and physical parameter loading.
+///
+/// This layer deliberately has no graph builder. A `ParameterSet` may be used
+/// to construct any number of graphs, while graph construction remains owned
+/// by `nml_ir::ProgramBuilder` (exported by the facade as `Graph`).
 pub mod io {
     use super::safetensors::TensorRegistry;
-    use nml_ir::{Program, ProgramBuilder, Tensor};
-    use nml_runtime::{Buffer, Bufferized, Memory, NmlStruct, Platform, Sharding};
-    use nml_tensor::{Element, Slice};
-    use nml_types::{DType, Partition, Shape};
-    use std::cell::RefCell;
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::rc::Rc;
+    use nml_parameter::{Parameter, StorageSpec};
+    use nml_runtime::{Buffer, Loaded, LoadedParameter, Memory, ParameterTree, Platform, Sharding};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Symbolic checkpoint view and eventual direct-to-buffer loader.
-    pub struct TensorStore {
-        inner: Rc<RefCell<Store>>,
-        prefix: String,
-    }
-
-    struct Store {
+    /// An immutable namespace over validated checkpoint artifacts.
+    #[derive(Clone)]
+    pub struct ParameterSet {
         registry: TensorRegistry,
-        builder: ProgramBuilder,
-        tied_symbols: BTreeMap<String, Tensor>,
-        path_to_record: BTreeMap<String, String>,
-        record_shapes: BTreeMap<String, Shape>,
+        prefix: String,
     }
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -447,790 +441,150 @@ pub mod io {
         peak_staging_bytes: usize,
     }
 
-    impl TensorStore {
+    impl ParameterSet {
         pub fn new(registry: TensorRegistry) -> Self {
             Self {
-                inner: Rc::new(RefCell::new(Store {
-                    registry,
-                    builder: ProgramBuilder::new(),
-                    tied_symbols: BTreeMap::new(),
-                    path_to_record: BTreeMap::new(),
-                    record_shapes: BTreeMap::new(),
-                })),
+                registry,
                 prefix: String::new(),
             }
         }
 
+        /// Returns another immutable view into the same artifact index.
         pub fn view(&self, prefix: &str) -> Self {
             Self {
-                inner: Rc::clone(&self.inner),
+                registry: self.registry.clone(),
                 prefix: join(&self.prefix, prefix),
             }
         }
 
-        pub fn layer(&self, index: usize) -> Self {
-            self.view(&index.to_string())
-        }
-
-        pub fn activation(&self, name: &str, shape: Shape) -> Tensor {
-            self.inner.borrow_mut().builder.input(name, shape)
-        }
-
-        pub fn linear(
-            &self,
-            input: Tensor,
-            weight: Tensor,
-            bias: Option<Tensor>,
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .linear(input, weight, bias)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn constant(&self, value: &Slice<'_>) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .constant(value)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn scalar<T: Element>(&self, value: T) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .scalar(value)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn add(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .add(left, right)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn subtract(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .subtract(left, right)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn multiply(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .multiply(left, right)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn divide(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .divide(left, right)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn power(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .power(left, right)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn remainder(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .remainder(left, right)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn minimum(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .minimum(left, right)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn maximum(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .maximum(left, right)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn clamp(
-            &self,
-            input: Tensor,
-            minimum: Tensor,
-            maximum: Tensor,
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .clamp(input, minimum, maximum)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn negate(&self, input: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .negate(input)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn abs(&self, input: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .abs(input)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn equal(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .equal(left, right)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn not_equal(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .not_equal(left, right)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn greater(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .greater(left, right)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn greater_equal(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .greater_equal(left, right)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn less(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .less(left, right)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn less_equal(&self, left: Tensor, right: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .less_equal(left, right)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn select(
-            &self,
-            predicate: Tensor,
-            on_true: Tensor,
-            on_false: Tensor,
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .select(predicate, on_true, on_false)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn convert(&self, input: Tensor, dtype: DType) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .convert(input, dtype)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn reshape(&self, input: Tensor, shape: Shape) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .reshape(input, shape)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn transpose(
-            &self,
-            input: Tensor,
-            permutation: &[usize],
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .transpose(input, permutation)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn broadcast_in_dim(
-            &self,
-            input: Tensor,
-            shape: Shape,
-            dimensions: &[usize],
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .broadcast_in_dim(input, shape, dimensions)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn iota(&self, shape: Shape, axis: usize) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .iota(shape, axis)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn concatenate(&self, inputs: &[Tensor], axis: usize) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .concatenate(inputs, axis)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn slice(
-            &self,
-            input: Tensor,
-            starts: &[i64],
-            limits: &[i64],
-            strides: &[i64],
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .slice(input, starts, limits, strides)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn dynamic_slice(
-            &self,
-            input: Tensor,
-            starts: &[Tensor],
-            sizes: &[i64],
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .dynamic_slice(input, starts, sizes)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn dynamic_update_slice(
-            &self,
-            input: Tensor,
-            update: Tensor,
-            starts: &[Tensor],
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .dynamic_update_slice(input, update, starts)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn gather(
-            &self,
-            input: Tensor,
-            indices: Tensor,
-            axis: usize,
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .gather(input, indices, axis)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn gather_slices(
-            &self,
-            input: Tensor,
-            indices: Tensor,
-            axis: usize,
-            slice_size: i64,
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .gather_slices(input, indices, axis, slice_size)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn token_embedding(
-            &self,
-            weight: Tensor,
-            indices: Tensor,
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .token_embedding(weight, indices)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn reduce_sum(&self, input: Tensor, axes: &[usize]) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .reduce_sum(input, axes)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn reduce_max(&self, input: Tensor, axes: &[usize]) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .reduce_max(input, axes)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn reduce_min(&self, input: Tensor, axes: &[usize]) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .reduce_min(input, axes)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn mean(&self, input: Tensor, axes: &[usize]) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .mean(input, axes)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn log_sum_exp(&self, input: Tensor, axes: &[usize]) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .log_sum_exp(input, axes)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn argmax(&self, input: Tensor, axis: usize) -> Result<(Tensor, Tensor), super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .argmax(input, axis)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn softmax(&self, input: Tensor, axis: usize) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .softmax(input, axis)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn rms_norm(
-            &self,
-            input: Tensor,
-            weight: Option<Tensor>,
-            axis: usize,
-            epsilon: f64,
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .rms_norm(input, weight, axis, epsilon)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn normalize_variance(
-            &self,
-            input: Tensor,
-            axis: usize,
-            epsilon: f64,
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .normalize_variance(input, axis, epsilon)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn layer_norm(
-            &self,
-            input: Tensor,
-            weight: Option<Tensor>,
-            bias: Option<Tensor>,
-            axis: usize,
-            epsilon: f64,
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .layer_norm(input, weight, bias, axis, epsilon)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn normalize_l2(
-            &self,
-            input: Tensor,
-            axes: &[usize],
-            epsilon: f64,
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .normalize_l2(input, axes, epsilon)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn rope(
-            &self,
-            input: Tensor,
-            positions: Tensor,
-            options: nml_ir::RopeOptions,
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .rope(input, positions, options)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn attention(
-            &self,
-            query: Tensor,
-            key: Tensor,
-            value: Tensor,
-            query_positions: Tensor,
-            key_positions: Tensor,
-            options: nml_ir::AttentionOptions,
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .attention(query, key, value, query_positions, key_positions, options)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn paged_attention(
-            &self,
-            query: Tensor,
-            key_cache: Tensor,
-            value_cache: Tensor,
-            page_table: Tensor,
-            sequence_lengths: Tensor,
-            query_positions: Tensor,
-            options: nml_ir::AttentionOptions,
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .paged_attention(
-                    query,
-                    key_cache,
-                    value_cache,
-                    page_table,
-                    sequence_lengths,
-                    query_positions,
-                    options,
-                )
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn with_partitions(
-            &self,
-            input: Tensor,
-            partitions: &[Partition],
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .with_partitions(input, partitions)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn exp(&self, input: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .exp(input)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn log(&self, input: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .log(input)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn sqrt(&self, input: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .sqrt(input)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn rsqrt(&self, input: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .rsqrt(input)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn tanh(&self, input: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .tanh(input)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn sin(&self, input: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .sin(input)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn cos(&self, input: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .cos(input)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn floor(&self, input: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .floor(input)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn ceil(&self, input: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .ceil(input)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn relu(&self, input: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .relu(input)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn sigmoid(&self, input: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .sigmoid(input)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn silu(&self, input: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .silu(input)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn gelu(&self, input: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .gelu(input)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn leaky_relu(&self, input: Tensor, slope: f64) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .leaky_relu(input, slope)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn quick_gelu(&self, input: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .quick_gelu(input)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn swiglu(&self, gate: Tensor, value: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .swiglu(gate, value)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn geglu(&self, gate: Tensor, value: Tensor) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .geglu(gate, value)
-                .map_err(super::Error::Ir)
-        }
-
-        /// Declares ZML-style activation donation for an executable output.
-        pub fn reuse_buffer(
-            &self,
-            output: Tensor,
-            activation: Tensor,
-        ) -> Result<Tensor, super::Error> {
-            self.inner
-                .borrow_mut()
-                .builder
-                .reuse_buffer(output, activation)
-                .map_err(super::Error::Ir)
-        }
-
-        pub fn tensor(
+        pub fn dense(
             &self,
             name: &str,
-            expected: Shape,
+            expected: nml_types::Shape,
             aliases: &[&str],
-        ) -> Result<Tensor, super::Error> {
-            self.maybe_tensor(name, expected, aliases)?
+        ) -> Result<Parameter, super::Error> {
+            self.maybe_dense(name, expected, aliases)?
                 .ok_or_else(|| super::Error::MissingTensor(join(&self.prefix, name)))
         }
 
-        pub fn maybe_tensor(
+        pub fn maybe_dense(
             &self,
             name: &str,
-            expected: Shape,
+            expected: nml_types::Shape,
             aliases: &[&str],
-        ) -> Result<Option<Tensor>, super::Error> {
-            let primary = join(&self.prefix, name);
+        ) -> Result<Option<Parameter>, super::Error> {
+            let logical_name = join(&self.prefix, name);
             let aliases = aliases
                 .iter()
                 .map(|alias| join(&self.prefix, alias))
                 .collect::<Vec<_>>();
-            let mut store = self.inner.borrow_mut();
-            let resolved = if store.registry.contains(&primary) {
-                Some(primary.clone())
+            let artifact_name = if self.registry.contains(&logical_name) {
+                Some(logical_name.clone())
             } else {
                 let present = aliases
                     .iter()
-                    .filter(|alias| store.registry.contains(alias))
-                    .cloned()
+                    .filter(|alias| self.registry.contains(alias))
                     .collect::<Vec<_>>();
                 match present.as_slice() {
                     [] => None,
-                    [only] => Some(only.clone()),
-                    _ => return Err(super::Error::AmbiguousAlias(primary)),
+                    [only] => Some((*only).clone()),
+                    _ => return Err(super::Error::AmbiguousAlias(logical_name)),
                 }
             };
-            let Some(resolved) = resolved else {
+            let Some(artifact_name) = artifact_name else {
                 return Ok(None);
             };
-            let actual = store.registry.shape(&resolved)?;
+            let actual = self.registry.shape(&artifact_name)?;
             if !super::safetensors::storage_compatible(actual, expected) {
                 return Err(super::Error::ShapeMismatch {
-                    name: resolved,
+                    name: artifact_name,
                     expected,
                     actual,
                 });
             }
-            let tensor = if let Some(tensor) = store.tied_symbols.get(&resolved) {
-                let declared = store.record_shapes[&resolved];
-                if declared != expected {
-                    return Err(super::Error::ShapeMismatch {
-                        name: resolved,
-                        expected,
-                        actual: declared,
-                    });
-                }
-                *tensor
-            } else {
-                let tensor = store.builder.parameter(resolved.clone(), expected);
-                store.tied_symbols.insert(resolved.clone(), tensor);
-                store.record_shapes.insert(resolved.clone(), expected);
-                tensor
-            };
-            store.path_to_record.insert(primary, resolved);
-            Ok(Some(tensor))
+            Parameter::dense(logical_name, artifact_name, expected)
+                .map(Some)
+                .map_err(super::Error::Parameter)
         }
 
-        pub fn load<T: NmlStruct>(
+        pub fn load<T: ParameterTree>(
             &self,
             model: &T,
             platform: &Platform,
             options: &LoadOptions,
-        ) -> Result<Bufferized<T>, super::Error> {
+        ) -> Result<Loaded<T>, super::Error> {
             Ok(self.load_accounted(model, platform, options)?.0)
         }
 
-        fn load_accounted<T: NmlStruct>(
+        fn load_accounted<T: ParameterTree>(
             &self,
             model: &T,
             platform: &Platform,
             options: &LoadOptions,
-        ) -> Result<(Bufferized<T>, LoadAccounting), super::Error> {
-            let store = self.inner.borrow();
-            // Resolve the complete model before the first file read or device
-            // allocation. A malformed derived structure therefore cannot
-            // leave a half-loaded parameter set behind.
-            let mut paths = Vec::new();
-            model.visit_tensors("", &mut |path, _tensor| paths.push(path.to_owned()));
-            let mut plan = BTreeMap::<String, String>::new();
-            for path in paths {
-                let record = store
-                    .path_to_record
-                    .get(&path)
-                    .ok_or_else(|| super::Error::UnboundModelPath(path.clone()))?;
-                plan.insert(path, record.clone());
+        ) -> Result<(Loaded<T>, LoadAccounting), super::Error> {
+            // Build and validate the complete physical load plan before the
+            // first host allocation or device transfer.
+            let mut records = BTreeMap::<String, StorageSpec>::new();
+            let mut logical_parameters = BTreeMap::<String, Parameter>::new();
+            let mut validation_error = None;
+            model.visit_parameters("", &mut |_path, parameter| {
+                if validation_error.is_some() {
+                    return;
+                }
+                match logical_parameters.get(parameter.name()) {
+                    Some(previous) if previous != parameter => {
+                        validation_error = Some(super::Error::InconsistentParameterDefinition(
+                            parameter.name().to_owned(),
+                        ));
+                        return;
+                    }
+                    Some(_) => {}
+                    None => {
+                        logical_parameters.insert(parameter.name().to_owned(), parameter.clone());
+                    }
+                }
+                for component in parameter.components() {
+                    let artifact = component.artifact_name();
+                    let storage = component.storage();
+                    match records.get(artifact) {
+                        Some(previous) if *previous != storage => {
+                            validation_error = Some(super::Error::InconsistentArtifactStorage {
+                                name: artifact.to_owned(),
+                                first: *previous,
+                                second: storage,
+                            });
+                            return;
+                        }
+                        Some(_) => continue,
+                        None => {}
+                    }
+                    match self.registry.shape(artifact) {
+                        Ok(actual)
+                            if super::safetensors::storage_compatible(actual, storage.shape()) => {}
+                        Ok(actual) => {
+                            validation_error = Some(super::Error::ShapeMismatch {
+                                name: artifact.to_owned(),
+                                expected: storage.shape(),
+                                actual,
+                            });
+                            return;
+                        }
+                        Err(error) => {
+                            validation_error = Some(error);
+                            return;
+                        }
+                    }
+                    records.insert(artifact.to_owned(), storage);
+                }
+            });
+            if let Some(error) = validation_error {
+                return Err(error);
             }
 
-            let records = plan
-                .values()
-                .cloned()
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .map(|record| {
-                    let shape = store.record_shapes[&record];
-                    (record, shape)
-                })
-                .collect::<Vec<_>>();
+            let records = records.into_iter().collect::<Vec<_>>();
             let record_bytes = records
                 .iter()
-                .map(|(_, shape)| shape.byte_count().map_err(super::Error::Shape))
+                .map(|(_, storage)| storage.shape().byte_count().map_err(super::Error::Shape))
                 .collect::<Result<Vec<_>, _>>()?;
             let worker_count = options.parallelism.min(records.len()).max(1);
             let peak_staging_bytes = if platform.name() == "cuda" {
@@ -1265,12 +619,13 @@ pub mod io {
                 ..LoadAccounting::default()
             };
             let mut loaded = BTreeMap::<String, Buffer>::new();
+
             if platform.name() == "cuda" {
-                for (completed, (record, shape)) in records.iter().enumerate() {
-                    let mut reader = store.registry.reader(record).map_err(super::Error::Io)?;
+                for (completed, (artifact, storage)) in records.iter().enumerate() {
+                    let mut reader = self.registry.reader(artifact).map_err(super::Error::Io)?;
                     let buffer = platform
-                        .upload_checkpoint_from(
-                            *shape,
+                        .upload_component_from(
+                            *storage,
                             options.sharding.clone(),
                             options.memory,
                             options.staging_buffers,
@@ -1281,7 +636,7 @@ pub mod io {
                     accounting.reads += 1;
                     accounting.allocations += 1;
                     accounting.uploads += 1;
-                    loaded.insert(record.clone(), buffer);
+                    loaded.insert(artifact.clone(), buffer);
                     if let Some(progress) = &options.progress {
                         progress(completed + 1, records.len());
                     }
@@ -1289,25 +644,25 @@ pub mod io {
             } else {
                 let next = AtomicUsize::new(0);
                 std::thread::scope(|scope| -> Result<(), super::Error> {
-                    // A rendezvous channel bounds live host tensors to the worker
-                    // count: no worker can read the next tensor until the main
-                    // thread has accepted and started uploading its current one.
+                    // A rendezvous channel bounds live host components to the
+                    // worker count. No worker reads another component until
+                    // the main thread has accepted its current one.
                     let (sender, receiver) = std::sync::mpsc::sync_channel(0);
                     for _ in 0..worker_count {
                         let sender = sender.clone();
-                        let registry = store.registry.clone();
+                        let registry = self.registry.clone();
                         let records = &records;
                         let next = &next;
                         scope.spawn(move || {
                             loop {
                                 let index = next.fetch_add(1, Ordering::Relaxed);
-                                let Some((record, shape)) = records.get(index) else {
+                                let Some((artifact, storage)) = records.get(index) else {
                                     break;
                                 };
                                 if sender
                                     .send((
-                                        record.clone(),
-                                        registry.read_with_shape(record, *shape),
+                                        artifact.clone(),
+                                        registry.read_with_shape(artifact, storage.shape()),
                                     ))
                                     .is_err()
                                 {
@@ -1318,7 +673,7 @@ pub mod io {
                     }
                     drop(sender);
                     for completed in 0..records.len() {
-                        let (record, slice) = receiver
+                        let (artifact, slice) = receiver
                             .recv()
                             .map_err(|_| super::Error::LoaderWorkerFailed)?;
                         let slice = slice?;
@@ -1328,7 +683,7 @@ pub mod io {
                             .map_err(super::Error::Runtime)?;
                         accounting.allocations += 1;
                         accounting.uploads += 1;
-                        loaded.insert(record, buffer);
+                        loaded.insert(artifact, buffer);
                         if let Some(progress) = &options.progress {
                             progress(completed + 1, records.len());
                         }
@@ -1336,35 +691,28 @@ pub mod io {
                     Ok(())
                 })?;
             }
+
             debug_assert_eq!(accounting.reads, accounting.planned);
             debug_assert_eq!(accounting.allocations, accounting.planned);
             debug_assert_eq!(accounting.uploads, accounting.planned);
-            let buffers = model.bufferize("", &mut |path, _tensor| {
-                let record = plan
-                    .get(path)
-                    .expect("validated model traversal is deterministic");
-                Ok::<Buffer, super::Error>(
-                    loaded
-                        .get(record)
-                        .expect("every unique planned record was loaded")
-                        .clone(),
-                )
+            let loaded_model = model.load_parameters("", &mut |_path, parameter| {
+                let components = parameter
+                    .components()
+                    .iter()
+                    .map(|component| {
+                        loaded
+                            .get(component.artifact_name())
+                            .expect("validated physical component was loaded")
+                            .clone()
+                    })
+                    .collect();
+                LoadedParameter::new(parameter.clone(), components).map_err(super::Error::Runtime)
             })?;
-            Ok((buffers, accounting))
-        }
-
-        pub fn finish(self, outputs: &[(String, Tensor)]) -> Result<Program, super::Error> {
-            let store = Rc::try_unwrap(self.inner)
-                .map_err(|_| super::Error::OutstandingTensorStoreView)?
-                .into_inner();
-            store
-                .builder
-                .finish_named(outputs)
-                .map_err(super::Error::Ir)
+            Ok((loaded_model, accounting))
         }
     }
 
-    /// Bounded loader policy without exposing its plan or accounting records.
+    /// Bounded loader policy without exposing private plans or accounting.
     pub struct LoadOptions {
         sharding: Sharding,
         memory: Memory,
@@ -1412,9 +760,8 @@ pub mod io {
             Ok(self)
         }
 
-        /// Reports `(completed_unique_tensors, total_unique_tensors)` after a
-        /// buffer becomes persistent. The callback never observes private load
-        /// plans, paths, or allocation identities.
+        /// Reports `(completed_components, total_unique_components)` after a
+        /// component becomes persistent.
         pub fn progress(mut self, callback: impl Fn(usize, usize) + Send + Sync + 'static) -> Self {
             self.progress = Some(Arc::new(callback));
             self
@@ -1424,58 +771,61 @@ pub mod io {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use nml_parameter::Parameter;
+        use nml_runtime::ParameterTree;
         use nml_types::{DType, Shape};
         use safetensors::tensor::{Dtype, View};
         use std::borrow::Cow;
+        use std::collections::BTreeMap;
 
-        struct Tied {
-            first: Tensor,
-            second: Tensor,
+        struct Pair {
+            first: Parameter,
+            second: Parameter,
         }
 
-        struct TiedBuffers {
-            first: Buffer,
-            second: Buffer,
+        struct LoadedPair {
+            first: LoadedParameter,
+            second: LoadedParameter,
         }
 
-        impl NmlStruct for Tied {
-            type Buffers = TiedBuffers;
+        impl ParameterTree for Pair {
+            type Loaded = LoadedPair;
 
-            fn visit_tensors(&self, prefix: &str, visitor: &mut dyn FnMut(&str, Tensor)) {
-                visitor(&join(prefix, "first"), self.first);
-                visitor(&join(prefix, "second"), self.second);
+            fn visit_parameters(&self, prefix: &str, visitor: &mut dyn FnMut(&str, &Parameter)) {
+                visitor(&join(prefix, "first"), &self.first);
+                visitor(&join(prefix, "second"), &self.second);
             }
 
-            fn visit_buffers(
-                buffers: &Self::Buffers,
+            fn visit_loaded(
+                loaded: &Self::Loaded,
                 prefix: &str,
-                visitor: &mut dyn FnMut(&str, &Buffer),
+                visitor: &mut dyn FnMut(&str, &LoadedParameter),
             ) {
-                visitor(&join(prefix, "first"), &buffers.first);
-                visitor(&join(prefix, "second"), &buffers.second);
+                visitor(&join(prefix, "first"), &loaded.first);
+                visitor(&join(prefix, "second"), &loaded.second);
             }
 
-            fn bufferize<E>(
+            fn load_parameters<E>(
                 &self,
                 prefix: &str,
-                resolve: &mut impl FnMut(&str, Tensor) -> Result<Buffer, E>,
-            ) -> Result<Self::Buffers, E> {
-                Ok(TiedBuffers {
-                    first: resolve(&join(prefix, "first"), self.first)?,
-                    second: resolve(&join(prefix, "second"), self.second)?,
+                resolve: &mut impl FnMut(&str, &Parameter) -> Result<LoadedParameter, E>,
+            ) -> Result<Self::Loaded, E> {
+                Ok(LoadedPair {
+                    first: resolve(&join(prefix, "first"), &self.first)?,
+                    second: resolve(&join(prefix, "second"), &self.second)?,
                 })
             }
         }
 
-        struct Fixture([u8; 8]);
+        struct TensorData(Vec<u8>);
 
-        impl View for &Fixture {
+        impl View for &TensorData {
             fn dtype(&self) -> Dtype {
-                Dtype::F16
+                Dtype::F32
             }
 
             fn shape(&self) -> &[usize] {
-                &[2, 2]
+                &[2]
             }
 
             fn data(&self) -> Cow<'_, [u8]> {
@@ -1488,41 +838,48 @@ pub mod io {
         }
 
         #[test]
-        fn unique_storage_plan_is_accounted_once_for_tied_fields() {
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
+        fn tied_components_are_planned_read_allocated_and_uploaded_once() {
             let root = std::env::temp_dir().join(format!(
-                "nml-loader-accounting-{}-{nonce}",
-                std::process::id()
+                "nml-loader-accounting-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
             ));
             std::fs::create_dir_all(&root).unwrap();
-            let fixture = Fixture([0, 0, 0, 60, 0, 64, 0, 66]);
-            let tensors = BTreeMap::from([("shared", &fixture)]);
-            std::fs::write(
-                root.join("model.safetensors"),
-                ::safetensors::serialize(tensors, None).unwrap(),
-            )
-            .unwrap();
+            let tensor = TensorData(
+                [1.0f32, -2.0]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            );
+            let bytes =
+                safetensors::serialize(BTreeMap::from([("shared", &tensor)]), None).unwrap();
+            std::fs::write(root.join("model.safetensors"), bytes).unwrap();
 
             let registry = TensorRegistry::from_path(&root).unwrap();
-            let store = TensorStore::new(registry);
-            let shape = Shape::new(DType::F16, &[2, 2]).unwrap();
-            let model = Tied {
-                first: store.tensor("first", shape, &["shared"]).unwrap(),
-                second: store.tensor("second", shape, &["shared"]).unwrap(),
+            let parameters = ParameterSet::new(registry);
+            let shape = Shape::new(DType::F32, &[2]).unwrap();
+            let model = Pair {
+                first: parameters.dense("first", shape, &["shared"]).unwrap(),
+                second: parameters.dense("second", shape, &["shared"]).unwrap(),
             };
-            let platform = Platform::cpu().unwrap();
-            let options = LoadOptions::new(Sharding::replicated());
-            let (buffers, accounting) = store.load_accounted(&model, &platform, &options).unwrap();
+            let platform = Platform::cpu_with_devices(1).unwrap();
+            let (loaded, accounting) = parameters
+                .load_accounted(&model, &platform, &LoadOptions::new(Sharding::single()))
+                .unwrap();
+
             assert_eq!(accounting.planned, 1);
             assert_eq!(accounting.reads, 1);
             assert_eq!(accounting.allocations, 1);
             assert_eq!(accounting.uploads, 1);
             assert_eq!(accounting.peak_staging_bytes, 8);
-            assert!(!buffers.first.is_uniquely_owned());
-            assert!(!buffers.second.is_uniquely_owned());
+            let first = loaded.first.components().next().unwrap().1;
+            let second = loaded.second.components().next().unwrap().1;
+            assert!(!first.is_uniquely_owned());
+            assert!(!second.is_uniquely_owned());
+
             std::fs::remove_dir_all(root).unwrap();
         }
     }
@@ -1544,7 +901,7 @@ pub enum Error {
     Json(serde_json::Error),
     Tensor(nml_tensor::Error),
     Shape(nml_types::ShapeError),
-    Ir(nml_ir::Error),
+    Parameter(nml_parameter::Error),
     Runtime(nml_runtime::Error),
     MissingRepository(std::path::PathBuf),
     MissingShard(std::path::PathBuf),
@@ -1573,8 +930,12 @@ pub enum Error {
         expected: nml_types::Shape,
         actual: nml_types::Shape,
     },
-    UnboundModelPath(String),
-    OutstandingTensorStoreView,
+    InconsistentArtifactStorage {
+        name: String,
+        first: nml_parameter::StorageSpec,
+        second: nml_parameter::StorageSpec,
+    },
+    InconsistentParameterDefinition(String),
     InvalidLoadOption(&'static str),
     LoaderWorkerFailed,
 }
@@ -1586,7 +947,7 @@ impl std::fmt::Display for Error {
             Self::Json(error) => error.fmt(f),
             Self::Tensor(error) => error.fmt(f),
             Self::Shape(error) => error.fmt(f),
-            Self::Ir(error) => error.fmt(f),
+            Self::Parameter(error) => error.fmt(f),
             Self::Runtime(error) => error.fmt(f),
             Self::MissingRepository(path) => {
                 write!(f, "no safetensors repository at {}", path.display())
@@ -1633,15 +994,14 @@ impl std::fmt::Display for Error {
                 f,
                 "checkpoint tensor {name:?} shape mismatch: expected {expected:?}, received {actual:?}"
             ),
-            Self::UnboundModelPath(path) => {
-                write!(
-                    f,
-                    "model field {path:?} was not created by this TensorStore"
-                )
-            }
-            Self::OutstandingTensorStoreView => {
-                f.write_str("TensorStore views remain live while finishing the program")
-            }
+            Self::InconsistentArtifactStorage { name, first, second } => write!(
+                f,
+                "checkpoint artifact {name:?} is used with inconsistent physical storage contracts: {first:?} and {second:?}"
+            ),
+            Self::InconsistentParameterDefinition(name) => write!(
+                f,
+                "logical parameter {name:?} is declared with inconsistent representation or artifact binding"
+            ),
             Self::InvalidLoadOption(message) => write!(f, "invalid load option: {message}"),
             Self::LoaderWorkerFailed => {
                 f.write_str("checkpoint reader terminated before completing the load plan")

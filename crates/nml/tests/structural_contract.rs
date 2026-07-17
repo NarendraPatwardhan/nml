@@ -1,32 +1,32 @@
-use nml::NmlStruct as _;
+use nml::ParameterTree as _;
 use nml_types::{DType, Shape};
 
-#[derive(nml::NmlStruct)]
+#[derive(nml::ParameterTree)]
 struct Layer {
-    weight: nml::Tensor,
-    bias: Option<nml::Tensor>,
+    weight: nml::Parameter,
+    bias: Option<nml::Parameter>,
     #[nml(skip)]
     label: &'static str,
 }
 
-#[derive(nml::NmlStruct)]
+#[derive(nml::ParameterTree)]
 struct Model {
     layers: Vec<Layer>,
-    tuple: (nml::Tensor, [nml::Tensor; 2]),
-    boxed: Box<nml::Tensor>,
+    tuple: (nml::Parameter, [nml::Parameter; 2]),
+    boxed: Box<nml::Parameter>,
 }
 
-#[derive(nml::NmlStruct)]
-struct TupleLayer(nml::Tensor, #[nml(skip)] &'static str, nml::Tensor);
+#[derive(nml::ParameterTree)]
+struct TupleLayer(nml::Parameter, #[nml(skip)] &'static str, nml::Parameter);
 
-#[derive(nml::NmlStruct)]
+#[derive(nml::ParameterTree)]
 enum Choice {
     Dense {
-        value: nml::Tensor,
+        value: nml::Parameter,
         #[nml(skip)]
         id: u32,
     },
-    Pair(nml::Tensor, #[nml(skip)] bool, nml::Tensor),
+    Pair(nml::Parameter, #[nml(skip)] bool, nml::Parameter),
     Empty,
 }
 
@@ -39,45 +39,49 @@ mod derive_hygiene {
     #[derive(Debug)]
     pub struct ProductError;
 
-    #[derive(nml::NmlStruct)]
+    #[derive(nml::ParameterTree)]
     pub struct Model {
-        pub weight: nml::Tensor,
+        pub weight: nml::Parameter,
     }
 }
 
 #[test]
 fn derive_is_independent_of_call_site_result_aliases() {
-    let mut builder = nml_ir::ProgramBuilder::new();
     let shape = Shape::new(DType::F16, &[1]).unwrap();
     let model = derive_hygiene::Model {
-        weight: builder.parameter("weight", shape),
+        weight: nml::Parameter::dense("weight", "weight", shape).unwrap(),
     };
     let _uses_product_result: derive_hygiene::Result<()> = Ok(());
-    let result = model.bufferize("model", &mut |_, _| {
-        Err::<nml::Buffer, _>(derive_hygiene::ProductError)
+    let result = model.load_parameters("model", &mut |_, _| {
+        Err::<nml::LoadedParameter, _>(derive_hygiene::ProductError)
     });
     assert!(result.is_err());
 }
 
 #[test]
 fn derive_visits_nested_models_in_deterministic_field_order() {
-    let mut builder = nml_ir::ProgramBuilder::new();
     let shape = Shape::new(DType::F16, &[2, 2]).unwrap();
-    let tensors = (0..6)
-        .map(|index| builder.parameter(format!("p{index}"), shape))
+    let parameters = (0..6)
+        .map(|index| {
+            let name = format!("p{index}");
+            nml::Parameter::dense(&name, &name, shape).unwrap()
+        })
         .collect::<Vec<_>>();
     let model = Model {
         layers: vec![Layer {
-            weight: tensors[0],
-            bias: Some(tensors[1]),
+            weight: parameters[0].clone(),
+            bias: Some(parameters[1].clone()),
             label: "metadata is stripped",
         }],
-        tuple: (tensors[2], [tensors[3], tensors[4]]),
-        boxed: Box::new(tensors[5]),
+        tuple: (
+            parameters[2].clone(),
+            [parameters[3].clone(), parameters[4].clone()],
+        ),
+        boxed: Box::new(parameters[5].clone()),
     };
     assert_eq!(model.layers[0].label, "metadata is stripped");
     let mut paths = Vec::new();
-    model.visit_tensors("model", &mut |path, _| paths.push(path.to_owned()));
+    model.visit_parameters("model", &mut |path, _| paths.push(path.to_owned()));
     assert_eq!(
         paths,
         [
@@ -90,25 +94,29 @@ fn derive_visits_nested_models_in_deterministic_field_order() {
         ]
     );
 
-    let tuple = TupleLayer(tensors[0], "metadata is stripped", tensors[1]);
+    let tuple = TupleLayer(
+        parameters[0].clone(),
+        "metadata is stripped",
+        parameters[1].clone(),
+    );
     assert_eq!(tuple.1, "metadata is stripped");
     let mut tuple_paths = Vec::new();
-    tuple.visit_tensors("tuple", &mut |path, _| tuple_paths.push(path.to_owned()));
+    tuple.visit_parameters("tuple", &mut |path, _| tuple_paths.push(path.to_owned()));
     assert_eq!(tuple_paths, ["tuple.0", "tuple.2"]);
 
     let variants = [
         Choice::Dense {
-            value: tensors[0],
+            value: parameters[0].clone(),
             id: 7,
         },
-        Choice::Pair(tensors[1], true, tensors[2]),
+        Choice::Pair(parameters[1].clone(), true, parameters[2].clone()),
         Choice::Empty,
     ];
     assert!(matches!(&variants[0], Choice::Dense { id: 7, .. }));
     assert!(matches!(&variants[1], Choice::Pair(_, true, _)));
     let mut count = 0;
     for variant in &variants {
-        variant.visit_tensors("choice", &mut |_, _| count += 1);
+        variant.visit_parameters("choice", &mut |_, _| count += 1);
     }
     assert_eq!(count, 3);
 
@@ -118,21 +126,25 @@ fn derive_visits_nested_models_in_deterministic_field_order() {
     let shared = platform
         .upload(&host, nml::Sharding::replicated(), nml::Memory::Default)
         .unwrap();
-    let buffers = model
-        .bufferize("model", &mut |_, _| Ok::<_, ()>(shared.clone()))
+    let loaded = model
+        .load_parameters("model", &mut |_, parameter| {
+            nml::LoadedParameter::new(parameter.clone(), vec![shared.clone()]).map_err(|_| ())
+        })
         .unwrap();
-    let mut buffer_paths = Vec::new();
-    Model::visit_buffers(&buffers, "model", &mut |path, _| {
-        buffer_paths.push(path.to_owned())
+    let mut loaded_paths = Vec::new();
+    Model::visit_loaded(&loaded, "model", &mut |path, _| {
+        loaded_paths.push(path.to_owned())
     });
-    assert_eq!(buffer_paths, paths);
+    assert_eq!(loaded_paths, paths);
 
     for variant in &variants {
-        let buffers = variant
-            .bufferize("choice", &mut |_, _| Ok::<_, ()>(shared.clone()))
+        let loaded = variant
+            .load_parameters("choice", &mut |_, parameter| {
+                nml::LoadedParameter::new(parameter.clone(), vec![shared.clone()]).map_err(|_| ())
+            })
             .unwrap();
         let mut visited = 0;
-        Choice::visit_buffers(&buffers, "choice", &mut |_, _| visited += 1);
+        Choice::visit_loaded(&loaded, "choice", &mut |_, _| visited += 1);
         assert_eq!(
             visited,
             match variant {

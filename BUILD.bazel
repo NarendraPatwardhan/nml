@@ -69,6 +69,7 @@ _COMMON_CONTRACTS = [
     "//crates/nml-ir:ir_contract_test",
     "//crates/nml-kernel-triton:triton_kernel_contract_test",
     "//crates/nml-mlir:mlir_contract_test",
+    "//crates/nml-parameter:parameter_contract_test",
     "//crates/nml-pjrt-cpu:cpu_runtime_contract_test",
     "//crates/nml-platform:host_contract_test",
     "//crates/nml-runtime:runtime_structure_contract_test",

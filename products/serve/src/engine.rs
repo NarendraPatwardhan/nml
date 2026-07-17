@@ -4,9 +4,9 @@
 
 use nml::attention::{Cache, CacheSpec};
 use nml::exe::Arguments;
-use nml::io::{LoadOptions, TensorStore};
+use nml::io::{LoadOptions, ParameterSet};
 use nml::safetensors::TensorRegistry;
-use nml::{Buffer, DataType, Memory, NmlStruct, Platform, Shape, Sharding};
+use nml::{Buffer, DataType, Graph, Loaded, Memory, ParameterTree, Platform, Shape, Sharding};
 use std::error::Error as StdError;
 use std::fmt;
 use std::marker::PhantomData;
@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 /// will consume `Engine` without exporting a model taxonomy through `nml`.
 pub(crate) trait Model: Sized {
     type Configuration;
-    type Checkpoint: NmlStruct;
+    type Checkpoint: ParameterTree;
     type Protocol;
 
     const NAME: &'static str;
@@ -40,11 +40,11 @@ pub(crate) trait Model: Sized {
     ) -> Result<CacheGeometry>;
     fn placement(configuration: &Self::Configuration) -> Result<Sharding>;
     fn declare(
-        store: &TensorStore,
+        parameters: &ParameterSet,
         configuration: &Self::Configuration,
     ) -> Result<Self::Checkpoint>;
     fn build_graph(
-        store: &TensorStore,
+        graph: &mut Graph,
         checkpoint: &Self::Checkpoint,
         configuration: &Self::Configuration,
         sequence: usize,
@@ -281,7 +281,7 @@ pub(crate) struct Engine<'platform, M: Model> {
     placement: Sharding,
     cache_geometry: CacheGeometry,
     executables: ExecutableFamily,
-    parameters: <M::Checkpoint as NmlStruct>::Buffers,
+    parameters: Loaded<M::Checkpoint>,
     startup_timings: StartupTimings,
 }
 
@@ -306,10 +306,13 @@ impl<'platform, M: Model> Engine<'platform, M> {
             ));
         }
 
+        let parameter_set = ParameterSet::new(model.registry.clone());
+        let checkpoint = M::declare(&parameter_set, &model.configuration)?;
         let (prefill, prefill_compilation) = compile_graph::<M>(
             platform,
             &placement,
             &model,
+            &checkpoint,
             shape.prefill_tokens,
             GraphKind::Prefill {
                 batch: shape.batch_capacity,
@@ -320,6 +323,7 @@ impl<'platform, M: Model> Engine<'platform, M> {
             platform,
             &placement,
             &model,
+            &checkpoint,
             1,
             GraphKind::Decode {
                 batch: shape.batch_capacity,
@@ -330,8 +334,6 @@ impl<'platform, M: Model> Engine<'platform, M> {
         // Loading follows compilation so compiler memory does not compete with
         // the persistent checkpoint allocation. The stored buffers are cloned
         // into fresh argument sets for every request and never re-uploaded.
-        let load_store = TensorStore::new(model.registry.clone());
-        let checkpoint = M::declare(&load_store, &model.configuration)?;
         let loader_parallelism = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1)
@@ -339,7 +341,7 @@ impl<'platform, M: Model> Engine<'platform, M> {
         let load_options =
             external(LoadOptions::new(placement.clone()).parallelism(loader_parallelism))?;
         let started = Instant::now();
-        let parameters = external(load_store.load(&checkpoint, platform, &load_options))?;
+        let parameters = external(parameter_set.load(&checkpoint, platform, &load_options))?;
         let parameter_upload = started.elapsed();
 
         Ok(Self {
@@ -519,13 +521,13 @@ fn compile_graph<M: Model>(
     platform: &Platform,
     placement: &Sharding,
     model: &PreparedModel<M>,
+    checkpoint: &M::Checkpoint,
     sequence: usize,
     kind: GraphKind,
 ) -> Result<(nml::Exe, Duration)> {
-    let store = TensorStore::new(model.registry.clone());
-    let checkpoint = M::declare(&store, &model.configuration)?;
-    let outputs = M::build_graph(&store, &checkpoint, &model.configuration, sequence, kind)?;
-    let program = external(store.finish(&named_outputs(outputs)))?;
+    let mut graph = Graph::new();
+    let outputs = M::build_graph(&mut graph, checkpoint, &model.configuration, sequence, kind)?;
+    let program = external(graph.finish_named(&named_outputs(outputs)))?;
     let started = Instant::now();
     let executable = external(platform.compile(&program, placement.clone()))?;
     Ok((executable, started.elapsed()))
@@ -541,14 +543,14 @@ fn named_outputs(outputs: GraphOutputs) -> Vec<(String, nml::Tensor)> {
     named
 }
 
-fn bind_parameters<T: NmlStruct>(
+fn bind_parameters<T: ParameterTree>(
     arguments: &mut Arguments<'_>,
-    parameters: &T::Buffers,
+    parameters: &Loaded<T>,
 ) -> Result<()> {
     let mut failure = None;
-    T::visit_buffers(parameters, "", &mut |name, buffer| {
+    T::visit_loaded(parameters, "", &mut |_name, parameter| {
         if failure.is_none()
-            && let Err(error) = arguments.set(name, buffer.clone())
+            && let Err(error) = arguments.set_parameter(parameter)
         {
             failure = Some(Error::external(error));
         }

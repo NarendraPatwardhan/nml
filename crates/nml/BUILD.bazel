@@ -9,6 +9,7 @@ nml_rust_library(
     deps = [
         "//crates/nml-checkpoint:nml_checkpoint",
         "//crates/nml-ir:nml_ir",
+        "//crates/nml-parameter:nml_parameter",
         "//crates/nml-runtime:nml_runtime",
         "//crates/nml-tensor:nml_tensor",
         "//crates/nml-tokenizer:nml_tokenizer",

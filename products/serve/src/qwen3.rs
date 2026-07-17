@@ -10,8 +10,8 @@ use crate::engine::{
     ProtocolIdentity,
 };
 use config::Config;
-use nml::io::TensorStore;
-use nml::{DataType, Platform, Sharding};
+use nml::io::ParameterSet;
+use nml::{DataType, Graph, Platform, Sharding};
 use std::error::Error as StdError;
 use std::fmt;
 use std::io::Write;
@@ -179,21 +179,21 @@ impl Model for Qwen3 {
     }
 
     fn declare(
-        store: &TensorStore,
+        parameters: &ParameterSet,
         configuration: &Self::Configuration,
     ) -> engine::Result<Self::Checkpoint> {
-        model::declare(store, configuration)
+        model::declare(parameters, configuration)
             .map_err(|error| engine::Error::model(Self::NAME, error))
     }
 
     fn build_graph(
-        store: &TensorStore,
+        graph: &mut Graph,
         checkpoint: &Self::Checkpoint,
         configuration: &Self::Configuration,
         sequence: usize,
         kind: GraphKind,
     ) -> engine::Result<GraphOutputs> {
-        model::build_graph(store, checkpoint, configuration, sequence, kind)
+        model::build_graph(graph, checkpoint, configuration, sequence, kind)
             .map_err(|error| engine::Error::model(Self::NAME, error))
     }
 }

@@ -65,17 +65,21 @@ CPU or CUDA PJRT plugin
 PJRT LoadedExecutable over persistent and donated Buffers
 ```
 
-The system separates five concepts that must not collapse into one another:
+The system separates six concepts that must not collapse into one another:
 
 - `Tensor` is a symbolic value used while constructing a compiled program.
+- `Parameter` is an immutable logical model value with one closed physical
+  representation and one or more named components.
 - `Shape` describes dtype, dimensions, semantic axes, layout, and partitions.
 - `Slice` is shaped host storage or a shaped view over host storage.
 - `Buffer` owns one or more device allocations and their placement.
 - `Exe` owns a compiled executable and its argument/result contract.
 
-`Bufferized<T>` and structural traversal connect Rust model structures to this
-lifecycle. They do not turn checkpoint parser records, transfer guards,
-individual PJRT shards, launch records, or MLIR objects into public concepts.
+One parameter-tree derive connects Rust model structures to loaded parameter
+trees. It maps each logical `Parameter` leaf to one `LoadedParameter`; dense
+storage is the one-component case and structured representations retain all
+components behind the same leaf. Checkpoint records, transfer guards,
+individual PJRT shards, launch records, and MLIR objects remain private.
 
 ### 2.1 Package responsibilities
 
@@ -83,10 +87,11 @@ individual PJRT shards, launch records, or MLIR objects into public concepts.
 | --- | --- |
 | `crates/nml` | Compact public facade and product-facing composition. |
 | `crates/nml-types` | Dtypes, bounded shapes, semantic axes, layouts, and partition metadata. |
+| `crates/nml-parameter` | Logical parameter identity, closed representation specifications, and physical-component contracts. |
 | `crates/nml-tensor` | Typed/aligned host tensor storage and views. |
 | `crates/nml-ir` | Symbolic tensor programs, validation, StableHLO/Shardy lowering, attention, and portable MoE. |
 | `crates/nml-derive` | Auditable Rust structural traversal generated for model values. |
-| `crates/nml-checkpoint` | SafeTensors discovery, declarations, aliases, tied weights, and loading. |
+| `crates/nml-checkpoint` | Physical artifact indexing plus parameter declaration, binding, aliases, tied weights, and component loading. It never owns graph operations. |
 | `crates/nml-sharding` | Logical meshes, tensor placement, and Shardy-facing contracts. |
 | `crates/nml-runtime` | Platforms, buffers, executables, argument binding, result ownership, and cache state. |
 | `crates/nml-compiler` | StableHLO version negotiation and compilation orchestration. |
@@ -112,18 +117,28 @@ Native C, C++, CUDA, MLIR, TTIR, and vendor APIs remain where their ecosystems
 require them; Rust does not attempt to rewrite XLA or performance kernels for
 the sake of language uniformity.
 
+NML is pre-alpha and owes no backward compatibility. An API or internal model
+that obstructs a simpler, safer, or more scalable design is replaced directly;
+we do not accumulate deprecated aliases, migration adapters, or parallel
+legacy/new subsystems. Compatibility begins only when a later release contract
+explicitly says so. This freedom does not weaken verification: every redesign
+must preserve or replace the applicable permanent product evidence.
+
 The public root surface stays comparable in magnitude to ZML's useful core.
-Its principal concepts are `DataType`, `Shape`, `Tensor`, `Slice`, `Buffer`,
-`Exe`, `Bufferized<T>`, `Memory`, `Platform`, and `Sharding`. Backend launch
-records, custom-call ABIs, MLIR owners, PJRT handles, checkpoint plans, and
-kernel selectors are not root-level product types.
+Its principal concepts are `DataType`, `Shape`, `Tensor`, `Parameter`, `Graph`,
+`Slice`, `Buffer`, `Exe`, `Memory`, `Platform`, and `Sharding`.
+`Parameter` is the immutable logical model-weight concept justified by dense
+and structured quantized storage; backend representations remain private.
+Backend launch records, custom-call ABIs, MLIR owners, PJRT handles, checkpoint
+plans, physical encoding records, and kernel selectors are not root-level
+product types.
 
 Rust traits and procedural derives replace the structural role of Zig
-reflection. A derive may flatten tensor-bearing fields, construct bufferized
-counterparts, map checkpoint names, and rebuild results, but the generated
-behavior remains explicit and inspectable. Ordinary graph operations live on
-the tensor store rather than creating a public class hierarchy for every
-operation or backend.
+reflection. One parameter-tree derive flattens `Parameter`-bearing fields,
+constructs loaded counterparts, and rebuilds nested results; generated behavior
+remains explicit and inspectable. It never maps arbitrary graph `Tensor` values
+to `Buffer`s. Ordinary graph operations live on `Graph`, independently of
+artifact indexing, parameter declaration, loading, and preparation.
 
 Errors cross public boundaries as structured Rust results. Panics are reserved
 for violated internal invariants that callers cannot cause. Unsupported device,
@@ -168,9 +183,16 @@ checkpoint encoding
 kernel and hardware capability
 ```
 
-W4A16, W8A8, and NVFP4 are product goals, but none is currently a supported
-execution vertical. Their implementation remains deferred until explicitly
-scheduled. Section 14 defines the acceptance boundary.
+NVFP4 is the current first-priority execution vertical, defined in
+[`NVFP4.md`](./NVFP4.md). It is represented as one logical `Parameter` backed
+by packed payload, scale, and global-factor components, not as an ordinary
+dtype or an arbitrary tuple of tensors. The representation must remain packed
+through loading and device residency and lower through capability-selected CPU,
+pre-Blackwell emulation, or native Blackwell kernels.
+
+W4A16 and W8A8 remain later independent product goals. Implementing NVFP4 does
+not select their signedness, calibration, grouping, scale, or checkpoint
+contracts. Section 14 defines the common acceptance boundary.
 
 ### 4.3 Shape invariants
 
@@ -367,13 +389,13 @@ types merely because Qwen was the first complete model.
 
 GPT-OSS 20B is the intended default serving model. NML does not infer support
 for its architecture or checkpoint representation from a model-family name.
-The first GPT-OSS product vertical uses BF16. Before implementation, one exact
-BF16 artifact from a trustworthy distributor must be selected and pinned by
-distributor, revision, file hashes, configuration, tensor names, and dtypes.
-NVFP4 is a later, independent product vertical considered only after the BF16
-model and serving system are complete. The official MXFP4 release does not
-create an NML requirement to implement MXFP4. Unknown or ambiguous GPT-OSS
-checkpoint variants are rejected rather than interpreted heuristically.
+The first GPT-OSS product vertical uses one exact NVFP4 artifact selected and
+pinned by distributor, revision, file hashes, configuration, tensor records,
+packing, scales, layout, and conversion provenance. The official MXFP4 release
+does not create an NML requirement to implement MXFP4. Unknown or ambiguous
+GPT-OSS checkpoint variants are rejected rather than interpreted
+heuristically. [`NVFP4.md`](./NVFP4.md) owns the complete representation,
+kernel, hardware, and acceptance architecture.
 
 The GPT-OSS model vertical will reuse the existing RMSNorm, GQA, RoPE/YaRN,
 dense and sliding-window attention, paged cache, top-k MoE, grouped expert,
@@ -382,7 +404,9 @@ verify the selected artifact's exact configuration and tensor mapping,
 attention-sink denominator bias, clamped/residual SwiGLU semantics, alternating
 dense/window attention schedule, `o200k_harmony` tokenization behavior, Harmony
 roles/channels, and end-to-end output contract. A BF16 artifact adds no new
-quantization format but carries its full memory cost. An NVFP4 artifact is
+quantization format but carries its full memory cost; it may be used as a
+bounded independent oracle or conversion source when explicitly selected, but
+it is no longer a prerequisite product milestone. The NVFP4 artifact is
 admitted only through the complete quantization contract in section 14.1.
 
 The serving layer adds request scheduling, global paged-cache ownership,
@@ -737,11 +761,15 @@ The remaining validation debt is explicit:
 - run native Linux AArch64 CPU/CUDA contracts, including DGX Spark;
 - run native Apple Silicon CPU contracts.
 
-The main new product territory is:
+The current first-priority product territory is the exact GPT-OSS 20B NVFP4
+vertical in [`NVFP4.md`](./NVFP4.md): artifact identity, parameter/storage
+redesign, CPU execution, fused pre-Blackwell emulation, native Blackwell
+execution, grouped MoE, Shardy placement, and complete model evidence.
 
-- the exact GPT-OSS 20B artifact selected for the default serving product;
-- W4A16, W8A8, and NVFP4 execution verticals when selected by a concrete
-  product artifact or workload;
+Later product territory includes:
+
+- W4A16 and W8A8 execution verticals when selected by a concrete product
+  artifact or workload;
 - explicitly authored analytic backward graphs and LoRA optimizer/state flows;
 - additional model families and modalities selected by concrete products;
 - orchestration such as speculative decoding built over existing cache and
@@ -771,9 +799,10 @@ A quantization recipe is supported only when all of the following hold:
 Quantized formats are introduced only for an exact selected product artifact
 or workload. Distributor reputation alone is insufficient: the pinned files
 and their metadata must define one auditable representation. Similar names do
-not make two FP4 recipes interchangeable, and NML does not add MXFP4, NVFP4, or
-generic four-bit cases speculatively. A trusted BF16 artifact remains a valid
-product choice when its declared memory and performance costs are accepted.
+not make two FP4 recipes interchangeable. NVFP4 is now explicitly selected;
+MXFP4 and generic four-bit cases are not. A trusted BF16 artifact remains a
+valid oracle or later product choice when its declared provenance, memory, and
+performance costs are accepted.
 
 W4A16 still requires a concrete choice of signedness, calibration/checkpoint
 convention, group axis and size, scale/zero-point dtype, nibble order,
@@ -812,7 +841,7 @@ table is a compact compatibility index, not a migration checklist.
 | D-001 | NML is independently implemented product code informed by readable references; dependency/build reuse is separately audited. |
 | D-002 | CPU and NVIDIA CUDA are the only accelerator backends. |
 | D-003 | The ordinary dtype set is bool, 8/16/32/64-bit signed and unsigned integers, F16/BF16/F32/F64, and C64/C128. |
-| D-004 | W4A16, W8A8, and NVFP4 are first-class future product goals when justified by exact selected artifacts or workloads, not enum-only claims. |
+| D-004 | NVFP4 is a selected first-priority product vertical; W4A16 and W8A8 remain independent future goals, and none is an enum-only claim. |
 | D-005 | Upstream editor, CI, and repository-personalization files are not inherited. |
 | D-006 | NML is an acceleration substrate, not LLMD or a hosted serving clone. |
 | D-007 | General autograd is outside scope; analytic backward programs may be authored explicitly. |
@@ -836,7 +865,7 @@ table is a compact compatibility index, not a migration checklist.
 | D-025 | Original upstream sources are preferred; ZML-hosted source forks require explicit review. |
 | D-026 | Attention and complete selected CPU/CUDA substrate coverage precede novel quantization. |
 | D-027 | BuildBuddy is opt-in, credential-free in-repo, hermetic, image-pinned remote execution/cache. |
-| D-028 | GPT-OSS is implemented and served in BF16 first; NVFP4 remains deferred until that product path is complete and an exact NVFP4 artifact is selected. |
+| D-028 | GPT-OSS 20B NVFP4 is the first-priority product vertical; BF16 may support its oracle/conversion evidence but is not a prerequisite serving milestone. |
 | D-029 | Shardy is the only SPMD partitioner; legacy GSPMD is out. |
 | D-030 | Placement metadata is part of the graph/checkpoint/runtime contract, not a later retrofit. |
 | D-031 | Compile, package, CPU, and real-GPU contracts run where their resources truthfully exist. |
@@ -853,12 +882,15 @@ table is a compact compatibility index, not a migration checklist.
 | D-042 | BuildBuddy owns compilation, CPU execution, GPU-independent/package contracts, and OCI construction; GPU execution consumes the immutable image elsewhere. |
 | D-043 | RunPod templates use REST where reliable, while Pod placement, lifecycle, runtime/SSH mapping, and termination remain GraphQL-owned; application readiness is independent. |
 | D-044 | RunPod orchestration is a rewritten standard-library Python 3.12 `rules_python` tool; `rules_uv` is absent until accepted third-party dependencies require locking. |
-| D-045 | GPT-OSS 20B BF16 is the intended default serving model after one exact trustworthy BF16 artifact is selected; Qwen3 remains a permanent regression model. |
-| D-046 | GPT-OSS checkpoint representations are ordered product verticals: BF16 first, NVFP4 only after BF16 serving is complete, MXFP4 is not implied, and unknown recipes hard-fail. |
+| D-045 | GPT-OSS 20B with one exact trustworthy NVFP4 artifact is the intended default model; Qwen3 remains a permanent dense regression model. |
+| D-046 | The selected GPT-OSS checkpoint vertical is NVFP4; BF16 is optional oracle/source evidence, MXFP4 is not implied, and unknown recipes hard-fail. |
 | D-047 | Model weights remain outside OCI layers and are mounted or revision-pinned into an optional model cache. |
 | D-048 | `rules_img` is NML's sole OCI rule set; `rules_oci` and parallel image graphs are prohibited. |
-| D-049 | Product work proceeds in five acceptance tracks: Qwen OCI, RunPod execution, GPT-OSS BF16, serving improvements, then an independently selected NVFP4 vertical. |
+| D-049 | Product work proceeds with the complete GPT-OSS NVFP4 vertical first; OCI closure, general serving improvements, and unrelated formats resume afterward unless directly required for NVFP4 evidence. |
 | D-050 | Public GHCR is the OCI registry; rules_img uses its registry API, supported GitHub administration uses REST, the GitHub CLI is prohibited, and package visibility uses a one-time web action only because REST lacks that mutation. |
+| D-051 | NML is pre-alpha and has no backward-compatibility obligation; obstructive APIs and internals are replaced without legacy adapters when a better verified design is available. |
+| D-052 | Ordinary `Tensor`/`Buffer` values remain single-shape dense values; one logical `Parameter`/loaded-parameter boundary owns dense or structured physical components. `TensorStore`, `NmlStruct`, `Bufferized<T>`, dense-only parameter input markers, and logical-shape checkpoint upload are deleted rather than adapted. |
+| D-053 | NVFP4 dispatch is truthful by capability: CPU and pre-Blackwell devices consume compact weights through exact/fused emulation, while only proven SM100+ block-scaled execution is called native NVFP4. |
 
 ## 16. Provenance and relationship to ZML
 

@@ -159,6 +159,20 @@ pub type Complex64 = Complex<f32>;
 pub type Complex128 = Complex<f64>;
 
 /// The ordinary tensor element types supported by NML.
+///
+/// A dtype is a complete scalar contract: the bits of one element are enough
+/// to interpret its value, and the element has a fixed logical width, host
+/// storage width/alignment, and compiler/runtime spelling. BF16 is therefore a
+/// dtype even when a model was converted to BF16 from some other
+/// representation; each stored BF16 value remains independently meaningful.
+///
+/// A quantized representation is instead a tensor-level contract. Its meaning
+/// may depend on packed payload bits, block/group geometry, scale or zero-point
+/// tensors, physical layout, logical/compute/accumulation dtypes, and a kernel
+/// capability. Names such as W4A16, W8A8, and NVFP4 describe such recipes, not
+/// ordinary scalar variants for this enum. An internal E2M1 payload type would
+/// still be only one component of NVFP4; adding it here would not constitute
+/// NVFP4 support.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub enum DType {

@@ -15,6 +15,7 @@ nml_rust_library(
     deps = [
         "//crates/nml-kernel-triton:nml_kernel_triton",
         "//crates/nml-mlir:nml_mlir",
+        "//crates/nml-parameter:nml_parameter",
         "//crates/nml-sharding:nml_sharding",
         "//crates/nml-tensor:nml_tensor",
         "//crates/nml-types:nml_types",
@@ -33,6 +34,7 @@ nml_rust_test(
     deps = [
         ":nml_ir",
         "//crates/nml-mlir:nml_mlir",
+        "//crates/nml-parameter:nml_parameter",
         "//crates/nml-sharding:nml_sharding",
         "//crates/nml-tensor:nml_tensor",
         "//crates/nml-types:nml_types",

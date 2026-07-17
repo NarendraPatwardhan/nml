@@ -5,7 +5,8 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use nml_ir::{InputKind, Program};
+use nml_ir::{InputBinding, Program};
+use nml_parameter::{Parameter, StorageSpec};
 use nml_pjrt::{Client, Device, LoadedExecutable};
 pub use nml_sharding::Sharding;
 use nml_tensor::Slice;
@@ -165,19 +166,23 @@ impl Platform {
         })
     }
 
-    /// Streams checkpoint bytes through CUDA's reusable mapped DMA lanes.
-    /// CPU deliberately reads one aligned tensor and uses the ordinary
+    /// Streams one physical parameter component through CUDA's reusable
+    /// mapped DMA lanes. The component storage contract, rather than a logical
+    /// parameter shape, determines the PJRT buffer that is allocated.
+    ///
+    /// CPU deliberately reads one aligned component and uses the ordinary
     /// immutable-host transfer path.
     #[doc(hidden)]
-    pub fn upload_checkpoint_from(
+    pub fn upload_component_from(
         &self,
-        shape: Shape,
+        storage: StorageSpec,
         sharding: Sharding,
         memory: Memory,
         staging_buffers: usize,
         chunk_bytes: usize,
         mut read: impl FnMut(usize, &mut [u8]) -> std::io::Result<()>,
     ) -> Result<Buffer, Error> {
+        let shape = storage.shape();
         if staging_buffers == 0 || chunk_bytes == 0 {
             return Err(Error::InvalidStaging {
                 buffers: staging_buffers,
@@ -988,25 +993,71 @@ impl Buffer {
     }
 }
 
-/// Structural mapping from symbolic tensors to persistent buffers.
-///
-/// The derive macro generates companion storage privately in the model's own
-/// module; NML exposes only this one trait and the `Bufferized<T>` mapping.
-pub trait NmlStruct {
-    type Buffers;
-
-    fn visit_tensors(&self, prefix: &str, visitor: &mut dyn FnMut(&str, nml_ir::Tensor));
-
-    fn visit_buffers(buffers: &Self::Buffers, prefix: &str, visitor: &mut dyn FnMut(&str, &Buffer));
-
-    fn bufferize<E>(
-        &self,
-        prefix: &str,
-        resolve: &mut impl FnMut(&str, nml_ir::Tensor) -> Result<Buffer, E>,
-    ) -> Result<Self::Buffers, E>;
+/// Runtime ownership of every physical component for one logical parameter.
+#[derive(Clone)]
+pub struct LoadedParameter {
+    parameter: Parameter,
+    components: Vec<Buffer>,
 }
 
-pub type Bufferized<T> = <T as NmlStruct>::Buffers;
+impl LoadedParameter {
+    pub fn new(parameter: Parameter, components: Vec<Buffer>) -> Result<Self, Error> {
+        if parameter.components().len() != components.len() {
+            return Err(Error::ParameterComponentCount {
+                parameter: parameter.name().to_owned(),
+                expected: parameter.components().len(),
+                actual: components.len(),
+            });
+        }
+        for (spec, buffer) in parameter.components().iter().zip(&components) {
+            if spec.storage().shape() != buffer.shape() {
+                return Err(Error::ArgumentShape {
+                    name: spec.binding_name().to_owned(),
+                    expected: spec.storage().shape(),
+                    actual: buffer.shape(),
+                });
+            }
+        }
+        Ok(Self {
+            parameter,
+            components,
+        })
+    }
+
+    pub fn parameter(&self) -> &Parameter {
+        &self.parameter
+    }
+
+    pub fn components(&self) -> impl Iterator<Item = (&nml_parameter::ComponentSpec, &Buffer)> {
+        self.parameter.components().iter().zip(&self.components)
+    }
+
+    pub fn component(&self, role: nml_parameter::ComponentRole) -> Option<&Buffer> {
+        self.components()
+            .find_map(|(spec, buffer)| (spec.role() == role).then_some(buffer))
+    }
+}
+
+/// Structural mapping from logical parameters to loaded parameter owners.
+pub trait ParameterTree {
+    type Loaded;
+
+    fn visit_parameters(&self, prefix: &str, visitor: &mut dyn FnMut(&str, &Parameter));
+
+    fn visit_loaded(
+        loaded: &Self::Loaded,
+        prefix: &str,
+        visitor: &mut dyn FnMut(&str, &LoadedParameter),
+    );
+
+    fn load_parameters<E>(
+        &self,
+        prefix: &str,
+        resolve: &mut impl FnMut(&str, &Parameter) -> Result<LoadedParameter, E>,
+    ) -> Result<Self::Loaded, E>;
+}
+
+pub type Loaded<T> = <T as ParameterTree>::Loaded;
 
 /// A compiled executable with named, reusable argument bindings.
 pub struct Exe {
@@ -1023,7 +1074,7 @@ pub struct Exe {
 struct Binding {
     name: String,
     shape: Shape,
-    kind: InputKind,
+    contract: InputBinding,
 }
 
 #[derive(Clone)]
@@ -1044,10 +1095,10 @@ impl Exe {
     ) -> Result<Self, Error> {
         let inputs = program
             .inputs()
-            .map(|(name, shape, kind)| Binding {
+            .map(|(name, shape, contract)| Binding {
                 name: name.to_owned(),
                 shape,
-                kind,
+                contract: contract.clone(),
             })
             .collect();
         let outputs = program
@@ -1097,7 +1148,7 @@ impl Exe {
 }
 
 pub mod exe {
-    use super::{Buffer, Error, Exe, InputKind};
+    use super::{Buffer, Error, Exe, LoadedParameter};
 
     pub struct Arguments<'exe> {
         pub(super) executable: &'exe Exe,
@@ -1113,33 +1164,86 @@ pub mod exe {
                 .iter()
                 .position(|binding| binding.name == name)
                 .ok_or_else(|| Error::UnknownArgument(name.to_owned()))?;
+            self.validate(index, &buffer)?;
+            self.slots[index] = Some(buffer);
+            Ok(self)
+        }
+
+        fn validate(&self, index: usize, buffer: &Buffer) -> Result<(), Error> {
             let binding = &self.executable.inputs[index];
             if binding.shape != buffer.shape {
                 return Err(Error::ArgumentShape {
-                    name: name.to_owned(),
+                    name: binding.name.clone(),
                     expected: binding.shape,
                     actual: buffer.shape,
                 });
             }
             if buffer.backend != self.executable.backend {
-                return Err(Error::ArgumentPlatform(name.to_owned()));
+                return Err(Error::ArgumentPlatform(binding.name.clone()));
             }
             if buffer.platform_id != self.executable.platform_id {
-                return Err(Error::ArgumentPlatform(name.to_owned()));
+                return Err(Error::ArgumentPlatform(binding.name.clone()));
             }
             if buffer.sharding != self.executable.sharding {
-                return Err(Error::ArgumentSharding(name.to_owned()));
+                return Err(Error::ArgumentSharding(binding.name.clone()));
             }
             if self.baked[index] {
-                return Err(Error::BakedArgument(name.to_owned()));
+                return Err(Error::BakedArgument(binding.name.clone()));
             }
-            self.slots[index] = Some(buffer);
+            Ok(())
+        }
+
+        /// Binds every physical component of one logical parameter and checks
+        /// the executable's representation-aware component manifest.
+        pub fn set_parameter(&mut self, parameter: &LoadedParameter) -> Result<&mut Self, Error> {
+            let mut assignments = Vec::with_capacity(parameter.parameter().components().len());
+            for (component, buffer) in parameter.components() {
+                let index = self
+                    .executable
+                    .inputs
+                    .iter()
+                    .position(|binding| binding.name == component.binding_name())
+                    .ok_or_else(|| Error::UnknownArgument(component.binding_name().to_owned()))?;
+                let binding = &self.executable.inputs[index];
+                let nml_ir::InputBinding::ParameterComponent(contract) = &binding.contract else {
+                    return Err(Error::ArgumentIsNotParameterComponent(
+                        component.binding_name().to_owned(),
+                    ));
+                };
+                if contract.parameter() != parameter.parameter().name()
+                    || contract.representation() != parameter.parameter().representation_id()
+                    || contract.role() != component.role()
+                    || contract.storage() != component.storage()
+                {
+                    return Err(Error::ParameterContract {
+                        parameter: parameter.parameter().name().to_owned(),
+                        component: component.binding_name().to_owned(),
+                    });
+                }
+                if assignments
+                    .iter()
+                    .any(|(assigned, _): &(usize, Buffer)| *assigned == index)
+                {
+                    return Err(Error::ParameterContract {
+                        parameter: parameter.parameter().name().to_owned(),
+                        component: component.binding_name().to_owned(),
+                    });
+                }
+                self.validate(index, buffer)?;
+                assignments.push((index, buffer.clone()));
+            }
+            // Validate every component before changing any slot. A malformed
+            // multi-component parameter must never leave a partially rebound
+            // executable behind.
+            for (index, buffer) in assignments {
+                self.slots[index] = Some(buffer);
+            }
             Ok(self)
         }
 
         pub fn bake(&mut self) -> Result<&mut Self, Error> {
             for (index, binding) in self.executable.inputs.iter().enumerate() {
-                if binding.kind == InputKind::Parameter {
+                if binding.contract.is_parameter_component() {
                     if self.slots[index].is_none() {
                         return Err(Error::MissingArgument(binding.name.clone()));
                     }
@@ -1310,6 +1414,16 @@ pub enum Error {
     UnknownArgument(String),
     MissingArgument(String),
     BakedArgument(String),
+    ArgumentIsNotParameterComponent(String),
+    ParameterContract {
+        parameter: String,
+        component: String,
+    },
+    ParameterComponentCount {
+        parameter: String,
+        expected: usize,
+        actual: usize,
+    },
     ArgumentShape {
         name: String,
         expected: Shape,
@@ -1363,6 +1477,27 @@ impl fmt::Display for Error {
             Self::UnknownArgument(name) => write!(f, "unknown executable argument {name:?}"),
             Self::MissingArgument(name) => write!(f, "missing executable argument {name:?}"),
             Self::BakedArgument(name) => write!(f, "baked parameter {name:?} cannot be replaced"),
+            Self::ArgumentIsNotParameterComponent(name) => {
+                write!(
+                    f,
+                    "executable argument {name:?} is not a parameter component"
+                )
+            }
+            Self::ParameterContract {
+                parameter,
+                component,
+            } => write!(
+                f,
+                "loaded parameter {parameter:?} does not satisfy component binding {component:?}"
+            ),
+            Self::ParameterComponentCount {
+                parameter,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "loaded parameter {parameter:?} has {actual} components, expected {expected}"
+            ),
             Self::ArgumentShape {
                 name,
                 expected,

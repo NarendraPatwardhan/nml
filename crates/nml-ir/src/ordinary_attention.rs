@@ -5,7 +5,7 @@
 //! remains complete and is emitted for CPU, unsupported CUDA devices, dtypes,
 //! and layouts.  FA2 is only reachable for its exact dense ABI.
 
-use crate::{attention_backend, AttentionOptions, Error};
+use crate::{AttentionOptions, Error, attention_backend};
 use nml_mlir::{
     Block, Context, Region, StableHloBinary, StableHloComparison, StableHloComparisonType,
     StableHloUnary, Type, Value,

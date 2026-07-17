@@ -3,9 +3,12 @@
 #![forbid(unsafe_code)]
 
 pub use nml_checkpoint::{io, safetensors};
-pub use nml_derive::NmlStruct;
-pub use nml_ir::Tensor;
-pub use nml_runtime::{Buffer, Bufferized, Exe, Memory, NmlStruct, Platform, Sharding, exe};
+pub use nml_derive::ParameterTree;
+pub use nml_ir::{ProgramBuilder as Graph, Tensor};
+pub use nml_parameter::Parameter;
+pub use nml_runtime::{
+    Buffer, Exe, Loaded, LoadedParameter, Memory, ParameterTree, Platform, Sharding, exe,
+};
 pub use nml_tensor::Slice;
 pub use nml_types::{AxisTag, DType as DataType, Partition, Shape};
 

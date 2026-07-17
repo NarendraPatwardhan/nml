@@ -1,7 +1,7 @@
 //! Numerical product contract for model-enabling tensor and neural operations.
 
 use nml_ir::ProgramBuilder;
-use nml_types::{BFloat16, Complex64, DType, Shape, F16};
+use nml_types::{BFloat16, Complex64, DType, F16, Shape};
 
 const ROWS: usize = 2;
 const WIDTH: usize = 4;
@@ -34,10 +34,12 @@ fn execute_float_contract(platform: &nml::Platform, dtype: DType) {
     let gate = builder.input("gate", shape);
     let norm_weight = builder.input("norm_weight", Shape::new(dtype, &[WIDTH as i64]).unwrap());
     let norm_bias = builder.input("norm_bias", Shape::new(dtype, &[WIDTH as i64]).unwrap());
-    let embedding_weight = builder.input(
+    let embedding_parameter = nml::Parameter::dense(
+        "embedding_weight",
         "embedding_weight",
         Shape::new(dtype, &[5, WIDTH as i64]).unwrap(),
-    );
+    )
+    .unwrap();
     let token_ids = builder.input("token_ids", Shape::new(DType::I32, &[2, 3]).unwrap());
     let scores = builder.input("scores", Shape::new(dtype, &[3, 5]).unwrap());
 
@@ -63,7 +65,7 @@ fn execute_float_contract(platform: &nml::Platform, dtype: DType) {
     let swiglu = builder.swiglu(gate, input).unwrap();
     let geglu = builder.geglu(gate, input).unwrap();
     let embedding = builder
-        .token_embedding(embedding_weight, token_ids)
+        .token_embedding(&embedding_parameter, token_ids)
         .unwrap();
     let (maxima, indices) = builder.argmax(scores, 1).unwrap();
 
@@ -132,12 +134,12 @@ fn execute_float_contract(platform: &nml::Platform, dtype: DType) {
         Shape::new(dtype, &[WIDTH as i64]).unwrap(),
         &norm_bias,
     );
-    set_float(
+    set_parameter_float(
         platform,
         &mut arguments,
-        "embedding_weight",
-        Shape::new(dtype, &[5, WIDTH as i64]).unwrap(),
+        &embedding_parameter,
         &embedding_weight,
+        nml::Sharding::single(),
     );
     set_i32(
         platform,
@@ -153,6 +155,7 @@ fn execute_float_contract(platform: &nml::Platform, dtype: DType) {
         Shape::new(dtype, &[3, 5]).unwrap(),
         &scores,
     );
+    arguments.bake().unwrap();
     let results = arguments.call().unwrap();
 
     let input = rounded(dtype, &input);
@@ -1305,13 +1308,17 @@ fn execute_moe_contract(platform: &nml::Platform, dtype: DType) {
     let mut builder = ProgramBuilder::new();
     let hidden = builder.input("hidden", hidden_shape);
     let router = builder.input("router", router_shape);
-    let gate_up = builder.input("gate_up", gate_up_shape);
-    let down = builder.input("down", down_shape);
+    let gate_up_parameter = nml::Parameter::dense("gate_up", "gate_up", gate_up_shape).unwrap();
+    let down_parameter = nml::Parameter::dense("down", "down", down_shape).unwrap();
     let swiglu = builder
-        .moe_swiglu(hidden, router, gate_up, down, 2)
+        .moe_swiglu(hidden, router, &gate_up_parameter, &down_parameter, 2)
         .unwrap();
-    let geglu = builder.moe_geglu(hidden, router, gate_up, down, 2).unwrap();
-    let reglu = builder.moe_reglu(hidden, router, gate_up, down, 2).unwrap();
+    let geglu = builder
+        .moe_geglu(hidden, router, &gate_up_parameter, &down_parameter, 2)
+        .unwrap();
+    let reglu = builder
+        .moe_reglu(hidden, router, &gate_up_parameter, &down_parameter, 2)
+        .unwrap();
     let program = builder
         .finish_named(&[
             ("swiglu".to_owned(), swiglu),
@@ -1336,8 +1343,21 @@ fn execute_moe_contract(platform: &nml::Platform, dtype: DType) {
     let mut arguments = executable.args();
     set_float(platform, &mut arguments, "hidden", hidden_shape, &hidden);
     set_float(platform, &mut arguments, "router", router_shape, &router);
-    set_float(platform, &mut arguments, "gate_up", gate_up_shape, &gate_up);
-    set_float(platform, &mut arguments, "down", down_shape, &down);
+    set_parameter_float(
+        platform,
+        &mut arguments,
+        &gate_up_parameter,
+        &gate_up,
+        nml::Sharding::single(),
+    );
+    set_parameter_float(
+        platform,
+        &mut arguments,
+        &down_parameter,
+        &down,
+        nml::Sharding::single(),
+    );
+    arguments.bake().unwrap();
     let results = arguments.call().unwrap();
 
     let hidden = rounded(dtype, &hidden);
@@ -1397,10 +1417,12 @@ fn execute_expert_parallel_moe_contract(platform: &nml::Platform) {
     let mut builder = ProgramBuilder::new();
     let hidden = builder.input("parallel_hidden", hidden_shape);
     let router = builder.input("parallel_router", router_shape);
-    let gate_up = builder.input("parallel_gate_up", gate_up_shape);
-    let down = builder.input("parallel_down", down_shape);
+    let gate_up_parameter =
+        nml::Parameter::dense("parallel_gate_up", "parallel_gate_up", gate_up_shape).unwrap();
+    let down_parameter =
+        nml::Parameter::dense("parallel_down", "parallel_down", down_shape).unwrap();
     let output = builder
-        .moe_swiglu(hidden, router, gate_up, down, 2)
+        .moe_swiglu(hidden, router, &gate_up_parameter, &down_parameter, 2)
         .unwrap();
     let program = builder
         .finish_named(&[("parallel_output".to_owned(), output)])
@@ -1426,8 +1448,6 @@ fn execute_expert_parallel_moe_contract(platform: &nml::Platform) {
     for (name, shape, values) in [
         ("parallel_hidden", hidden_shape, hidden.as_slice()),
         ("parallel_router", router_shape, router.as_slice()),
-        ("parallel_gate_up", gate_up_shape, gate_up.as_slice()),
-        ("parallel_down", down_shape, down.as_slice()),
     ] {
         let host = nml::Slice::from_typed(shape, values).unwrap();
         let buffer = platform
@@ -1435,6 +1455,21 @@ fn execute_expert_parallel_moe_contract(platform: &nml::Platform) {
             .unwrap();
         arguments.set(name, buffer).unwrap();
     }
+    set_parameter_float(
+        platform,
+        &mut arguments,
+        &gate_up_parameter,
+        &gate_up,
+        mesh.clone(),
+    );
+    set_parameter_float(
+        platform,
+        &mut arguments,
+        &down_parameter,
+        &down,
+        mesh.clone(),
+    );
+    arguments.bake().unwrap();
     let results = arguments.call().unwrap();
     let expected = moe_reference(
         &hidden,
@@ -1699,6 +1734,23 @@ fn set_float(
         .upload(&host, nml::Sharding::single(), nml::Memory::Default)
         .unwrap();
     arguments.set(name, buffer).unwrap();
+}
+
+fn set_parameter_float(
+    platform: &nml::Platform,
+    arguments: &mut nml::exe::Arguments<'_>,
+    parameter: &nml::Parameter,
+    values: &[f32],
+    sharding: nml::Sharding,
+) {
+    let shape = parameter.shape();
+    let bytes = encode(shape.dtype(), values);
+    let host = nml::Slice::from_bytes(shape, &bytes).unwrap();
+    let buffer = platform
+        .upload(&host, sharding, nml::Memory::Default)
+        .unwrap();
+    let loaded = nml::LoadedParameter::new(parameter.clone(), vec![buffer]).unwrap();
+    arguments.set_parameter(&loaded).unwrap();
 }
 
 fn set_i32(

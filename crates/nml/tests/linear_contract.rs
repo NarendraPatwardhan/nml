@@ -13,22 +13,22 @@ const OUTPUTS: usize = 3;
 const HIDDEN: usize = 5;
 const MLP_BATCH: usize = 4;
 
-#[derive(nml::NmlStruct)]
+#[derive(nml::ParameterTree)]
 struct Linear {
-    weight: nml::Tensor,
-    bias: Option<nml::Tensor>,
+    weight: nml::Parameter,
+    bias: Option<nml::Parameter>,
 }
 
-#[derive(nml::NmlStruct)]
+#[derive(nml::ParameterTree)]
 struct Mlp {
     first: Linear,
     second: Linear,
 }
 
-#[derive(nml::NmlStruct)]
+#[derive(nml::ParameterTree)]
 struct TiedParameters {
-    first: nml::Tensor,
-    second: nml::Tensor,
+    first: nml::Parameter,
+    second: nml::Parameter,
 }
 
 struct TensorData {
@@ -91,9 +91,9 @@ fn rank_three_linear_executes(platform: &nml::Platform, dtype: DType) {
     let bias_shape = Shape::new(dtype, &[OUTPUTS as i64]).unwrap();
     let mut builder = nml_ir::ProgramBuilder::new();
     let input = builder.input("input", input_shape);
-    let weight = builder.input("weight", weight_shape);
-    let bias = builder.input("bias", bias_shape);
-    let output = builder.linear(input, weight, Some(bias)).unwrap();
+    let weight = nml::Parameter::dense("weight", "weight", weight_shape).unwrap();
+    let bias = nml::Parameter::dense("bias", "bias", bias_shape).unwrap();
+    let output = builder.linear(input, &weight, Some(&bias)).unwrap();
     assert_eq!(
         output.shape().dimensions(),
         &[BATCHES as i64, SEQUENCE as i64, OUTPUTS as i64]
@@ -121,22 +121,29 @@ fn rank_three_linear_executes(platform: &nml::Platform, dtype: DType) {
     );
 
     let mut arguments = executable.args();
-    for (name, shape, values) in [
-        ("input", input_shape, input_values.as_slice()),
-        ("weight", weight_shape, weight_values.as_slice()),
-        ("bias", bias_shape, bias_values.as_slice()),
+    let input_bytes = encode(dtype, &input_values);
+    let input_slice = nml::Slice::from_bytes(input_shape, &input_bytes).unwrap();
+    arguments
+        .set(
+            "input",
+            platform
+                .upload(&input_slice, placement.clone(), nml::Memory::Default)
+                .unwrap(),
+        )
+        .unwrap();
+    for (parameter, values) in [
+        (&weight, weight_values.as_slice()),
+        (&bias, bias_values.as_slice()),
     ] {
         let bytes = encode(dtype, values);
-        let slice = nml::Slice::from_bytes(shape, &bytes).unwrap();
-        arguments
-            .set(
-                name,
-                platform
-                    .upload(&slice, placement.clone(), nml::Memory::Default)
-                    .unwrap(),
-            )
+        let slice = nml::Slice::from_bytes(parameter.shape(), &bytes).unwrap();
+        let buffer = platform
+            .upload(&slice, placement.clone(), nml::Memory::Default)
             .unwrap();
+        let loaded = nml::LoadedParameter::new(parameter.clone(), vec![buffer]).unwrap();
+        arguments.set_parameter(&loaded).unwrap();
     }
+    arguments.bake().unwrap();
     let results = arguments.call().unwrap();
     assert_result_close(&results, "output", dtype, &expected);
 }
@@ -205,34 +212,34 @@ fn execute_checkpoint_backed_mlp(
     second_weight_values: &[f32],
     second_bias_values: &[f32],
 ) {
-    let store = nml::io::TensorStore::new(registry);
-    let first_store = store.view("first");
-    let second_store = store.view("second");
+    let parameters = nml::io::ParameterSet::new(registry);
+    let first_parameters = parameters.view("first");
+    let second_parameters = parameters.view("second");
     let first = Linear {
-        weight: first_store
-            .tensor(
+        weight: first_parameters
+            .dense(
                 "weight",
                 Shape::new(dtype, &[HIDDEN as i64, INPUTS as i64]).unwrap(),
                 &[],
             )
             .unwrap(),
         bias: Some(
-            first_store
-                .tensor("bias", Shape::new(dtype, &[HIDDEN as i64]).unwrap(), &[])
+            first_parameters
+                .dense("bias", Shape::new(dtype, &[HIDDEN as i64]).unwrap(), &[])
                 .unwrap(),
         ),
     };
     let second = Linear {
-        weight: second_store
-            .tensor(
+        weight: second_parameters
+            .dense(
                 "weight",
                 Shape::new(dtype, &[OUTPUTS as i64, HIDDEN as i64]).unwrap(),
                 &[],
             )
             .unwrap(),
         bias: Some(
-            second_store
-                .tensor("bias", Shape::new(dtype, &[OUTPUTS as i64]).unwrap(), &[])
+            second_parameters
+                .dense("bias", Shape::new(dtype, &[OUTPUTS as i64]).unwrap(), &[])
                 .unwrap(),
         ),
     };
@@ -243,40 +250,23 @@ fn execute_checkpoint_backed_mlp(
             .with_partitions(&[nml::Partition::Sharded(axis), nml::Partition::Unspecified])
             .unwrap();
     }
-    let input = store.activation("input", input_shape);
-    let hidden = store
-        .linear(input, model.first.weight, model.first.bias)
+    let mut graph = nml::Graph::new();
+    let input = graph.input("input", input_shape);
+    let hidden = graph
+        .linear(input, &model.first.weight, model.first.bias.as_ref())
         .unwrap();
-    let hidden = store.gelu(hidden).unwrap();
-    let output = store
-        .linear(hidden, model.second.weight, model.second.bias)
+    let hidden = graph.gelu(hidden).unwrap();
+    let output = graph
+        .linear(hidden, &model.second.weight, model.second.bias.as_ref())
         .unwrap();
     let options = nml::io::LoadOptions::new(placement.clone());
-    let parameters = store.load(&model, platform, &options).unwrap();
-    drop(first_store);
-    drop(second_store);
-    let program = store.finish(&[("output".to_owned(), output)]).unwrap();
+    let loaded = parameters.load(&model, platform, &options).unwrap();
+    let program = graph
+        .finish_named(&[("output".to_owned(), output)])
+        .unwrap();
     let executable = platform.compile(&program, placement.clone()).unwrap();
     let mut arguments = executable.args();
-    arguments
-        .set("first.weight", parameters.first.weight.clone())
-        .unwrap();
-    arguments
-        .set(
-            "first.bias",
-            parameters.first.bias.as_ref().unwrap().clone(),
-        )
-        .unwrap();
-    arguments
-        .set("second.weight", parameters.second.weight.clone())
-        .unwrap();
-    arguments
-        .set(
-            "second.bias",
-            parameters.second.bias.as_ref().unwrap().clone(),
-        )
-        .unwrap();
-    arguments.bake().unwrap();
+    bind_parameters::<Mlp>(&mut arguments, &loaded);
 
     for invocation in 0..2 {
         let activations = (0..MLP_BATCH * INPUTS)
@@ -491,6 +481,22 @@ fn platform() -> nml::Platform {
     }
 }
 
+fn bind_parameters<T: nml::ParameterTree>(
+    arguments: &mut nml::exe::Arguments<'_>,
+    loaded: &nml::Loaded<T>,
+) {
+    let mut failure = None;
+    T::visit_loaded(loaded, "", &mut |_path, parameter| {
+        if failure.is_none() {
+            failure = arguments.set_parameter(parameter).err();
+        }
+    });
+    if let Some(error) = failure {
+        panic!("parameter binding failed: {error}");
+    }
+    arguments.bake().unwrap();
+}
+
 fn run_variant(platform: &nml::Platform, dtype: DType, with_bias: bool, sharded: bool) {
     let root = temporary_directory(dtype, with_bias, sharded);
     std::fs::create_dir_all(&root).unwrap();
@@ -503,22 +509,22 @@ fn run_variant(platform: &nml::Platform, dtype: DType, with_bias: bool, sharded:
     write_checkpoint(&root, &weight, with_bias.then_some(&bias), sharded);
 
     let registry = nml::safetensors::TensorRegistry::from_path(&root).unwrap();
-    let store = nml::io::TensorStore::new(registry);
+    let parameters = nml::io::ParameterSet::new(registry);
     let weight_shape = Shape::new(dtype, &[OUTPUTS as i64, INPUTS as i64]).unwrap();
     let bias_shape = Shape::new(dtype, &[OUTPUTS as i64]).unwrap();
     let input_shape = Shape::new(dtype, &[BATCH as i64, INPUTS as i64]).unwrap();
-    let weight_tensor = store.tensor("weight", weight_shape, &[]).unwrap();
-    let bias_tensor = if with_bias {
-        Some(store.tensor("bias", bias_shape, &[]).unwrap())
+    let weight = parameters.dense("weight", weight_shape, &[]).unwrap();
+    let bias = if with_bias {
+        Some(parameters.dense("bias", bias_shape, &[]).unwrap())
     } else {
-        store.maybe_tensor("bias", bias_shape, &[]).unwrap()
+        parameters.maybe_dense("bias", bias_shape, &[]).unwrap()
     };
-    let model = Linear {
-        weight: weight_tensor,
-        bias: bias_tensor,
-    };
-    let input = store.activation("input", input_shape);
-    let output = store.linear(input, model.weight, model.bias).unwrap();
+    let model = Linear { weight, bias };
+    let mut graph = nml::Graph::new();
+    let input = graph.input("input", input_shape);
+    let output = graph
+        .linear(input, &model.weight, model.bias.as_ref())
+        .unwrap();
     let progress = Arc::new(Mutex::new(Vec::new()));
     let progress_log = Arc::clone(&progress);
     let load_options = nml::io::LoadOptions::new(nml::Sharding::replicated())
@@ -529,29 +535,31 @@ fn run_variant(platform: &nml::Platform, dtype: DType, with_bias: bool, sharded:
         .progress(move |completed, total| {
             progress_log.lock().unwrap().push((completed, total));
         });
-    let parameters = store.load(&model, platform, &load_options).unwrap();
+    let loaded = parameters.load(&model, platform, &load_options).unwrap();
     let unique_parameters = usize::from(with_bias) + 1;
     assert_eq!(
         progress.lock().unwrap().last().copied(),
         Some((unique_parameters, unique_parameters))
     );
-    let original_weight = parameters
+    let original_weight = loaded
         .weight
+        .components()
+        .next()
+        .map(|(_, buffer)| buffer)
+        .unwrap()
         .to_slice()
         .unwrap()
         .contiguous_bytes()
         .unwrap()
         .to_vec();
-    let program = store.finish(&[("output".to_owned(), output)]).unwrap();
+    let program = graph
+        .finish_named(&[("output".to_owned(), output)])
+        .unwrap();
     let executable = platform
         .compile(&program, nml::Sharding::replicated())
         .unwrap();
     let mut arguments = executable.args();
-    arguments.set("weight", parameters.weight.clone()).unwrap();
-    if let Some(bias) = &parameters.bias {
-        arguments.set("bias", bias.clone()).unwrap();
-    }
-    arguments.bake().unwrap();
+    bind_parameters::<Linear>(&mut arguments, &loaded);
 
     let activation_sets = [
         [
@@ -583,8 +591,12 @@ fn run_variant(platform: &nml::Platform, dtype: DType, with_bias: bool, sharded:
     }
 
     assert_eq!(
-        parameters
+        loaded
             .weight
+            .components()
+            .next()
+            .map(|(_, buffer)| buffer)
+            .unwrap()
             .to_slice()
             .unwrap()
             .contiguous_bytes()
@@ -637,10 +649,10 @@ fn tied_parameters_load_once_and_share_storage(platform: &nml::Platform) {
     );
 
     let registry = nml::safetensors::TensorRegistry::from_path(&root).unwrap();
-    let store = nml::io::TensorStore::new(registry);
+    let parameters = nml::io::ParameterSet::new(registry);
     let model = TiedParameters {
-        first: store.tensor("first", shape, &["shared"]).unwrap(),
-        second: store.tensor("second", shape, &["shared"]).unwrap(),
+        first: parameters.dense("first", shape, &["shared"]).unwrap(),
+        second: parameters.dense("second", shape, &["shared"]).unwrap(),
     };
     let progress = Arc::new(Mutex::new(Vec::new()));
     let progress_log = Arc::clone(&progress);
@@ -658,20 +670,22 @@ fn tied_parameters_load_once_and_share_storage(platform: &nml::Platform) {
         .progress(move |completed, total| {
             progress_log.lock().unwrap().push((completed, total));
         });
-    let parameters = store.load(&model, platform, &options).unwrap();
+    let loaded = parameters.load(&model, platform, &options).unwrap();
     assert_eq!(progress.lock().unwrap().as_slice(), &[(1, 1)]);
-    assert!(!parameters.first.is_uniquely_owned());
-    assert!(!parameters.second.is_uniquely_owned());
+    let first = loaded.first.components().next().unwrap().1;
+    let second = loaded.second.components().next().unwrap().1;
+    assert!(!first.is_uniquely_owned());
+    assert!(!second.is_uniquely_owned());
 
     // `Clone` is the tied/shared-storage operation. `copy` must allocate a
     // distinct physical buffer while preserving bytes and placement.
-    let copied = parameters.first.copy().unwrap();
+    let copied = first.copy().unwrap();
     assert!(copied.is_uniquely_owned());
     assert_eq!(
         copied.to_slice().unwrap().contiguous_bytes().unwrap(),
         tensor.bytes
     );
-    assert!(parameters.first.clone().delete().is_err());
+    assert!(first.clone().delete().is_err());
     copied.delete().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -694,15 +708,15 @@ fn truncated_checkpoint_releases_in_flight_transfers(platform: &nml::Platform) {
         .unwrap()
         .set_len(length - 12)
         .unwrap();
-    let store = nml::io::TensorStore::new(registry);
+    let parameters = nml::io::ParameterSet::new(registry);
     let model = Linear {
-        weight: store.tensor("weight", shape, &[]).unwrap(),
+        weight: parameters.dense("weight", shape, &[]).unwrap(),
         bias: None,
     };
     let options = nml::io::LoadOptions::new(nml::Sharding::replicated())
         .staging(2, 8)
         .unwrap();
-    assert!(store.load(&model, platform, &options).is_err());
+    assert!(parameters.load(&model, platform, &options).is_err());
     std::fs::remove_dir_all(root).unwrap();
 }
 

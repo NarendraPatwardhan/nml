@@ -20,8 +20,8 @@ fn representative_execution_has_phase_separated_bounds() {
     let weight_shape = Shape::new(DType::F32, &[WIDTH as i64, WIDTH as i64]).unwrap();
     let mut builder = ProgramBuilder::new();
     let input = builder.input("input", activation_shape);
-    let weight = builder.parameter("weight", weight_shape);
-    let projected = builder.linear(input, weight, None).unwrap();
+    let weight = parameter("weight", weight_shape);
+    let projected = builder.linear(input, &weight, None).unwrap();
     let activated = builder.silu(projected).unwrap();
     let program = builder
         .finish_named(&[("output".to_owned(), activated)])
@@ -43,14 +43,19 @@ fn representative_execution_has_phase_separated_bounds() {
     let input = platform
         .upload(&input_host, nml::Sharding::single(), nml::Memory::Default)
         .unwrap();
-    let weight = platform
+    let weight_buffer = platform
         .upload(&weight_host, nml::Sharding::single(), nml::Memory::Default)
         .unwrap();
     let upload = upload_started.elapsed();
 
     let mut arguments = executable.args();
     arguments.set("input", input).unwrap();
-    arguments.set("weight", weight).unwrap().bake().unwrap();
+    let loaded_weight = nml::LoadedParameter::new(weight, vec![weight_buffer]).unwrap();
+    arguments
+        .set_parameter(&loaded_weight)
+        .unwrap()
+        .bake()
+        .unwrap();
     let first_started = Instant::now();
     let first = arguments.call().unwrap();
     let first_execution = first_started.elapsed();
@@ -103,9 +108,11 @@ fn measure_spatial_workloads(platform: &nml::Platform) {
     let image_kernel_shape = Shape::new(DType::F32, &[32, 16, 3, 3]).unwrap();
     let mut builder = ProgramBuilder::new();
     let audio = builder.input("audio", audio_shape);
-    let audio_kernel = builder.parameter("audio_kernel", audio_kernel_shape);
+    let audio_parameter = parameter("audio_kernel", audio_kernel_shape);
+    let audio_kernel = builder.parameter_value(&audio_parameter).unwrap();
     let image = builder.input("image", image_shape);
-    let image_kernel = builder.parameter("image_kernel", image_kernel_shape);
+    let image_parameter = parameter("image_kernel", image_kernel_shape);
+    let image_kernel = builder.parameter_value(&image_parameter).unwrap();
     let audio = builder
         .conv1d(audio, audio_kernel, 1, [3, 3], 1, 1, 1)
         .unwrap();
@@ -136,12 +143,7 @@ fn measure_spatial_workloads(platform: &nml::Platform) {
     let compile = compile_started.elapsed();
     let upload_started = Instant::now();
     let mut arguments = executable.args();
-    for (name, shape) in [
-        ("audio", audio_shape),
-        ("audio_kernel", audio_kernel_shape),
-        ("image", image_shape),
-        ("image_kernel", image_kernel_shape),
-    ] {
+    for (name, shape) in [("audio", audio_shape), ("image", image_shape)] {
         let count = shape.element_count().unwrap();
         let values = (0..count)
             .map(|index| ((index * 11 % 97) as f32 - 48.0) / 128.0)
@@ -152,6 +154,8 @@ fn measure_spatial_workloads(platform: &nml::Platform) {
             .unwrap();
         arguments.set(name, buffer).unwrap();
     }
+    set_generated_parameter(platform, &mut arguments, &audio_parameter, 11, 97, 128.0);
+    set_generated_parameter(platform, &mut arguments, &image_parameter, 11, 97, 128.0);
     arguments.bake().unwrap();
     let upload = upload_started.elapsed();
     let first_started = Instant::now();
@@ -200,10 +204,10 @@ fn measure_moe_workload(platform: &nml::Platform) {
     let mut builder = ProgramBuilder::new();
     let hidden = builder.input("hidden", hidden_shape);
     let router = builder.input("router", router_shape);
-    let gate_up = builder.parameter("gate_up", gate_up_shape);
-    let down = builder.parameter("down", down_shape);
+    let gate_up = parameter("gate_up", gate_up_shape);
+    let down = parameter("down", down_shape);
     let output = builder
-        .moe_swiglu(hidden, router, gate_up, down, 2)
+        .moe_swiglu(hidden, router, &gate_up, &down, 2)
         .unwrap();
     let program = builder
         .finish_named(&[("output".to_owned(), output)])
@@ -214,12 +218,7 @@ fn measure_moe_workload(platform: &nml::Platform) {
     let compile = compile_started.elapsed();
     let upload_started = Instant::now();
     let mut arguments = executable.args();
-    for (name, shape) in [
-        ("hidden", hidden_shape),
-        ("router", router_shape),
-        ("gate_up", gate_up_shape),
-        ("down", down_shape),
-    ] {
+    for (name, shape) in [("hidden", hidden_shape), ("router", router_shape)] {
         let count = shape.element_count().unwrap();
         let values = (0..count)
             .map(|index| ((index * 17 % 113) as f32 - 56.0) / 256.0)
@@ -230,6 +229,8 @@ fn measure_moe_workload(platform: &nml::Platform) {
             .unwrap();
         arguments.set(name, buffer).unwrap();
     }
+    set_generated_parameter(platform, &mut arguments, &gate_up, 17, 113, 256.0);
+    set_generated_parameter(platform, &mut arguments, &down, 17, 113, 256.0);
     arguments.bake().unwrap();
     let upload = upload_started.elapsed();
     let first_started = Instant::now();
@@ -265,6 +266,31 @@ fn assert_finite(results: &nml::exe::Results, name: &str) {
             .all(|item| f32::from_le_bytes(item.try_into().unwrap()).is_finite()),
         "{name} contains a non-finite value"
     );
+}
+
+fn parameter(name: &str, shape: Shape) -> nml::Parameter {
+    nml::Parameter::dense(name, name, shape).unwrap()
+}
+
+fn set_generated_parameter(
+    platform: &nml::Platform,
+    arguments: &mut nml::exe::Arguments<'_>,
+    parameter: &nml::Parameter,
+    multiplier: usize,
+    modulus: usize,
+    divisor: f32,
+) {
+    let shape = parameter.shape();
+    let center = (modulus / 2) as f32;
+    let values = (0..shape.element_count().unwrap())
+        .map(|index| ((index * multiplier % modulus) as f32 - center) / divisor)
+        .collect::<Vec<_>>();
+    let host = nml::Slice::from_typed(shape, &values).unwrap();
+    let buffer = platform
+        .upload(&host, nml::Sharding::single(), nml::Memory::Default)
+        .unwrap();
+    let loaded = nml::LoadedParameter::new(parameter.clone(), vec![buffer]).unwrap();
+    arguments.set_parameter(&loaded).unwrap();
 }
 
 #[allow(clippy::too_many_arguments)]

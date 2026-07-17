@@ -7,8 +7,8 @@
 
 use crate::{Error, MoeActivation};
 use nml_kernel_triton::{
-    build_grouped_projection, DType as KernelDType, GatedActivation, GroupedProjectionConfig,
-    KernelLaunch, KernelSpec, TensorSpec,
+    DType as KernelDType, GatedActivation, GroupedProjectionConfig, KernelLaunch, KernelSpec,
+    TensorSpec, build_grouped_projection,
 };
 use nml_mlir::{Block, Context, Region, Type, Value};
 use nml_types::{DType, Shape};

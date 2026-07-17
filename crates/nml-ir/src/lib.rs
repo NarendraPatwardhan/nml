@@ -16,6 +16,7 @@ use nml_mlir::{
     StableHloBinary, StableHloComparison, StableHloComparisonType, StableHloFftType,
     StableHloUnary, Type as MlirType, Value as MlirValue,
 };
+use nml_parameter::{ComponentRole, Parameter, RepresentationId, StorageEncoding, StorageSpec};
 use nml_sharding::Sharding;
 use nml_tensor::{Element, Slice};
 use nml_types::{
@@ -155,6 +156,7 @@ impl RopeOptions {
 #[derive(Debug)]
 pub enum Error {
     ForeignTensor,
+    InvalidParameter(String),
     DTypeMismatch {
         left: DType,
         right: DType,
@@ -263,6 +265,7 @@ impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ForeignTensor => formatter.write_str("tensor belongs to a different program"),
+            Self::InvalidParameter(message) => write!(formatter, "invalid parameter: {message}"),
             Self::DTypeMismatch { left, right } => {
                 write!(formatter, "dtype mismatch: {left:?} versus {right:?}")
             }
@@ -448,7 +451,8 @@ impl From<nml_sharding::Error> for Error {
 pub struct ProgramBuilder {
     identifier: u64,
     inputs: Vec<usize>,
-    input_kinds: Vec<InputKind>,
+    input_bindings: Vec<InputBinding>,
+    parameter_components: HashMap<String, (usize, Parameter)>,
     values: Vec<Value>,
     operations: Vec<Operation>,
     aliases: HashMap<usize, usize>,
@@ -460,7 +464,8 @@ impl ProgramBuilder {
         Self {
             identifier: NEXT_PROGRAM_ID.fetch_add(1, Ordering::Relaxed),
             inputs: Vec::new(),
-            input_kinds: Vec::new(),
+            input_bindings: Vec::new(),
+            parameter_components: HashMap::new(),
             values: Vec::new(),
             operations: Vec::new(),
             aliases: HashMap::new(),
@@ -469,21 +474,85 @@ impl ProgramBuilder {
     }
 
     pub fn input(&mut self, name: impl Into<String>, shape: Shape) -> Tensor {
-        self.named_input(name, shape, InputKind::Activation)
+        self.named_input(name, shape, InputBinding::Activation)
     }
 
-    pub fn parameter(&mut self, name: impl Into<String>, shape: Shape) -> Tensor {
-        self.named_input(name, shape, InputKind::Parameter)
+    /// Materializes the ordinary component of a dense logical parameter.
+    ///
+    /// Representation-aware operations call this internally. It remains
+    /// available for ordinary operations such as normalization whose parameter
+    /// semantics require dense storage.
+    pub fn parameter_value(&mut self, parameter: &Parameter) -> Result<Tensor, Error> {
+        let component = parameter.dense_component();
+        let storage = component.storage();
+        if storage.encoding() != StorageEncoding::Dense(parameter.shape().dtype())
+            || storage.shape() != parameter.shape()
+        {
+            return Err(Error::InvalidParameter(format!(
+                "dense parameter {:?} has inconsistent logical and physical storage",
+                parameter.name()
+            )));
+        }
+        if let Some((value, declared)) = self.parameter_components.get(component.binding_name()) {
+            if declared != parameter {
+                return Err(Error::InvalidParameter(format!(
+                    "component binding {:?} is reused by another parameter definition",
+                    component.binding_name()
+                )));
+            }
+            let tensor = self.tensor(*value);
+            if tensor.shape != storage.shape() {
+                return Err(Error::InvalidParameter(format!(
+                    "component binding {:?} is reused with another shape",
+                    component.binding_name()
+                )));
+            }
+            let position = self
+                .inputs
+                .iter()
+                .position(|input| input == value)
+                .expect("registered parameter component is an input");
+            let expected = InputBinding::ParameterComponent(ParameterComponentBinding {
+                parameter: parameter.name().to_owned(),
+                representation: parameter.representation_id(),
+                role: component.role(),
+                storage,
+            });
+            if self.input_bindings[position] != expected {
+                return Err(Error::InvalidParameter(format!(
+                    "component binding {:?} is reused by another parameter contract",
+                    component.binding_name()
+                )));
+            }
+            return Ok(tensor);
+        }
+        let binding = InputBinding::ParameterComponent(ParameterComponentBinding {
+            parameter: parameter.name().to_owned(),
+            representation: parameter.representation_id(),
+            role: component.role(),
+            storage,
+        });
+        let tensor = self.named_input(component.binding_name(), storage.shape(), binding);
+        self.parameter_components.insert(
+            component.binding_name().to_owned(),
+            (tensor.value, parameter.clone()),
+        );
+        Ok(tensor)
     }
 
-    fn named_input(&mut self, name: impl Into<String>, shape: Shape, kind: InputKind) -> Tensor {
+    fn named_input(
+        &mut self,
+        name: impl Into<String>,
+        shape: Shape,
+        binding: InputBinding,
+    ) -> Tensor {
         let value = self.values.len();
         self.values.push(Value {
             name: name.into(),
             shape,
         });
         self.inputs.push(value);
-        self.input_kinds.push(kind);
+        self.input_bindings.push(binding);
         self.tensor(value)
     }
 
@@ -1119,8 +1188,8 @@ impl ProgramBuilder {
         &mut self,
         hidden: Tensor,
         router_logits: Tensor,
-        gate_up_weights: Tensor,
-        down_weights: Tensor,
+        gate_up_weights: &Parameter,
+        down_weights: &Parameter,
         experts_per_token: usize,
     ) -> Result<Tensor, Error> {
         self.moe_gated(
@@ -1137,8 +1206,8 @@ impl ProgramBuilder {
         &mut self,
         hidden: Tensor,
         router_logits: Tensor,
-        gate_up_weights: Tensor,
-        down_weights: Tensor,
+        gate_up_weights: &Parameter,
+        down_weights: &Parameter,
         experts_per_token: usize,
     ) -> Result<Tensor, Error> {
         self.moe_gated(
@@ -1155,8 +1224,8 @@ impl ProgramBuilder {
         &mut self,
         hidden: Tensor,
         router_logits: Tensor,
-        gate_up_weights: Tensor,
-        down_weights: Tensor,
+        gate_up_weights: &Parameter,
+        down_weights: &Parameter,
         experts_per_token: usize,
     ) -> Result<Tensor, Error> {
         self.moe_gated(
@@ -2367,7 +2436,12 @@ impl ProgramBuilder {
 
     /// Gathers rows from a `[vocabulary, embedding]` weight without imposing a
     /// model-layer type or a particular checkpoint path.
-    pub fn token_embedding(&mut self, weight: Tensor, indices: Tensor) -> Result<Tensor, Error> {
+    pub fn token_embedding(
+        &mut self,
+        weight: &Parameter,
+        indices: Tensor,
+    ) -> Result<Tensor, Error> {
+        let weight = self.parameter_value(weight)?;
         self.require_rank(weight, "token embedding weight", 2)?;
         self.require_local(indices)?;
         require_index_dtype(indices.shape.dtype())?;
@@ -3943,9 +4017,10 @@ impl ProgramBuilder {
     pub fn linear(
         &mut self,
         input: Tensor,
-        weight: Tensor,
-        bias: Option<Tensor>,
+        weight: &Parameter,
+        bias: Option<&Parameter>,
     ) -> Result<Tensor, Error> {
+        let weight = self.parameter_value(weight)?;
         self.require_local(input)?;
         if input.shape.rank() == 0 {
             return Err(Error::InvalidLinearAlgebra(
@@ -3958,6 +4033,7 @@ impl ProgramBuilder {
         let Some(bias) = bias else {
             return Ok(product);
         };
+        let bias = self.parameter_value(bias)?;
         self.require_rank(bias, "linear bias", 1)?;
         let output_axis = product.shape.rank() - 1;
         if bias.shape.dimensions()[0] != product.shape.dimensions()[output_axis] {
@@ -4148,7 +4224,7 @@ impl ProgramBuilder {
             .iter()
             .position(|value| *value == input.value)
             .ok_or(Error::ForeignTensor)?;
-        if self.input_kinds[input_position] != InputKind::Activation {
+        if self.input_bindings[input_position] != InputBinding::Activation {
             return Err(Error::AliasInputIsNotAnActivation(
                 self.values[input.value].name.clone(),
             ));
@@ -4206,7 +4282,7 @@ impl ProgramBuilder {
             .collect();
         Ok(Program {
             inputs: self.inputs,
-            input_kinds: self.input_kinds,
+            input_bindings: self.input_bindings,
             values: self.values,
             operations: self.operations,
             outputs: outputs.iter().map(|(_, tensor)| tensor.value).collect(),
@@ -4349,11 +4425,13 @@ impl ProgramBuilder {
         &mut self,
         hidden: Tensor,
         router_logits: Tensor,
-        gate_up_weights: Tensor,
-        down_weights: Tensor,
+        gate_up_weights: &Parameter,
+        down_weights: &Parameter,
         experts_per_token: usize,
         activation: MoeActivation,
     ) -> Result<Tensor, Error> {
+        let gate_up_weights = self.parameter_value(gate_up_weights)?;
+        let down_weights = self.parameter_value(down_weights)?;
         for tensor in [hidden, router_logits, gate_up_weights, down_weights] {
             self.require_local(tensor)?;
             self.require_float(tensor, "mixture_of_experts")?;
@@ -5293,7 +5371,7 @@ fn validate_extended_rope(
 
 pub struct Program {
     inputs: Vec<usize>,
-    input_kinds: Vec<InputKind>,
+    input_bindings: Vec<InputBinding>,
     values: Vec<Value>,
     operations: Vec<Operation>,
     outputs: Vec<usize>,
@@ -5308,12 +5386,12 @@ impl Program {
             .map(|value| self.values[*value].name.as_str())
     }
 
-    pub fn inputs(&self) -> impl Iterator<Item = (&str, Shape, InputKind)> {
+    pub fn inputs(&self) -> impl Iterator<Item = (&str, Shape, &InputBinding)> {
         self.inputs.iter().enumerate().map(|(index, value)| {
             (
                 self.values[*value].name.as_str(),
                 self.values[*value].shape,
-                self.input_kinds[index],
+                &self.input_bindings[index],
             )
         })
     }
@@ -6986,10 +7064,42 @@ pub enum FftType {
     Irfft,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum InputKind {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InputBinding {
     Activation,
-    Parameter,
+    ParameterComponent(ParameterComponentBinding),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParameterComponentBinding {
+    parameter: String,
+    representation: RepresentationId,
+    role: ComponentRole,
+    storage: StorageSpec,
+}
+
+impl InputBinding {
+    pub const fn is_parameter_component(&self) -> bool {
+        matches!(self, Self::ParameterComponent(_))
+    }
+}
+
+impl ParameterComponentBinding {
+    pub fn parameter(&self) -> &str {
+        &self.parameter
+    }
+
+    pub const fn representation(&self) -> RepresentationId {
+        self.representation
+    }
+
+    pub const fn role(&self) -> ComponentRole {
+        self.role
+    }
+
+    pub const fn storage(&self) -> StorageSpec {
+        self.storage
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

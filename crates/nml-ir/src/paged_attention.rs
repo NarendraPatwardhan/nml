@@ -4,12 +4,12 @@
 //! avoids exposing StableHLO control-flow details through NML's model-authoring
 //! API, while the emitted graph still uses ordinary, portable StableHLO.
 
-use crate::{attention_backend, AttentionOptions, Error};
+use crate::{AttentionOptions, Error, attention_backend};
 use nml_kernel_triton::{
+    AttentionGeometry, AttentionLaunch, DType as KernelDType, KernelLaunch, KernelSpec,
+    PagedAttention2dConfig, PagedAttention3dConfig, SegmentReductionConfig, TensorSpec,
     build_paged_attention_2d, build_paged_attention_3d, build_segment_reduction,
-    select_attention_launch, AttentionGeometry, AttentionLaunch, DType as KernelDType,
-    KernelLaunch, KernelSpec, PagedAttention2dConfig, PagedAttention3dConfig,
-    SegmentReductionConfig, TensorSpec,
+    select_attention_launch,
 };
 use nml_mlir::{
     Block, Context, Operation, Region, StableHloBinary, StableHloComparison,
@@ -970,8 +970,18 @@ fn body_region<'context>(
     let state = (0..state_types.len())
         .map(|index| block.argument(index))
         .collect::<Result<Vec<_>, _>>()?;
-    let [counter, old_max, old_sum, old_accumulator, query, key_cache, value_cache, page_table, lengths, query_positions] =
-        state.as_slice()
+    let [
+        counter,
+        old_max,
+        old_sum,
+        old_accumulator,
+        query,
+        key_cache,
+        value_cache,
+        page_table,
+        lengths,
+        query_positions,
+    ] = state.as_slice()
     else {
         unreachable!("portable paged-attention loop state is fixed")
     };
