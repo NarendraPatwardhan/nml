@@ -44,6 +44,10 @@ impl PagedAttention2dConfig {
             || self.tile_size <= 0
             || !(self.tile_size as u64).is_power_of_two()
             || self.head_size <= 0
+            // Both QK and PV use the retained NVIDIA `tt.dot` contract.  A
+            // smaller K tile is not a legal accelerated specialization; the
+            // graph-level selector keeps such heads on portable StableHLO.
+            || self.padded_head_size < 16
             || self.padded_head_size < self.head_size
             || !(self.padded_head_size as u64).is_power_of_two()
             || self.block_q <= 0

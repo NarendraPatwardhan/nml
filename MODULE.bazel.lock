@@ -40,6 +40,7 @@
     "https://bcr.bazel.build/modules/bazel_features/1.42.0/MODULE.bazel": "e8ca15cb2639c5f12183db6dcb678735555d0cdd739b32a0418b6532b5e565f8",
     "https://bcr.bazel.build/modules/bazel_features/1.42.1/MODULE.bazel": "275a59b5406ff18c01739860aa70ad7ccb3cfb474579411decca11c93b951080",
     "https://bcr.bazel.build/modules/bazel_features/1.43.0/MODULE.bazel": "defa2226f06ba20550d6548c3a2ea2a7929634437a52973869c20c225450eb91",
+    "https://bcr.bazel.build/modules/bazel_features/1.46.0/MODULE.bazel": "3371af60ed64c67aa05401c08005e6b0418433b2a18712994e17300f0a610b2a",
     "https://bcr.bazel.build/modules/bazel_features/1.47.0/MODULE.bazel": "e34df3cb35b1684cfa69923a61ae3803595babd3942cd306a488d51400886b30",
     "https://bcr.bazel.build/modules/bazel_features/1.50.0/MODULE.bazel": "2083ef9c7a469f520890483ccf8e0189d6e71e2117e7752e15e6554433d5ae3e",
     "https://bcr.bazel.build/modules/bazel_features/1.50.0/source.json": "e0ee3debde2789ff56e4452e612d126925ba9ab64d4bde79c67f099d2902df9b",
@@ -82,6 +83,8 @@
     "https://bcr.bazel.build/modules/googletest/1.11.0/MODULE.bazel": "3a83f095183f66345ca86aa13c58b59f9f94a2f81999c093d4eeaa2d262d12f4",
     "https://bcr.bazel.build/modules/googletest/1.17.0.bcr.2/MODULE.bazel": "827f54f492a3ce549c940106d73de332c2b30cebd0c20c0bc5d786aba7f116cb",
     "https://bcr.bazel.build/modules/googletest/1.17.0.bcr.2/source.json": "3664514073a819992320ffbce5825e4238459df344d8b01748af2208f8d2e1eb",
+    "https://bcr.bazel.build/modules/hermetic_launcher/0.0.10/MODULE.bazel": "d4203a9442a3fbee02d2188b584a84a4af015f1810b2502e3bb45b758625981b",
+    "https://bcr.bazel.build/modules/hermetic_launcher/0.0.10/source.json": "2fcfffd3d6e32c1530ca85d8ec08b0872bb611ed3890f858dfa212c57f7694d8",
     "https://bcr.bazel.build/modules/jsoncpp/1.9.5/MODULE.bazel": "31271aedc59e815656f5736f282bb7509a97c7ecb43e927ac1a37966e0578075",
     "https://bcr.bazel.build/modules/jsoncpp/1.9.6.bcr.2/MODULE.bazel": "64f508885f907ac2518039b3d0c5c1703a8f6137d9f5d635067ba93d33c2670a",
     "https://bcr.bazel.build/modules/jsoncpp/1.9.6.bcr.2/source.json": "13199fa0a267ca46814e9e6ab313a71890c8f1822e57376fdc23a2d2cd384051",
@@ -93,9 +96,10 @@
     "https://bcr.bazel.build/modules/llvm/0.8.9/MODULE.bazel": "9e35ff5bcac996f9edc1b44b8f8baa58c7855e742c5608b07d925dcdbe642100",
     "https://bcr.bazel.build/modules/llvm/0.8.9/source.json": "424b907b38875f1346b65946e5e482b202b842bd3a570abbe07047d2bc7d667b",
     "https://bcr.bazel.build/modules/nlohmann_json/3.6.1/MODULE.bazel": "6f7b417dcc794d9add9e556673ad25cb3ba835224290f4f848f8e2db1e1fca74",
+    "https://bcr.bazel.build/modules/package_metadata/0.0.10/MODULE.bazel": "cb66e0ce830e01bc00cd9edc984963704f2759ca893a649996e2b1c5c1ea7271",
+    "https://bcr.bazel.build/modules/package_metadata/0.0.10/source.json": "8fc6bece244828a69b3cc608f381118d67fa3cc2aa1a2851dfe8d99a8076d7d0",
     "https://bcr.bazel.build/modules/package_metadata/0.0.3/MODULE.bazel": "77890552ecea9e284b5424c9de827a58099348763a4359e975c359a83d4faa83",
     "https://bcr.bazel.build/modules/package_metadata/0.0.5/MODULE.bazel": "ef4f9439e3270fdd6b9fd4dbc3d2f29d13888e44c529a1b243f7a31dfbc2e8e4",
-    "https://bcr.bazel.build/modules/package_metadata/0.0.5/source.json": "2326db2f6592578177751c3e1f74786b79382cd6008834c9d01ec865b9126a85",
     "https://bcr.bazel.build/modules/patchelf/0.18.0.bcr.1/MODULE.bazel": "35320668481400503dea7c75313473b9ffd6dea4e7ba583b96a896199b0088d5",
     "https://bcr.bazel.build/modules/patchelf/0.18.0.bcr.1/source.json": "d877d271ef5d531407885322054c99c7f0617a9a85ff99c0a70f4ced7f13e13a",
     "https://bcr.bazel.build/modules/pcre2/10.45/MODULE.bazel": "9bdc838aa2e21be030d7181385e45a5c87b14575bb7ff35d10b5be3d56913bed",
@@ -172,6 +176,8 @@
     "https://bcr.bazel.build/modules/rules_go/0.53.0/MODULE.bazel": "a4ed760d3ac0dbc0d7b967631a9a3fd9100d28f7d9fcf214b4df87d4bfff5f9a",
     "https://bcr.bazel.build/modules/rules_go/0.59.0/MODULE.bazel": "b7e43e7414a3139a7547d1b4909b29085fbe5182b6c58cbe1ed4c6272815aeae",
     "https://bcr.bazel.build/modules/rules_go/0.59.0/source.json": "1df17bb7865cfc029492c30163cee891d0dd8658ea0d5bfdf252c4b6db5c1ef6",
+    "https://bcr.bazel.build/modules/rules_img/0.3.16/MODULE.bazel": "04c6155f85a430022e9b6934096012482f2e0e31621be5b44dfbd0d0fb28aade",
+    "https://bcr.bazel.build/modules/rules_img/0.3.16/source.json": "f6d928ff2cccbe5b47e271de5aa578bfa3ab452a88da4194a8407fcf5aa139a4",
     "https://bcr.bazel.build/modules/rules_java/4.0.0/MODULE.bazel": "5a78a7ae82cd1a33cef56dc578c7d2a46ed0dca12643ee45edbb8417899e6f74",
     "https://bcr.bazel.build/modules/rules_java/5.3.5/MODULE.bazel": "a4ec4f2db570171e3e5eb753276ee4b389bae16b96207e9d3230895c99644b86",
     "https://bcr.bazel.build/modules/rules_java/6.3.0/MODULE.bazel": "a97c7678c19f236a956ad260d59c86e10a463badb7eb2eda787490f4c969b963",
@@ -235,6 +241,8 @@
     "https://bcr.bazel.build/modules/rules_python/1.9.0/source.json": "3921ea0b65298d51aead5b9e4a82203d7be9b5918619b58b53f1c259f4e63169",
     "https://bcr.bazel.build/modules/rules_robolectric/4.14.1.2/MODULE.bazel": "d44fec647d0aeb67b9f3b980cf68ba634976f3ae7ccd6c07d790b59b87a4f251",
     "https://bcr.bazel.build/modules/rules_robolectric/4.14.1.2/source.json": "37c10335f2361c337c5c1f34ed36d2da70534c23088062b33a8bdaab68aa9dea",
+    "https://bcr.bazel.build/modules/rules_runfiles_group/0.0.1-rc.5/MODULE.bazel": "8e124a40a5a00e7ae8a103e2bdfea636392bc4ae7a26f416a07dfc41f3216cc9",
+    "https://bcr.bazel.build/modules/rules_runfiles_group/0.0.1-rc.5/source.json": "32efc01a4b29cbb5b2b97fd1f7d6025e68eb20eea498f1127b068082e315d6cf",
     "https://bcr.bazel.build/modules/rules_rust/0.69.0/MODULE.bazel": "4326fec48f2fef0d514de46346f7f77e200c82936dd08b91c9ef039fbdad5c10",
     "https://bcr.bazel.build/modules/rules_rust/0.71.3/MODULE.bazel": "e2390c96f77d65f00c769bf665678c5424188e9c777239cfaae2a8d2dde7b981",
     "https://bcr.bazel.build/modules/rules_rust/0.71.3/source.json": "5eb5d8068571725bc893045f8137ed7937988f23d73c53ea443470e8047598ad",
@@ -638,7 +646,7 @@
     "@@rules_rust+//crate_universe:extensions.bzl%crate": {
       "general": {
         "bzlTransitiveDigest": "D+v2nQkofNqX/NSJpZYGMyor/d0VinsF7T44dgmb1fQ=",
-        "usagesDigest": "XFE8vxMHiiGlKmOQdplHTaGc0WM7gLbLNzH1CVaHQgI=",
+        "usagesDigest": "m8mKKKNUjSRyP2TQcL+zTACVx/2SlSLlczilaayXgAM=",
         "recordedInputs": [
           "ENV:CARGO_BAZEL_DEBUG \\0",
           "ENV:CARGO_BAZEL_GENERATOR_SHA256 \\0",
@@ -1738,7 +1746,7 @@
                 "https://static.crates.io/crates/tokio/1.52.3/download"
               ],
               "strip_prefix": "tokio-1.52.3",
-              "build_file_content": "###############################################################################\n# @generated\n# DO NOT MODIFY: This file is auto-generated by a crate_universe tool. To \n# regenerate this file, run the following:\n#\n#     bazel mod show_repo 'nml'\n###############################################################################\n\nload(\"@rules_rust//cargo:defs.bzl\", \"cargo_toml_env_vars\")\n\nload(\"@rules_rust//rust:defs.bzl\", \"rust_library\")\n\n# buildifier: disable=bzl-visibility\nload(\"@rules_rust//crate_universe/private:selects.bzl\", \"selects\")\n\npackage(default_visibility = [\"//visibility:public\"])\n\ncargo_toml_env_vars(\n    name = \"cargo_toml_env_vars\",\n    src = \"Cargo.toml\",\n)\n\nrust_library(\n    name = \"tokio\",\n    deps = [\n        \"@rust_crates__libc-0.2.186//:libc\",\n        \"@rust_crates__mio-1.2.2//:mio\",\n        \"@rust_crates__pin-project-lite-0.2.17//:pin_project_lite\",\n        \"@rust_crates__signal-hook-registry-1.4.8//:signal_hook_registry\",\n        \"@rust_crates__socket2-0.6.5//:socket2\",\n    ],\n    proc_macro_deps = [\n        \"@rust_crates__tokio-macros-2.7.0//:tokio_macros\",\n    ],\n    compile_data = glob(\n        allow_empty = True,\n        include = [\"**\"],\n        exclude = [\n            \"**/* *\",\n            \".tmp_git_root/**/*\",\n            \"BUILD\",\n            \"BUILD.bazel\",\n            \"WORKSPACE\",\n            \"WORKSPACE.bazel\",\n        ],\n    ),\n    crate_features = [\n        \"default\",\n        \"libc\",\n        \"macros\",\n        \"mio\",\n        \"net\",\n        \"rt\",\n        \"rt-multi-thread\",\n        \"signal\",\n        \"signal-hook-registry\",\n        \"socket2\",\n        \"sync\",\n        \"time\",\n        \"tokio-macros\",\n    ],\n    crate_root = \"src/lib.rs\",\n    edition = \"2021\",\n    rustc_env_files = [\n        \":cargo_toml_env_vars\",\n    ],\n    rustc_flags = [\n        \"--cap-lints=allow\",\n    ],\n    srcs = glob(\n        allow_empty = True,\n        include = [\"**/*.rs\"],\n    ),\n    tags = [\n        \"cargo-bazel\",\n        \"crate-name=tokio\",\n        \"manual\",\n        \"noclippy\",\n        \"norustfmt\",\n    ],\n    target_compatible_with = select({\n        \"@rules_rust//rust/platform:aarch64-apple-darwin\": [],\n        \"@rules_rust//rust/platform:aarch64-unknown-linux-gnu\": [],\n        \"@rules_rust//rust/platform:x86_64-unknown-linux-gnu\": [],\n        \"//conditions:default\": [\"@platforms//:incompatible\"],\n    }),\n    version = \"1.52.3\",\n)\n"
+              "build_file_content": "###############################################################################\n# @generated\n# DO NOT MODIFY: This file is auto-generated by a crate_universe tool. To \n# regenerate this file, run the following:\n#\n#     bazel mod show_repo 'nml'\n###############################################################################\n\nload(\"@rules_rust//cargo:defs.bzl\", \"cargo_toml_env_vars\")\n\nload(\"@rules_rust//rust:defs.bzl\", \"rust_library\")\n\n# buildifier: disable=bzl-visibility\nload(\"@rules_rust//crate_universe/private:selects.bzl\", \"selects\")\n\npackage(default_visibility = [\"//visibility:public\"])\n\ncargo_toml_env_vars(\n    name = \"cargo_toml_env_vars\",\n    src = \"Cargo.toml\",\n)\n\nrust_library(\n    name = \"tokio\",\n    deps = [\n        \"@rust_crates__bytes-1.12.1//:bytes\",\n        \"@rust_crates__libc-0.2.186//:libc\",\n        \"@rust_crates__mio-1.2.2//:mio\",\n        \"@rust_crates__pin-project-lite-0.2.17//:pin_project_lite\",\n        \"@rust_crates__signal-hook-registry-1.4.8//:signal_hook_registry\",\n        \"@rust_crates__socket2-0.6.5//:socket2\",\n    ],\n    proc_macro_deps = [\n        \"@rust_crates__tokio-macros-2.7.0//:tokio_macros\",\n    ],\n    compile_data = glob(\n        allow_empty = True,\n        include = [\"**\"],\n        exclude = [\n            \"**/* *\",\n            \".tmp_git_root/**/*\",\n            \"BUILD\",\n            \"BUILD.bazel\",\n            \"WORKSPACE\",\n            \"WORKSPACE.bazel\",\n        ],\n    ),\n    crate_features = [\n        \"bytes\",\n        \"default\",\n        \"io-util\",\n        \"libc\",\n        \"macros\",\n        \"mio\",\n        \"net\",\n        \"process\",\n        \"rt\",\n        \"rt-multi-thread\",\n        \"signal\",\n        \"signal-hook-registry\",\n        \"socket2\",\n        \"sync\",\n        \"time\",\n        \"tokio-macros\",\n    ],\n    crate_root = \"src/lib.rs\",\n    edition = \"2021\",\n    rustc_env_files = [\n        \":cargo_toml_env_vars\",\n    ],\n    rustc_flags = [\n        \"--cap-lints=allow\",\n    ],\n    srcs = glob(\n        allow_empty = True,\n        include = [\"**/*.rs\"],\n    ),\n    tags = [\n        \"cargo-bazel\",\n        \"crate-name=tokio\",\n        \"manual\",\n        \"noclippy\",\n        \"norustfmt\",\n    ],\n    target_compatible_with = select({\n        \"@rules_rust//rust/platform:aarch64-apple-darwin\": [],\n        \"@rules_rust//rust/platform:aarch64-unknown-linux-gnu\": [],\n        \"@rules_rust//rust/platform:x86_64-unknown-linux-gnu\": [],\n        \"//conditions:default\": [\"@platforms//:incompatible\"],\n    }),\n    version = \"1.52.3\",\n)\n"
             }
           },
           "rust_crates__tokio-macros-2.7.0": {

@@ -89,6 +89,10 @@ nml_rust_test(
         "//platforms:cuda.enabled": [],
         "//conditions:default": ["@platforms//:incompatible"],
     }),
+    visibility = [
+        "//:__pkg__",
+        "//tools/device-contracts:__pkg__",
+    ],
 )
 
 filegroup(

@@ -1,0 +1,159 @@
+"""Permanent CUDA device-contract execution and OCI distribution."""
+
+load("//bazel:rust.bzl", "nml_rust_binary", "nml_rust_library", "nml_rust_test")
+load("//bazel:runfiles_layers.bzl", "oci_layered_binary")
+load("@rules_img//img:image.bzl", "image_from_binary")
+load("@rules_img//img:load.bzl", "image_load")
+load("@rules_img//img:push.bzl", "image_push")
+load("@rules_img//img:test.bzl", "image_structure_test")
+
+# Every target in this package exists to execute product acceptance contracts.
+# The package default also covers rules_img's private intermediate layer and
+# manifest targets, which cannot inherit `testonly` through the macro surface.
+package(default_testonly = True)
+
+_CONTRACTS = [
+    "//crates/nml-kernel-flash-attention:flash_attention_device_capability_contract_test",
+    "//crates/nml-pjrt-cuda:cuda_runtime_contract_test",
+    "//crates/nml:linear_cuda_contract_test",
+    "//crates/nml:attention_cuda_contract_test",
+    "//crates/nml:neural_ops_cuda_contract_test",
+    "//crates/nml:execution_performance_cuda_contract_test",
+]
+
+_RUST_DEPS = [
+    "@rust_crates//axum",
+    "@rust_crates//serde",
+    "@rust_crates//serde_json",
+    "@rust_crates//tokio",
+    "@rust_crates//tokio-util",
+]
+
+_RUNNER_ENV = {
+    "NML_ATTENTION_CONTRACT": "$(rlocationpath //crates/nml:attention_cuda_contract_test)",
+    "NML_CUDA_RUNTIME_CONTRACT": "$(rlocationpath //crates/nml-pjrt-cuda:cuda_runtime_contract_test)",
+    "NML_CUDA_RUNTIME": "$(rlocationpath //platforms/cuda:runtime)",
+    "NML_EXECUTION_PERFORMANCE_CONTRACT": "$(rlocationpath //crates/nml:execution_performance_cuda_contract_test)",
+    "NML_FLASH_ATTENTION_CAPABILITY_CONTRACT": "$(rlocationpath //crates/nml-kernel-flash-attention:flash_attention_device_capability_contract_test)",
+    "NML_LINEAR_CONTRACT": "$(rlocationpath //crates/nml:linear_cuda_contract_test)",
+    "NML_NEURAL_OPS_CONTRACT": "$(rlocationpath //crates/nml:neural_ops_cuda_contract_test)",
+}
+
+nml_rust_library(
+    name = "device_contract_runner",
+    srcs = ["src/lib.rs"],
+    crate_root = "src/lib.rs",
+    data = _CONTRACTS + ["//platforms/cuda:runtime"],
+    deps = _RUST_DEPS + ["@rules_rust//rust/runfiles"],
+    rustc_env = _RUNNER_ENV,
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": ["@platforms//os:linux"],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    testonly = True,
+    visibility = [":__pkg__"],
+)
+
+nml_rust_binary(
+    name = "run_device_contracts",
+    srcs = ["src/main.rs"],
+    crate_root = "src/main.rs",
+    deps = [
+        ":device_contract_runner",
+        "@rust_crates//tokio",
+    ],
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": ["@platforms//os:linux"],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    testonly = True,
+    visibility = ["//visibility:public"],
+)
+
+# Preserve the runner's ordinary executable/runfiles semantics while exposing
+# stable dependency grouping to rules_img. The wrapper is an OCI concern; the
+# Rust binary remains the direct local-debugging entry point.
+oci_layered_binary(
+    name = "device_contract_entrypoint",
+    application_runfiles = _CONTRACTS,
+    binary = ":run_device_contracts",
+)
+
+nml_rust_test(
+    name = "device_contract_runner_contract_test",
+    srcs = ["src/lib.rs"],
+    crate_root = "src/lib.rs",
+    data = _CONTRACTS + ["//platforms/cuda:runtime"],
+    deps = _RUST_DEPS + ["@rules_rust//rust/runfiles"],
+    rustc_env = _RUNNER_ENV,
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": ["@platforms//os:linux"],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
+# This image is the permanent remote execution envelope for GPU contracts. It
+# deliberately excludes the serving product and model data: an acceptance Pod
+# can prove the CUDA substrate without inheriting a model server's lifecycle or
+# writable state. The runner's data edges preserve every contract executable,
+# its runfiles, and the complete compatibility-capable PJRT runtime.
+image_from_binary(
+    name = "device_contract_image",
+    base = "@distroless_cc_debian12",
+    binary = ":device_contract_entrypoint",
+    cmd = [],
+    config_fragment = "device_contract_image_config.json",
+    env = {
+        "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
+    },
+    labels = {
+        "org.opencontainers.image.description": "NML permanent CUDA device-contract runner",
+        "org.opencontainers.image.source": "https://github.com/NarendraPatwardhan/nml",
+        "org.opencontainers.image.title": "nml-device-contracts",
+    },
+    path = "/usr/local/bin/nml-device-contracts",
+    stamp = "disabled",
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    testonly = True,
+    visibility = ["//visibility:public"],
+)
+
+image_load(
+    name = "load_device_contract_image",
+    daemon = "docker",
+    image = ":device_contract_image",
+    strategy = "eager",
+    tag = "nml/device-contracts:cuda",
+    testonly = True,
+    visibility = ["//visibility:public"],
+)
+
+image_push(
+    name = "publish_device_contract_image",
+    image = ":device_contract_image",
+    registry = "ghcr.io",
+    repository = "narendrapatwardhan/nml",
+    stamp = "disabled",
+    strategy = "eager",
+    tag = "cuda-contracts-linux-amd64",
+    testonly = True,
+    visibility = ["//visibility:public"],
+)
+
+image_structure_test(
+    name = "device_contract_image_structure_test",
+    size = "small",
+    configs = select({
+        "//platforms:is_linux_x86_64": ["device_contract_image_structure_linux_x86_64.yaml"],
+        "//platforms:is_linux_aarch64": ["device_contract_image_structure_linux_aarch64.yaml"],
+        "//conditions:default": [],
+    }),
+    image = ":device_contract_image",
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)

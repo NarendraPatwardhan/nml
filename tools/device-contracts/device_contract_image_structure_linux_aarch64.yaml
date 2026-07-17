@@ -1,0 +1,66 @@
+schemaVersion: "2.0.0"
+
+metadataTest:
+  envVars:
+    - key: NVIDIA_DRIVER_CAPABILITIES
+      value: compute,utility
+  labels:
+    - key: org.opencontainers.image.title
+      value: nml-device-contracts
+    - key: org.opencontainers.image.source
+      value: https://github.com/NarendraPatwardhan/nml
+    - key: org.opencontainers.image.description
+      value: NML permanent CUDA device-contract runner
+  entrypoint:
+    - /usr/local/bin/nml-device-contracts
+  cmd: []
+  exposedPorts:
+    - "8080/tcp"
+  workdir: /usr/local/bin/nml-device-contracts.runfiles/_main
+
+fileExistenceTests:
+  - name: device-contract runner is executable
+    path: /usr/local/bin/nml-device-contracts
+    shouldExist: true
+    isExecutableBy: owner
+    uid: 0
+    gid: 0
+  - name: CUDA PJRT plugin is packaged
+    path: /.shared_runfiles/+cuda_packages+libpjrt_cuda_linux_arm64/runtime/lib/libpjrt_cuda.so
+    shouldExist: true
+  - name: CUDA compatibility driver is packaged
+    path: /.shared_runfiles/+cuda_packages+libpjrt_cuda_linux_arm64/runtime/lib/compat/libcuda.so.1
+    shouldExist: true
+  - name: FlashAttention capability contract is packaged
+    path: /.shared_runfiles/_main/crates/nml-kernel-flash-attention/flash_attention_device_capability_contract_test
+    shouldExist: true
+    isExecutableBy: owner
+  - name: CUDA runtime contract is packaged
+    path: /.shared_runfiles/_main/crates/nml-pjrt-cuda/cuda_runtime_contract_test
+    shouldExist: true
+    isExecutableBy: owner
+  - name: linear contract is packaged
+    path: /.shared_runfiles/_main/crates/nml/linear_cuda_contract_test
+    shouldExist: true
+    isExecutableBy: owner
+  - name: attention contract is packaged
+    path: /.shared_runfiles/_main/crates/nml/attention_cuda_contract_test
+    shouldExist: true
+    isExecutableBy: owner
+  - name: neural-ops contract is packaged
+    path: /.shared_runfiles/_main/crates/nml/neural_ops_cuda_contract_test
+    shouldExist: true
+    isExecutableBy: owner
+  - name: execution-performance contract is packaged
+    path: /.shared_runfiles/_main/crates/nml/execution_performance_cuda_contract_test
+    shouldExist: true
+    isExecutableBy: owner
+  - name: serving product is excluded
+    path: /usr/local/bin/nml-serve
+    shouldExist: false
+  - name: image has no shell
+    path: /bin/sh
+    shouldExist: false
+  - name: image has no package manager
+    path: /usr/bin/apt-get
+    shouldExist: false

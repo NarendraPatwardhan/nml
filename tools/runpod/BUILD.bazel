@@ -1,0 +1,31 @@
+"""Hermetic RunPod lifecycle control for NML GPU artifacts."""
+
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "runpod_lib",
+    srcs = [
+        "api.py",
+        "controller.py",
+        "lease.py",
+    ],
+    imports = ["."],
+    visibility = [":__pkg__"],
+)
+
+py_binary(
+    name = "runpod",
+    srcs = ["main.py"],
+    main = "main.py",
+    deps = [":runpod_lib"],
+    python_version = "3.12",
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "runpod_contract_test",
+    srcs = ["runpod_test.py"],
+    main = "runpod_test.py",
+    deps = [":runpod_lib"],
+    python_version = "3.12",
+)

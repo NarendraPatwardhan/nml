@@ -18,12 +18,12 @@ mod paged_attention;
 mod specification;
 mod unified_attention;
 
-pub use moe::{build_grouped_projection, GatedActivation, GroupedProjectionConfig};
-pub use paged_attention::{select_attention_launch, AttentionGeometry, AttentionLaunch};
+pub use moe::{GatedActivation, GroupedProjectionConfig, build_grouped_projection};
+pub use paged_attention::{AttentionGeometry, AttentionLaunch, select_attention_launch};
 pub use specification::{KernelLaunch, KernelSpec, OutputAlias, TensorSpec};
 pub use unified_attention::{
-    build_paged_attention_2d, build_paged_attention_3d, build_segment_reduction,
     PagedAttention2dConfig, PagedAttention3dConfig, SegmentReductionConfig,
+    build_paged_attention_2d, build_paged_attention_3d, build_segment_reduction,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -798,10 +798,6 @@ impl Builder {
 
     pub fn sqrt(&mut self, value: &Value) -> Result<Value, Error> {
         self.float_unary("sqrt", value)
-    }
-
-    pub fn tanh(&mut self, value: &Value) -> Result<Value, Error> {
-        self.float_unary("tanh", value)
     }
 
     pub fn reduce(

@@ -254,7 +254,7 @@ fn gated_activation(
             let inner = builder.add(&gate_f32, &correction)?;
             let scale = builder.full_float_like(&gate_f32, 0.7978845608028654)?;
             let inner = builder.multiply(&inner, &scale)?;
-            let inner = builder.tanh(&inner)?;
+            let inner = tanh_via_exp2(builder, &inner)?;
             let one = builder.full_float_like(&gate_f32, 1.0)?;
             let inner = builder.add(&one, &inner)?;
             let half = builder.full_float_like(&gate_f32, 0.5)?;
@@ -264,6 +264,27 @@ fn gated_activation(
         }
     };
     builder.multiply(&shape, &value)
+}
+
+/// Expresses tanh through the exp2 operation accepted by XLA's retained
+/// Triton pipeline. The direct `math.tanh` TTIR operation verifies in MLIR but
+/// is not legalizable by that pipeline. Evaluating the exponential at
+/// `-2 * abs(x)` keeps the approximation bounded for both signs instead of
+/// overflowing on large negative GELU inputs.
+fn tanh_via_exp2(builder: &mut Builder, value: &super::Value) -> Result<super::Value, Error> {
+    let negative_value = builder.negate(value)?;
+    let magnitude = builder.maximum(value, &negative_value)?;
+    let exponent_scale = builder.full_float_like(&magnitude, -2.0 * std::f64::consts::LOG2_E)?;
+    let exponent = builder.multiply(&magnitude, &exponent_scale)?;
+    let exponential = builder.exp2(&exponent)?;
+    let one = builder.full_float_like(&magnitude, 1.0)?;
+    let numerator = builder.subtract(&one, &exponential)?;
+    let denominator = builder.add(&one, &exponential)?;
+    let positive = builder.divide(&numerator, &denominator)?;
+    let negative = builder.negate(&positive)?;
+    let zero = builder.full_float_like(value, 0.0)?;
+    let nonnegative = builder.compare(Comparison::GreaterEqual, value, &zero)?;
+    builder.select(&nonnegative, &positive, &negative)
 }
 
 fn pointer(builder: &mut Builder, name: &str, dtype: DType) -> Result<super::Value, Error> {

@@ -5,7 +5,7 @@
 //! tensor ABI, layouts, aliases, and launch validation used to create the one
 //! StableHLO operation.
 
-use super::{require_identifier, DType, Error};
+use super::{DType, Error, require_identifier};
 use nml_mlir::{
     Context, Operation, OutputOperandAlias, TritonCustomCall, Type, Value as MlirValue,
 };

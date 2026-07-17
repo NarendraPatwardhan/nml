@@ -1,6 +1,7 @@
 //! Qwen3 graph construction.
 
 use super::{Error, Result, config::Config, nml_result};
+use crate::engine::{GraphKind, GraphOutputs};
 use nml::io::TensorStore;
 use nml::{DataType, NmlStruct, Shape, Tensor};
 
@@ -49,17 +50,6 @@ struct Transformer {
 #[derive(NmlStruct)]
 pub(crate) struct Checkpoint {
     model: Transformer,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum GraphKind {
-    Prefill { capacity: usize },
-    Decode { capacity: usize },
-}
-
-pub(crate) struct GraphOutputs {
-    pub(crate) token: Tensor,
-    pub(crate) caches: Vec<(Tensor, Tensor)>,
 }
 
 pub(crate) fn declare(store: &TensorStore, config: &Config) -> Result<Checkpoint> {
@@ -114,11 +104,22 @@ pub(crate) fn build_graph(
     kind: GraphKind,
 ) -> Result<GraphOutputs> {
     if sequence == 0 {
-        return Err(Error::Contract(
+        return Err(Error::contract(
             "Qwen3 graphs require a nonempty token sequence",
         ));
     }
-    let token_shape = nml_result(Shape::new(DataType::I32, &[1, dimension(sequence)?]))?;
+    let batch = match kind {
+        GraphKind::Prefill { batch, .. } | GraphKind::Decode { batch, .. } => batch,
+    };
+    if batch != 1 {
+        return Err(Error::contract(
+            "Qwen3 compatibility graphs currently require batch capacity one",
+        ));
+    }
+    let token_shape = nml_result(Shape::new(
+        DataType::I32,
+        &[dimension(batch)?, dimension(sequence)?],
+    ))?;
     let tokens = store.activation("tokens", token_shape);
     let positions = match kind {
         GraphKind::Prefill { .. } => nml_result(store.iota(token_shape, 1))?,
@@ -129,10 +130,10 @@ pub(crate) fn build_graph(
         }
     };
     let cache_capacity = match kind {
-        GraphKind::Prefill { capacity } | GraphKind::Decode { capacity } => capacity,
+        GraphKind::Prefill { capacity, .. } | GraphKind::Decode { capacity, .. } => capacity,
     };
     if cache_capacity < sequence {
-        return Err(Error::Contract(
+        return Err(Error::contract(
             "cache capacity is smaller than graph sequence",
         ));
     }
@@ -226,7 +227,7 @@ pub(crate) fn build_graph(
                 positions,
                 nml::attention::Options::default(),
             ))?,
-            GraphKind::Decode { capacity } => {
+            GraphKind::Decode { capacity, .. } => {
                 let key_positions = nml_result(store.iota(
                     nml_result(Shape::new(DataType::I32, &[1, dimension(capacity)?]))?,
                     1,
@@ -310,5 +311,5 @@ fn dimension(value: usize) -> Result<i64> {
 }
 
 fn dimension_i64(value: usize) -> Result<i64> {
-    i64::try_from(value).map_err(|_| Error::Contract("Qwen3 dimension exceeds I64"))
+    i64::try_from(value).map_err(|_| Error::contract("Qwen3 dimension exceeds I64"))
 }

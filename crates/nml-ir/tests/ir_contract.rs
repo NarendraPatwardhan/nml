@@ -1376,6 +1376,39 @@ fn cuda_paged_attention_selects_only_upstream_supported_flash_variants() {
     assert!(!unsupported_dtype.contains("nml.flash_attention_2.paged"));
     assert!(unsupported_dtype.contains("__gpu$xla.gpu.triton"));
     assert!(!unsupported_dtype.contains("stablehlo.case"));
+
+    // Tiny heads are valid model semantics but cannot fill the retained
+    // NVIDIA tt.dot K tile. They stay on exact StableHLO instead of entering a
+    // kernel specialization whose physical dot geometry differs from QK.
+    let mut builder = ProgramBuilder::new();
+    let query = builder.input("query", Shape::new(DType::F32, &[1, 2, 2, 4]).unwrap());
+    let key_cache = builder.input("key_cache", Shape::new(DType::F32, &[3, 2, 1, 4]).unwrap());
+    let value_cache = builder.input(
+        "value_cache",
+        Shape::new(DType::F32, &[3, 2, 1, 4]).unwrap(),
+    );
+    let page_table = builder.input("page_table", Shape::new(DType::I32, &[1, 2]).unwrap());
+    let lengths = builder.input("lengths", Shape::new(DType::I32, &[1]).unwrap());
+    let positions = builder.input("positions", Shape::new(DType::I32, &[1, 2]).unwrap());
+    let output = builder
+        .paged_attention(
+            query,
+            key_cache,
+            value_cache,
+            page_table,
+            lengths,
+            positions,
+            AttentionOptions::default(),
+        )
+        .unwrap();
+    let program = builder.finish(&[output]).unwrap();
+    let context = Context::new();
+    let module = program
+        .module_with_sharding_cuda(&context, &Sharding::single(), 80, 8, 6)
+        .unwrap();
+    let tiny_head = module.text();
+    assert!(!tiny_head.contains("__gpu$xla.gpu.triton"), "{tiny_head}");
+    assert!(tiny_head.contains("stablehlo.while"), "{tiny_head}");
 }
 
 #[test]

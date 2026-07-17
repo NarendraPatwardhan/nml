@@ -130,7 +130,10 @@ cc_test(
         "//platforms:cuda.enabled": ["@platforms//os:linux"],
         "//conditions:default": ["@platforms//:incompatible"],
     }),
-    # The repository root packages this executable for remote compilation and
-    # local GPU execution; it is not a general public kernel target.
-    visibility = ["//:__pkg__"],
+    # The repository root exports the compiled executable; the device runner
+    # alone also receives its runfiles so OCI execution remains Bazel-faithful.
+    visibility = [
+        "//:__pkg__",
+        "//tools/device-contracts:__pkg__",
+    ],
 )

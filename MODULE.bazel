@@ -63,12 +63,19 @@ bazel_dep(name = "rules_cc", version = "0.2.19")
 # supplies the hermetic nvcc action model; it does not select an NML backend.
 bazel_dep(name = "rules_cuda", version = "0.3.0")
 bazel_dep(name = "tar.bzl", version = "0.10.4")
+# rules_img is the sole OCI graph. Its provider-oriented representation keeps
+# large CUDA layers remote until a load or push actually needs their bytes,
+# which matches NML's BuildBuddy-first build topology.
+bazel_dep(name = "rules_img", version = "0.3.16")
 
 # Keep this at the current rules_rust release when deliberately updating the
 # toolchain. The compiler pin below remains independent: rules and compiler are
 # different compatibility surfaces and should move only when each is reviewed.
 bazel_dep(name = "rules_rust", version = "0.71.3")
 bazel_dep(name = "rules_rust_bindgen", version = "0.71.3")
+# rules_img consumes this provider protocol to keep stable binary runfiles in
+# OCI layers separate from frequently changing product executables.
+bazel_dep(name = "rules_runfiles_group", version = "0.0.1-rc.5")
 
 RUST_EDITION = "2024"
 RUST_VERSION = "1.97.0"
@@ -117,6 +124,17 @@ use_repo(rust, "rust_toolchains")
 # do not register rules_rust's implicit stable-plus-nightly defaults.
 register_toolchains("@rust_toolchains//:all")
 
+# The RunPod lifecycle controller is standard-library-only Python, but its
+# interpreter is still a build input. Pin one hermetic 3.12 toolchain rather
+# than inheriting whichever `python3` happens to be installed on a coordinator.
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    is_default = True,
+    python_version = "3.12",
+)
+use_repo(python, "python_3_12", "pythons_hub")
+register_toolchains("@pythons_hub//:all")
+
 # Test execution follows the native OS/architecture but must not inherit
 # target-only ABI constraints from CUDA's hermetic C++ platform. Without these
 # toolchains Bazel 9 either rejects CUDA-configured tests or executes all build
@@ -150,6 +168,18 @@ use_repo(cuda_compiler, "cuda")
 # second explicit repository rather than an ambient checkout or system input.
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 git_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
+
+# Pin the complete multi-platform index rather than architecture-specific tags.
+# rules_img selects the amd64 or arm64 manifest under the image transition, so
+# both supported Linux products inherit one reviewed Debian 12 userspace line.
+image_pull = use_repo_rule("@rules_img//img:pull.bzl", "pull")
+image_pull(
+    name = "distroless_cc_debian12",
+    digest = "sha256:7ee09f36862efbdbf70422db263e411c2618409ca46faa555bd5b636155307df",
+    registry = "gcr.io",
+    repository = "distroless/cc-debian12",
+    tag = "latest",
+)
 
 # IREE's tokenizer is a small, independently useful runtime component. Follow
 # ZML's sparse source boundary while keeping the dependency on the original
@@ -205,7 +235,7 @@ crate.spec(package = "sha2", version = "=0.10.9")
 crate.spec(package = "syn", features = ["full"], version = "=2.0.118")
 crate.spec(
     package = "tokio",
-    features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"],
+    features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"],
     version = "=1.52.3",
 )
 crate.spec(package = "tokio-util", features = ["rt"], version = "=0.7.18")

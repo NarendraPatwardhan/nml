@@ -8,6 +8,12 @@
 
 use nml_types::DType;
 
+// The retained Triton kernel expresses QK and PV as `tt.dot` operations.  Its
+// NVIDIA tensor-core lowering requires a K tile of at least sixteen elements;
+// smaller heads are still valid attention geometry, but belong on the exact
+// StableHLO implementation rather than an under-filled accelerator tile.
+const TRITON_MINIMUM_HEAD_DIMENSION: i64 = 16;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Backend {
     Portable,
@@ -43,7 +49,10 @@ pub(crate) fn paged(
     capability_minor: u16,
 ) -> Backend {
     let supported_cuda = capability_major == 8 || (capability_major == 9 && capability_minor == 0);
-    if !matches!(dtype, DType::F16 | DType::Bf16 | DType::F32) || !supported_cuda {
+    if !matches!(dtype, DType::F16 | DType::Bf16 | DType::F32)
+        || !supported_cuda
+        || head_dimension < TRITON_MINIMUM_HEAD_DIMENSION
+    {
         return Backend::Portable;
     }
     if matches!(dtype, DType::F16 | DType::Bf16)

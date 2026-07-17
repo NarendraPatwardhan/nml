@@ -2,7 +2,9 @@
 
 #![forbid(unsafe_code)]
 
-/// Qwen3 checkpoint, graph, and single-request generation engine.
+mod engine;
+
+/// Qwen3 checkpoint, graph adapter, and one-shot compatibility API.
 ///
 /// The serving scheduler will consume this engine without moving model-specific
 /// types into NML's backend-independent public facade.

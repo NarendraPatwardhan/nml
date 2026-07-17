@@ -1,9 +1,9 @@
 use nml_kernel_triton::{
+    ArgumentKind, AttentionGeometry, AttentionLaunch, Builder, Comparison, DType, Error,
+    GatedActivation, GroupedProjectionConfig, KernelLaunch, KernelSpec, OutputAlias,
+    PagedAttention2dConfig, PagedAttention3dConfig, Reduction, SegmentReductionConfig, TensorSpec,
     build_grouped_projection, build_paged_attention_2d, build_paged_attention_3d,
-    build_segment_reduction, select_attention_launch, ArgumentKind, AttentionGeometry,
-    AttentionLaunch, Builder, Comparison, DType, Error, GatedActivation, GroupedProjectionConfig,
-    KernelLaunch, KernelSpec, OutputAlias, PagedAttention2dConfig, PagedAttention3dConfig,
-    Reduction, SegmentReductionConfig, TensorSpec,
+    build_segment_reduction, select_attention_launch,
 };
 use nml_mlir::{Block, Context, Region};
 
@@ -109,23 +109,32 @@ fn grouped_expert_projections_are_verified_ttir() {
             .unwrap();
             assert!(down.contains("tt.func public @moe_grouped_down"), "{down}");
             assert!(down.contains("arith.mulf"), "{down}");
+            if activation == GatedActivation::Gelu {
+                assert!(down.contains("math.exp2"), "{down}");
+                assert!(
+                    !down.contains("math.tanh"),
+                    "XLA's retained Triton pipeline cannot legalize math.tanh: {down}"
+                );
+            }
         }
     }
 
-    assert!(build_grouped_projection(GroupedProjectionConfig {
-        dtype: DType::F64,
-        assignments: 32,
-        input_size: 64,
-        output_size: 64,
-        local_experts: 4,
-        source_row_divisor: 1,
-        block_m: 16,
-        block_n: 32,
-        block_k: 32,
-        gated_activation: None,
-        multiply_routing_weight: false,
-    })
-    .is_err());
+    assert!(
+        build_grouped_projection(GroupedProjectionConfig {
+            dtype: DType::F64,
+            assignments: 32,
+            input_size: 64,
+            output_size: 64,
+            local_experts: 4,
+            source_row_divisor: 1,
+            block_m: 16,
+            block_n: 32,
+            block_k: 32,
+            gated_activation: None,
+            multiply_routing_weight: false,
+        })
+        .is_err()
+    );
 }
 
 #[test]
@@ -605,17 +614,39 @@ fn non_power_of_two_gqa_uses_padded_masked_head_lanes() {
 fn invalid_attention_geometry_never_reaches_ttir() {
     let mut invalid = geometry(false, 4);
     invalid.num_query_heads = 30;
-    assert!(select_attention_launch(invalid)
-        .unwrap_err()
-        .to_string()
-        .contains("not divisible"));
+    assert!(
+        select_attention_launch(invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("not divisible")
+    );
 
     invalid = geometry(false, 4);
     invalid.core_count = 0;
-    assert!(select_attention_launch(invalid)
-        .unwrap_err()
-        .to_string()
-        .contains("core count"));
+    assert!(
+        select_attention_launch(invalid)
+            .unwrap_err()
+            .to_string()
+            .contains("core count")
+    );
+}
+
+#[test]
+fn sub_tile_head_dimensions_are_not_valid_ttir_specializations() {
+    let result = build_paged_attention_2d(PagedAttention2dConfig {
+        dtype: DType::F32,
+        num_query_heads: 2,
+        queries_per_kv: 2,
+        page_size: 2,
+        tile_size: 16,
+        head_size: 4,
+        padded_head_size: 4,
+        block_q: 1,
+        block_m: 2,
+        sliding_window: None,
+        causal: true,
+    });
+    assert!(matches!(result, Err(Error::InvalidKernelSpec(_))));
 }
 
 #[test]

@@ -1,10 +1,17 @@
-"""Qwen serving product."""
+"""Model execution and serving product."""
 
 load("//bazel:rust.bzl", "nml_rust_binary", "nml_rust_library", "nml_rust_test")
+load("//bazel:runfiles_layers.bzl", "oci_layered_binary")
+load("@rules_img//img:image.bzl", "image_from_binary")
+load("@rules_img//img:layer.bzl", "image_layer")
+load("@rules_img//img:load.bzl", "image_load")
+load("@rules_img//img:push.bzl", "image_push")
+load("@rules_img//img:test.bzl", "image_structure_test")
 
 nml_rust_library(
     name = "nml_serve",
     srcs = [
+        "src/engine.rs",
         "src/lib.rs",
         "src/qwen3.rs",
         "src/qwen3/config.rs",
@@ -24,7 +31,12 @@ nml_rust_binary(
     srcs = ["src/main.rs"],
     crate_root = "src/main.rs",
     data = select({
-        "//platforms:cuda.enabled": ["//platforms/cuda:runtime_system_driver"],
+        # Product executables carry the complete distributable runtime. This is
+        # the same runfiles closure packaged by rules_img, including the
+        # compatibility overlay needed when a deployment host's kernel driver
+        # predates NML's CUDA userspace. Device-only tests retain the smaller
+        # system-driver package because their host is part of the test contract.
+        "//platforms:cuda.enabled": ["//platforms/cuda:runtime"],
         "//conditions:default": [],
     }),
     deps = [
@@ -33,17 +45,123 @@ nml_rust_binary(
     ],
     env = select({
         "//platforms:cuda.enabled": {
-            "NML_CUDA_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime_system_driver)",
+            "NML_CUDA_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime)",
         },
         "//conditions:default": {},
     }),
     visibility = ["//:__pkg__"],
 )
 
+# Keep the slowly changing PJRT/CUDA/model-engine runfiles separate from the
+# executable layer. A server-only Rust edit then changes one small registry
+# blob instead of repacking and retransferring the complete runtime closure.
+oci_layered_binary(
+    name = "serve_image_entrypoint",
+    binary = ":serve",
+)
+
+# rules_cuda links CUDA kernels against its hermetic CUDA 12 runtime. Bazel
+# normally teaches its launcher where that runfile lives, but a container
+# starts the ELF binary directly. Give the dynamic loader one stable image path
+# without copying the library or leaking rules_cuda's encoded repository path
+# into the public image configuration. The symlink target is selected by the
+# same truthful native platform that produced the binary.
+image_layer(
+    name = "serve_cuda_dynamic_loader",
+    symlinks = select({
+        "//platforms:is_linux_x86_64": {
+            "/usr/local/lib/nml/libcudart.so.12": "/usr/local/bin/nml-serve.runfiles/_main/_solib_k8/_U_A_Arules_Ucuda++toolchain+cuda_Ucudart_Uv12.8.57_S_S_Ccudart_Uso___Ucudart_Slib/libcudart.so.12",
+        },
+        "//platforms:is_linux_aarch64": {
+            "/usr/local/lib/nml/libcudart.so.12": "/usr/local/bin/nml-serve.runfiles/_main/_solib_aarch64/_U_A_Arules_Ucuda++toolchain+cuda_Ucudart_Uv12.8.57_S_S_Ccudart_Uso___Ucudart_Slib/libcudart.so.12",
+        },
+        "//conditions:default": {},
+    }),
+    visibility = [":__pkg__"],
+)
+
+# The image is a product artifact rather than a second build of the product.
+# rules_img captures the Rust target's complete runfiles closure for the active
+# native Linux CUDA platform. NML deliberately has no cross-compilation
+# toolchain: x86-64 and AArch64 manifests are built on their truthful native
+# venues and may be joined into an index only after both descriptors exist.
+# Keeping the executable at a fixed absolute path makes the container
+# entrypoint stable while its adjacent runfiles directory preserves Bazel's
+# runtime lookup model.
+image_from_binary(
+    name = "serve_image",
+    base = "@distroless_cc_debian12",
+    binary = ":serve_image_entrypoint",
+    cmd = [],
+    env = {
+        "LD_LIBRARY_PATH": "/usr/local/lib/nml",
+    },
+    labels = {
+        "org.opencontainers.image.description": "NML Qwen inference over the CPU and CUDA acceleration substrate",
+        "org.opencontainers.image.source": "https://github.com/NarendraPatwardhan/nml",
+        "org.opencontainers.image.title": "nml-serve",
+    },
+    layers = [":serve_cuda_dynamic_loader"],
+    path = "/usr/local/bin/nml-serve",
+    stamp = "disabled",
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    visibility = ["//visibility:public"],
+)
+
+# Loading is an explicit operator action. The eager strategy makes Bazel fetch
+# the final compressed application layer through its authenticated BuildBuddy
+# connection before handing it to Docker. This avoids a second credential
+# system in the post-build loader; it does not download or recreate the much
+# larger LLVM/XLA/CUDA action cache. Loading is not a test and therefore does
+# not imply that the manifest has executed on an NVIDIA device.
+image_load(
+    name = "load_serve_image",
+    daemon = "docker",
+    image = ":serve_image",
+    strategy = "eager",
+    tag = "nml/serve:qwen",
+    visibility = ["//visibility:public"],
+)
+
+# GHCR is the durable handoff between BuildBuddy and GPU venues. The first tag
+# says exactly which native manifest it names; a future multi-platform index
+# may claim the shorter `qwen` tag only after native AArch64 evidence exists.
+# Eager publication consumes the authenticated Bazel output already present on
+# the trusted coordinator and authenticates to GHCR through Docker's private
+# credential store. Registry credentials never enter a Bazel action or source
+# file, and acceptance consumers use the emitted digest rather than this tag.
+image_push(
+    name = "publish_serve_image",
+    image = ":serve_image",
+    registry = "ghcr.io",
+    repository = "narendrapatwardhan/nml",
+    stamp = "disabled",
+    strategy = "eager",
+    tag = "qwen-linux-amd64",
+)
+
+# Structure validation reads OCI configuration and mtree metadata only. It is
+# safe on BuildBuddy and validates both manifests without claiming GPU runtime
+# evidence or downloading model weights.
+image_structure_test(
+    name = "serve_image_structure_test",
+    size = "small",
+    configs = select({
+        "//platforms:is_linux_x86_64": ["serve_image_structure_linux_x86_64.yaml"],
+        "//platforms:is_linux_aarch64": ["serve_image_structure_linux_aarch64.yaml"],
+        "//conditions:default": [],
+    }),
+    image = ":serve_image",
+)
+
 nml_rust_test(
     name = "serve_contract_test",
     size = "small",
     srcs = [
+        "src/engine.rs",
         "src/lib.rs",
         "src/qwen3.rs",
         "src/qwen3/config.rs",

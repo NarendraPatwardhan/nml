@@ -1,1597 +1,367 @@
-# NML implementation milestones
+# NML work plan
 
-This file is the live implementation and acceptance ledger for NML's ordered
-product milestones. The first milestone established this complete execution
-path:
+Status: current implementation tracker
+
+[`SYSTEM.md`](./SYSTEM.md) defines architecture and stable decisions. This file
+contains only current capability evidence and work that still changes the
+product. Git history is the archive for completed implementation details; this
+file is not a chronological diary.
+
+## Acceptance language
+
+- `[x]` means the capability is implemented and its applicable permanent
+  contracts have passed.
+- `[ ]` means executable product work remains.
+- `DEFERRED` means the work is deliberately outside the current sequence. It is
+  retained here so it cannot silently become an implied capability.
+- Building a kernel proves that it compiles. Reading device capability proves
+  that dispatch can inspect the device. Neither proves that the kernel launched
+  or produced correct values.
+- A CUDA path is accepted when normal product dispatch selects it on suitable
+  hardware, launches it through XLA/PJRT, and compares its output with an
+  independent numerical reference. Tests do not expose a backend override just
+  to manufacture coverage.
+
+## Completed substrate
+
+The first seven implementation milestones are complete. Their detailed task
+history remains in Git; the resulting product capabilities are:
+
+- [x] Rust types, shapes, layouts, semantic axes, and compact tensor-program API.
+- [x] Owned MLIR construction, StableHLO serialization, Shardy annotations, XLA
+  compilation, and distinct CPU/CUDA PJRT loaders over common safe ownership.
+- [x] Typed host slices, persistent device buffers, donation/aliasing, named
+  executable arguments, checkpoint declarations, SafeTensors loading, and
+  structural model traversal.
+- [x] Primitive algebra, unary math, nonlinear activations, structural
+  operations, reductions, normalization, indexing, sorting, sampling,
+  convolution, pooling, resize, FFT/IFFT, and explicit-state random generation.
+- [x] Shardy-native logical meshes, four-device CPU execution, tiled placement,
+  explicit collectives, and expert-sharded CPU MoE.
+- [x] Ordinary attention, RoPE, masks, sliding windows, persistent dense/paged
+  KV state, and portable blockwise paged attention.
+- [x] CUDA custom-call lifecycle, upstream FA2/FA3 adapters, Triton paged
+  attention, and grouped Triton expert projections.
+- [x] IREE tokenization and end-to-end Qwen3-0.6B BF16 generation on CPU and the
+  local SM75 CUDA product path.
+
+## Real CUDA path evidence
+
+The current remote artifact is the public device-contract image at:
 
 ```text
-typed Rust graph -> verified StableHLO/MLIR -> XLA compile options
-                 -> PJRT compilation -> owned buffers -> CPU/CUDA execution
+ghcr.io/narendrapatwardhan/nml@sha256:f128c4581b4dd4e8d5df0974bf20cb62b260381dcae12d34e8a0ba23787371fe
 ```
 
-A checkbox is marked complete only after its stated product contract exists and
-the corresponding acceptance target passes. Partial implementations, generated
-bindings without a safe owner, and compilation without execution remain
-unchecked.
-
-## 1. Canonical types and tensor metadata
-
-- [x] Add `nml-types` with the canonical scalar set: bool; signed and unsigned
-      8/16/32/64-bit integers; F16, BF16, F32, F64; C64 and C128.
-- [x] Add stable host representations for F16, BF16, C64 and C128, including
-      explicit size and alignment contracts.
-- [x] Add dtype classification, byte width, alignment, StableHLO spelling, and
-      rejection of unordered operations for complex values.
-- [x] Add rank-8 bounded shapes with checked element and byte counts, logical
-      axis tags, partition metadata, and explicit physical layouts.
-- [x] Keep MLIR `index` outside `DType` and make it impossible to use as a PJRT
-      tensor element type.
-- [x] Pass the complete dtype, complex-layout, shape-overflow, rank, layout, and
-      metadata contract suite.
-
-## 2. Pinned XLA compiler graph
-
-- [x] Lift the XLA module graph at commit
-      `41370d1124c74d7b93a207136a636d8c631cbed9`, following ZML's dependency and
-      patch structure for the compiler portions NML consumes.
-- [x] Obtain PJRT, MLIR C API, StableHLO, Shardy, XLA compiler APIs, and generated
-      option schemas from that single pinned source graph.
-- [x] Remove the standalone PJRT-header repository after all ABI bindings use
-      headers from the XLA source graph.
-- [x] Preserve the current CPU/CUDA plugin packages, supported hosts, CUDA
-      runtime closure, and hard-error capability policy.
-- [x] Pass clean-cache default, CPU, and CUDA dependency-resolution and Bazel
-      graph contracts.
-
-## 3. Rust MLIR ownership
-
-- [x] Add `nml-mlir-sys` bindings for the exact MLIR C API surface used by NML.
-- [x] Add `nml-mlir` RAII ownership for contexts, modules, regions, blocks,
-      operations, types, attributes, locations, diagnostics, and pass managers.
-- [x] Register Func, Arith, StableHLO, and Shardy dialects.
-- [x] Implement compiler-internal MLIR index types, index constants, and signed
-      and unsigned index casts without adding an index runtime dtype.
-- [x] Map every canonical `DType`, including C64/C128, to MLIR tensor element
-      types.
-- [x] Add permanent builders for functions, returns, constants, `dot_general`,
-      complex/real/imaginary operations, and StableHLO FFT operations.
-- [x] Verify modules and support deterministic textual and bytecode
-      serialization with owned diagnostic errors.
-- [x] Pass ownership, invalid-module, complex, index, and serialization
-      contracts.
-
-## 4. PJRT execution ownership
-
-- [x] Refactor plugin/client ownership so every dependent PJRT object keeps the
-      necessary API and library state alive independent of Rust lexical borrows.
-- [x] Add owned `Event`, `Memory`, `Buffer`, `Executable`, and
-      `LoadedExecutable` wrappers.
-- [x] Add checked host-to-device and device-to-host transfers for scalar, empty,
-      and multidimensional buffers.
-- [x] Add executable metadata, addressable-device discovery, execute options,
-      argument/result ownership, readiness, deletion, and completion errors.
-- [x] Preserve useful plugin diagnostics while destroying every PJRT error and
-      owned object exactly once.
-- [x] Pass lifecycle, transfer, metadata, failure, CPU, and CUDA runtime
-      contracts through the same safe Rust API.
-
-## 5. XLA compile options
-
-- [x] Add `nml-xla-sys` bindings to the pinned generated upb/protobuf option
-      representations used by ZML.
-- [x] Add a safe compile-options model for replicas, partitions, device
-      assignment, mandatory Shardy partitioning, and backend-specific settings.
-- [x] Negotiate the StableHLO target version with the pinned compiler and retain
-      serialized buffers for the complete PJRT compile call.
-- [x] Preserve ZML's CUDA latency-hiding scheduler override and PJRT device
-      capability discovery, then apply NML's hard unsupported-GPU policy.
-- [x] Reject invalid topology, assignment, partition, and backend combinations
-      before crossing the PJRT ABI.
-- [x] Pass deterministic serialization and CPU/CUDA compilation contracts.
-
-## 6. Typed graph and permanent execution contracts
-
-- [x] Add `nml-ir` with a scoped compilation context, deterministic symbols,
-      programs, inputs, outputs, and typed symbolic tensors.
-- [x] Validate dtypes, ranks, layouts, contracting axes, batch axes, and result
-      shapes before emitting MLIR.
-- [x] Implement `dot_general`, two-dimensional `matmul`, complex construction,
-      and real/imaginary extraction.
-- [x] Execute an F32 `[3, 5] x [5, 4]` matmul on CPU and CUDA and compare each
-      result with the Rust reference using
-      `abs(actual - expected) <= 1e-4 + 1e-4 * abs(expected)`.
-- [x] Execute a C64 construction/real/imaginary round trip on CPU and CUDA.
-- [x] Exercise GPU custom-call registration through the real CUDA plugin
-      initialization path.
-- [x] Pass deterministic-IR, pre-emission validation, CPU execution, CUDA
-      execution, numerical, and unsupported-GPU contracts.
-
-## Milestone acceptance
-
-- [x] `bazel --output_user_root=../nml-bazel-cache test //...`
-- [x] `bazel --output_user_root=../nml-bazel-cache test --config=cpu //...`
-- [x] `bazel --output_user_root=../nml-bazel-cache test --config=cuda //...`
-- [x] `git diff --check`
-- [x] The complete typed graph -> StableHLO -> XLA -> PJRT -> CPU/CUDA numerical
-      execution path passes on supported real hardware.
-
-Numerical FFT execution, quantization, model loading, decoding, training, and
-higher-level model APIs are subsequent product milestones. FFT builders and
-complex compiler types do not constitute an end-to-end FFT support claim.
-
----
-
-# Milestone 2: parameter, buffer, and checkpoint substrate
-
-This milestone adds ZML's host-slice, persistent-buffer, structural-model, and
-safetensors lifecycle in Rust. The implementation may use focused internal
-types, but they do not automatically become public API.
-
-The public surface remains comparable to ZML's. The root `nml` facade exposes
-the existing `DataType`, `Shape`, and symbolic `Tensor` concepts together with
-`Slice`, `Buffer`, `Exe`, `Bufferized<T>`, `Memory`, `Platform`, and `Sharding`.
-Checkpoint details remain under `nml::safetensors` and loading remains under
-`nml::io`, as in ZML. Executable argument/result helpers may live under
-`nml::exe`, but are not additional root concepts.
-
-Storage allocation implementations, mutable-view helpers, transfer guards,
-events, individual device shards, buffer identities, binding tables, load
-plans, load reports, and safetensors parser records remain private. A later
-caller requirement and explicit API review are required before exposing one of
-them.
-
-A checkbox below is marked complete immediately after its stated product
-contract and durable tests pass. Compile-only work, parser-only work, and a
-partial backend remain unchecked.
-
-## 1. Bazel graph and public facade
-
-- [x] Import exact upstream Rust dependencies through `rules_rust`
-      crate-universe direct specifications. Bazel remains the only build graph;
-      no Cargo workspace or ZML-hosted source fork is introduced.
-- [x] Add the repository's `rust_proc_macro` wrapper with the same stable Rust,
-      edition, warning, unsafe-block, and supported-host policy as every other
-      NML Rust target.
-- [x] Add only the internal crate boundaries required by the implementation:
-      host tensor storage, runtime buffer/executable ownership, structural
-      derive generation, and checkpoint loading. Their implementation types
-      stay private to the root facade.
-- [x] Add one `nml` facade crate and route product callers through it. Keep raw
-      PJRT, MLIR, XLA, loader-planning, and derive-support modules out of the
-      ordinary public surface.
-- [x] Pass default, CPU, and CUDA dependency-resolution and facade-visibility
-      contracts.
-
-## 2. `Slice`: typed and aligned host tensor storage
-
-- [x] Implement the single public `Slice` abstraction for shaped host storage.
-      It may either borrow caller storage or own a dtype-aligned allocation,
-      while allocation strategy and mutability machinery remain private.
-- [x] Record and validate shape, physical layout, byte offset, byte strides,
-      backing extent, mutability, and byte order. Scalars, empty dimensions,
-      sub-slices, transposed views, and negative strides must use checked
-      address arithmetic.
-- [x] Implement contiguity detection, typed reads/writes, strided copies, and
-      explicit dense materialization. Dtype, alignment, bounds, mutability, and
-      endian mismatches are diagnostic errors.
-- [x] Add correct F16 and BF16 conversion helpers for checkpoint fixtures and
-      independent host reference calculations.
-- [x] Replace raw byte vectors in ordinary buffer transfer APIs with `Slice`.
-      Raw bytes remain available only at explicit FFI or serialization
-      boundaries.
-- [x] Pass permanent alignment, offset, stride, layout, endian, scalar, empty,
-      overflow, and ownership contracts.
-
-## 3. PJRT memory and transfer completion
-
-- [x] Extend the checked PJRT ABI for client/device memory discovery, default
-      memory, memory kind and addressability, explicit layouts, uninitialized
-      buffers, on-device sizes, memory/device copies, DMA mapping, and
-      asynchronous host-to-device transfer managers.
-- [x] Pass typed client creation options to PJRT, including ZML's CPU device
-      count, without adding backend-specific public client types.
-- [x] Preserve ZML's `Memory.Kind` choices: default, device, pinned host, and
-      unpinned host. Unsupported requested memory is a structured error rather
-      than a fallback.
-- [x] Make transfer completion retain every borrowed host allocation until PJRT
-      releases it. Transfer guards and individual PJRT buffers remain runtime
-      implementation details behind public `Buffer` construction.
-- [x] Implement `Buffer.toSlice`/`toSliceAlloc`, readiness, explicit deletion,
-      device/memory copies, and deterministic destruction without returning raw
-      byte vectors.
-- [x] Pass the same lifecycle, memory selection, transfer, copy, error, and
-      destruction contracts through the CPU and CUDA loaders.
-
-## 4. `Sharding` and persistent `Buffer`
-
-- [x] Port the CPU/CUDA-relevant ZML physical-mesh, logical-axis sharding,
-      placement, canonical-device ordering, replicated placement, and tiled
-      placement semantics.
-- [x] Implement public `Buffer` as one logical tensor with private PJRT shards,
-      its `Shape`, `Sharding`, `Platform`, and selected memory kind.
-- [x] Upload contiguous and strided `Slice` views to the correct shard
-      placement without materializing a persistent dense or converted copy.
-- [x] Implement download/reassembly, shard readiness, byte accounting, explicit
-      physical copy, and shared ownership for tied parameters. Sharing a
-      buffer is distinguishable internally from allocating another device
-      buffer.
-- [x] Require unique ownership for donation and preserve one destruction point
-      for shared/tied storage.
-- [x] Exercise replicated and tiled placement through real multi-device CPU
-      PJRT configuration and every available real CUDA device.
-- [x] Pass placement arithmetic, shard reconstruction, replication,
-      copy-versus-share, donation eligibility, and lifetime contracts.
-
-## 5. `Exe`: named parameters and reusable arguments
-
-- [x] Extend `Program` with deterministic named inputs and outputs, retaining
-      whether each input is a parameter or an activation. Reject duplicate
-      names before MLIR emission.
-- [x] Add the StableHLO operations required by a conventional linear layer:
-      general dot against `[out, in]` weights, elementwise addition, and bias
-      broadcasting.
-- [x] Have compilation return public `Exe`, which owns the loaded PJRT
-      executable and keeps input/output shapes, shardings, names, and alias
-      expectations private.
-- [x] Follow ZML's `Exe.args`, `Arguments.set`, `Arguments.bake`, `Exe.results`,
-      and `Exe.call` lifecycle. Argument/result helpers live in `nml::exe`, not
-      as new root-level concepts.
-- [x] Let baked parameter buffers be reused across calls while activations are
-      replaced. Validate name, order, dtype, shape, layout, platform, sharding,
-      missing arguments, and excess arguments before PJRT execution.
-- [x] Implement ZML-style multi-device argument flattening and result
-      reconstruction.
-- [x] Preserve explicit output/input alias declarations. Parameters are
-      non-donatable unless a later mutable-parameter API says otherwise;
-      activation donation consumes uniquely owned storage.
-- [x] Pass repeated-call, baked-parameter, result reconstruction, donation,
-      output-alias, and invalid-binding contracts on CPU and CUDA.
-
-## 6. Rust `Bufferized<T>` structural generation
-
-- [x] Implement one public `NmlStruct` derive and the public
-      `Bufferized<T> = <T as NmlStruct>::Buffers` mapping. Generated companion
-      types and traversal support do not become root exports.
-- [x] Support named and tuple structs, enums, nested derived values, `Option`,
-      `Vec`, arrays, `Box`, tuples, and explicit skipped metadata.
-- [x] Generate deterministic symbolic-tensor traversal, buffer traversal,
-      argument flattening, result reconstruction, and checkpoint field paths.
-- [x] Strip non-tensor metadata from bufferized structures and preserve the
-      source structure wherever tensor fields exist, matching ZML's behavior.
-- [x] Deduplicate repeated symbolic tensor identities during loading and bind
-      every tied occurrence to the same underlying buffer.
-- [x] Provide a manual trait implementation path for structures that cannot be
-      derived without exposing another public traversal framework.
-- [x] Pass nested-model, optional-bias, layer-vector, enum, skipped-metadata,
-      deterministic-order, and tied-field contracts.
-
-## 7. Safetensors registry and `TensorStore`
-
-- [x] Implement `nml::safetensors::TensorRegistry` for a direct safetensors
-      file, `model.safetensors`, and `model.safetensors.index.json` repositories.
-      Parse only the bounded header through the upstream safetensors metadata
-      representation.
-- [x] Validate header size, JSON, shape products, dtype byte counts, offsets,
-      file extent, duplicate names, index/shard agreement, missing shards, path
-      containment, and integer overflow before device allocation.
-- [x] Map safetensors encodings in NML's canonical dtype set and reject FP8,
-      sub-byte, or otherwise unsupported encodings until their own product
-      milestones.
-- [x] Preserve safetensors' little-endian row-major contract and reject a
-      non-native transfer rather than performing an implicit conversion.
-- [x] Implement `nml::io::TensorStore` and its prefix/layer view behavior,
-      binding checkpoint records to symbolic tensor identities as ZML does.
-- [x] Resolve aliases deterministically: the primary name wins; with no primary,
-      exactly one present alias is accepted; multiple present aliases are an
-      ambiguity error.
-- [x] Resolve tied weights through shared symbolic/storage identity so they are
-      read and uploaded once.
-- [x] Pass single-file, sharded-index, prefix, optional-field, alias,
-      tied-weight, malformed-file, unsupported-dtype, and path-containment
-      contracts.
-
-## 8. Parallel checkpoint-to-buffer loading
-
-- [x] Build and validate the complete unique-storage load plan before allocating
-      device memory. Loader plan records and accounting stay private.
-- [x] On CPU, read each unique tensor into an aligned `Slice`, upload it, wait
-      for completion, and release staging storage immediately afterward.
-- [x] On CUDA, port ZML's bounded double-buffered DMA path using mapped staging
-      chunks, asynchronous transfer managers, reusable buffers, and completion
-      events.
-- [x] Dispatch file-order spans to tiled and replicated shards without rereading
-      replicated bytes or retaining a full converted checkpoint.
-- [x] Support bounded parallelism, staging-buffer count, chunk size, selected
-      memory kind, and progress reporting through `nml::io.LoadOptions`, the
-      single additional public configuration type already analogous to ZML.
-- [x] Clean up every submitted transfer, event, staging allocation, and
-      completed device buffer exactly once after any partial failure.
-- [x] Keep allocation/read/upload counters private but inspectable by in-crate
-      acceptance tests to prove deduplication and bounded staging memory.
-- [x] Pass parallel loading, span dispatch, deduplication, bounded-memory,
-      truncated-read, transfer-failure, and cleanup contracts.
-
-## 9. FP16/BF16 linear-layer product contract
-
-- [x] Define a derived linear structure with `[out, in]` weight and optional
-      `[out]` bias, constructed through a `TensorStore` view and loaded as
-      `Bufferized<Linear>`.
-- [x] Generate real single-file and sharded safetensors fixtures for FP16 and
-      BF16, both with and without bias, using the upstream serializer.
-- [x] For each variant, load parameters once, compile once, bake the resulting
-      buffers once, and execute at least three distinct activation inputs.
-- [x] Run identical model, loading, binding, and execution code on CPU and
-      CUDA.
-- [x] Compute an independent F32 host reference, round to the output dtype, and
-      require each result to be within four output-dtype ULPs with a `1e-5`
-      absolute floor.
-- [x] Prove through private runtime identity/accounting that each unique
-      parameter is uploaded once, tied fields share storage, parameter storage
-      remains unchanged across calls, and execution performs no checkpoint
-      reads or parameter uploads.
-- [x] Execute a separate real alias/donation contract that consumes a unique
-      activation and returns the correctly aliased result through `Exe`.
-
-## Milestone 2 acceptance
-
-- [x] All added tests are permanent product contracts; no probe, smoke, spike,
-      demo, compatibility-only, or temporary target remains.
-- [x] `bazel --output_user_root=../nml-bazel-cache test //...`
-- [x] `bazel --output_user_root=../nml-bazel-cache test --config=cpu //...`
-- [x] `bazel --output_user_root=../nml-bazel-cache test --config=cuda //...`
-- [x] The CUDA loading, parameterized execution, donation, and alias contracts
-      pass on a real supported NVIDIA device.
-- [x] The pushed revision's BuildBuddy workflow passes while reusing the remote
-      cache.
-- [x] `git diff --check`
-- [x] Milestone 2 is complete only when FP16/BF16 safetensors parameters load
-      once into persistent CPU/CUDA buffers, flow through `Bufferized<T>`, and
-      execute repeatedly with correct results through the compact ZML-shaped
-      public API.
-
----
-
-# Milestone 3: Shardy-native execution and nonlinear graph foundations
-
-This milestone makes partitioning part of the ordinary graph/runtime contract
-before attention is introduced. It also adds the algebra, shape transforms,
-and nonlinear operations required to express attention and genuine MLPs. The
-public surface remains one `Shape`, `Tensor`, `Sharding`, `Buffer`, and `Exe`
-model; compiler implementation records do not become product concepts.
-
-## 1. Sharding model and compiler ownership
-
-- [x] Remove the GSPMD selector and make Shardy the only XLA partitioner.
-- [x] Replace positional tiled placement with logical mesh axes identified by
-      `AxisTag`, retaining single-device and replicated placement.
-- [x] Validate unique nonzero mesh axes, checked device products, referenced
-      tensor axes, even partitioning, and exact platform device availability.
-- [x] Pass the selected `Sharding` into compilation so one topology-independent
-      `Program` can be compiled for single, replicated, or mesh execution.
-- [x] Store the resolved topology in `Exe` and reject buffers whose platform,
-      placement, shard count, or logical mesh differs before PJRT execution.
-- [x] Resolve single execution as one replica/partition, replicated execution
-      as one partition with one replica per device, and mesh execution as one
-      replica with the mesh product as its partition count.
-- [x] Generate deterministic device assignments and diagnostic hard errors for
-      unavailable or inconsistent topologies.
-
-## 2. Shardy MLIR integration
-
-- [x] Bind the pinned Shardy C attribute API and add context-owned Rust wrappers
-      for mesh, dimension-sharding, tensor-sharding, and per-value attributes.
-- [x] Emit one deterministic `sdy.mesh` declaration for mesh programs and lower
-      `Shape` partition metadata to function input/output `sdy.sharding` attrs.
-- [x] Add an explicit graph operation for intermediate
-      `sdy.sharding_constraint` placement.
-- [x] Add a region-safe internal `sdy.manual_computation` builder for future
-      custom kernels without exposing another root public abstraction.
-- [x] Reject invalid and cross-context Shardy objects before module verification
-      and keep textual and bytecode output deterministic.
-
-## 3. Runtime placement and checkpoint loading
-
-- [x] Derive tensor-local upload ranges from the logical mesh and each
-      `Shape::partitions()` entry rather than positional partition factors.
-- [x] Replicate tensor data across unused mesh axes and reject duplicate or
-      ambiguous consumption of a logical mesh axis.
-- [x] Reassemble globally ordered host tensors from partitioned PJRT buffers.
-- [x] Preserve direct checkpoint-to-local-shard loading without a second full
-      persistent host tensor.
-- [x] Accept tiled executable arguments/results only when their resolved
-      placement exactly matches the compiled topology.
-- [x] Preserve replicated loading and repeated-execution behavior and pass
-      permanent placement, mismatch, cleanup, and reconstruction contracts.
-
-## 4. Primitive algebra
-
-- [x] Add owned tensor constants and typed rank-zero scalars whose storage
-      remains valid through MLIR construction.
-- [x] Add subtraction, multiplication, division, minimum, maximum, and negation.
-- [x] Add equality, inequality, ordered comparisons, boolean selection, and
-      dtype conversion; identical conversion reuses the symbolic value.
-- [x] Follow ZML's elementwise rule: exact shape/metadata match or explicit
-      rank-zero scalar broadcasting, never implicit NumPy rank expansion.
-- [x] Preserve logical axes and partitions and reject unsupported dtype or
-      metadata combinations before MLIR emission.
-- [x] Expose the operations through `ProgramBuilder` and `TensorStore` without
-      public operation, comparison, or activation enums.
-
-## 5. Compiled reshape and transpose
-
-- [x] Add StableHLO reshape with an explicit output `Shape`, checked equal
-      element counts, and mesh-valid output partition metadata.
-- [x] Express an explicit reshape partition change as a Shardy constraint
-      rather than silently reinterpreting local storage.
-- [x] Add StableHLO transpose with a complete unique permutation, moving
-      dimensions, semantic axis tags, and partitions together.
-- [x] Define compiled transpose as a materialized row-major result while
-      retaining separate zero-copy host-view physical-layout semantics.
-- [x] Pass permanent attention-head reshape/transpose contracts for
-      `[batch, sequence, heads, head_dim]` layouts.
-
-## 6. Unary math and activations
-
-- [x] Add `exp`, `log`, `sqrt`, `rsqrt`, `tanh`, `sin`, and `cos`, preserving
-      the complete input shape metadata.
-- [x] Add ReLU, StableHLO logistic sigmoid, SiLU, ZML-compatible
-      tanh-approximate GELU, leaky ReLU, and quickGELU as graph compositions.
-- [x] Verify FP32, FP16, and BF16 behavior against independent host references
-      with dtype-appropriate tolerances.
-
-## 7. Integrated product contracts
-
-- [x] Load and execute a checkpoint-backed two-layer nonlinear MLP on CPU and
-      CUDA rather than treating individual emitted operations as completion.
-- [x] Execute the MLP on CPU in single, replicated, and logical-mesh modes.
-- [x] Execute a partitioned dot whose contracting axis requires
-      compiler-inserted communication and compare its reconstructed result with
-      the unsharded reference.
-- [x] Exercise the same Shardy-aware graph-building path on single-device CUDA.
-- [x] Verify repeated execution, parameter ownership, constants, comparisons,
-      selection, conversion, reshape, transpose, and activations through PJRT.
-
-## Milestone 3 acceptance
-
-- [x] All tests are permanent product contracts; no probe, smoke, spike, demo,
-      compatibility-only, or temporary target remains.
-- [x] BuildBuddy executes `bb test --config=buildbuddy --config=cpu
-      //:cpu_contracts` with compile actions on RBE.
-- [x] BuildBuddy executes the CUDA-configured contracts that do not own the
-      packaged runtime or a physical device with `bb test
-      --config=buildbuddy --config=cuda //:cuda_remote_contracts`.
-- [x] BuildBuddy compiles the exact CUDA contract binaries without assembling
-      their runtime data and populates the authenticated action cache with `bb
-      build --config=buildbuddy --config=cuda //:cuda_contract_binaries`.
-- [x] The NVIDIA host assembles the pinned system-driver runtime and executes
-      only those cached contracts with `bb test --config=buildbuddy
-      --config=cuda --cache_test_results=no //:cuda_device_contracts`.
-- [x] The real CUDA contracts pass on a supported NVIDIA device and unsupported
-      GPU capabilities remain hard diagnostic errors.
-- [x] The pushed revision's BuildBuddy workflow passes while reusing the remote
-      cache.
-- [x] `git diff --check`
-- [x] Milestone 3 is complete only when Shardy-partitioned execution and the
-      checkpoint-backed nonlinear model work through the compact public API on
-      the applicable CPU/CUDA targets.
-
----
-
-# Milestone 4: portable attention semantics and paged KV state
-
-This milestone ports ZML's real tensor/StableHLO attention foundation and adds
-the portable paged path required by D-032. CPU and CUDA consume the same graph
-semantics. The root API gains only the small attention configuration and cache
-descriptions that a model author must provide; operation records, reduction
-regions, loop state, page traversal, and backend dispatch remain internal.
-
-## 1. Attention prerequisite operations
-
-- [x] Add dimension-aware `iota`, concatenate, static slice, dynamic slice,
-      dynamic update slice, and general gather operations with checked shapes,
-      indices, layouts, logical axes, and partitions.
-- [x] Add generic single-input sum and maximum reductions with correctly typed
-      identities, region ownership, retained non-reduced metadata, and explicit
-      accumulation dtype where required.
-- [x] Add numerically stable softmax and RMS normalization composites, including
-      FP32 accumulation for FP16/BF16 and conversion back to the input dtype.
-- [x] Preserve ZML's explicit broadcasting rules and reject implicit rank
-      expansion, invalid gather dimension numbers, out-of-range static slices,
-      and unsupported reduction dtypes before MLIR emission.
-- [x] Expose the required operations through `TensorStore` without exporting
-      public operation, reduction, or gather-configuration enums at NML's root.
-
-## 2. StableHLO control-flow ownership
-
-- [x] Add RAII builders for `stablehlo.reduce`, `stablehlo.return`,
-      `stablehlo.while`, and loop/reduction regions using the existing owned
-      `Region`, `Block`, `Operation`, and `Value` model.
-- [x] Represent attention loop state without allowing foreign tensors,
-      cross-context values, mismatched result types, or unterminated regions.
-- [x] Carry a bounded runtime loop index and tensor state through
-      `stablehlo.while`; general paged attention must not scale graph size with
-      maximum page count.
-- [x] Pass deterministic text, bytecode, verification, invalid-region, and XLA
-      compilation contracts for reductions and loop-carried tensors.
-
-## 3. RoPE, masks, and ordinary attention
-
-- [x] Implement interleaved and sequential rotary embeddings from position
-      tensors, with configurable base/scaling and checked even rotary width.
-- [x] Implement causal, non-causal, and sliding-window masks from runtime query
-      and key positions, using negative infinity plus ZML-compatible zero output
-      for a completely masked row.
-- [x] Implement scaled dot-product attention with FP32 score/softmax
-      accumulation and input-dtype output.
-- [x] Support MHA, GQA, and MQA without materializing repeated persistent KV
-      heads; validate query-to-KV head divisibility and semantic head axes.
-- [x] Support prefill, single-token decode, and multi-token decode through the
-      same ordinary attention graph.
-
-## 4. Persistent dense and paged KV state
-
-- [x] Define the compact public cache description needed to allocate split K/V
-      storage, page tables, sequence lengths, and compile-time capacity bounds.
-- [x] Allocate dense and paged caches as ordinary persistent `Buffer` values on
-      the selected platform and sharding, with no backend-specific public cache
-      type.
-- [x] Implement append/update graphs for dense and paged K/V storage using
-      dynamic updates, returning aliasable cache outputs rather than allocating
-      replacement storage on every decode step.
-- [x] Validate page size, physical/logical capacity, page identifiers, sequence
-      lengths, batch ownership, dtype, head geometry, platform, and sharding
-      before execution.
-- [x] Support deterministic truncate, rollback, and replay by updating logical
-      lengths/page tables without copying unaffected K/V pages.
-
-## 5. Portable blockwise paged attention
-
-- [x] Traverse logical pages with bounded `stablehlo.while` and gather physical
-      K/V pages directly from the page table.
-- [x] Carry the online-softmax running maximum, rescaled denominator, and value
-      accumulator in FP32 across pages, including fully masked pages without
-      producing NaNs.
-- [x] Apply runtime tail-token, causal, non-causal, and sliding-window masks
-      before page-local reductions.
-- [x] Support MHA, GQA, and MQA head mapping, prefill, single-token decode, and
-      multi-token decode without expanding persistent KV heads.
-- [x] Prove through graph and allocation contracts that the product path does
-      not materialize a contiguous logical KV cache or the complete attention
-      score matrix.
-- [x] Keep the same StableHLO implementation executable on CPU and CUDA as the
-      correctness/performance path and CUDA fallback required by D-032.
-
-## 6. Integrated product contracts
-
-- [x] Compare ordinary and paged attention against independent dense host math
-      for FP32, FP16, and BF16 with dtype-appropriate tolerances.
-- [x] Cover empty context, partially occupied final pages, non-contiguous and
-      shared physical pages, boundary capacities, invalid page identifiers,
-      and invalid sequence lengths.
-- [x] Cover causal and non-causal attention, sliding windows, MHA/GQA/MQA,
-      prefill, single-token decode, and multi-token decode.
-- [x] Execute successive cache updates, repeated decode calls, truncation,
-      rollback, and replay while proving storage identity and unaffected-page
-      contents remain stable.
-- [x] Execute the same checkpoint-backed attention block and cache lifecycle on
-      CPU and real CUDA through the compact public API.
-- [x] Exercise Shardy-compatible head/batch placement without introducing a
-      second attention or cache representation.
-
-## Milestone 4 acceptance
-
-- [x] All tests are permanent product contracts; no probe, smoke, spike, demo,
-      compatibility-only, or temporary target remains.
-- [x] BuildBuddy executes the CPU and CUDA-remote contract suites and compiles
-      the exact CUDA runtime contract binaries without assembling CUDA runtime
-      data remotely.
-- [x] The NVIDIA host executes the cached ordinary/paged attention and cache
-      contracts on the real supported GPU.
-- [x] The pushed revision's BuildBuddy workflow passes while reusing the remote
-      cache.
-- [x] `git diff --check`
-- [x] Milestone 4 is complete only when ordinary attention, portable blockwise
-      paged attention, and persistent rollback-capable KV state execute through
-      the compact public API on CPU and CUDA without dense-cache materialization.
-
----
-
-# Pre-Milestone 5: model-enabling capability closure
-
-This bounded slice closes the inexpensive ZML capabilities that are already
-natural compositions of NML's typed StableHLO substrate. It does not introduce
-a model hierarchy, sampling policy object, backend-specific dispatch, or a
-reference-model package. Operations remain on the existing `ProgramBuilder`
-and `TensorStore` surfaces so later CUDA kernels, richer reductions, and
-sampling strategies can replace or reuse their lowering without changing model
-code.
-
-## 1. Coherent elementwise and reduction tail
-
-- [x] Add typed absolute value, power, remainder, clamp, floor, and ceil with
-      correct scalar broadcasting, complex-result dtype behavior, and
-      pre-emission dtype validation.
-- [x] Add reduction minimum, mean, and numerically stable log-sum-exp while
-      preserving retained axis tags and partition metadata.
-- [x] Extend the narrow MLIR builders only where a distinct StableHLO operation
-      is required; composites remain explicit graph compositions so XLA can
-      fuse them normally.
-- [x] Add deterministic StableHLO and invalid-contract coverage for every new
-      primitive and composite.
-
-## 2. Embedding, normalization, and gated activations
-
-- [x] Add token embedding as the checked rank-two vocabulary gather already
-      used by ZML, accepting any supported integer index tensor without adding
-      a public embedding-layer type.
-- [x] Add variance normalization, LayerNorm, and L2 normalization with F16 and
-      BF16 accumulation in F32, explicit epsilon validation, and optional
-      LayerNorm affine parameters.
-- [x] Add SwiGLU and GeGLU as shape-safe composites of the existing activation
-      and multiplication operations; do not couple gating to a particular
-      projection layout or checkpoint naming scheme.
-- [x] Execute embedding, normalization, and gating numerical contracts for F32,
-      F16, and BF16 on every applicable CPU/CUDA product backend.
-
-## 3. Argmax and compiled greedy selection
-
-- [x] Add an axis-reducing argmax that returns both values and indices, chooses
-      I32 indices unless the reduced dimension requires I64, selects the first
-      index on ties, and propagates the first encountered NaN as ZML does.
-- [x] Represent argmax as a general two-result StableHLO reduction rather than
-      a sampling-specific custom operation, leaving top-k, sorting, and
-      stochastic sampling unconstrained.
-- [x] Expose argmax through `TensorStore`; its index result is the compiled
-      greedy-selection path without adding a premature sampling-policy type.
-- [x] Execute numerical, tie, NaN, dtype, axis, metadata, CPU, and CUDA
-      contracts.
-
-## Acceptance
-
-- [x] `rustfmt` passes for every changed Rust source.
-- [x] BuildBuddy executes `bb test --config=buildbuddy --config=cpu
-      //:cpu_contracts` with compile actions on RBE.
-- [x] BuildBuddy executes `bb test --config=buildbuddy --config=cuda
-      //:cuda_remote_contracts` and builds `//:cuda_contract_binaries`.
-- [x] Applicable real-device CUDA contracts execute locally after their exact
-      binaries have been populated through the remote cache.
-- [x] `git diff --check`
-- [x] The capability ledger is updated only for complete product families; a
-      new operation does not overstate convolution, stochastic sampling,
-      general scatter, or other unfinished substrate work.
-
----
-
-# Milestone 5: CUDA FlashAttention and Triton paged attention
-
-This milestone adds two independent CUDA acceleration mechanisms behind the
-attention semantics completed in Milestone 4.  The portable StableHLO paths
-remain the oracle and CUDA fallback. A kernel is hardware-validated only after
-its numerical result and lifecycle behavior execute on compatible hardware;
-parsing TTIR, compiling a target, or registering a symbol is never presented as
-that validation. D-038 nevertheless lets the implementation milestone close
-with those real-device runs explicitly deferred, provided the complete product
-artifacts and unchanged future execution contracts continue to compile.
-
-The pinned ZML snapshot is the architectural reference.  NML departs where
-Rust needs explicit ownership and where D-025 requires original upstream
-FlashAttention rather than ZML's hosted source fork.  Internal kernel types
-stay crate-private; the public surface remains `nml::attention` plus the
-existing tensor/cache operations.
-
-## 1. Backend contracts and capability policy
-
-- [x] Define one internal attention-backend decision with `Portable`,
-      `CudaTriton`, `CudaFlash2`, and `CudaFlash3` implementations; do not add
-      public per-kernel parameter or metadata families.
-- [x] Read CUDA compute capability from the PJRT device description and make
-      feature support explicit: upstream FA2 requires SM80+, FA3 requires
-      SM90, and the pinned XLA Triton backend decides its own supported CUDA
-      range.  An explicitly requested unsupported backend returns a hard,
-      diagnostic error; automatic selection may use the portable path required
-      by D-032.
-- [x] Keep all shape, dtype, head-ratio, causal/window, layout, page-table, and
-      alias validation above backend dispatch so every implementation receives
-      the same already-validated semantic contract.
-- [x] Record the important reference departure: ZML routes every non-SM90 CUDA
-      device to its hosted FA2 fork, while NML's original-upstream FA2 cannot
-      run on the local SM75 GTX 1660 Ti, and the pinned XLA compiler also
-      rejects Triton below SM80.  SM75 therefore validates the portable CUDA
-      fallback and capability diagnostics; Triton/FA2/FA3 need compatible
-      remote hardware.
-
-## 2. Pinned TTIR ownership and bindings
-
-- [x] Add the Triton dialect from the already pinned XLA dependency graph to
-      NML's MLIR C boundary.  Bind only dialect registration, pointer/tensor
-      descriptor types, and enum attributes actually needed by retained CUDA
-      kernels.
-- [x] Extend `nml-mlir` with safe context-bounded TTIR handles and generic
-      operation construction without exposing raw `Mlir*` objects or allowing
-      TTIR operations in the long-lived StableHLO program context.
-- [x] Create each kernel in an isolated non-threaded MLIR context, register the
-      `tt`, `arith`, `math`, `scf`, and `cf` dialects it needs, verify the
-      finished module, serialize deterministic textual TTIR, and destroy the
-      complete context before ordinary graph compilation continues.
-- [x] Add permanent contracts for pointer/type attributes, invalid ownership,
-      malformed operations, deterministic serialization, verification
-      failures, and repeated context creation/destruction.
-
-## 3. Private Rust Triton kernel substrate
-
-- [x] Implement crate-private `DType`, `Value`, named argument declarations,
-      and a builder covering the arithmetic, pointer, load/store, broadcast,
-      reduction, dot, range, program-id, and structured-control-flow operations
-      used by unified attention.  Dtypes are limited to NML's retained set.
-- [x] Implement typed kernel specifications with ordered named inputs and
-      outputs, explicit result shapes, output/operand aliases, three-dimensional
-      launch grids, warp/stage counts, and deterministic configuration errors.
-- [x] Lower a typed kernel invocation to `stablehlo.custom_call` target
-      `__gpu$xla.gpu.triton` with typed-FFI backend configuration, row-major
-      operand/result layouts, embedded verified TTIR, and validated aliases.
-- [x] Add permanent builder and custom-call contracts that exercise every
-      operation family used by attention, reject cross-context values, malformed
-      TTIR, and bad launch/alias contracts, verify and serialize the exact
-      TTIR-bearing StableHLO artifact, and compile the permanent CUDA contract
-      binary against the pinned PJRT plugin.
-- [ ] `DEFERRED` Run XLA's device-specific compilation of those exact TTIR
-      artifacts on SM80+ hardware. The test binary and its Triton source graph
-      must continue to build before the RunPod execution gate is scheduled.
-
-## 4. Unified Triton paged attention
-
-- [x] Port ZML's CUDA-relevant 2D unified paged-attention kernel, retaining
-      blockwise online softmax, causal and sliding-window masks, MHA/GQA/MQA
-      head mapping, arbitrary valid page tables, padded head dimensions, and
-      FP32 accumulation for FP16/BF16 inputs.
-- [x] Port the split-K 3D attention kernel and segment-reduction kernel with
-      explicit intermediate shapes and no logical-KV or full-score-matrix
-      materialization.
-- [x] Port the CUDA launch-selection policy (2D prefill and sufficiently large
-      decode; 3D split-K otherwise) without the excluded oneAPI specialization.
-      Configuration choices are deterministic functions of validated geometry
-      and CUDA device attributes.
-- [x] Integrate Triton as the preferred CUDA paged-attention implementation
-      while preserving the same cache storage, page table, update, rollback,
-      replay, and portable fallback contracts from Milestone 4.
-- [x] Compile the permanent numerical contract covering prefill, single-token
-      and multi-token decode, mixed sequence lengths, page boundaries, shared
-      and non-contiguous pages, sliding windows, MHA/GQA/MQA, repeated
-      execution, and both 2D and 3D launch paths. The same binary selects the
-      portable fallback on SM75 and the private optimized implementation from
-      the real device capability.
-- [ ] `DEFERRED` Execute that unchanged contract's Triton 2D and split-K paths
-      on rented SM80+ RunPod hardware.
-
-## 5. Original-upstream FlashAttention integration
-
-- [x] Pin an original Dao-AILab FlashAttention revision and its transitive
-      CUTLASS inputs by immutable digest.  Build only forward inference kernels
-      and supported FP16/BF16 head dimensions through Bazel; do not introduce
-      PyTorch, Python packaging, a prebuilt wheel, or ZML's hosted fork.
-- [x] Carry a small audited C ABI adapter as a local NML source file.  It owns
-      no tensors, accepts explicit dimensions/strides/stream, translates to
-      upstream FA2/FA3 parameter records, reports launch/configuration errors,
-      and contains no model or dispatch policy.
-- [x] Implement Rust-side typed XLA FFI handlers and process-lifetime
-      registration through the existing PJRT GPU custom-call extension.
-      Registration is idempotent per loaded plugin and handler code outlives
-      every executable that may call it.
-- [x] Lower ordinary dense attention to FA2 on SM80-SM89 and FA3 on
-      SM90, including causal/sliding-window behavior, GQA/MQA, workspace/result
-      aliases, and deterministic rejection of unsupported dtypes, head sizes,
-      layouts, or compute capabilities.
-- [x] Integrate upstream-supported paged prefill/decode variants only where
-      their semantics cover NML's page-table contract; configurations not
-      covered by upstream remain on Triton rather than acquiring a second cache
-      representation or unaudited downstream patch.
-- [x] Compile and link the unchanged numerical/lifecycle contract with the
-      original-upstream FA2 SM80 and FA3 SM90a products, including every dense
-      and supported paged shape selected by the future hardware runs.
-- [ ] `DEFERRED` Execute FA2 on rented SM80+ RunPod hardware and FA3 on rented
-      SM90 RunPod hardware. Remote compilation remains a required build
-      condition and is not recorded as runtime validation.
-
-## 6. Integrated product and failure contracts
-
-- [x] Keep one device-polymorphic numerical contract that compares portable
-      CPU, portable CUDA, Triton CUDA, and FlashAttention CUDA against
-      independent dense host math for every mutually supported retained dtype
-      and geometry with dtype-appropriate tolerances. CPU and SM75 branches
-      execute now; optimized branches compile now and execute under the D-038
-      deferred hardware gate.
-- [x] Prove in-place cache updates and declared output aliases preserve
-      unaffected pages, rollback/replay state, and repeated-execution behavior
-      without cache reallocation. Keep its I32 index geometry eligible for the
-      future Triton run instead of accidentally validating only the portable
-      fallback.
-- [x] Cover malformed TTIR/backend configuration, cross-context values,
-      duplicate registration, unsupported SM/dtype/head geometry, and
-      upstream adapter argument errors with stable failures. Registration
-      extension absence remains a hard platform-construction error; automatic
-      dispatch may use portable semantics, but no public or test-only backend
-      selector is introduced.
-- [ ] `DEFERRED` Exercise real FA2/FA3/Triton kernel-launch failures and verify
-      their propagated diagnostics on compatible RunPod hardware; a launch
-      failure cannot be manufactured honestly on the local unsupported GPU.
-- [x] Keep CPU and portable CUDA product contracts independent of external
-      FlashAttention packaging so unsupported hosts build and use NML without
-      loading a CUDA attention library. Keep the full distribution runtime and
-      the lighter system-driver runtime under separate package contracts.
-
-## Milestone 5 acceptance
-
-- [x] `rustfmt` passes for every changed Rust source.
-- [x] The authenticated `bb` coordinator executes `bb test
-      --config=buildbuddy --config=cpu //:cpu_contracts` with compile actions
-      distributed through BuildBuddy RBE.
-- [x] The authenticated `bb` coordinator executes `bb test
-      --config=buildbuddy --config=cuda //:cuda_remote_contracts` and builds
-      `//:cuda_contract_binaries` plus the exact FlashAttention/Triton product
-      artifacts without running them on a GPU-less executor.
-- [x] `//:cuda_package_contracts` proves the complete distributable runtime
-      contains the pinned driver-compatibility overlay while the local-device
-      runtime contains the same user-space closure and intentionally omits only
-      that overlay.
-- [x] The local SM75 device executes the portable CUDA runtime, linear,
-      nonlinear, ordinary-attention, and paged-attention contracts. Permanent
-      dispatch contracts prove Triton is excluded below SM80, while the local
-      adapter contract proves explicit FA2/FA3 requests fail before launch
-      with the expected capability diagnostics. Every device contract is an
-      exclusive Bazel test so independent XLA clients never contend for the
-      singleton physical GPU.
-- [ ] `DEFERRED` The unchanged attention contract executes Triton and FA2 on
-      rented SM80+ hardware and FA3 on rented SM90 hardware. These remain
-      explicit hardware-validation gates and are not prerequisites for closing
-      the implementation milestone under D-038.
-- [x] `git diff --check`
-- [x] Milestone 5 implementation is complete when every Triton/FlashAttention
-      product artifact and unchanged future hardware contract compiles through
-      the compact public API, and every hardware-independent numerical,
-      ownership, packaging, lifecycle, and failure gate passes. Real SM80/SM90
-      execution remains visibly deferred rather than being represented as
-      completed validation.
-
-## Deferred RunPod execution procedure
-
-Use the same committed revision and the same `attention_cuda_contract_test`
-binary on both machines; do not add a backend selector or a reduced hardware
-test. On an SM80-SM89 machine it exercises FA2 dense/paged attention plus
-Triton 2D and split-K through the F32/small-page cases. On an exact SM90
-machine it exercises FA3 dense/paged attention plus the same Triton paths.
-
-```text
-nvidia-smi --query-gpu=name,compute_cap,driver_version --format=csv,noheader
-bb build --config=buildbuddy --config=cuda //:cuda_contract_binaries
-bb test --config=buildbuddy --config=cuda --cache_test_results=no \
-  //crates/nml:attention_cuda_contract_test
-```
-
-Record the RunPod GPU model, compute capability, driver, invocation link, and
-numerical result before checking the deferred SM80 or SM90 boxes. A successful
-remote build, an SM75 fallback run, or an adapter capability diagnostic does
-not satisfy either execution gate.
-
----
-
-# Milestone 6: CPU/CUDA acceleration substrate closure
-
-This milestone closes the general acceleration substrate selected for NML's
-CPU/CUDA products before new quantization work begins. The pinned ZML snapshot
-is read as a rich capability and design reference; it is neither an exact
-specification nor any kind of Bazel input. An NML operation may be a primitive,
-a checked composite, or a private backend specialization, and it may deliberately
-improve on or replace the reference architecture.
-
-The order below is deliberate. It closes the general graph language before
-building higher-level convolution, sampling, distributed, and MoE families on
-top. The capability audit prevents accidental omissions, but NML's recorded
-requirements decide what is selected. Compilation alone does not satisfy a
-numerical or performance obligation for selected capabilities.
-
-## 1. NML capability selection and reference audit
-
-- [x] Maintain one NML-owned capability map organized by product behavior:
-      elementwise, structural, indexing, reduction/window, linear algebra,
-      convolution/spatial, ordering/random/sampling, attention,
-      recurrent/state-space, MoE, distribution, and runtime ownership. The map
-      begins with NML requirements; it is not generated from ZML's API.
-- [x] Use the pinned ZML source only as a read-only audit reference to catch
-      useful ideas or accidental omissions. Record a reference location only
-      where it explains a design decision; never import ZML targets, files,
-      forks, target names, or a one-for-one operation inventory into NML's
-      Bazel graph or acceptance contract.
-- [x] Record NML's selected semantics, supported dtypes and devices, dispatch,
-      alias/workspace ownership, and verification evidence for each selected
-      family. Improvements and broader NML behavior are first-class outcomes,
-      not parity deviations.
-- [x] Give unselected ideas an explicit NML rationale only when they are
-      relevant enough to risk future confusion: deferred or out of scope. NML
-      does not owe every leaf in the reference tree a corresponding entry.
-
-## 2. Primitive, structural, and linear-algebra closure
-
-- [x] Implement boolean/integer AND, OR, XOR, and NOT as typed StableHLO
-      operations without introducing a public operation enum. Preserve scalar
-      broadcasting, axis tags, partitions, dtype rejection, and CPU/CUDA
-      numerical behavior.
-- [x] Implement the retained bit-manipulation and numerical-classification
-      family: bitcast, shifts, leading-zero/population count, finite checks,
-      sign, `expm1`, rounding modes, and reduce-precision semantics. Classify
-      any dtype-specific reference behavior excluded by D-003 explicitly.
-- [x] Complete structural tensor construction and movement: pad, reverse,
-      stack, repeat/stutter, squeeze/axis insertion, split/chunk, outer product,
-      diagonal/triangular construction, rolling, Cartesian products, and
-      optimization barriers. These must retain NML's tag, partition, and
-      physical-layout invariants rather than becoming shape-only helpers.
-- [x] Add the retained higher linear-algebra operations, including triangular
-      solve and Cholesky, with explicit shape/dtype validation and independent
-      host references on CPU and CUDA.
-
-## 3. General indexing, mutation, and control-flow closure
-
-- [x] Generalize gather to the retained multi-axis/batching/offset forms and
-      implement StableHLO scatter with explicit update-computation semantics,
-      sorted/unique promises, out-of-bounds behavior, and tag/partition
-      preservation.
-- [x] Cover slice, dynamic-slice, dynamic-update, gather, and scatter together
-      across scalar and tensor indices, empty updates, repeated indices,
-      negative/out-of-range indices, donation, and repeated execution.
-- [x] Complete reusable StableHLO control-flow ownership needed by retained
-      composites, including multi-value `while` state and any conditional form
-      not already covered by attention. Loop-carried shapes and shardings must
-      be invariant and validated before MLIR construction.
-
-## 4. Windowed reductions, convolution, pooling, and spatial transforms
-
-- [x] Add a typed reduce-window substrate with window dimensions, strides,
-      base/window dilation, padding, and a constrained set of reducer
-      computations. Use it for cumulative sum and pooling where that matches
-      the reference semantics.
-- [x] Implement retained 1D/2D convolution with explicit batch, feature, and
-      spatial dimension numbers; grouped and depthwise forms; stride,
-      dilation, and padding; and FP16/BF16/FP32 accumulation contracts.
-- [x] Implement max-pooling and the retained nearest/linear/bilinear/cubic
-      resize and upsample families as typed composites or StableHLO operations.
-      Coordinate transformation and edge behavior are part of the contract.
-- [x] Establish correctness and performance cases representative of language,
-      vision, and audio workloads on both CPU and CUDA rather than validating
-      only tiny parser examples. The permanent performance contract covers a
-      nonlinear language projection, 1D audio convolution/pooling, and 2D
-      vision convolution/pooling with phase-separated measurements.
-
-## 5. Ordering, random generation, and sampling
-
-- [x] Implement stable and unstable sort over values and associated indices,
-      with an NML-defined total ordering for NaNs and deterministic
-      tie-breaking rules.
-- [x] Build argsort and top-k on the shared sort substrate, including dynamic
-      and bounded-k validation without introducing backend-specific public
-      result types.
-- [x] Implement explicit-state StableHLO random-bit generation and deterministic
-      state threading, then uniform, normal, and Gumbel distributions. Reusing
-      a consumed state must be difficult through the ordinary execution API.
-- [x] Implement greedy, temperature, top-k, top-p, min-p, and combined dynamic
-      token sampling with permanent distribution, determinism, invalid-option,
-      and repeated-state contracts on CPU and CUDA.
-
-## 6. Shardy execution, collectives, and distributed ownership
-
-- [x] Extend the existing Shardy metadata path to real multi-device placement,
-      host-to-local-shard loading, result assembly, and stable device assignment.
-      Real four-device CPU meshes and the local CUDA device use the same
-      ownership path. GSPMD remains excluded by D-029.
-- [x] Implement all-reduce and the retained collective semantics through
-      Shardy-aware graph construction, including replica groups, reduction
-      dtypes, channel ownership, repeated execution, and hard topology errors.
-- [x] Implement manual-computation regions needed by expert parallelism without
-      exposing raw MLIR regions publicly. Global-to-local shapes and shardings
-      are derived only for the manually owned mesh axis and checked at the Rust
-      boundary, preserving independent automatic data-parallel axes.
-- [x] Run real four-device CPU numerical and failure contracts for tiled
-      contractions, explicit collectives, host shard loading/result assembly,
-      and expert-sharded MoE. A one-device mesh or emitted Shardy attribute is
-      not treated as distributed execution evidence.
-- [ ] `DEFERRED` Run the same multi-device ownership and collective contracts on
-      a rented multi-GPU CUDA host. The developer machine has one SM75 device;
-      neither remote compilation nor repeating a value on that device is
-      multi-GPU evidence.
-
-## 7. MoE routing and grouped expert execution
-
-- [x] Implement an independent portable MoE product path: top-k routing,
-      stable token-to-expert grouping, capacity/padding rules, gate/up
-      projection, activation, down projection, router weighting, and output
-      combination.
-- [x] Implement private Rust/Triton grouped expert GEMMs while retaining routing,
-      stable assignment sorting, and block alignment in shared StableHLO. This
-      deliberately reduces the reference kernel surface: CUDA specializes only
-      the projections, launch configuration remains privately owned, and no
-      ZML-hosted source fork enters the build. The K-tile body is one `scf.for`
-      region rather than a model-width-dependent static expansion.
-- [x] Integrate expert sharding through Shardy manual computation and
-      all-reduce. Local expert IDs, empty experts, repeated token assignments,
-      and nonuniform loads have explicit numerical and ownership contracts.
-- [x] Cover the selected optimized BF16/FP16/FP32 MoE capability honestly. The
-      pinned kernel's advertised but rejected FP8/INT8/INT4 modes do not become
-      NML claims and do not pre-empt the deferred NML quantization recipes. All
-      three ordinary dtypes and SiLU/GELU/ReLU gates build verified TTIR and
-      typed SM80 custom calls; CPU and SM75 execute the portable path.
-- [x] Establish CPU and local-SM75 CUDA correctness plus representative
-      routing/GEMM performance gates with compilation and transfer separated
-      from steady execution.
-- [ ] `DEFERRED` Execute the unchanged grouped Triton kernels and hybrid
-      data/expert Shardy region on rented SM80/SM90 multi-GPU hardware. The
-      local SM75 correctly rejects Triton execution and remains accelerated by
-      the XLA CUDA portable graph.
-
-## 8. Remaining neural, runtime, and operational capabilities
-
-- [x] Account for and implement retained recurrent/state-space composites such
-      as Gated DeltaNet only after their primitive dependencies are complete.
-      Stateful step and full-sequence forms agree numerically; the sequence
-      recurrence lowers privately to one `stablehlo.while`, keeping graph size
-      independent of context length.
-- [x] Audit scaled-dot and other specialized numerical paths against D-003 and
-      the deferred quantization boundary, implementing only the retained
-      non-quantized CPU/CUDA semantics during this milestone. The pinned
-      `scaled_dot` is already the typed convert/multiply/dot composition;
-      microscaled `tt.dot_scaled` belongs to deferred W8A8/NVFP4 work.
-- [x] Close applicable memory-kind, donation, alias, executable-argument,
-      checkpoint-loading, and device-topology gaps discovered by the NML
-      capability map and product contracts. Milestone 2's lifecycle contracts
-      remain the shared implementation and now run beside the expanded graph,
-      distributed, and repeated-execution contracts.
-- [x] Add the phase-separated measurement hooks needed for D-013 performance
-      obligations without adding profiler types to the public facade. The
-      permanent harness reports compilation, upload, first execution,
-      steady-state execution, and download independently; full PJRT/XSpace
-      profiling remains its own product surface rather than a prerequisite for
-      honest wall-clock evidence.
-
-## 9. Integrated substrate and performance gate
-
-- [x] Give every non-hardware-deferred applicable leaf a permanent
-      IR-validation, numerical,
-      ownership/lifecycle, failure, and performance contract proportional to
-      its behavior. CPU remains both reference and performance target; CUDA
-      fallback and specialized paths are measured separately.
-- [x] Run the complete CPU contracts, CUDA remote-build/package contracts,
-      exact CUDA binary build, local SM75 device contracts, and real
-      four-device CPU contracts. The final BuildBuddy invocations are recorded
-      under milestone acceptance below.
-- [ ] `DEFERRED` Run the already-built SM80/SM90 attention/MoE specializations
-      and multi-GPU CUDA contracts on matching rented hardware, as required by
-      the repository's hardware-evidence policy.
-- [x] Re-audit the pinned ZML snapshot and NML product requirements after
-      implementation. Resolve accidental omissions in the selected substrate;
-      unselected reference features remain documented choices, not failures.
-
-## Milestone 6 acceptance
-
-- [x] Every capability selected for the NML CPU/CUDA substrate is implemented
-      and verified on available applicable hardware; unavailable SM80/SM90 and
-      multi-GPU execution obligations remain explicit `DEFERRED` contracts.
-      Reference-only ideas never enter the Bazel graph merely for accounting.
-- [x] The compact `nml` facade remains similar in magnitude to ZML's useful
-      public surface; backend, kernel, ABI, launch, and MLIR ownership types stay
-      private. Milestone 6 adds no root-level public type.
-- [x] `rustfmt` and `git diff --check` pass.
-- [x] BuildBuddy passes the CPU and CUDA-remote suites and builds every exact
-      CUDA contract binary; local/rented devices execute the contracts that own
-      their hardware. Final reviewed evidence: CPU
-      `ccab3987-3c74-493b-b03f-f9daba2d2dc1`, CUDA remote/package
-      `3ecbc0c7-a27a-4a7b-95f0-eb4f49c95a56`, exact CUDA binaries
-      `82e3b91f-74d9-4bf5-9704-7ef024311147`, and local SM75
-      `e50e5aa3-56a9-4fe9-a87f-4c77b5a7fcfe`.
-- [x] Representative CPU and CUDA measurements meet the performance obligations
-      recorded under D-013, with compilation and transfer time reported
-      separately from steady-state execution. On the 2026-07-15 baseline, CPU
-      steady-state language/spatial/MoE execution is 0.237/2.099/0.693 ms and
-      local SM75 CUDA is 0.168/0.213/0.223 ms; compilation, upload, first run,
-      and download remain separately printed by the permanent contract.
-- [x] Milestone 6 implementation closes with no accidental gap in the selected
-      substrate. Exact ZML parity is not required. Explicit rented-hardware
-      executions and W4A16 remain deferred until the owner schedules them.
-
----
-
-# Milestone 7: IREE tokenization and Qwen3-0.6B bf16 generation
-
-This milestone converts the completed acceleration substrate into one real text
-generation product without turning the root facade into a serving framework.
-The official Qwen3 checkpoint, its Hugging Face tokenizer, and the pinned ZML
-implementation are evidence sources. NML owns the Rust model/session design,
-keeps remote model acquisition outside the runtime, and admits no alternate
-Python, Cargo, or ZML dependency graph.
-
-## 1. IREE tokenizer ownership
-
-- [x] Pin IREE commit `4d4e97d00f099a21f38eeff26f82a6d9e3643a11`
-      from the original repository with the tokenizer-only Bazel dependency
-      closure and the Hugging Face compatibility corrections required by the
-      pinned ZML path. Keep patch provenance explicit and do not depend on a
-      ZML repository target or source fork.
-- [x] Add a narrow C bridge that owns IREE tokenizer, encoder, and decoder
-      state, consumes every returned `iree_status_t` exactly once, and exposes
-      only sized byte/token buffers across the Rust ABI.
-- [x] Add one safe Rust `Tokenizer` API with file/byte construction, vocabulary
-      lookup, complete encoding, complete decoding, and incremental token
-      decoding. State reset, partial consumption, resource exhaustion, UTF-8
-      fragments, and destruction must have permanent contracts.
-- [x] Verify a bounded tokenizer fixture and the real pinned Qwen3
-      `tokenizer.json`, including chat special tokens and known token IDs.
-
-## 2. Qwen3 model and checkpoint contract
-
-- [x] Parse and validate the local `config.json`: exact dense Qwen3 architecture,
-      bf16 storage, tied word embeddings, supported activation/RoPE/cache
-      behavior, positive dimensions, GQA divisibility, and checkpoint tensor
-      shapes. Unsupported variants must fail before parameter upload.
-- [x] Declare the checkpoint hierarchy with NML structural derivation and exact
-      Hugging Face names: embedding/final norm, 28 decoder layers, Q/K/V/O
-      projections, Q/K head normalization, two residual norms, and SwiGLU
-      projections. Tied output logits must reuse the embedding buffer rather
-      than allocate or load a duplicate.
-- [x] Generalize the shared linear operation from rank-2 activations to any
-      non-scalar activation whose last axis contracts with `[out, in]`. Preserve
-      tags, partitions, bias broadcasting, validation, StableHLO lowering, and
-      rank-2 behavior; add numerical CPU/CUDA product coverage.
-
-## 3. Compiled prefill and decode architecture
-
-- [x] Implement one backend-neutral Qwen3 block graph with FP32 RMSNorm/RoPE
-      accumulation, Q/K normalization, sequential-half RoPE, causal GQA,
-      SwiGLU, residual connections, final norm, tied vocabulary projection, and
-      greedy token selection.
-- [x] Compile a prompt-length-specific prefill program that consumes token IDs,
-      writes every layer's dense K/V state through declared output aliases, and
-      emits the first token without retaining logits on the host.
-- [x] Compile one static single-token decode program that donates and reinstalls
-      every layer cache, masks unused capacity by absolute key/query position,
-      reuses baked parameters across calls, and emits one token per invocation.
-- [x] Keep model parameters loaded once and shared by both executables. Cache
-      storage, token activations, result ownership, compilation, upload, first
-      execution, steady decode, and download must remain distinguishable.
-
-## 4. Local Qwen3-0.6B product execution
-
-- [x] Add a focused Bazel-built Qwen3 executable accepting a local model
-      directory, prompt, generation bound, and cache capacity. It applies the
-      Qwen3 non-thinking single-user chat template, streams incremental IREE
-      decoding, stops on the configured EOS token, and reports phase timings.
-- [x] Pin official `Qwen/Qwen3-0.6B` revision
-      `c1899de289a04d12100db370d81485cdf75e47ca`; verify the 1,503,300,328-byte
-      bf16 safetensors SHA-256
-      `f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b`
-      and the tokenizer SHA-256
-      `aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4`.
-      The ignored `models/` directory is an input cache, never source.
-- [x] Run real bf16 CPU prefill and multi-token decode on the local machine,
-      capture the prompt/token/output transcript and timings, and verify the
-      generated token sequence against an independent implementation or fixed
-      known-good oracle for the same pinned revision.
-- [x] Review the complete implementation for compact API surface, ownership,
-      failure atomicity, graph size, checkpoint memory, and consistency with
-      the established NML/ZML architecture; remove incidental scaffolding.
-
-The real local contract used the non-thinking prompt for “What is the capital
-of France?”, encoded 19 prompt tokens, and generated token IDs
-`[785, 6722, 315, 9625]`, decoding exactly to `The capital of France`. An
-isolated Hugging Face/PyTorch bf16 run over the same local files produced the
-same prompt bytes, prompt IDs, generated IDs, and text; it was an independent
-oracle only and introduced no repository or runtime dependency. The first
-recorded product run reported 2.668/2.530 seconds for prefill/decode
-compilation, 7.928 seconds for parameter upload, 1.925 seconds for prefill,
-0.376 seconds for the first decode step, and 0.807 seconds for the remaining
-decode steps. The permanent hash-plus-generation contract passed as BuildBuddy
-invocation `f151180c-d7b7-4f4e-9fbf-47d4af2e68c7`.
-
-## Milestone 7 acceptance
-
-- [x] The IREE tokenizer and Qwen3 libraries have permanent unit, integration,
-      ABI, checkpoint, numerical, and lifecycle contracts; no probe, smoke,
-      prototype, or Python runtime dependency is part of the product path.
-- [x] The exact official Qwen3-0.6B bf16 checkpoint generates coherent text on
-      the local CPU through tokenizer -> checkpoint -> StableHLO -> XLA -> PJRT
-      -> persistent KV decode -> tokenizer, with evidence for more than one
-      generated token.
-- [x] Existing CPU contracts pass, BuildBuddy passes the CPU and CUDA-remote
-      gates, exact CUDA binaries build, `rustfmt` passes, and `git diff --check`
-      is clean.
-- [x] The reviewed milestone is committed and pushed only after all applicable
-      gates above are true.
-
-BuildBuddy acceptance evidence: CPU contracts
-`e4664f45-64c4-4d31-a948-a37d5189626c`; exact CUDA binaries, including the
-Qwen3 product, `6dc22d79-6f73-4e55-b0ab-ceac9cebbddc`; and GPU-independent
-CUDA/package contracts `bc42e144-b97b-4a23-8baf-34adf87ef556`.
-
----
-
-# Milestone 8: Qwen serving engine
-
-This milestone turns the existing Qwen3 execution product into a long-running,
-Qwen-only serving system. It does not move scheduler, HTTP, tool protocol, or
-Prometheus types into the `nml` facade. NML remains the acceleration substrate;
-`products/serve` owns request policy and composes the substrate into a server.
-
-The execution path is:
-
-```text
-HTTP chat request and stream
-  -> validation, Qwen template, and tokenization
-  -> bounded admission queue
-  -> continuous-batching scheduler on one engine owner
-  -> global physical K/V page arena and prefix index
-  -> bucketed prefill or fixed-capacity batched decode executable
-  -> Shardy/XLA/PJRT CPU or CUDA execution
-  -> sampled tokens, tool-call parser, stream, and Prometheus observations
-```
-
-The Tokio runtime owns sockets, timers, cancellation, bounded channels, and
-response streams. It does not own or concurrently enter PJRT. A dedicated
-engine thread owns `Platform`, parameters, executables, scheduler state, and
-the cache arena. This preserves NML's existing device lifetime rules and keeps
-blocking compilation, transfer, and execution work off Tokio workers.
-
-Every checkbox represents permanent product code and its durable contract. An
-HTTP endpoint that calls the existing batch-one `generate` function once per
-request is not continuous batching. A page-table type without global page
-ownership is not paged serving. Emitted Shardy is not tensor-parallel execution.
-
-## 1. Product boundary and async foundation
-
-- [x] Rename `products/qwen3` to `products/serve`, rename the Bazel library and
-      executable to `nml_serve` and `serve`, and place the existing Qwen3 engine
-      under `nml_serve::qwen3`. Preserve the real Qwen3 BF16 oracle and CUDA
-      product-binary ownership through the new labels.
-- [x] Pin the initial async/serving dependency graph directly through Bzlmod:
-      Tokio 1.52.3, Tokio Util 0.7.18, Axum 0.8.9, Tower 0.5.3,
-      `prometheus-client` 0.25.0, `tracing` 0.1.44, and
-      `tracing-subscriber` 0.3.23. Cargo remains outside the product build and
-      dependencies are attached to Bazel targets only when their owning module
-      lands.
-- [ ] Split the current one-shot generation function into a reusable Qwen model
-      engine and a thin compatibility generation path. Engine construction
-      validates the model, loads parameters once, compiles the configured
-      executable set once, and exposes no network or Tokio type.
-- [ ] Add one Tokio process runtime for HTTP, signals, timers, response streams,
-      and bounded channels. Start one named engine thread that constructs and
-      exclusively owns the NML platform and all PJRT-dependent state.
-- [ ] Define bounded command, completion, token-stream, cancellation, and
-      shutdown messages. A saturated admission channel must reject or await
-      according to explicit policy; it must never grow an unbounded request or
-      token queue.
-- [ ] Make startup and shutdown transactional. Failure after partial model,
-      executable, page, or listener initialization releases every resource;
-      graceful shutdown stops admission, cancels or drains requests according
-      to one deadline, reclaims pages, joins the engine owner, and only then
-      destroys the platform.
-- [ ] Keep CPU and CUDA behind the same serving engine contract. Backend choice,
-      model path, bind address, capacity limits, page geometry, batch limits,
-      compilation buckets, tensor-parallel topology, and shutdown deadline are
-      immutable validated startup configuration.
-
-## 2. Qwen request and protocol contract
-
-- [ ] Implement a deliberately bounded OpenAI-compatible
-      `/v1/chat/completions` subset for Qwen, including non-streaming responses
-      and SSE streaming. Reject unsupported request fields explicitly instead
-      of accepting and ignoring them.
-- [ ] Represent request IDs, ordered chat messages, generation limit, stop
-      conditions, temperature/top-k/top-p parameters, deterministic seed, tool
-      declarations, tool choice, and stream preference as validated product
-      types. Tensor/compiler types do not enter the wire schema.
-- [ ] Enforce configured limits before admission: encoded prompt length, maximum
-      generated tokens, message/tool/schema bytes, number of tools, queue
-      capacity, total resident pages, and per-request deadline.
-- [ ] Return structured error bodies for validation, overload, cancellation,
-      timeout, unsupported Qwen configuration, capacity exhaustion, compilation,
-      and execution failures. Internal paths, device pointers, and checkpoint
-      metadata must not leak into protocol responses.
-- [ ] Stream complete UTF-8 token fragments in order, finish each stream exactly
-      once, and propagate client disconnect into scheduler cancellation without
-      blocking the Axum connection task on engine cleanup.
-- [ ] Add `/health/live`, `/health/ready`, and `/v1/models`. Readiness becomes
-      true only after model validation, parameter loading, required compilation,
-      and cache-arena allocation complete successfully.
-
-## 3. Reusable and batch-shaped Qwen execution
-
-- [ ] Remove batch-one assumptions from Qwen token, position, attention, cache,
-      sampling, and output shapes. A configured maximum slot count is static in
-      each executable while active slots, token positions, sequence lengths,
-      and sampling state are runtime tensors.
-- [ ] Replace request-specific compilation with a finite startup-declared set of
-      prefill chunk/length buckets plus one fixed-capacity decode executable.
-      The request path may select or reuse a bucket but may not compile an
-      unbounded new graph for every prompt length.
-- [ ] Preserve one shared parameter allocation across every prefill/decode
-      executable. Compilation remains ordered before the large persistent
-      checkpoint upload unless measured memory evidence justifies a change.
-- [ ] Add active-slot masks and deterministic inactive-slot semantics so a
-      partially occupied decode batch neither reads unassigned pages nor
-      mutates inactive state. Slot reuse must clear all logical metadata before
-      a new request observes it.
-- [ ] Move greedy and stochastic sampling into the batched graph with one
-      explicit RNG state and generation policy per active request. Fixed seeds
-      must reproduce results independently of which other requests share a
-      scheduler tick.
-- [ ] Return token IDs, finish reasons, and updated RNG/cache state without
-      downloading logits. The scheduler must not retain a vocabulary-sized host
-      tensor per request.
-- [ ] Preserve the pinned Qwen3-0.6B single-request CPU and CUDA oracle through
-      the new engine, then compare mixed-batch results against independent
-      sequential executions for every supported sampling mode.
-
-## 4. Global paged K/V arena
-
-- [ ] Replace per-request dense Qwen caches with one server-owned physical page
-      arena per model/topology. Every layer uses identical logical ownership;
-      request state contains page leases and lengths rather than owning separate
-      full-capacity K/V allocations.
-- [ ] Define checked page geometry and capacity accounting from dtype, layer
-      count, KV heads, head width, page size, physical pages, sharding, and
-      device memory budget. Startup must report the exact persistent parameter,
-      cache, workspace, and reserved memory plan before accepting requests.
-- [ ] Implement page leases with generation-stamped identities so stale request
-      handles cannot free or remap a page that has been returned and reused.
-      Allocation, rollback, cancellation, normal completion, engine error, and
-      shutdown each have one idempotent reclamation path.
-- [ ] Replace per-page full-table uploads with one batched scheduler-tick
-      metadata update for active page tables, lengths, positions, and slot
-      masks. Metadata transfer volume must scale with configured active slots,
-      not with the number of individual page-allocation calls.
-- [ ] Build Qwen prefill and decode through NML's paged-cache update and paged
-      attention semantics. CPU uses portable blockwise attention; compatible
-      CUDA devices dispatch to FA/Triton while SM75 retains the same portable
-      graph meaning.
-- [ ] Support prompt chunks and generated tokens crossing page boundaries,
-      partially occupied final pages, empty context, maximum capacity, slot
-      migration, rollback, and replay without constructing a dense persistent
-      cache or complete attention matrix.
-- [ ] Add allocator invariants and failure-injection contracts proving no double
-      allocation, use-after-free, cross-request visibility, leaked page, or
-      unaccounted K/V allocation after arbitrary admission/cancellation/error
-      sequences.
-
-## 5. Continuous batching scheduler
-
-- [ ] Model each request as an explicit state machine: admitted, waiting for
-      pages, prefill-ready, prefilling, decode-ready, decoding, streaming,
-      finished, cancelled, or failed. Only the engine owner mutates scheduler
-      and page state.
-- [ ] Implement bounded admission using token, page, slot, and queue budgets.
-      Reject work that can never fit; queue temporarily blocked work fairly;
-      reserve enough capacity to make admitted requests progress.
-- [ ] Schedule chunked/bucketed prefill and decode under explicit per-tick token
-      budgets. Long prompts must not indefinitely starve decode or short-prefill
-      requests, and decode traffic must not prevent bounded prefill progress.
-- [ ] Assemble multiple independent active requests into one physical decode
-      invocation and refill vacated slots between ticks without recompilation.
-      A permanent contract must observe at least two requests in the same XLA
-      call; concurrent one-request calls do not satisfy this task.
-- [ ] Make cancellation race-safe at every boundary: queued, page-waiting,
-      in-flight prefill, in-flight decode, token-ready, and stream-disconnected.
-      PJRT calls that cannot be interrupted finish privately, after which their
-      outputs are discarded and all leases reclaimed.
-- [ ] Isolate request-local validation, deadline, stream, and sampling failures.
-      A device-wide execution failure may fail the current physical batch but
-      must leave scheduler/page ownership internally consistent and readiness
-      transition according to declared recovery policy.
-- [ ] Measure queue delay, time to first token, inter-token latency, tokens per
-      second, physical batch occupancy, prefill/decode mix, and page pressure
-      separately. Under concurrent requests, continuous decode must demonstrate
-      a throughput advantage over sequential one-request execution on the same
-      backend and model.
-
-## 6. Prefix caching
-
-- [ ] Define a prefix identity over exact token IDs plus model/checkpoint
-      revision, tokenizer and chat-template revision, RoPE/scaling configuration,
-      dtype/quantization recipe, adapter identity, page geometry, and sharding
-      topology. Text hashes alone are not cache keys.
-- [ ] Index only completely materialized immutable page-aligned prefixes.
-      Partial trailing pages remain request-owned; extension from a shared
-      prefix uses copy-on-write so one request can never mutate another's K/V.
-- [ ] Reference-count shared page leases across live requests and cache entries.
-      Request completion drops its references without evicting a reusable
-      prefix; eviction removes index ownership and frees pages only when the last
-      live reference is gone.
-- [ ] Implement bounded LRU or equivalent eviction under the same page budget as
-      request admission. The scheduler may evict unreferenced cached prefixes
-      before rejecting a request, but may not evict pages held by active work.
-- [ ] Reuse the longest valid cached prefix, prefill only the uncached suffix,
-      and preserve absolute positions and RoPE semantics. Exact output must
-      match a cache-disabled execution for full hits, partial hits, collisions,
-      extensions, cancellations, and concurrent consumers.
-- [ ] Report hit/miss/partial-hit counts, reused and computed prompt tokens,
-      resident cached pages, eviction count, and prefix lookup time. A permanent
-      performance contract must show reduced prefill execution for a shared
-      prompt rather than counting a metadata lookup as a hit.
-
-## 7. Qwen tensor parallel serving
-
-- [ ] Record one Qwen tensor-parallel partition plan using existing semantic
-      axes: vocabulary/embedding, Q/K/V heads and projections, attention output,
-      gated/up projections, and down projection. Replication and reductions must
-      be explicit where algebra requires them.
-- [ ] Annotate Qwen checkpoint declarations and intermediate shapes so Shardy
-      drives parameter loading, local shard shapes, collectives, and executable
-      placement. The server exposes one logical model and never manually copies
-      a full parameter set to every device unless the plan marks it replicated.
-- [ ] Compile the same paged prefill/decode engine for single-device and tensor-
-      parallel topologies. Page tables and request scheduling remain logical
-      server state; K/V page placement follows the selected model/head sharding.
-- [ ] Execute a four-device CPU tensor-parallel Qwen contract and compare logits,
-      generated IDs, cache contents, and prefix reuse with the single-device
-      oracle. This is the topology-independent correctness gate.
-- [ ] Execute the unchanged contract on rented homogeneous multi-GPU CUDA
-      hardware, including concurrent batches, collectives, cancellation, prefix
-      sharing, and memory accounting. Remote compilation or multiple logical
-      devices on one GPU is not acceptance evidence.
-- [ ] Produce hard startup errors for incompatible device counts, heterogeneous
-      compute capabilities, indivisible model dimensions, unsupported sharding,
-      or insufficient per-device memory before admitting traffic.
-
-## 8. Qwen tool calling
-
-- [ ] Replace the current hard-coded single-user prompt with a versioned Qwen
-      chat-template implementation covering system, user, assistant, and tool
-      result messages. Preserve the existing non-thinking plain-chat oracle.
-- [ ] Validate and serialize tool names, descriptions, JSON schemas, and tool
-      choice into the exact selected Qwen template contract with strict byte,
-      depth, property, and tool-count bounds.
-- [ ] Implement an incremental parser that distinguishes assistant text, tool
-      calls, arguments, finish reason, and malformed/incomplete output across
-      arbitrary tokenizer fragment boundaries. Streaming must never expose a
-      partially parsed structure as a completed call.
-- [ ] Return tool calls to the client; the serving product does not execute user
-      tools. Accept subsequent tool-result messages and support multiple
-      assistant/tool rounds while preserving prefix-cache correctness.
-- [ ] Add fixed Qwen tool-call transcripts for no-tool, forced-tool, automatic
-      tool selection, parallel/multiple calls if supported by the selected
-      template, Unicode arguments, malformed JSON, cancellation, and streamed
-      versus non-streamed equivalence.
-
-## 9. Prometheus metrics and structured tracing
-
-- [ ] Own one `prometheus-client` registry and expose `/metrics` in Prometheus
-      text format without routing through the engine owner. Metric collection
-      may read atomics or bounded snapshots but must not block a PJRT tick.
-- [ ] Export request totals by bounded outcome, active/queued requests, prompt
-      and generated tokens, prefill/decode batch size and occupancy, queue/TTFT/
-      inter-token/request latency histograms, page use/free state, prefix hits
-      and evictions, compilation/load time, execution failures, and cancellation.
-- [ ] Prohibit request IDs, prompt contents, tool names, arbitrary model paths,
-      and other unbounded values from metric labels. Model/backend/topology
-      labels come only from startup-bounded enumerations.
-- [ ] Add structured `tracing` spans that connect HTTP request, admission,
-      scheduler transitions, physical batches, page leases, XLA executions,
-      output streaming, and completion while redacting prompt and tool data by
-      default.
-- [ ] Verify exact metric deltas and terminal gauges after successful, failed,
-      overloaded, cancelled, prefix-hit, and tool-call requests. Encoding
-      `/metrics` concurrently with execution must neither deadlock nor alter
-      generated output.
-
-## 10. Speculative decoding and DFlash
-
-- [ ] Define a scheduler-level speculative interface over draft proposal,
-      target block verification, accepted prefix length, replacement token,
-      sampling/RNG state, and atomic KV commit/rollback. It remains independent
-      of HTTP and a particular draft algorithm.
-- [ ] Implement a conventional Qwen draft/target vertical first using a smaller
-      compatible Qwen checkpoint. Run draft and target as separately owned
-      executables with explicit tokenizer/vocabulary compatibility and no
-      duplicated target parameter buffers.
-- [ ] Verify multiple proposed tokens in one target graph, commit accepted cache
-      state, and roll back rejected suffixes using the existing logical cache
-      semantics. Greedy output must exactly match ordinary target decoding;
-      stochastic output must preserve the declared target distribution and RNG
-      progression.
-- [ ] Record the exact public DFlash algorithm, Qwen-compatible model artifacts,
-      checkpoint metadata, and numerical contract before implementation. DFlash
-      becomes another draft producer behind the same verification/rollback
-      boundary rather than a second serving scheduler.
-- [ ] Integrate Qwen DFlash requests with continuous batching, page admission,
-      prefix sharing, cancellation, tensor parallelism, streaming, and metrics.
-      Draft work receives an explicit budget so low acceptance cannot starve
-      ordinary decode progress.
-- [ ] Measure proposal length, accepted tokens, acceptance ratio, target calls
-      avoided, draft cost, end-to-end latency, and memory overhead. Acceptance
-      requires fewer target decode invocations and improved measured latency or
-      throughput on a declared Qwen workload, not merely identical text.
-
-## 11. Serving resilience and product acceptance
-
-- [ ] Add deterministic scheduler/model tests with controlled Tokio time plus
-      real threaded integration contracts. Tests must cover admission races,
-      disconnects, deadline expiry, channel closure, engine failure, listener
-      failure, signal shutdown, and repeated startup/destruction.
-- [ ] Add a real loopback HTTP contract that starts `serve`, waits for readiness,
-      submits concurrent streaming and non-streaming Qwen requests, observes
-      physical batching and page reuse, cancels traffic, checks metrics, and
-      shuts down with zero active requests and zero leased pages.
-- [ ] Compare every supported server path with direct Qwen execution: ordinary
-      paged serving, prefix hit/miss, tensor-parallel execution, tools, and
-      speculation must preserve their declared numerical/token semantics.
-- [ ] Run CPU contracts through BuildBuddy, build all CUDA server/device
-      binaries remotely, run the SM75 portable serving path locally, and run
-      SM80/SM90 attention plus multi-GPU tensor-parallel contracts on rented
-      hardware. Each venue records only evidence it actually executes.
-- [ ] Establish optimized-build baselines for startup, resident parameter/cache
-      memory, TTFT, inter-token latency, prompt/decode throughput, continuous-
-      batch scaling, prefix reuse, and speculation. Compilation, upload, first
-      execution, and steady execution remain separate measurements.
-- [ ] Review the complete serving product for bounded memory, single-owner PJRT
-      access, failure atomicity, cancellation safety, API compactness, protocol
-      correctness, observability cardinality, and absence of temporary targets
-      before marking the milestone complete.
-
-## Milestone 8 acceptance
-
-- [ ] One long-running `//products/serve:serve` process serves multiple
-      concurrent Qwen requests through real continuous batching and a global
-      paged KV arena on CPU and CUDA.
-- [ ] Prefix caching, Qwen tensor parallelism, tool calling, Prometheus metrics,
-      and Qwen speculative decoding satisfy their numerical, ownership,
-      failure, memory, and performance contracts above.
-- [ ] No server concern expands the compact `nml` facade unless a reusable
-      acceleration primitive is independently justified and reviewed.
-- [ ] All applicable BuildBuddy, local GPU, rented GPU, formatting, and
-      repository checks pass; hardware-deferred evidence is never substituted
-      with compilation.
-
----
-
-# Capability ledger
-
-This high-level ledger remains at the end of this file while detailed work is
-added to the milestone sections above. It tracks usable product capabilities,
-not individual IR operations or implementation artifacts. Check an item only
-when its applicable CPU/CUDA numerical, ownership, failure, and performance
-contracts are permanent and passing. Parser support, emitted StableHLO,
-successful compilation, registered symbols, or an unexecuted kernel do not by
-themselves complete an item.
-
-- [x] ReLU, GELU, SiLU, sigmoid, and other activations.
-- [x] Multiplication, subtraction, division, and the selected elementwise
-      operation families. Core arithmetic, ordering, absolute value, power,
-      remainder, clamp, floor, ceil, and boolean/integer AND/OR/XOR/NOT are
-      complete. Shifts, bitcasts, leading-zero/population counts, finite/sign
-      classification, `expm1`, rounding, and reduced precision are also
-      complete.
-- [x] Reshape and transpose in compiled graphs.
-- [x] Reductions, normalization, and softmax, including sum/min/max/mean,
-      log-sum-exp, argmax, RMSNorm, LayerNorm, and L2 normalization.
-- [x] Gather/scatter and embedding lookup, including batched ND forms,
-      out-of-bounds behavior, repeated indices, and donation.
-- [x] Convolution, pooling, and nearest/linear/bilinear/cubic resizing.
-- [x] Explicit-state uniform, normal, and Gumbel random-number generation.
-- [x] Stable/unstable sorting, argsort, top-k, greedy and stochastic sampling.
-- [x] Portable ordinary and blockwise paged attention, RoPE, and masks.
-- [x] Persistent KV-cache allocation, page-table updates, paging, truncation,
-      rollback, and replay without a persistent dense KV copy.
-- [x] Hugging Face tokenizer-backed dense Qwen3 bf16 generation with compiled
-      prefill, persistent-cache decode, tied embeddings, and greedy sampling.
-- [ ] Qwen continuous batching with bounded admission, chunked/bucketed
-      prefill, one physical decode batch, cancellation, and streaming.
-- [ ] Server-owned paged KV arena and prefix caching with reference-counted
-      shared pages, copy-on-write extension, eviction, and memory accounting.
-- [ ] Qwen tool calling and Prometheus serving metrics.
-- [ ] Qwen speculative decoding, including DFlash after its exact public Qwen
-      artifact and algorithm contract is recorded.
-- [ ] CUDA FlashAttention and Triton kernels.
-- [ ] MoE routing and grouped matrix multiplication. Portable CPU/SM75 routing
-      and expert execution, expert-sharded four-device CPU execution, and
-      verified SM80+ grouped TTIR are complete; grouped-kernel execution remains
-      `DEFERRED` to rented SM80/SM90 hardware.
-- [ ] Quantization: W4A16, W8A8, and NVFP4. `DEFERRED` by D-028 until the
-      CPU/CUDA substrate-coverage gate passes and the owner explicitly
-      schedules it.
-- [ ] Training or explicitly authored analytic backward graphs.
-- [ ] Real distributed sharding and collectives. Four-device CPU placement,
-      tiled contractions, explicit collectives, and expert sharding are real
-      numerical contracts; multi-GPU CUDA execution remains `DEFERRED`.
+It was built from source commit
+`bd62d67d5d1197fda0b18097d5c3ed70eadeaeeb` with a recorded dirty source bit.
+That identity matters: later source changes require a new digest and new
+evidence.
+
+### Executed contract set
+
+The unchanged six-contract image ran on an RTX A6000 (SM86) and an H100 80GB
+HBM3 (SM90). Every contract passed, and both Pods were terminated with cleanup
+confirmed.
+
+| Permanent contract | SM86 | SM90 | What the success establishes |
+| --- | --- | --- | --- |
+| CUDA runtime | passed | passed | Packaged CUDA/PJRT runtime loads and owns the real device. |
+| Checkpoint linear | passed | passed | Real SafeTensors parameters upload once and execute repeatedly. |
+| Attention | passed | passed | Portable semantics plus the capability-selected Flash/Triton paths launch and match an independent dense reference. |
+| Neural operations | passed | passed | The general operation set and grouped Triton MoE execute numerically in F32, F16, and BF16. |
+| Execution performance | passed | passed | Linear+SiLU, convolution/pooling, and grouped Triton MoE pass phase-separated regression ceilings. |
+| Flash capability policy | passed | passed | Device discovery works and the Flash implementation for the *other* architecture rejects before dereferencing dummy launch inputs. This is policy evidence, not supported-kernel execution evidence. |
+
+Run records:
+
+- [x] SM86: lease `f76a42f3-27b3-4ffa-8eb7-ac27b66bff8f`, driver
+  `570.195.03`, all six contracts in 37.576 seconds.
+- [x] SM90: lease `2a37f867-fb63-4c15-a3a6-fc8ba83b5f28`, driver
+  `580.126.09`, all six contracts in 35.371 seconds.
+
+### Which optimized paths actually ran
+
+The attention contract uses ordinary public attention shapes. The detected
+compute capability drives the private lowering; there is no test-only backend
+selector.
+
+| Path | Real execution evidence |
+| --- | --- |
+| FA2 ordinary attention | [x] SM86 launched F16 causal/sliding-window and BF16 noncausal/custom-scale attention and matched the host reference. |
+| FA2 paged attention | [x] SM86 launched F16 and BF16, page size 256, prefill and single-token decode, and matched the host reference. |
+| FA3 ordinary attention | [x] SM90 launched the same F16/BF16 ordinary attention cases and matched the host reference. |
+| FA3 paged attention | [x] SM90 launched F16 and BF16 page sizes 16 and 256 for prefill and single-token decode and matched the host reference. |
+| Triton paged 2D | [x] SM86 used page-16 F16/BF16/F32 prefill; SM90 used the F32 case. Outputs matched the same host reference. |
+| Triton paged split-K | [x] SM86 used page-16 F16/BF16/F32 single-token decode; SM90 used the F32 case. Outputs matched the same host reference. |
+| Triton grouped MoE | [x] SM86 and SM90 launched SwiGLU, GELU, and ReLU expert paths in F32, F16, and BF16 and matched the portable host calculation. |
+
+The SM86 run is the acceptance evidence for the FA2 dispatch class
+(SM80-SM89). The SM90 run is the acceptance evidence for FA3. NML does not
+require one rented card for every marketing SKU or minor compute capability
+when the code selects the same implementation path.
+
+### What has not run on suitable rented CUDA hardware
+
+This is the complete current hardware debt; it must not be inflated into a
+claim that FA2, FA3, or Triton are compile-only.
+
+- [ ] Dedicated attention performance workloads have not measured FA2, FA3,
+  Triton 2D, or Triton split-K latency/throughput across representative prefill,
+  decode, sequence-length, and page geometries. Their numerical paths are real;
+  their tuning quality is not yet established.
+- [ ] No homogeneous multi-GPU CUDA run has exercised Shardy partitioning,
+  cross-device collectives, tensor parallelism, or expert parallelism. The
+  current rented evidence is single-device. A single-device all-reduce did run,
+  but it is an identity operation and is not distributed evidence.
+- [ ] The Qwen production image and real checkpoint have not run on the rented
+  FA2/FA3 hosts. Qwen has CPU and local SM75 end-to-end evidence; the rented
+  image was the substrate contract image, not the serving image.
+- [ ] Linux AArch64 CUDA packaging and execution have not run on a native
+  DGX-Spark-class host.
+- [ ] A failure originating *after launch* inside a supported FA2, FA3, Triton
+  attention, or Triton MoE kernel has not occurred in a permanent product
+  contract, so end-to-end supported-kernel failure propagation has not been
+  observed on those devices. Incompatible FA2/FA3 capability rejection did run.
+  We will not add an artificial crashing kernel merely to check this box.
+- [ ] The corrected `f128...371fe` image has not also been run on the local SM75
+  host. Earlier local SM75 contracts and the Qwen production image ran
+  successfully, but they are different artifact evidence.
+
+GPT-OSS, continuous batching, prefix caching, tool calling, and quantization
+have not run because those product capabilities are not implemented yet. They
+are implementation work below, not missing validation of an existing kernel.
+
+## Current milestone: deployment closure with Qwen retained
+
+This milestone ends when one immutable Linux CUDA artifact can be built by
+BuildBuddy, published once, and executed unchanged through the same permanent
+interface on local and RunPod GPUs. Qwen remains the regression model while
+the execution envelope is completed.
+
+### OCI construction and publication
+
+- [x] Use `rules_img` as the only OCI construction graph over digest-pinned
+  distroless bases. Do not add `rules_oci` as a parallel graph.
+- [x] Build separate production-serving and device-contract images over the
+  same CUDA/PJRT runtime contract. Model weights stay outside both images.
+- [x] Build and structure-test the native Linux x86-64 images through
+  BuildBuddy.
+- [x] Publish public images to `ghcr.io/narendrapatwardhan/nml` through the OCI
+  Registry API. GitHub CLI is not part of publication or administration.
+- [ ] Make exact digest references mandatory in local and RunPod acceptance
+  commands. Mutable tags may exist only for discovery and must resolve to the
+  recorded digest before execution.
+- [ ] Add immutable source-revision labels during trusted publication. Select a
+  non-root runtime user only after local NVIDIA and RunPod device access prove
+  the least privilege that works in both venues.
+- [ ] Prove a clean local machine can pull and execute the BuildBuddy-built
+  image without downloading the LLVM/XLA/CUDA build cache.
+- [ ] Extend the BuildBuddy workflow to build CPU contracts, GPU-independent
+  CUDA contracts, exact CUDA binaries, image structure contracts, and OCI
+  images in their truthful venues. Hosted workers never execute device tests.
+- [ ] `DEFERRED`: build the Linux AArch64 image on a native Linux AArch64 CUDA
+  venue and combine the native manifests into one index.
+
+### Local and RunPod execution
+
+- [x] The in-image Rust runner owns a fixed manifest of permanent contracts,
+  serial execution, deadlines, bounded logs, structured hardware identity,
+  immutable results, and child cleanup. It never invokes Bazel or a shell.
+- [x] The Bazel-built RunPod controller uses GraphQL for Pod placement/status,
+  ports, and termination; REST is limited to optional template management.
+- [x] Lease state is atomic and external to the repository. Success, failure,
+  timeout, interruption, and controller exceptions all enter the same
+  termination path; an unconfirmed termination remains a visible possibly
+  billable orphan.
+- [x] Execute one digest unchanged on real FA2 and FA3 dispatch classes and
+  retain structured terminal results: the SM86 and SM90 runs above.
+- [ ] Add one repository-owned local executor that accepts an exact digest,
+  uses Docker or Podman with the NVIDIA runtime's `--gpus all` contract, mounts
+  only declared inputs/results, and removes the container after completion.
+- [ ] Run the corrected contract digest through that local executor on SM75 and
+  compare the structured results with direct Bazel device execution.
+- [ ] Finish runner lifecycle evidence when real permanent events are available:
+  contract failure, deadline, client disconnect, and shutdown during execution.
+  Unsupported selection, malformed request, repeated-run rejection, immutable
+  result retrieval, and normal cleanup already pass. Do not create disposable
+  probes or deliberately crashing GPU binaries.
+- [ ] Require named RunPod secret references before remote model download or
+  private artifact access. Raw credentials never enter Pod configuration,
+  Bazel inputs, logs, or lease records.
+- [ ] Add an optional persistent model-cache/network-volume identity only when
+  remote model execution needs it. Every mount must be revalidated against the
+  exact model manifest; filenames are not artifact identity.
+
+## Next milestone: GPT-OSS 20B BF16
+
+Qwen remains a permanent regression model. GPT-OSS becomes the default only
+after one exact BF16 artifact is selected and the complete model passes.
+
+### Select and pin one artifact
+
+- [x] Audit trustworthy BF16 distributions by immutable revision, actual
+  SafeTensors inventory, tensor shapes/dtypes, tokenizer/Harmony files,
+  conversion provenance, and reproducibility.
+- [x] Record the audit result: `unsloth/gpt-oss-20b-BF16` revision
+  `cc89b3e7fd423253264883a80a4fa5abc619649f` is structurally viable and contains
+  41,829,514,368 bytes of BF16 tensors, but Unsloth states that it was
+  up-converted from the official MXFP4 payload. FriendliAI and CrusoeAI mirror
+  the same shards. `lmsys/gpt-oss-20b-bf16` is rejected because most parameters
+  are actually F8_E5M2. The z-lab DFlash repository is a Qwen draft model, not a
+  GPT-OSS base checkpoint.
+- [ ] Make the owner decision whether the documented Unsloth up-conversion is
+  acceptable as the BF16 product artifact. Do not describe it as original
+  pre-quantization BF16 weights.
+- [ ] Pin the selected revision and a checked manifest containing every required
+  file, size, hash, role, tensor name, shape, and dtype. Mismatch must fail
+  before graph construction or device allocation.
+
+### Implement the checkpoint and model
+
+- [ ] Parse and validate the exact configuration: architecture, layer/expert
+  counts, head geometry, attention schedule, context/RoPE parameters,
+  normalization, activation, tokenizer identity, and output-weight policy.
+- [ ] Declare exact embedding, attention, router, expert, normalization,
+  attention-sink, and output tensors. Do not guess aliases, alternate names, or
+  transposes.
+- [ ] Preserve BF16 in host storage, device storage, and ordinary contractions;
+  report checkpoint, persistent device, executable, cache, and workspace memory
+  before upload.
+- [ ] Build the private GPT-OSS block graph from existing RMSNorm, GQA,
+  RoPE/YaRN, dense/sliding attention, top-k MoE, grouped expert, residual, and
+  Shardy primitives.
+- [ ] Add learned attention-sink denominator bias to portable ordinary and
+  paged online softmax. Optimized backends may be used only where their ABI can
+  preserve the exact semantics; otherwise dispatch must choose the portable
+  path truthfully.
+- [ ] Implement the exact clamped/residual SwiGLU composite and alternating
+  full-attention/128-token-window schedule, including boundary and long-position
+  contracts.
+- [ ] Validate `o200k_harmony` tokenization through the existing IREE tokenizer
+  boundary and implement versioned Harmony rendering/incremental parsing for
+  roles, analysis/final channels, tool calls, and tool results.
+- [ ] Compare selected block/expert outputs with an independent trustworthy
+  implementation using declared tolerances.
+- [ ] Execute the complete pinned GPT-OSS 20B BF16 artifact on capable rented
+  CUDA hardware. Compare fixed prompt tokens, intermediate values, channel
+  structure, and greedy continuation with the independent oracle. A reduced
+  model or isolated block does not satisfy end-to-end acceptance.
+
+## Following milestone: serving product
+
+Serving stays above the compact `nml` facade. One dedicated engine owner holds
+PJRT state; Tokio owns network and orchestration, never opportunistic PJRT work.
+
+### Engine and protocol
+
+- [x] Establish a private model-neutral engine boundary and retain Qwen through
+  it. The current compatibility path truthfully supports batch capacity one.
+- [ ] Add one Tokio runtime with bounded command/completion/token channels,
+  cancellation tokens, deadlines, signals, and transactional startup/shutdown.
+- [ ] Add bounded Axum/Tower chat-completions and Responses-style HTTP routes,
+  streaming, liveness, readiness, and model identity endpoints.
+- [ ] Enforce prompt/output/message/tool/schema/queue/concurrency limits before
+  unbounded allocation or device work.
+- [ ] Implement Harmony validation, rendering, incremental UTF-8/channel/tool
+  parsing, and deterministic malformed-output handling. The server returns tool
+  calls; it does not execute user tools.
+
+### Batching and cache ownership
+
+- [ ] Remove batch-one assumptions from model inputs, positions, cache state,
+  logits selection, sampling, and result demultiplexing.
+- [ ] Compile a finite startup-declared family of prefill buckets and
+  fixed-capacity decode executables while sharing one parameter allocation.
+- [ ] Create one server-owned physical K/V page arena with checked accounting,
+  generation-stamped leases, and one idempotent reclamation path.
+- [ ] Execute at least two independent requests in one physical decode call and
+  compare output, RNG, and cache state with independent sequential execution.
+- [ ] Schedule chunked prefill and decode under explicit per-tick token/sequence
+  budgets with starvation bounds and slot refill without recompilation.
+- [ ] Make cancellation correct while queued, page-waiting, in-flight,
+  token-ready, streaming, and disconnected.
+- [ ] Add prefix caching over exact token/model/protocol/RoPE/representation/
+  topology identity. Share only immutable complete pages; partial extension is
+  copy-on-write and eviction shares the admission page budget.
+
+### Distributed serving, observability, and resilience
+
+- [ ] Define the GPT-OSS tensor-parallel plan for embeddings/output, attention,
+  routers, experts, and reductions through Shardy.
+- [ ] Compare the four-device CPU topology with the single-device oracle, then
+  run the unchanged paged/batched contract on homogeneous multi-GPU CUDA.
+- [ ] Expose bounded-cardinality Prometheus metrics and structured tracing for
+  admission, queueing, batches, pages, prefix reuse, compilation, execution,
+  streaming, cancellation, errors, and shutdown. User content and secrets never
+  become labels.
+- [ ] Cover admission races, disconnects, deadlines, page exhaustion,
+  engine/listener failure, signals, repeated lifecycle, and partial streams.
+- [ ] Run a real loopback server contract with concurrent streaming and
+  non-streaming requests, physical batching, page/prefix reuse, tools,
+  cancellation, metrics, and graceful zero-owner shutdown.
+- [ ] Record phase-separated startup, memory, TTFT, inter-token latency,
+  throughput, batching scale, prefix-reuse, and shutdown baselines.
+
+### Speculative decoding
+
+- [ ] Select an exact draft artifact or public algorithm before implementing a
+  producer. DFlash is not assumed to apply to GPT-OSS.
+- [ ] Define model-independent proposal, verification, cache rollback, and RNG
+  semantics over the existing engine.
+- [ ] Prove greedy equivalence or the declared stochastic distribution and
+  retain the path only if measured target invocations or latency improve after
+  draft cost and memory are included.
+
+## Deferred quantization milestone
+
+This work begins only after the BF16 GPT-OSS serving path is complete.
+
+- [ ] `DEFERRED`: audit trustworthy GPT-OSS 20B NVFP4 artifacts by immutable
+  revision, actual packing/scales, conversion provenance, hardware assumptions,
+  and oracle outputs; select exactly one.
+- [ ] `DEFERRED`: implement that artifact's packed checkpoint storage, scale
+  semantics, layout transforms, accumulation dtype, capability gates, portable
+  dequantized reference, and selected CUDA execution path.
+- [ ] `DEFERRED`: run the complete NVFP4 model through generation, paged serving,
+  continuous batching, tensor parallelism, prefix caching, and Harmony; compare
+  it with both the artifact oracle and NML's BF16 baseline.
+- [ ] `DEFERRED`: measure total checkpoint/resident/workspace memory, upload,
+  compilation, TTFT, latency, throughput, and output deltas before accepting the
+  representation.
+- [ ] `DEFERRED`: W4A16 and W8A8 remain separate future verticals. An NVFP4
+  decision does not imply their packing, kernels, or checkpoint formats.
+
+## Capability ledger
+
+This ledger tracks usable product families, not individual opcodes. A completed
+family has durable applicable CPU/CUDA numerical and ownership coverage; a
+pending product family is not implied by the primitives beneath it.
+
+- [x] Arithmetic, comparisons, selection, casts, bit operations, unary math,
+  activations, and complex/FFT operations.
+- [x] Reshape, transpose, concatenation, slicing, dynamic update, gather,
+  scatter, embeddings, and layout-aware compiled graphs.
+- [x] Reductions, softmax, RMSNorm, LayerNorm, L2 normalization, log-sum-exp,
+  argmax, and related composites.
+- [x] Matrix contraction, linear layers, convolution, pooling, and spatial
+  resize.
+- [x] Explicit-state random generation, stable/unstable sorting, argsort, top-k,
+  greedy selection, and stochastic sampling.
+- [x] Ordinary and blockwise paged attention, RoPE, masks, sliding windows, and
+  persistent KV update/truncate/rollback/replay.
+- [x] Capability-dispatched FA2, FA3, Triton paged attention, and grouped Triton
+  MoE with real suitable-device numerical execution.
+- [x] Portable MoE routing/expert execution and four-device CPU expert sharding.
+- [x] IREE tokenization and Qwen3-0.6B BF16 generation.
+- [ ] Immutable OCI execution fully closed across BuildBuddy, local NVIDIA, and
+  RunPod, including digest-only interfaces and the remaining clean-consumer
+  proof.
+- [ ] GPT-OSS 20B BF16 generation with exact checkpoint, sink, clamped/residual
+  SwiGLU, alternating windows, YaRN, tokenizer, and Harmony semantics.
+- [ ] Continuous batching, server-owned paged KV arena, prefix caching, bounded
+  streaming/cancellation, tools, and metrics.
+- [ ] Real multi-GPU CUDA Shardy execution and collectives.
+- [ ] Dedicated optimized attention performance and tuning evidence.
+- [ ] `DEFERRED`: NVFP4, W4A16, and W8A8 complete quantized execution verticals.
+- [ ] `DEFERRED`: explicitly authored analytic backward/training graphs.

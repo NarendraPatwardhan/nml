@@ -1211,9 +1211,10 @@ fn execute_variant(
         DType::Bf16 => 2e-2,
         _ => unreachable!(),
     };
-    assert_close(&ordinary, &expected, tolerance);
-    assert_close(&paged, &expected, tolerance);
-    assert_close(&paged, &ordinary, tolerance);
+    let case = format!("dtype={dtype:?}, causal={causal}, sliding_window={sliding_window:?}");
+    assert_close_in(&ordinary, &expected, tolerance, &format!("ordinary {case}"));
+    assert_close_in(&paged, &expected, tolerance, &format!("paged {case}"));
+    assert_close_in(&paged, &ordinary, tolerance, &format!("cross-path {case}"));
 }
 
 fn ordinary_program(dtype: DType, options: AttentionOptions) -> nml_ir::Program {
@@ -1393,11 +1394,15 @@ fn reference_attention(
 }
 
 fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+    assert_close_in(actual, expected, tolerance, "attention result");
+}
+
+fn assert_close_in(actual: &[f32], expected: &[f32], tolerance: f32, context: &str) {
     assert_eq!(actual.len(), expected.len());
     for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
         assert!(
             (actual - expected).abs() <= tolerance,
-            "value {index}: expected {expected}, received {actual}, tolerance {tolerance}"
+            "{context}, value {index}: expected {expected}, received {actual}, tolerance {tolerance}"
         );
     }
 }

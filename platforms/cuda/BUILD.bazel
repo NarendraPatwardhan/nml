@@ -49,6 +49,7 @@ filegroup(
     visibility = [
         "//crates:__subpackages__",
         "//products:__subpackages__",
+        "//tools/device-contracts:__pkg__",
     ],
 )
 

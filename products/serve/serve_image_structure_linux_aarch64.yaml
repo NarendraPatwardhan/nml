@@ -1,0 +1,55 @@
+schemaVersion: "2.0.0"
+
+metadataTest:
+  envVars:
+    - key: LD_LIBRARY_PATH
+      value: /usr/local/lib/nml
+    - key: NML_CUDA_RUNTIME_RLOCATION
+      value: +cuda_packages+libpjrt_cuda_linux_arm64/runtime
+  labels:
+    - key: org.opencontainers.image.title
+      value: nml-serve
+    - key: org.opencontainers.image.source
+      value: https://github.com/NarendraPatwardhan/nml
+    - key: org.opencontainers.image.description
+      value: NML Qwen inference over the CPU and CUDA acceleration substrate
+  entrypoint:
+    - /usr/local/bin/nml-serve
+  cmd: []
+  workdir: /usr/local/bin/nml-serve.runfiles/_main
+
+fileExistenceTests:
+  - name: hermetic CUDA dynamic-loader path exists
+    path: /usr/local/lib/nml/libcudart.so.12
+    shouldExist: true
+  - name: NML serve entrypoint is executable
+    path: /usr/local/bin/nml-serve
+    shouldExist: true
+    isExecutableBy: owner
+    uid: 0
+    gid: 0
+  - name: CPU PJRT plugin is packaged
+    path: /.shared_runfiles/+cpu_pjrt_plugin+libpjrt_cpu_linux_arm64/libpjrt_cpu.so
+    shouldExist: true
+  - name: CUDA PJRT plugin is packaged
+    path: /.shared_runfiles/+cuda_packages+libpjrt_cuda_linux_arm64/runtime/lib/libpjrt_cuda.so
+    shouldExist: true
+  - name: CUDA custom-call redirector is packaged
+    path: /.shared_runfiles/+cuda_packages+libpjrt_cuda_linux_arm64/runtime/lib/libnml_cuda.so.0
+    shouldExist: true
+  - name: CUDA compatibility driver is packaged
+    path: /.shared_runfiles/+cuda_packages+libpjrt_cuda_linux_arm64/runtime/lib/compat/libcuda.so.1
+    shouldExist: true
+  - name: CUDA driver selector is executable
+    path: /.shared_runfiles/+cuda_packages+libpjrt_cuda_linux_arm64/runtime/bin/driver_compatibility
+    shouldExist: true
+    isExecutableBy: owner
+  - name: model weights are not image content
+    path: /models
+    shouldExist: false
+  - name: production image has no shell
+    path: /bin/sh
+    shouldExist: false
+  - name: production image has no package manager
+    path: /usr/bin/apt-get
+    shouldExist: false
