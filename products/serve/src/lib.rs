@@ -18,6 +18,17 @@ pub struct GenerationOptions {
     pub cache_capacity: Option<usize>,
 }
 
+/// One bounded execution profile compiled before the model becomes resident.
+///
+/// Capacities are upper bounds. The product normalizes them to its finite
+/// prefill and paged-cache buckets, deduplicates equivalent profiles, and
+/// rejects requests that fit none of the compiled profiles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompilationProfile {
+    pub max_prompt_tokens: usize,
+    pub max_sequence_tokens: usize,
+}
+
 /// Incremental Harmony events emitted by the product.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
@@ -60,9 +71,11 @@ pub struct GenerationReport {
 
 /// One process-persistent model owner.
 ///
-/// Artifact validation, tokenizer construction, parameter upload, and compiled
-/// component families are retained across requests. Request tokens, parser
-/// state, K/V storage, and sampling state never escape a generation call.
+/// Artifact validation and tokenizer construction precede compilation of every
+/// configured component family. Parameter upload begins only after compilation
+/// succeeds. The resulting plan and parameters are retained across requests;
+/// request tokens, parser state, K/V storage, and sampling state never escape a
+/// generation call.
 pub struct Generator<'platform> {
     inner: gpt_oss::Generator<'platform>,
 }
@@ -71,14 +84,15 @@ impl<'platform> Generator<'platform> {
     pub fn load(
         platform: &'platform nml::Platform,
         model_directory: impl AsRef<Path>,
+        profiles: &[CompilationProfile],
     ) -> Result<Self, Error> {
         Ok(Self {
-            inner: gpt_oss::Generator::load(platform, model_directory.as_ref())?,
+            inner: gpt_oss::Generator::load(platform, model_directory.as_ref(), profiles)?,
         })
     }
 
     pub fn generate<E>(
-        &mut self,
+        &self,
         options: GenerationOptions,
         mut emit: impl FnMut(Event) -> Result<(), E>,
     ) -> Result<GenerationReport, Error>

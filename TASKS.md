@@ -107,8 +107,11 @@ persistent dense weight expansion.
   hidden state and every K/V pair. Share one request-owned I32 identity page
   table instead of copying model policy into the generic runtime cache owner.
 - [x] Use finite power-of-two prefill buckets and page-aligned power-of-two cache
-  buckets. Retain compiled families and uploaded parameters across requests;
-  parser, positions, page metadata, and K/V storage remain request-local.
+  buckets. Validate, normalize, and deduplicate every configured profile;
+  compile the complete plan while the checkpoint is metadata-only, then upload
+  parameters. Requests select the smallest fitting resident profile and never
+  compile. Executables and parameters persist across requests; parser,
+  positions, page metadata, and K/V storage remain request-local.
 - [x] Pin structural contracts for component input counts, parameter-component
   counts, phase-specific state, donation aliases, representative-layer scope,
   and bucket rejection. Pin a real CPU two-executable dependency chain with a

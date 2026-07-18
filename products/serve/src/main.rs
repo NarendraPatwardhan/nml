@@ -1,4 +1,4 @@
-use nml_serve::{Event, GenerationOptions, Timings};
+use nml_serve::{CompilationProfile, Event, GenerationOptions, Timings};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -27,12 +27,16 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
     let mut stdout = std::io::stdout().lock();
-    let mut generator = nml_serve::Generator::load(&platform, &cli.model)?;
+    let profile = CompilationProfile {
+        max_prompt_tokens: cli.prefill_capacity,
+        max_sequence_tokens: cli.cache_capacity,
+    };
+    let generator = nml_serve::Generator::load(&platform, &cli.model, &[profile])?;
     let report = generator.generate(
         GenerationOptions {
             prompt: cli.prompt,
             max_new_tokens: cli.max_new_tokens,
-            cache_capacity: cli.cache_capacity,
+            cache_capacity: Some(cli.cache_capacity),
         },
         |event| -> std::io::Result<()> {
             match event {
@@ -107,7 +111,8 @@ struct Cli {
     model: PathBuf,
     prompt: String,
     max_new_tokens: usize,
-    cache_capacity: Option<usize>,
+    prefill_capacity: usize,
+    cache_capacity: usize,
     backend: Backend,
 }
 
@@ -127,6 +132,7 @@ impl Cli {
         let mut model = None;
         let mut prompt = None;
         let mut max_new_tokens = 32usize;
+        let mut prefill_capacity = None;
         let mut cache_capacity = None;
         let mut backend = Backend::Cpu;
         while let Some(argument) = arguments.next() {
@@ -138,6 +144,12 @@ impl Cli {
                         &value(&mut arguments, "--max-new-tokens")?,
                         "--max-new-tokens",
                     )?;
+                }
+                "--prefill-capacity" => {
+                    prefill_capacity = Some(parse_usize(
+                        &value(&mut arguments, "--prefill-capacity")?,
+                        "--prefill-capacity",
+                    )?);
                 }
                 "--cache-capacity" => {
                     cache_capacity = Some(parse_usize(
@@ -160,7 +172,10 @@ impl Cli {
             model: model.ok_or_else(|| format!("--model is required\n{}", usage()))?,
             prompt: prompt.ok_or_else(|| format!("--prompt is required\n{}", usage()))?,
             max_new_tokens,
-            cache_capacity,
+            prefill_capacity: prefill_capacity
+                .ok_or_else(|| format!("--prefill-capacity is required\n{}", usage()))?,
+            cache_capacity: cache_capacity
+                .ok_or_else(|| format!("--cache-capacity is required\n{}", usage()))?,
             backend,
         }))
     }
@@ -179,5 +194,5 @@ fn parse_usize(value: &str, option: &str) -> Result<usize, String> {
 }
 
 fn usage() -> &'static str {
-    "usage: serve --model PATH --prompt TEXT [--max-new-tokens N] [--cache-capacity N] [--backend cpu|cuda]"
+    "usage: serve --model PATH --prompt TEXT --prefill-capacity N --cache-capacity N [--max-new-tokens N] [--backend cpu|cuda]"
 }

@@ -1,4 +1,4 @@
-use nml_serve::{Event, GenerationOptions, Timings};
+use nml_serve::{CompilationProfile, Event, GenerationOptions, Timings};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -15,6 +15,8 @@ const ARTIFACT_MANIFEST_SHA256: &str =
 const MODEL_IDENTITY: &str = "GPT-OSS 20B NVFP4";
 const PROMPT: &str = "What is the capital of France?";
 const MAX_NEW_TOKENS: usize = 32;
+const MAX_PROMPT_TOKENS: usize = 128;
+const MAX_SEQUENCE_TOKENS: usize = 256;
 const RETURN_TOKEN: u32 = 200_002;
 const CALL_TOKEN: u32 = 200_012;
 const PHYSICAL_PARAMETER_COMPONENTS: usize = 703;
@@ -52,8 +54,15 @@ fn full_checkpoint_executes_the_gpt_oss_nvfp4_cuda_product_contract() {
     // SAFETY: the contract process is single-threaded at initialization and no
     // XLA or PJRT API has run before the CUDA plugin is selected.
     let platform = unsafe { nml::Platform::cuda() }.expect("CUDA platform must initialize");
-    let mut generator = nml_serve::Generator::load(&platform, &model_directory)
-        .expect("the immutable GPT-OSS checkpoint must load");
+    let generator = nml_serve::Generator::load(
+        &platform,
+        &model_directory,
+        &[CompilationProfile {
+            max_prompt_tokens: MAX_PROMPT_TOKENS,
+            max_sequence_tokens: MAX_SEQUENCE_TOKENS,
+        }],
+    )
+    .expect("the immutable GPT-OSS checkpoint must compile before it loads");
     let mut events = Vec::new();
     let report = generator
         .generate(

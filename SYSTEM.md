@@ -374,9 +374,21 @@ local compatibility patches.
 package-private `gpt_oss` owner contains the exact artifact contract,
 configuration, checkpoint schema, Harmony protocol, bounded component graphs,
 and request execution. The public product surface is one persistent
-`Generator`: loading validates the artifact, constructs the tokenizer, uploads
-parameters once, and retains compiled shape families; generation owns only one
-request's tokens, parser, positions, page metadata, and K/V storage.
+`Generator`: loading validates the artifact, constructs the tokenizer, compiles
+every configured execution profile while the checkpoint is metadata-only, and
+only then uploads parameters once. The resulting immutable plan and resident
+parameters persist across requests; generation owns only one request's tokens,
+parser, positions, page metadata, and K/V storage.
+
+The GPT-OSS lifecycle is a strict product-owned type-state transition:
+`ModelDefinition -> CompiledDefinition -> ResidentModel -> RequestState`.
+Compilation profiles declare maximum prompt and total-sequence capacities and
+normalize to the finite prefill/cache families described below. Equivalent
+families compile once. A request selects the smallest resident profile that
+covers it and hard-fails when no profile fits; request execution never invokes
+XLA. This follows ZML's compile-before-buffer-load ordering and leaves device
+memory available to compiler autotuning without weakening NML's bounded
+multi-profile serving contract.
 
 Framework crates do not contain a model adapter, model registry, protocol, or
 checkpoint-family taxonomy. They expose semantic tensor operations, closed
@@ -982,6 +994,7 @@ table is a compact compatibility index, not a migration checklist.
 | D-054 | GPT-OSS uses one package-private `openai-harmony-gpt-oss-v1` protocol owner over IREE `o200k_harmony`; NML reimplements the narrow wire contract and does not consume the broader `openai-harmony` crate or execute user tools. |
 | D-055 | Framework crates expose model-independent mechanisms only; GPT-OSS artifact, architecture, protocol, scheduling, and lifecycle policy remain under `products/serve`. |
 | D-056 | GPT-OSS shape families compose bounded embedding, reusable layer-kind, and head executables through asynchronous PJRT dependencies; a full transformer is not one compiler module. |
+| D-057 | GPT-OSS compilation profiles are complete before parameter residency; request execution selects an existing bounded profile and never invokes XLA. |
 
 ## 16. Provenance and reference relationships
 

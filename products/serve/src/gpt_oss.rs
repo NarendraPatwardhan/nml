@@ -14,7 +14,8 @@ pub(crate) mod protocol;
 
 use checkpoint::{BoxError, Result};
 use config::Config;
-use execution::{CompiledModel, PreparedRequest, RunMetrics, StartupMetrics};
+use crate::CompilationProfile;
+use execution::{ModelDefinition, PreparedRequest, ResidentModel, RunMetrics, StartupMetrics};
 use nml::io::ParameterSet;
 use nml::safetensors::TensorRegistry;
 use protocol::{Conversation, HarmonyProtocol, Message, SystemContent};
@@ -37,11 +38,11 @@ const ARTIFACT_RECIPE: &str = "nml-nvfp4-weight-v1";
 const SOURCE_REPOSITORY: &str = "unsloth/gpt-oss-20b-BF16";
 const SOURCE_REVISION: &str = "cc89b3e7fd423253264883a80a4fa5abc619649f";
 
-/// Persistent product model. Loading, uploaded parameters, and compiled
-/// component families are reused by every request sent to this owner.
+/// Persistent product model. Its complete execution plan is compiled before
+/// its parameters become resident and is reused by every request.
 pub(crate) struct Generator<'platform> {
     protocol: HarmonyProtocol,
-    model: CompiledModel<'platform>,
+    model: ResidentModel<'platform>,
 }
 
 pub(crate) struct ProductReport {
@@ -76,7 +77,11 @@ pub(crate) struct ProductTimings {
 }
 
 impl<'platform> Generator<'platform> {
-    pub(crate) fn load(platform: &'platform nml::Platform, model_directory: &Path) -> Result<Self> {
+    pub(crate) fn load(
+        platform: &'platform nml::Platform,
+        model_directory: &Path,
+        profiles: &[CompilationProfile],
+    ) -> Result<Self> {
         let validation_started = Instant::now();
         validate_artifact(model_directory).map_err(boxed)?;
         let artifact_validation = validation_started.elapsed();
@@ -84,17 +89,17 @@ impl<'platform> Generator<'platform> {
         let protocol = HarmonyProtocol::load(model_directory).map_err(boxed)?;
         let registry = TensorRegistry::from_path(model_directory.join(CHECKPOINT_INDEX))
             .map_err(boxed)?;
-        let model = CompiledModel::load(
-            platform,
+        let definition = ModelDefinition::declare(
             config,
             ParameterSet::new(registry),
             artifact_validation,
         )?;
+        let model = definition.compile(platform, profiles)?.make_resident()?;
         Ok(Self { protocol, model })
     }
 
     pub(crate) fn generate(
-        &mut self,
+        &self,
         prompt: String,
         max_new_tokens: usize,
         cache_capacity: Option<usize>,
@@ -118,7 +123,6 @@ impl<'platform> Generator<'platform> {
             tokenization,
         )?;
         let prompt_tokens = request.tokens.len();
-        let selected_cache_capacity = request.cache_capacity;
         let mut parser = self.protocol.parser();
         let run = self.model.generate(&request, |token, _is_stop| {
             for event in parser.process(token).map_err(boxed)? {
@@ -137,7 +141,7 @@ impl<'platform> Generator<'platform> {
         Ok(ProductReport {
             prompt_tokens,
             generated_tokens: run.generated_tokens,
-            cache_capacity: selected_cache_capacity,
+            cache_capacity: run.cache_capacity,
             physical_parameter_components: startup.physical_parameter_components,
             parameter_source_bytes: startup.parameter_source_bytes,
             parameter_resident_bytes: startup.parameter_resident_bytes,
@@ -158,8 +162,8 @@ fn timings(
     ProductTimings {
         tokenization,
         artifact_validation: startup.artifact_validation,
-        prefill_compilation: run.prefill_compilation,
-        decode_compilation: run.decode_compilation,
+        prefill_compilation: startup.prefill_compilation,
+        decode_compilation: startup.decode_compilation,
         parameter_upload: startup.parameter_upload,
         cache_allocation: run.cache_allocation,
         prompt_upload: run.prompt_upload,
