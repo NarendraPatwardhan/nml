@@ -1,0 +1,2 @@
+huggingface-hub==0.34.4
+safetensors==0.6.2

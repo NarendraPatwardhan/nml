@@ -26,6 +26,26 @@ nml_rust_library(
     visibility = [":__pkg__"],
 )
 
+# GPT-OSS remains a private product adapter rather than a model taxonomy in
+# NML's public facade. Its own target gives the selected artifact, parameter
+# schema, and graph one coherent contract while keeping changes independent of
+# the Qwen regression adapter and serving control plane.
+nml_rust_library(
+    name = "gpt_oss",
+    srcs = [
+        "src/gpt_oss.rs",
+        "src/gpt_oss/config.rs",
+        "src/gpt_oss/model.rs",
+    ],
+    crate_root = "src/gpt_oss.rs",
+    deps = [
+        "//crates/nml:nml",
+        "@rust_crates//serde",
+        "@rust_crates//serde_json",
+    ],
+    visibility = [":__pkg__"],
+)
+
 nml_rust_binary(
     name = "serve",
     srcs = ["src/main.rs"],
@@ -168,6 +188,23 @@ nml_rust_test(
         "src/qwen3/model.rs",
     ],
     crate_root = "src/lib.rs",
+    deps = [
+        "//crates/nml:nml",
+        "@rust_crates//serde",
+        "@rust_crates//serde_json",
+    ],
+)
+
+nml_rust_test(
+    name = "gpt_oss_contract_test",
+    size = "small",
+    srcs = [
+        "src/gpt_oss.rs",
+        "src/gpt_oss/config.rs",
+        "src/gpt_oss/model.rs",
+    ],
+    crate_root = "src/gpt_oss.rs",
+    data = ["//artifacts/gpt-oss-20b-nvfp4:manifest"],
     deps = [
         "//crates/nml:nml",
         "@rust_crates//serde",

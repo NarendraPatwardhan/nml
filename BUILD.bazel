@@ -93,6 +93,7 @@ _CUDA_DEVICE_CONTRACTS = [
     "//crates/nml:attention_cuda_contract_test",
     "//crates/nml:neural_ops_cuda_contract_test",
     "//crates/nml:execution_performance_cuda_contract_test",
+    "//crates/nml:nvfp4_cuda_contract_test",
 ]
 
 _CUDA_PACKAGE_CONTRACTS = [
@@ -154,6 +155,7 @@ filegroup(
         "//crates/nml:attention_cuda_contract_binary",
         "//crates/nml:neural_ops_cuda_contract_binary",
         "//crates/nml:execution_performance_cuda_contract_binary",
+        "//crates/nml:nvfp4_cuda_contract_binary",
         "//products/serve:serve",
     ],
     testonly = True,

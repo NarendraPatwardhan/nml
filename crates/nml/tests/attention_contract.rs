@@ -1,7 +1,7 @@
 //! Numerical product contract shared by CPU and CUDA attention execution.
 
 use nml_ir::{AttentionOptions, ProgramBuilder, RopeLayout, RopeOptions, RopeScaling};
-use nml_types::{BFloat16, DType, F16, Shape};
+use nml_types::{BFloat16, DType, Shape, F16};
 use safetensors::tensor::{Dtype as SafeDType, View};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -53,10 +53,12 @@ fn ordinary_and_portable_paged_attention_execute_the_same_semantics() {
     for dtype in [DType::F32, DType::F16, DType::Bf16] {
         execute_variant(&platform, dtype, true, None);
         execute_variant(&platform, dtype, false, Some(2));
+        learned_sinks_match_across_ordinary_and_paged_attention(&platform, dtype);
     }
     execute_head_mapping(&platform, 2, 2); // MHA
     execute_head_mapping(&platform, 4, 2); // GQA
     rotary_embeddings_execute_both_layouts(&platform);
+    yarn_rotary_embeddings_apply_the_attention_amplitude(&platform);
     fully_masked_ordinary_attention_returns_zero(&platform);
     empty_paged_context_returns_zero(&platform);
     cache_update_rollback_and_replay_preserve_persistent_storage(&platform);
@@ -64,6 +66,130 @@ fn ordinary_and_portable_paged_attention_execute_the_same_semantics() {
     if env!("NML_ATTENTION_BACKEND") == "cuda" {
         accelerated_cuda_attention_matches_dense_reference(&platform);
     }
+}
+
+fn learned_sinks_match_across_ordinary_and_paged_attention(platform: &nml::Platform, dtype: DType) {
+    let mut builder = ProgramBuilder::new();
+    let query_shape = Shape::new(dtype, &[1, 1, 2, 4]).unwrap();
+    let dense_cache_shape = Shape::new(dtype, &[1, 3, 1, 4]).unwrap();
+    let paged_cache_shape = Shape::new(dtype, &[3, 2, 1, 4]).unwrap();
+    let query = builder.input("sink_query", query_shape);
+    let key = builder.input("sink_key", dense_cache_shape);
+    let value = builder.input("sink_value", dense_cache_shape);
+    let key_cache = builder.input("sink_key_cache", paged_cache_shape);
+    let value_cache = builder.input("sink_value_cache", paged_cache_shape);
+    let query_positions = builder.input(
+        "sink_query_positions",
+        Shape::new(DType::I32, &[1, 1]).unwrap(),
+    );
+    let key_positions = builder.input(
+        "sink_key_positions",
+        Shape::new(DType::I32, &[1, 3]).unwrap(),
+    );
+    let page_table = builder.input("sink_page_table", Shape::new(DType::I32, &[1, 2]).unwrap());
+    let lengths = builder.input(
+        "sink_sequence_lengths",
+        Shape::new(DType::I32, &[1]).unwrap(),
+    );
+    let sinks = builder.input("sinks", Shape::new(dtype, &[2]).unwrap());
+    let options = AttentionOptions {
+        causal: false,
+        sliding_window: None,
+        scale: None,
+    };
+    let ordinary = builder
+        .attention(
+            query,
+            key,
+            value,
+            query_positions,
+            key_positions,
+            Some(sinks),
+            options,
+        )
+        .unwrap();
+    let paged = builder
+        .paged_attention(
+            query,
+            key_cache,
+            value_cache,
+            page_table,
+            lengths,
+            query_positions,
+            Some(sinks),
+            options,
+        )
+        .unwrap();
+    let program = builder
+        .finish_named(&[
+            ("ordinary".to_owned(), ordinary),
+            ("paged".to_owned(), paged),
+        ])
+        .unwrap();
+    let executable = platform.compile(&program, nml::Sharding::single()).unwrap();
+    let mut args = executable.args();
+    set_float(platform, &mut args, "sink_query", query_shape, &[0.0; 8]);
+    set_float(
+        platform,
+        &mut args,
+        "sink_key",
+        dense_cache_shape,
+        &[0.0; 12],
+    );
+    let value = [2.0, 4.0, 6.0, 8.0]
+        .into_iter()
+        .cycle()
+        .take(12)
+        .collect::<Vec<_>>();
+    set_float(platform, &mut args, "sink_value", dense_cache_shape, &value);
+    set_float(
+        platform,
+        &mut args,
+        "sink_key_cache",
+        paged_cache_shape,
+        &[0.0; 24],
+    );
+    let paged_value = [2.0, 4.0, 6.0, 8.0]
+        .into_iter()
+        .cycle()
+        .take(24)
+        .collect::<Vec<_>>();
+    set_float(
+        platform,
+        &mut args,
+        "sink_value_cache",
+        paged_cache_shape,
+        &paged_value,
+    );
+    set_i32(platform, &mut args, "sink_query_positions", &[1, 1], &[2]);
+    set_i32(
+        platform,
+        &mut args,
+        "sink_key_positions",
+        &[1, 3],
+        &[0, 1, 2],
+    );
+    set_i32(platform, &mut args, "sink_page_table", &[1, 2], &[2, 0]);
+    set_i32(platform, &mut args, "sink_sequence_lengths", &[1], &[3]);
+    set_float(
+        platform,
+        &mut args,
+        "sinks",
+        Shape::new(dtype, &[2]).unwrap(),
+        &[0.0, 3.0_f32.ln()],
+    );
+    let results = args.call().unwrap();
+    let ordinary = decode(results.get("ordinary").unwrap().to_slice().unwrap());
+    let paged = decode(results.get("paged").unwrap().to_slice().unwrap());
+    let expected = [1.5, 3.0, 4.5, 6.0, 1.0, 2.0, 3.0, 4.0];
+    let tolerance = match dtype {
+        DType::F32 => 2e-5,
+        DType::F16 => 4e-3,
+        DType::Bf16 => 3e-2,
+        _ => unreachable!(),
+    };
+    assert_close_in(&ordinary, &expected, tolerance, "ordinary learned sinks");
+    assert_close_in(&paged, &expected, tolerance, "paged learned sinks");
 }
 
 fn fully_masked_ordinary_attention_returns_zero(platform: &nml::Platform) {
@@ -274,6 +400,7 @@ fn execute_accelerated_dense(platform: &nml::Platform, dtype: DType, options: At
             value_tensor,
             query_position_tensor,
             key_position_tensor,
+            None,
             options,
         )
         .unwrap();
@@ -437,6 +564,7 @@ fn execute_accelerated_paged(
             table_tensor,
             length_tensor,
             position_tensor,
+            None,
             options,
         )
         .unwrap();
@@ -667,6 +795,51 @@ fn rotary_embeddings_execute_both_layouts(platform: &nml::Platform) {
     assert_close(&interleaved, &expected_interleaved, 2e-5);
 }
 
+fn yarn_rotary_embeddings_apply_the_attention_amplitude(platform: &nml::Platform) {
+    let mut builder = ProgramBuilder::new();
+    let shape = Shape::new(DType::F32, &[1, 1, 1, 4]).unwrap();
+    let input = builder.input("yarn_input", shape);
+    let positions = builder.input("yarn_positions", Shape::new(DType::I32, &[1, 1]).unwrap());
+    let output = builder
+        .rope(
+            input,
+            positions,
+            RopeOptions {
+                base: 150_000.0,
+                rotary_dimensions: 4,
+                layout: RopeLayout::Sequential,
+                scaling: RopeScaling::Yarn {
+                    factor: 32.0,
+                    beta_fast: 32.0,
+                    beta_slow: 1.0,
+                    original_context: 4_096,
+                    truncate: false,
+                    attention_factor: None,
+                },
+            },
+        )
+        .unwrap();
+    let program = builder
+        .finish_named(&[("output".to_owned(), output)])
+        .unwrap();
+    let executable = platform.compile(&program, nml::Sharding::single()).unwrap();
+    let values = [1.0, -2.0, 3.0, -4.0];
+    let mut args = executable.args();
+    set_float(platform, &mut args, "yarn_input", shape, &values);
+    set_i32(platform, &mut args, "yarn_positions", &[1, 1], &[0]);
+    let actual = decode(
+        args.call()
+            .unwrap()
+            .get("output")
+            .unwrap()
+            .to_slice()
+            .unwrap(),
+    );
+    let amplitude = 1.0 + 0.1 * 32.0_f32.ln();
+    let expected = values.map(|value| value * amplitude);
+    assert_close(&actual, &expected, 2e-5);
+}
+
 fn checkpoint_backed_attention_block_executes(platform: &nml::Platform) {
     for dtype in [DType::F16, DType::Bf16] {
         let root = temporary_directory(dtype);
@@ -729,6 +902,7 @@ fn checkpoint_backed_attention_block_executes(platform: &nml::Platform) {
                 value,
                 positions,
                 positions,
+                None,
                 AttentionOptions::default(),
             )
             .unwrap();
@@ -844,6 +1018,7 @@ fn execute_head_mapping(platform: &nml::Platform, query_heads: usize, kv_heads: 
             value_tensor,
             query_positions,
             key_positions,
+            None,
             AttentionOptions::default(),
         )
         .unwrap();
@@ -1047,6 +1222,7 @@ fn cache_update_rollback_and_replay_preserve_persistent_storage(platform: &nml::
             page_table,
             lengths,
             positions,
+            None,
             AttentionOptions::default(),
         )
         .unwrap();
@@ -1229,7 +1405,15 @@ fn ordinary_program(dtype: DType, options: AttentionOptions) -> nml_ir::Program 
         builder.input("query_positions", Shape::new(DType::I32, &[1, 2]).unwrap());
     let key_positions = builder.input("key_positions", Shape::new(DType::I32, &[1, 3]).unwrap());
     let output = builder
-        .attention(query, key, value, query_positions, key_positions, options)
+        .attention(
+            query,
+            key,
+            value,
+            query_positions,
+            key_positions,
+            None,
+            options,
+        )
         .unwrap();
     builder
         .finish_named(&[("output".to_owned(), output)])
@@ -1245,7 +1429,7 @@ fn paged_program(dtype: DType, options: AttentionOptions) -> nml_ir::Program {
     let lengths = builder.input("sequence_lengths", Shape::new(DType::I32, &[1]).unwrap());
     let positions = builder.input("query_positions", Shape::new(DType::I32, &[1, 2]).unwrap());
     let output = builder
-        .paged_attention(query, key, value, table, lengths, positions, options)
+        .paged_attention(query, key, value, table, lengths, positions, None, options)
         .unwrap();
     builder
         .finish_named(&[("output".to_owned(), output)])

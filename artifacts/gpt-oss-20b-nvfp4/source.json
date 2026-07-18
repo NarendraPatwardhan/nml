@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "repository": "unsloth/gpt-oss-20b-BF16",
+  "revision": "cc89b3e7fd423253264883a80a4fa5abc619649f",
+  "license": "apache-2.0",
+  "base_model": "openai/gpt-oss-20b",
+  "tensor_count": 411,
+  "tensor_dtype": "BF16",
+  "total_elements": 20914757184,
+  "files": [
+    {"path": ".gitattributes", "size": 1570, "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930"},
+    {"path": "README.md", "size": 6731, "sha256": "8f0e02cf5be26d282d0952a1701738a180b7ef4ca9e56c0e0caf3ed06339968e"},
+    {"path": "chat_template.jinja", "size": 15078, "sha256": "445c3a7c29d9cf61860179de179f60b6cf24834518b491016993eba63c8b1ecc"},
+    {"path": "config.json", "size": 1623, "sha256": "1f2cdaf00d4c53dac6250cd435e31b3dafb7ce60b7dc5e7622ee292d57861975"},
+    {"path": "generation_config.json", "size": 165, "sha256": "f75e6dde6e9ba405e496be663ab747517e765377ab6a37a5416cb9dfdac941e9"},
+    {"path": "model-00001-of-00009.safetensors", "size": 4504304664, "sha256": "dc729189133161b61e287dd7bdec06afc2b7f77ed1820ca53eda0553fa742230"},
+    {"path": "model-00002-of-00009.safetensors", "size": 4939127656, "sha256": "a4708b3da84cd7d559f5cd2eb9d0d13466ae1ccd90fdee8295d9ec3d8748582c"},
+    {"path": "model-00003-of-00009.safetensors", "size": 4939127656, "sha256": "96031fa4efe1e880b2f17ac4352c3a2d251129d8140d122b9e8649a2d45c51d2"},
+    {"path": "model-00004-of-00009.safetensors", "size": 4939127680, "sha256": "46e221c089ddcbacd6f4495a2dfccea2206cb8b21795ea868415125e9fb8139e"},
+    {"path": "model-00005-of-00009.safetensors", "size": 4939127704, "sha256": "f223ae981c1c8f4925334b8e0954ce78a613b0602d3eba28ea73f0146c9d73f3"},
+    {"path": "model-00006-of-00009.safetensors", "size": 4939127704, "sha256": "bf0e3a0ccf931369e3ebe77f1f6d0a1781d739d6cb1dfed7c54fedda3f94fe18"},
+    {"path": "model-00007-of-00009.safetensors", "size": 4939127704, "sha256": "51a3ad356e1a0d63de63f78975caf1a129d7d29bc00a7614de652aff7a4c57b0"},
+    {"path": "model-00008-of-00009.safetensors", "size": 4939127704, "sha256": "07a2d79388f1f6f1bebac3d03216b6ac47c2bf498640ab54ac8c15beb629847f"},
+    {"path": "model-00009-of-00009.safetensors", "size": 2751362856, "sha256": "6c1951ff65d233bcb7f50485d294cced6497b8e0d9707f57087912fc2352492e"},
+    {"path": "model.safetensors.index.json", "size": 33635, "sha256": "bb72789eabdd4253264b146ad5a1f98d3ac215e214c942e563e756357e044f74"},
+    {"path": "special_tokens_map.json", "size": 440, "sha256": "8464cabd6eda239fe46ebf8ae63b46c417721784a961a022f6b59174a2cda0e2"},
+    {"path": "tokenizer.json", "size": 27868174, "sha256": "0614fe83cadab421296e664e1f48f4261fa8fef6e03e63bb75c20f38e37d07d3"},
+    {"path": "tokenizer_config.json", "size": 4200, "sha256": "9279e942392b742d633c7adbb89ebe002c98399db8926a7af5125c726f404070"}
+  ]
+}

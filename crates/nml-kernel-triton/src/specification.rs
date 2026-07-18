@@ -202,6 +202,7 @@ const fn to_nml_dtype(dtype: DType) -> NmlDType {
     match dtype {
         DType::I1 => NmlDType::Bool,
         DType::I8 => NmlDType::I8,
+        DType::U8 => NmlDType::U8,
         DType::I16 => NmlDType::I16,
         DType::I32 => NmlDType::I32,
         DType::I64 => NmlDType::I64,

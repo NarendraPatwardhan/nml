@@ -10,7 +10,10 @@ from api import (
     ApiError,
     TemplateSpec,
     create_pod_document,
+    create_ssh_job_pod_document,
     is_capacity_failure,
+    same_exact_image,
+    ssh_endpoint,
     validate_template,
 )
 from controller import validate_result_identity, validate_runner_identity
@@ -30,6 +33,46 @@ class RunPodContract(unittest.TestCase):
         templated = create_pod_document("SECURE", False, True)
         self.assertIn("templateId: $templateId", templated)
         self.assertNotIn("imageName: $image", templated)
+
+        ssh_job = create_ssh_job_pod_document("COMMUNITY", True)
+        self.assertIn("imageName: $image", ssh_job)
+        self.assertIn("startSsh: true", ssh_job)
+        self.assertIn('ports: "22/tcp"', ssh_job)
+        self.assertIn("dataCenterId: $dataCenter", ssh_job)
+        self.assertNotIn("HF_TOKEN", ssh_job)
+
+    def test_ssh_endpoint_requires_the_dynamic_public_tcp_mapping(self) -> None:
+        pod = {
+            "runtime": {
+                "ports": [
+                    {
+                        "ip": "192.0.2.1",
+                        "isIpPublic": True,
+                        "privatePort": 22,
+                        "publicPort": 23456,
+                        "type": "tcp",
+                    }
+                ]
+            }
+        }
+        self.assertEqual(ssh_endpoint(pod), ("192.0.2.1", 23456))
+        pod["runtime"]["ports"][0]["isIpPublic"] = False
+        self.assertIsNone(ssh_endpoint(pod))
+
+    def test_exact_image_comparison_allows_only_registry_host_normalization(self) -> None:
+        digest = "sha256:" + "a" * 64
+        self.assertTrue(
+            same_exact_image(
+                f"docker.io/runpod/pytorch@{digest}", f"runpod/pytorch@{digest}"
+            )
+        )
+        self.assertFalse(
+            same_exact_image(
+                f"docker.io/runpod/pytorch@{digest}",
+                "runpod/pytorch@sha256:" + "b" * 64,
+            )
+        )
+        self.assertFalse(same_exact_image("runpod/pytorch:latest", "runpod/pytorch:latest"))
 
     def test_private_template_contract_rejects_drift(self) -> None:
         spec = TemplateSpec(

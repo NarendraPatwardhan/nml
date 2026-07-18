@@ -16,6 +16,7 @@ nml_rust_library(
     deps = [
         "//crates/nml-compiler:nml_compiler",
         "//crates/nml-ir:nml_ir",
+        "//crates/nml-kernel-nvfp4:nml_kernel_nvfp4",
         "//crates/nml-pjrt:nml_pjrt",
         "//crates/nml-parameter:nml_parameter",
         "//crates/nml-sharding:nml_sharding",

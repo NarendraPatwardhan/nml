@@ -1,0 +1,22 @@
+"""Immutable source inventory and NML NVFP4 recipe for GPT-OSS 20B."""
+
+filegroup(
+    name = "manifest",
+    srcs = [
+        "README.md",
+        "artifact-manifest.json",
+        "config.json",
+        "output-tensors.json",
+        "published.json",
+        "recipe.json",
+        "source.json",
+        "source-tensors.json",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "execution_fixture",
+    srcs = ["execution-fixture.json"],
+    visibility = ["//visibility:public"],
+)

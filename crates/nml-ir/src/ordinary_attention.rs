@@ -2,10 +2,14 @@
 //!
 //! The authored graph retains attention as one semantic operation so target
 //! selection can happen after PJRT capability discovery.  The portable graph
-//! remains complete and is emitted for CPU, unsupported CUDA devices, dtypes,
-//! and layouts.  FA2 is only reachable for its exact dense ABI.
+//! remains complete and is emitted for CPU and CUDA contracts outside the
+//! retained optimized domains. FA2 and FA3 are reachable only for their exact
+//! dense ABIs; learned sinks retain those kernels through their F32 LSE result.
 
-use crate::{AttentionOptions, Error, attention_backend};
+use crate::{
+    AttentionOptions, Error, attention_backend, attention_sink,
+    device_capabilities::CudaCapabilities,
+};
 use nml_mlir::{
     Block, Context, Region, StableHloBinary, StableHloComparison, StableHloComparisonType,
     StableHloUnary, Type, Value,
@@ -18,6 +22,7 @@ pub(crate) struct Inputs<'context> {
     pub value: Value<'context>,
     pub query_positions: Value<'context>,
     pub key_positions: Value<'context>,
+    pub sinks: Option<Value<'context>>,
     pub query_shape: Shape,
     pub key_shape: Shape,
     pub query_positions_dtype: DType,
@@ -30,16 +35,11 @@ pub(crate) fn lower_cuda<'context>(
     context: &'context Context,
     block: &mut Block<'context>,
     inputs: Inputs<'context>,
-    capability_major: u16,
-    capability_minor: u16,
+    capabilities: CudaCapabilities,
 ) -> Result<Value<'context>, Error> {
     let head_dimension = inputs.query_shape.dimensions()[3];
-    let backend = attention_backend::dense(
-        inputs.query_shape.dtype(),
-        head_dimension,
-        capability_major,
-        capability_minor,
-    );
+    let backend =
+        attention_backend::dense(inputs.query_shape.dtype(), head_dimension, capabilities);
     if backend != attention_backend::Backend::Portable && !flash_index_geometry_supported(&inputs) {
         return lower(context, block, inputs);
     }
@@ -184,8 +184,21 @@ fn append_flash<'context>(
         )?,
     };
     let output = call.result(0)?;
+    let softmax_lse = call.result(1)?;
     block.append_operation(call)?;
-    Ok(output)
+    attention_sink::correct_flash_output(
+        context,
+        block,
+        output,
+        softmax_lse,
+        inputs.sinks,
+        inputs.query_shape.dtype(),
+        *batch,
+        *query_length,
+        *query_heads,
+        *head_dimension,
+        inputs.result_type,
+    )
 }
 
 fn canonical_positions<'context>(
@@ -477,9 +490,30 @@ pub(crate) fn lower<'context>(
         &[4],
         Reduction::Maximum,
     )?;
+    let sink = inputs
+        .sinks
+        .map(|sink| {
+            sink_statistics(
+                context,
+                block,
+                sink,
+                inputs.query_shape.dtype(),
+                key_value_heads,
+                groups,
+                statistic_type,
+            )
+        })
+        .transpose()?;
+    let maximum_statistic = match sink {
+        Some(sink) => append_value(
+            block,
+            context.binary(StableHloBinary::Maximum, maximum, sink, statistic_type)?,
+        )?,
+        None => maximum,
+    };
     let maximum = append_value(
         block,
-        context.broadcast_in_dim(maximum, scores_type, &[0, 1, 2, 3])?,
+        context.broadcast_in_dim(maximum_statistic, scores_type, &[0, 1, 2, 3])?,
     )?;
     let shifted = append_value(
         block,
@@ -500,7 +534,7 @@ pub(crate) fn lower<'context>(
         block,
         context.select(valid, weights, zero_scores, scores_type)?,
     )?;
-    let denominator = reduce_f32(
+    let mut denominator = reduce_f32(
         context,
         block,
         weights,
@@ -508,6 +542,25 @@ pub(crate) fn lower<'context>(
         &[4],
         Reduction::Sum,
     )?;
+    if let Some(sink) = sink {
+        let shifted_sink = append_value(
+            block,
+            context.binary(
+                StableHloBinary::Subtract,
+                sink,
+                maximum_statistic,
+                statistic_type,
+            )?,
+        )?;
+        let sink_weight = append_value(
+            block,
+            context.unary_math(StableHloUnary::Exponential, shifted_sink, statistic_type)?,
+        )?;
+        denominator = append_value(
+            block,
+            context.add(denominator, sink_weight, statistic_type)?,
+        )?;
+    }
     let denominator = append_value(
         block,
         context.broadcast_in_dim(denominator, scores_type, &[0, 1, 2, 3])?,
@@ -573,6 +626,7 @@ fn clone_inputs<'context>(inputs: &Inputs<'context>) -> Inputs<'context> {
         value: inputs.value,
         query_positions: inputs.query_positions,
         key_positions: inputs.key_positions,
+        sinks: inputs.sinks,
         query_shape: inputs.query_shape,
         key_shape: inputs.key_shape,
         query_positions_dtype: inputs.query_positions_dtype,
@@ -580,6 +634,32 @@ fn clone_inputs<'context>(inputs: &Inputs<'context>) -> Inputs<'context> {
         result_type: inputs.result_type,
         options: inputs.options,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sink_statistics<'context>(
+    context: &'context Context,
+    block: &mut Block<'context>,
+    sinks: Value<'context>,
+    dtype: DType,
+    key_value_heads: i64,
+    groups: i64,
+    statistic_type: Type<'context>,
+) -> Result<Value<'context>, Error> {
+    let query_heads = key_value_heads
+        .checked_mul(groups)
+        .ok_or(Error::InvalidAttention(
+            "attention sink head geometry overflows",
+        ))?;
+    let dense_type = context.ranked_tensor_type(DType::F32, &[query_heads])?;
+    let sinks = convert_if_needed(context, block, sinks, dtype, DType::F32, dense_type)?;
+    let grouped_type = context.ranked_tensor_type(DType::F32, &[key_value_heads, groups])?;
+    let sinks = append_value(block, context.reshape(sinks, grouped_type)?)?;
+    append_value(
+        block,
+        context.broadcast_in_dim(sinks, statistic_type, &[1, 2])?,
+    )
+    .map_err(Into::into)
 }
 
 #[derive(Clone, Copy)]

@@ -5,6 +5,7 @@
 // single bindgen translation unit. They are two views of one pinned XLA/PJRT
 // boundary and must never be generated from different XLA revisions.
 #include "xla/ffi/api/c_api.h"
+#include "xla/pjrt/c/pjrt_c_api_ffi_extension.h"
 #include "xla/pjrt/c/pjrt_c_api_gpu_extension.h"
 
 #endif // NML_PJRT_H_

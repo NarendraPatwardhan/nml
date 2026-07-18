@@ -14,11 +14,16 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod moe;
+mod nvfp4;
 mod paged_attention;
 mod specification;
 mod unified_attention;
 
 pub use moe::{GatedActivation, GroupedProjectionConfig, build_grouped_projection};
+pub use nvfp4::{
+    NvFp4EmbeddingConfig, NvFp4GroupedProjectionConfig, NvFp4GroupedRole, NvFp4LinearConfig,
+    build_nvfp4_embedding, build_nvfp4_grouped_projection, build_nvfp4_linear,
+};
 pub use paged_attention::{AttentionGeometry, AttentionLaunch, select_attention_launch};
 pub use specification::{KernelLaunch, KernelSpec, OutputAlias, TensorSpec};
 pub use unified_attention::{
@@ -30,6 +35,7 @@ pub use unified_attention::{
 pub enum DType {
     I1,
     I8,
+    U8,
     I16,
     I32,
     I64,
@@ -43,7 +49,7 @@ impl DType {
     const fn spelling(self) -> &'static str {
         match self {
             Self::I1 => "i1",
-            Self::I8 => "i8",
+            Self::I8 | Self::U8 => "i8",
             Self::I16 => "i16",
             Self::I32 => "i32",
             Self::I64 => "i64",
@@ -61,11 +67,15 @@ impl DType {
     const fn bit_width(self) -> u8 {
         match self {
             Self::I1 => 1,
-            Self::I8 => 8,
+            Self::I8 | Self::U8 => 8,
             Self::I16 | Self::F16 | Self::Bf16 => 16,
             Self::I32 | Self::F32 => 32,
             Self::I64 | Self::F64 => 64,
         }
+    }
+
+    const fn is_unsigned(self) -> bool {
+        matches!(self, Self::I1 | Self::U8)
     }
 }
 
@@ -224,6 +234,36 @@ pub enum Comparison {
 pub enum Reduction {
     Sum,
     Maximum,
+}
+
+/// Storage interpretation for one `tt.dot_scaled` operand.
+///
+/// Packed formats describe the values represented by an I8 tensor; they are
+/// not general graph dtypes. The enum therefore lives only in this private
+/// kernel-construction crate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScaleDotElement {
+    E4M3,
+    E5M2,
+    E2M3,
+    E3M2,
+    E2M1,
+    Bf16,
+    F16,
+}
+
+impl ScaleDotElement {
+    const fn spelling(self) -> &'static str {
+        match self {
+            Self::E4M3 => "e4m3",
+            Self::E5M2 => "e5m2",
+            Self::E2M3 => "e2m3",
+            Self::E3M2 => "e3m2",
+            Self::E2M1 => "e2m1",
+            Self::Bf16 => "bf16",
+            Self::F16 => "fp16",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -599,6 +639,8 @@ impl Builder {
     pub fn divide(&mut self, left: &Value, right: &Value) -> Result<Value, Error> {
         let operation = if left.value_type.element().is_float() {
             "div"
+        } else if left.value_type.element().is_unsigned() {
+            "divu"
         } else {
             "divs"
         };
@@ -608,6 +650,8 @@ impl Builder {
     pub fn remainder(&mut self, left: &Value, right: &Value) -> Result<Value, Error> {
         let operation = if left.value_type.element().is_float() {
             "rem"
+        } else if left.value_type.element().is_unsigned() {
+            "remu"
         } else {
             "rems"
         };
@@ -647,9 +691,9 @@ impl Builder {
             (true, true) if dtype.bit_width() > source.bit_width() => "extf",
             (true, true) => "truncf",
             (true, false) => "fptosi",
-            (false, true) if source == DType::I1 => "uitofp",
+            (false, true) if source.is_unsigned() => "uitofp",
             (false, true) => "sitofp",
-            (false, false) if dtype.bit_width() > source.bit_width() && source == DType::I1 => {
+            (false, false) if dtype.bit_width() > source.bit_width() && source.is_unsigned() => {
                 "extui"
             }
             (false, false) if dtype.bit_width() > source.bit_width() => "extsi",
@@ -675,6 +719,15 @@ impl Builder {
         self.binary("and", left, right)
     }
 
+    pub fn shift_right_logical(&mut self, value: &Value, amount: &Value) -> Result<Value, Error> {
+        if !value.value_type.is_integer() || !amount.value_type.is_integer() {
+            return Err(Error::TypeMismatch {
+                operation: "logical shift right",
+            });
+        }
+        self.binary("shru", value, amount)
+    }
+
     pub fn minimum(&mut self, left: &Value, right: &Value) -> Result<Value, Error> {
         self.ordered_extreme("min", left, right)
     }
@@ -698,6 +751,10 @@ impl Builder {
             (true, Comparison::Greater) => "ogt",
             (true, Comparison::GreaterEqual) => "oge",
             (false, Comparison::Equal) => "eq",
+            (false, Comparison::Less) if left.value_type.element().is_unsigned() => "ult",
+            (false, Comparison::LessEqual) if left.value_type.element().is_unsigned() => "ule",
+            (false, Comparison::Greater) if left.value_type.element().is_unsigned() => "ugt",
+            (false, Comparison::GreaterEqual) if left.value_type.element().is_unsigned() => "uge",
             (false, Comparison::Less) => "slt",
             (false, Comparison::LessEqual) => "sle",
             (false, Comparison::Greater) => "sgt",
@@ -911,6 +968,95 @@ impl Builder {
                 left.value_type.spelling(),
                 right.value_type.spelling(),
                 accumulator.value_type.spelling(),
+                accumulator.value_type.spelling(),
+            ),
+        )
+    }
+
+    /// Constructs the pinned Triton microscaling dot operation.
+    ///
+    /// Operand and scale layout constraints remain the caller's kernel-level
+    /// responsibility; `finish` reparses and verifies the complete TTIR module
+    /// so invalid packed geometries cannot reach XLA embedding.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dot_scaled(
+        &mut self,
+        left: &Value,
+        right: &Value,
+        accumulator: &Value,
+        left_scale: Option<&Value>,
+        right_scale: Option<&Value>,
+        left_element: ScaleDotElement,
+        right_element: ScaleDotElement,
+        lhs_k_pack: bool,
+        rhs_k_pack: bool,
+    ) -> Result<Value, Error> {
+        let mut operands = vec![left, right, accumulator];
+        operands.extend(left_scale);
+        operands.extend(right_scale);
+        self.require_values(&operands)?;
+        let ValueType::Tensor {
+            element: DType::F32,
+            pointer_address_space: None,
+            ..
+        } = &accumulator.value_type
+        else {
+            return Err(Error::TypeMismatch {
+                operation: "scaled dot accumulator",
+            });
+        };
+        for (value, element) in [(left, left_element), (right, right_element)] {
+            let packed = matches!(element, ScaleDotElement::E2M1);
+            if !matches!(
+                &value.value_type,
+                ValueType::Tensor {
+                    pointer_address_space: None,
+                    ..
+                }
+            ) || (packed && !matches!(value.value_type.element(), DType::I8 | DType::U8))
+            {
+                return Err(Error::TypeMismatch {
+                    operation: "scaled dot operand",
+                });
+            }
+        }
+        for scale in [left_scale, right_scale].into_iter().flatten() {
+            if !matches!(
+                &scale.value_type,
+                ValueType::Tensor {
+                    element: DType::I8 | DType::U8 | DType::F32,
+                    pointer_address_space: None,
+                    ..
+                }
+            ) {
+                return Err(Error::TypeMismatch {
+                    operation: "scaled dot scale",
+                });
+            }
+        }
+        let scaled_operand = |value: &Value, scale: Option<&Value>| match scale {
+            Some(scale) => format!("{} scale {}", value.id, scale.id),
+            None => value.id.clone(),
+        };
+        let scaled_type = |value: &Value, scale: Option<&Value>| match scale {
+            Some(scale) => format!(
+                "{}, {}",
+                value.value_type.spelling(),
+                scale.value_type.spelling()
+            ),
+            None => value.value_type.spelling(),
+        };
+        self.emit_value(
+            accumulator.value_type.clone(),
+            format!(
+                "tt.dot_scaled {}, {}, {} lhs = {} rhs = {} {{fastMath = false, lhs_k_pack = {lhs_k_pack}, rhs_k_pack = {rhs_k_pack}}} : {} * {} -> {}",
+                scaled_operand(left, left_scale),
+                scaled_operand(right, right_scale),
+                accumulator.id,
+                left_element.spelling(),
+                right_element.spelling(),
+                scaled_type(left, left_scale),
+                scaled_type(right, right_scale),
                 accumulator.value_type.spelling(),
             ),
         )
@@ -1413,6 +1559,8 @@ impl Builder {
         let (left, right) = self.broadcast_pair(left, right, operation)?;
         let suffix = if left.value_type.element().is_float() {
             "numf"
+        } else if left.value_type.element().is_unsigned() {
+            "ui"
         } else {
             "si"
         };

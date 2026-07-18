@@ -25,6 +25,272 @@ fn one_component_binding_cannot_alias_distinct_parameter_definitions() {
 }
 
 #[test]
+fn nvfp4_linear_is_one_semantic_operation_with_three_physical_components() {
+    let logical_shape = Shape::new(DType::Bf16, &[4, 16]).unwrap();
+    let weight = Parameter::nvfp4(
+        "projection.weight",
+        "model.projection.weight",
+        logical_shape,
+    )
+    .unwrap();
+    let bias = parameter("projection.bias", Shape::new(DType::Bf16, &[4]).unwrap());
+    let mut builder = ProgramBuilder::new();
+    let input = builder.input("hidden", Shape::new(DType::Bf16, &[2, 3, 16]).unwrap());
+    let output = builder.linear(input, &weight, Some(&bias)).unwrap();
+    assert_eq!(output.shape().dimensions(), &[2, 3, 4]);
+    let program = builder.finish(&[output]).unwrap();
+    let context = Context::new();
+    let sm75 = program
+        .module_with_sharding_cuda(&context, &nml_sharding::Sharding::single(), 24, 7, 5)
+        .unwrap();
+    sm75.verify().unwrap();
+    let sm75 = sm75.text();
+    assert_eq!(sm75.matches("nml.nvfp4.turing.linear").count(), 1, "{sm75}");
+    assert!(!sm75.contains("__gpu$xla.gpu.triton"), "{sm75}");
+    assert!(!sm75.contains("stablehlo.add"), "{sm75}");
+    // Blackwell retains this explicitly named compact-weight emulation route
+    // until the separate native block-scaled representation is prepared. It
+    // must never regress to a dense expansion while native work is pending.
+    for (major, minor) in [(8, 0), (9, 0), (10, 0)] {
+        let context = Context::new();
+        let module = program
+            .module_with_sharding_cuda(
+                &context,
+                &nml_sharding::Sharding::single(),
+                108,
+                major,
+                minor,
+            )
+            .unwrap();
+        module.verify().unwrap();
+        let text = module.text();
+        assert_eq!(text.matches("__gpu$xla.gpu.triton").count(), 1, "{text}");
+        assert!(text.contains("nvfp4_linear"), "{text}");
+        assert!(!text.contains("nml.nvfp4.linear"), "{text}");
+        assert!(!text.contains("stablehlo.add"), "{text}");
+        assert!(text.contains("tensor<6x4xbf16>"), "{text}");
+    }
+    let text = program.stablehlo().unwrap();
+
+    assert_eq!(text.matches("nml.nvfp4.linear").count(), 1, "{text}");
+    assert!(text.contains("tensor<4x8xui8>"), "{text}");
+    assert!(text.contains("tensor<4x1xui8>"), "{text}");
+    assert!(text.contains("tensor<f32>"), "{text}");
+    assert!(text.contains("api_version = 4 : i32"), "{text}");
+    assert!(!text.contains("stablehlo.add"), "{text}");
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
+
+    let bindings = program.inputs().collect::<Vec<_>>();
+    assert_eq!(bindings.len(), 5);
+    assert_eq!(bindings[0].0, "hidden");
+    assert_eq!(bindings[1].0, "projection.weight.nvfp4.payload");
+    assert_eq!(bindings[2].0, "projection.weight.nvfp4.block_scales");
+    assert_eq!(bindings[3].0, "projection.weight.nvfp4.global_scale");
+    assert_eq!(bindings[4].0, "projection.bias");
+
+    let mut dense_only = ProgramBuilder::new();
+    assert!(matches!(
+        dense_only.parameter_value(&weight),
+        Err(Error::InvalidParameter(message)) if message.contains("requires dense storage")
+    ));
+}
+
+#[test]
+fn nvfp4_linear_validates_optional_bias_before_authoring_the_compact_operation() {
+    let dtype = DType::F16;
+    let weight = Parameter::nvfp4(
+        "projection.weight",
+        "model.projection.weight",
+        Shape::new(dtype, &[4, 16]).unwrap(),
+    )
+    .unwrap();
+    let wrong_width = parameter("wrong_width", Shape::new(dtype, &[3]).unwrap());
+    let wrong_rank = parameter("wrong_rank", Shape::new(dtype, &[1, 4]).unwrap());
+    let wrong_dtype = parameter("wrong_dtype", Shape::new(DType::Bf16, &[4]).unwrap());
+    let mut builder = ProgramBuilder::new();
+    let input = builder.input("hidden", Shape::new(dtype, &[2, 16]).unwrap());
+
+    assert!(matches!(
+        builder.linear(input, &weight, Some(&wrong_width)),
+        Err(Error::DimensionMismatch { .. })
+    ));
+    assert!(matches!(
+        builder.linear(input, &weight, Some(&wrong_rank)),
+        Err(Error::RankMismatch {
+            operation: "linear bias",
+            ..
+        })
+    ));
+    assert!(matches!(
+        builder.linear(input, &weight, Some(&wrong_dtype)),
+        Err(Error::DTypeMismatch { .. })
+    ));
+
+    let output = builder.linear(input, &weight, None).unwrap();
+    let text = builder.finish(&[output]).unwrap().stablehlo().unwrap();
+    assert_eq!(text.matches("nml.nvfp4.linear").count(), 1, "{text}");
+    assert!(!text.contains("stablehlo.add"), "{text}");
+    assert!(!text.contains("wrong_width"), "{text}");
+    assert!(!text.contains("wrong_rank"), "{text}");
+    assert!(!text.contains("wrong_dtype"), "{text}");
+}
+
+#[test]
+fn nvfp4_embedding_preserves_index_shape_and_decodes_only_selected_rows() {
+    let weight = Parameter::nvfp4(
+        "embedding.weight",
+        "model.embedding.weight",
+        Shape::new(DType::F16, &[32, 17]).unwrap(),
+    )
+    .unwrap();
+    let mut builder = ProgramBuilder::new();
+    let indices = builder.input("token_ids", Shape::new(DType::I32, &[2, 3]).unwrap());
+    let output = builder.token_embedding(&weight, indices).unwrap();
+    assert_eq!(output.shape().dtype(), DType::F16);
+    assert_eq!(output.shape().dimensions(), &[2, 3, 17]);
+    let program = builder.finish(&[output]).unwrap();
+    let context = Context::new();
+    let sm75 = program
+        .module_with_sharding_cuda(&context, &nml_sharding::Sharding::single(), 24, 7, 5)
+        .unwrap();
+    sm75.verify().unwrap();
+    let sm75 = sm75.text();
+    assert_eq!(
+        sm75.matches("nml.nvfp4.turing.embedding").count(),
+        1,
+        "{sm75}"
+    );
+    assert!(!sm75.contains("__gpu$xla.gpu.triton"), "{sm75}");
+    for (major, minor) in [(8, 0), (9, 0), (10, 0)] {
+        let context = Context::new();
+        let module = program
+            .module_with_sharding_cuda(
+                &context,
+                &nml_sharding::Sharding::single(),
+                108,
+                major,
+                minor,
+            )
+            .unwrap();
+        module.verify().unwrap();
+        let text = module.text();
+        assert_eq!(text.matches("__gpu$xla.gpu.triton").count(), 1, "{text}");
+        assert!(text.contains("nvfp4_embedding"), "{text}");
+        assert!(!text.contains("nml.nvfp4.embedding"), "{text}");
+        assert!(text.contains("tensor<6x17xf16>"), "{text}");
+    }
+    let text = program.stablehlo().unwrap();
+    assert_eq!(text.matches("nml.nvfp4.embedding").count(), 1, "{text}");
+    assert!(text.contains("tensor<32x9xui8>"), "{text}");
+    assert!(text.contains("tensor<32x2xui8>"), "{text}");
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
+}
+
+#[test]
+fn clamped_swiglu_moe_keeps_model_semantics_above_weight_representation() {
+    fn build(nvfp4: bool) -> nml_ir::Program {
+        let dtype = DType::Bf16;
+        let mut builder = ProgramBuilder::new();
+        let hidden = builder.input("hidden", Shape::new(dtype, &[2, 4]).unwrap());
+        let router = builder.input("router", Shape::new(DType::F32, &[2, 3]).unwrap());
+        let gate_shape = Shape::new(dtype, &[3, 4, 10]).unwrap();
+        let down_shape = Shape::new(dtype, &[3, 5, 4]).unwrap();
+        let gate = if nvfp4 {
+            Parameter::nvfp4("gate", "model.gate", gate_shape).unwrap()
+        } else {
+            parameter("gate", gate_shape)
+        };
+        let down = if nvfp4 {
+            Parameter::nvfp4("down", "model.down", down_shape).unwrap()
+        } else {
+            parameter("down", down_shape)
+        };
+        let gate_bias = parameter("gate_bias", Shape::new(dtype, &[3, 10]).unwrap());
+        let down_bias = parameter("down_bias", Shape::new(dtype, &[3, 4]).unwrap());
+        let output = builder
+            .moe_clamped_swiglu(hidden, router, &gate, &gate_bias, &down, &down_bias, 2)
+            .unwrap();
+        assert_eq!(output.shape().dimensions(), &[2, 4]);
+        builder.finish(&[output]).unwrap()
+    }
+
+    let dense = build(false).stablehlo().unwrap();
+    assert!(!dense.contains("nml.nvfp4"), "{dense}");
+    assert!(dense.contains("stablehlo.dot_general"), "{dense}");
+    assert!(dense.contains("stablehlo.slice"), "{dense}");
+    assert!(dense.contains("stablehlo.clamp"), "{dense}");
+    Context::new()
+        .parse_module(&dense)
+        .unwrap()
+        .verify()
+        .unwrap();
+
+    let compact_program = build(true);
+    let compact = compact_program.stablehlo().unwrap();
+    assert_eq!(
+        compact.matches("nml.nvfp4.gpt_oss_experts").count(),
+        1,
+        "{compact}"
+    );
+    assert!(compact.contains("stablehlo.sort"), "{compact}");
+    assert!(compact.contains("tensor<3x4x5xui8>"), "{compact}");
+    assert!(compact.contains("tensor<3x5x2xui8>"), "{compact}");
+    Context::new()
+        .parse_module(&compact)
+        .unwrap()
+        .verify()
+        .unwrap();
+
+    let context = Context::new();
+    let sm75 = compact_program
+        .module_with_sharding_cuda(&context, &nml_sharding::Sharding::single(), 24, 7, 5)
+        .unwrap();
+    sm75.verify().unwrap();
+    let sm75 = sm75.text();
+    assert_eq!(
+        sm75.matches("nml.nvfp4.turing.expert_gate_up").count(),
+        1,
+        "{sm75}"
+    );
+    assert_eq!(
+        sm75.matches("nml.nvfp4.turing.expert_down").count(),
+        1,
+        "{sm75}"
+    );
+    assert!(!sm75.contains("__gpu$xla.gpu.triton"), "{sm75}");
+    assert!(!sm75.contains("nml.nvfp4.gpt_oss_experts"), "{sm75}");
+    assert!(sm75.contains("stablehlo.reduce"), "{sm75}");
+
+    for (major, minor) in [(8, 0), (9, 0), (10, 0)] {
+        let context = Context::new();
+        let module = compact_program
+            .module_with_sharding_cuda(
+                &context,
+                &nml_sharding::Sharding::single(),
+                108,
+                major,
+                minor,
+            )
+            .unwrap();
+        module.verify().unwrap();
+        let text = module.text();
+        assert_eq!(text.matches("__gpu$xla.gpu.triton").count(), 2, "{text}");
+        assert!(text.contains("nvfp4_grouped_gate_up"), "{text}");
+        assert!(text.contains("nvfp4_grouped_down"), "{text}");
+        assert!(!text.contains("nml.nvfp4.gpt_oss_experts"), "{text}");
+        assert!(text.contains("stablehlo.reduce"), "{text}");
+    }
+}
+
+#[test]
 fn matmul_is_typed_deterministic_and_verified() {
     fn build() -> String {
         let mut builder = ProgramBuilder::new();
@@ -1135,6 +1401,7 @@ fn rope_and_ordinary_attention_are_verified_compositions() {
             value,
             query_positions,
             key_positions,
+            None,
             AttentionOptions {
                 causal: true,
                 sliding_window: Some(4),
@@ -1179,6 +1446,7 @@ fn paged_attention_is_one_bounded_verified_stablehlo_loop() {
             page_table,
             lengths,
             positions,
+            None,
             AttentionOptions {
                 causal: true,
                 sliding_window: Some(6),
@@ -1235,6 +1503,7 @@ fn cuda_paged_attention_lowers_complete_typed_triton_artifacts() {
                 page_table,
                 lengths,
                 positions,
+                None,
                 AttentionOptions {
                     causal: true,
                     sliding_window: Some(32),
@@ -1313,6 +1582,7 @@ fn cuda_paged_attention_selects_only_upstream_supported_flash_variants() {
                 page_table,
                 lengths,
                 positions,
+                None,
                 options,
             )
             .unwrap();
@@ -1388,9 +1658,19 @@ fn cuda_paged_attention_selects_only_upstream_supported_flash_variants() {
     assert!(sm90.contains("stablehlo.case"), "{sm90}");
     assert!(sm90.contains("tensor<1xi32>"), "{sm90}");
 
-    let unbuilt_sm91 = lower(16, DType::F16, (9, 1));
-    assert!(!unbuilt_sm91.contains("nml.flash_attention_3.paged"));
-    assert!(unbuilt_sm91.contains("stablehlo.while"), "{unbuilt_sm91}");
+    // Architectures outside the exact upstream FlashAttention binaries retain
+    // the fused Triton implementation. They do not lose accelerated attention
+    // merely because a device-specific FA adapter is unavailable.
+    let sm91 = lower(16, DType::F16, (9, 1));
+    assert!(!sm91.contains("nml.flash_attention_3.paged"));
+    assert!(sm91.contains("__gpu$xla.gpu.triton"), "{sm91}");
+    assert!(!sm91.contains("stablehlo.while"), "{sm91}");
+
+    let sm100 = lower(16, DType::Bf16, (10, 0));
+    assert!(!sm100.contains("nml.flash_attention_2.paged"), "{sm100}");
+    assert!(!sm100.contains("nml.flash_attention_3.paged"), "{sm100}");
+    assert!(sm100.contains("__gpu$xla.gpu.triton"), "{sm100}");
+    assert!(!sm100.contains("stablehlo.while"), "{sm100}");
 
     let unsupported_dtype = lower(256, DType::F32, (8, 0));
     assert!(!unsupported_dtype.contains("nml.flash_attention_2.paged"));
@@ -1418,6 +1698,7 @@ fn cuda_paged_attention_selects_only_upstream_supported_flash_variants() {
             page_table,
             lengths,
             positions,
+            None,
             AttentionOptions::default(),
         )
         .unwrap();
@@ -1451,6 +1732,7 @@ fn cuda_dense_attention_selects_flash_version_inside_its_exact_capability_contra
                 value,
                 query_positions,
                 key_positions,
+                None,
                 AttentionOptions {
                     causal: true,
                     sliding_window: Some(4),
@@ -1501,6 +1783,247 @@ fn cuda_dense_attention_selects_flash_version_inside_its_exact_capability_contra
             && !unbuilt_future_architecture.contains("nml.flash_attention_3.forward"),
         "{unbuilt_future_architecture}"
     );
+}
+
+#[test]
+fn learned_sinks_preserve_dense_flash_dispatch_and_use_the_exact_lse_epilogue() {
+    use nml_sharding::Sharding;
+
+    fn lower(capability_major: u16, with_sinks: bool) -> String {
+        let mut builder = ProgramBuilder::new();
+        let query = builder.input("query", Shape::new(DType::Bf16, &[2, 3, 4, 64]).unwrap());
+        let key = builder.input("key", Shape::new(DType::Bf16, &[2, 5, 2, 64]).unwrap());
+        let value = builder.input("value", Shape::new(DType::Bf16, &[2, 5, 2, 64]).unwrap());
+        let query_positions =
+            builder.input("query_positions", Shape::new(DType::I32, &[2, 3]).unwrap());
+        let key_positions =
+            builder.input("key_positions", Shape::new(DType::I32, &[2, 5]).unwrap());
+        let sinks =
+            with_sinks.then(|| builder.input("sinks", Shape::new(DType::Bf16, &[4]).unwrap()));
+        let output = builder
+            .attention(
+                query,
+                key,
+                value,
+                query_positions,
+                key_positions,
+                sinks,
+                AttentionOptions {
+                    causal: false,
+                    sliding_window: None,
+                    scale: None,
+                },
+            )
+            .unwrap();
+        let program = builder.finish(&[output]).unwrap();
+        let context = Context::new();
+        let module = program
+            .module_with_sharding_cuda(&context, &Sharding::single(), 80, capability_major, 0)
+            .unwrap();
+        module.verify().unwrap();
+        module.text()
+    }
+
+    for (capability, call) in [
+        (8, "nml.flash_attention_2.forward"),
+        (9, "nml.flash_attention_3.forward"),
+    ] {
+        let baseline = lower(capability, false);
+        let with_sinks = lower(capability, true);
+        assert_eq!(baseline.matches(call).count(), 1, "{baseline}");
+        assert_eq!(with_sinks.matches(call).count(), 1, "{with_sinks}");
+        assert!(!with_sinks.contains("stablehlo.case"), "{with_sinks}");
+        assert!(
+            !with_sinks.contains("stablehlo.dot_general"),
+            "{with_sinks}"
+        );
+        assert_eq!(
+            with_sinks.matches("stablehlo.logistic").count(),
+            1,
+            "the Flash LSE must supply the exact sink-normalizer correction:\n{with_sinks}"
+        );
+    }
+}
+
+#[test]
+fn learned_sinks_preserve_each_optimized_paged_attention_dispatch() {
+    use nml_sharding::Sharding;
+
+    fn lower(
+        query_length: i64,
+        page_size: i64,
+        capability: (u16, u16),
+        with_sinks: bool,
+        options: AttentionOptions,
+    ) -> String {
+        let mut builder = ProgramBuilder::new();
+        let query = builder.input(
+            "query",
+            Shape::new(DType::Bf16, &[2, query_length, 4, 64]).unwrap(),
+        );
+        let key_cache = builder.input(
+            "key_cache",
+            Shape::new(DType::Bf16, &[7, page_size, 2, 64]).unwrap(),
+        );
+        let value_cache = builder.input(
+            "value_cache",
+            Shape::new(DType::Bf16, &[7, page_size, 2, 64]).unwrap(),
+        );
+        let page_table = builder.input("page_table", Shape::new(DType::I32, &[2, 5]).unwrap());
+        let lengths = builder.input("lengths", Shape::new(DType::I32, &[2]).unwrap());
+        let positions = builder.input(
+            "positions",
+            Shape::new(DType::I32, &[2, query_length]).unwrap(),
+        );
+        let sinks =
+            with_sinks.then(|| builder.input("sinks", Shape::new(DType::Bf16, &[4]).unwrap()));
+        let output = builder
+            .paged_attention(
+                query,
+                key_cache,
+                value_cache,
+                page_table,
+                lengths,
+                positions,
+                sinks,
+                options,
+            )
+            .unwrap();
+        let program = builder.finish(&[output]).unwrap();
+        let context = Context::new();
+        let module = program
+            .module_with_sharding_cuda(
+                &context,
+                &Sharding::single(),
+                80,
+                capability.0,
+                capability.1,
+            )
+            .unwrap();
+        module.verify().unwrap();
+        module.text()
+    }
+
+    let masked = AttentionOptions {
+        causal: true,
+        sliding_window: Some(32),
+        scale: None,
+    };
+    for (query_length, expected_calls) in [(3, 1), (1, 2)] {
+        let baseline = lower(query_length, 16, (8, 0), false, masked);
+        let with_sinks = lower(query_length, 16, (8, 0), true, masked);
+        assert_eq!(
+            baseline.matches("__gpu$xla.gpu.triton").count(),
+            expected_calls,
+            "{baseline}"
+        );
+        assert_eq!(
+            with_sinks.matches("__gpu$xla.gpu.triton").count(),
+            expected_calls,
+            "{with_sinks}"
+        );
+        assert!(!with_sinks.contains("stablehlo.while"), "{with_sinks}");
+    }
+
+    let unmasked = AttentionOptions {
+        causal: false,
+        sliding_window: None,
+        scale: None,
+    };
+    for (page_size, capability, call) in [
+        (256, (8, 0), "nml.flash_attention_2.paged"),
+        (16, (9, 0), "nml.flash_attention_3.paged"),
+    ] {
+        let baseline = lower(3, page_size, capability, false, unmasked);
+        let with_sinks = lower(3, page_size, capability, true, unmasked);
+        assert_eq!(baseline.matches(call).count(), 1, "{baseline}");
+        assert_eq!(with_sinks.matches(call).count(), 1, "{with_sinks}");
+        assert!(!with_sinks.contains("__gpu$xla.gpu.triton"), "{with_sinks}");
+        assert!(!with_sinks.contains("stablehlo.while"), "{with_sinks}");
+        assert_eq!(
+            with_sinks.matches("stablehlo.logistic").count(),
+            1,
+            "the paged Flash LSE must supply the exact sink-normalizer correction:\n{with_sinks}"
+        );
+    }
+}
+
+#[test]
+fn gpt_oss_identity_page_geometry_has_no_portable_cuda_branch() {
+    use nml_sharding::Sharding;
+
+    fn program(query_length: i64, capacity: i64) -> nml_ir::Program {
+        let mut builder = ProgramBuilder::new();
+        let query = builder.input(
+            "query",
+            Shape::new(DType::Bf16, &[1, query_length, 64, 64]).unwrap(),
+        );
+        let cache_shape = Shape::new(DType::Bf16, &[1, capacity, 8, 64]).unwrap();
+        let key_cache = builder.input("key_cache", cache_shape);
+        let value_cache = builder.input("value_cache", cache_shape);
+        let page_table = builder
+            .iota(Shape::new(DType::I32, &[1, 1]).unwrap(), 1)
+            .unwrap();
+        let lengths = builder.input("lengths", Shape::new(DType::I32, &[1]).unwrap());
+        let positions = builder.input(
+            "positions",
+            Shape::new(DType::I32, &[1, query_length]).unwrap(),
+        );
+        let sinks = builder.input("sinks", Shape::new(DType::Bf16, &[64]).unwrap());
+        let output = builder
+            .paged_attention(
+                query,
+                key_cache,
+                value_cache,
+                page_table,
+                lengths,
+                positions,
+                Some(sinks),
+                AttentionOptions {
+                    causal: true,
+                    sliding_window: Some(128),
+                    scale: None,
+                },
+            )
+            .unwrap();
+        builder.finish(&[output]).unwrap()
+    }
+
+    fn lower(program: &nml_ir::Program, capability: (u16, u16)) -> String {
+        let context = Context::new();
+        let module = program
+            .module_with_sharding_cuda(
+                &context,
+                &Sharding::single(),
+                108,
+                capability.0,
+                capability.1,
+            )
+            .unwrap();
+        module.verify().unwrap();
+        module.text()
+    }
+
+    // GPT-OSS uses 64 query heads, eight KV heads, 64-wide heads, learned
+    // sinks, and a 128-token local window on alternating layers. The finite
+    // product graph views its contiguous donated cache as one identity page.
+    let small = program(1, 8);
+    for capability in [(8, 0), (9, 0), (10, 0)] {
+        let text = lower(&small, capability);
+        assert!(!text.contains("stablehlo.while"), "{text}");
+        assert!(text.contains("__gpu$xla.gpu.triton"), "{text}");
+        if capability == (9, 0) {
+            assert!(text.contains("nml.flash_attention_3.paged"), "{text}");
+        }
+    }
+
+    // A finite family whose single identity page is divisible by 256 admits
+    // FA2. Arbitrary positions select its Triton alternate, never the portable
+    // StableHLO page loop.
+    let ampere = lower(&program(3, 256), (8, 0));
+    assert!(ampere.contains("nml.flash_attention_2.paged"), "{ampere}");
+    assert!(ampere.contains("__gpu$xla.gpu.triton"), "{ampere}");
+    assert!(!ampere.contains("stablehlo.while"), "{ampere}");
 }
 
 #[test]
@@ -1559,6 +2082,7 @@ fn ordinary_attention_preserves_shardy_head_and_batch_placement() {
             value,
             query_positions,
             key_positions,
+            None,
             AttentionOptions::default(),
         )
         .unwrap();
@@ -1636,6 +2160,7 @@ fn paged_attention_preserves_shardy_head_and_batch_placement() {
             page_table,
             sequence_lengths,
             query_positions,
+            None,
             AttentionOptions::default(),
         )
         .unwrap();
@@ -1662,6 +2187,7 @@ fn attention_geometry_is_rejected_before_mlir_construction() {
             value,
             positions,
             positions,
+            None,
             AttentionOptions::default(),
         ),
         Err(Error::InvalidAttention(_))
@@ -1692,6 +2218,7 @@ fn attention_geometry_is_rejected_before_mlir_construction() {
             value,
             positions,
             positions,
+            None,
             AttentionOptions::default(),
         ),
         Err(Error::InvalidAttention(_))
@@ -1709,6 +2236,7 @@ fn attention_geometry_is_rejected_before_mlir_construction() {
             value,
             positions,
             positions,
+            None,
             AttentionOptions {
                 scale: Some(f64::MAX),
                 ..AttentionOptions::default()
@@ -1729,6 +2257,7 @@ fn attention_geometry_is_rejected_before_mlir_construction() {
             value,
             positions,
             positions,
+            None,
             AttentionOptions {
                 sliding_window: Some(0),
                 ..AttentionOptions::default()
@@ -1753,6 +2282,7 @@ fn attention_geometry_is_rejected_before_mlir_construction() {
             page_table,
             lengths,
             positions,
+            None,
             AttentionOptions {
                 sliding_window: Some(0),
                 ..AttentionOptions::default()
@@ -2395,4 +2925,74 @@ fn expert_parallel_moe_derives_local_shards_inside_private_manual_computation() 
     assert_eq!(text.matches("stablehlo.all_reduce").count(), 1, "{text}");
     assert!(text.contains("dense<[[0, 1], [2, 3]]>"), "{text}");
     assert!(text.contains("tensor<2x64x32xf16>"), "{text}");
+}
+
+#[test]
+fn expert_parallel_nvfp4_derives_local_components_inside_the_shared_manual_boundary() {
+    use nml_sharding::Sharding;
+
+    let data_axis = AxisTag::new(221);
+    let expert_axis = AxisTag::new(222);
+    let expert_partition = [
+        Partition::Sharded(expert_axis),
+        Partition::Replicated,
+        Partition::Replicated,
+    ];
+    let mut builder = ProgramBuilder::new();
+    let hidden = builder.input(
+        "hidden",
+        Shape::new(DType::Bf16, &[4, 32])
+            .unwrap()
+            .with_partitions(&[Partition::Sharded(data_axis), Partition::Replicated])
+            .unwrap(),
+    );
+    let router = builder.input(
+        "router",
+        Shape::new(DType::F32, &[4, 4])
+            .unwrap()
+            .with_partitions(&[Partition::Sharded(data_axis), Partition::Replicated])
+            .unwrap(),
+    );
+    let gate_shape = Shape::new(DType::Bf16, &[4, 32, 64])
+        .unwrap()
+        .with_partitions(&expert_partition)
+        .unwrap();
+    let down_shape = Shape::new(DType::Bf16, &[4, 32, 32])
+        .unwrap()
+        .with_partitions(&expert_partition)
+        .unwrap();
+    let gate = Parameter::nvfp4("gate", "model.gate", gate_shape).unwrap();
+    let down = Parameter::nvfp4("down", "model.down", down_shape).unwrap();
+    let gate_bias = parameter(
+        "gate_bias",
+        Shape::new(DType::Bf16, &[4, 64])
+            .unwrap()
+            .with_partitions(&expert_partition[..2])
+            .unwrap(),
+    );
+    let down_bias = parameter(
+        "down_bias",
+        Shape::new(DType::Bf16, &[4, 32])
+            .unwrap()
+            .with_partitions(&expert_partition[..2])
+            .unwrap(),
+    );
+    let output = builder
+        .moe_clamped_swiglu(hidden, router, &gate, &gate_bias, &down, &down_bias, 2)
+        .unwrap();
+    let program = builder.finish(&[output]).unwrap();
+    let mesh = Sharding::mesh(&[(data_axis, 2), (expert_axis, 2)]).unwrap();
+    let text = program
+        .module_with_sharding_cuda(&Context::new(), &mesh, 108, 8, 0)
+        .unwrap()
+        .text();
+
+    assert!(text.contains("sdy.manual_computation"), "{text}");
+    assert!(text.contains("stablehlo.partition_id"), "{text}");
+    assert_eq!(text.matches("__gpu$xla.gpu.triton").count(), 2, "{text}");
+    assert!(text.contains("nvfp4_grouped_gate_up"), "{text}");
+    assert!(text.contains("nvfp4_grouped_down"), "{text}");
+    assert_eq!(text.matches("stablehlo.all_reduce").count(), 1, "{text}");
+    assert!(text.contains("tensor<2x32x32xui8>"), "{text}");
+    assert!(text.contains("tensor<2x32x4xui8>"), "{text}");
 }

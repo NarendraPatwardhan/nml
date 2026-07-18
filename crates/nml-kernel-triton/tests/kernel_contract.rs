@@ -1,9 +1,11 @@
 use nml_kernel_triton::{
     ArgumentKind, AttentionGeometry, AttentionLaunch, Builder, Comparison, DType, Error,
-    GatedActivation, GroupedProjectionConfig, KernelLaunch, KernelSpec, OutputAlias,
-    PagedAttention2dConfig, PagedAttention3dConfig, Reduction, SegmentReductionConfig, TensorSpec,
-    build_grouped_projection, build_paged_attention_2d, build_paged_attention_3d,
-    build_segment_reduction, select_attention_launch,
+    GatedActivation, GroupedProjectionConfig, KernelLaunch, KernelSpec, NvFp4EmbeddingConfig,
+    NvFp4GroupedProjectionConfig, NvFp4GroupedRole, NvFp4LinearConfig, OutputAlias,
+    PagedAttention2dConfig, PagedAttention3dConfig, Reduction, ScaleDotElement,
+    SegmentReductionConfig, TensorSpec, build_grouped_projection, build_nvfp4_embedding,
+    build_nvfp4_grouped_projection, build_nvfp4_linear, build_paged_attention_2d,
+    build_paged_attention_3d, build_segment_reduction, select_attention_launch,
 };
 use nml_mlir::{Block, Context, Region};
 
@@ -50,6 +52,160 @@ fn named_typed_kernel_is_deterministic_and_verified() {
     assert!(first.contains("tt.load"), "{first}");
     assert!(first.contains("arith.addf"), "{first}");
     assert!(first.contains("tt.store"), "{first}");
+}
+
+#[test]
+fn nvfp4_linear_decodes_compact_tiles_inside_one_verified_kernel() {
+    let config = NvFp4LinearConfig {
+        dtype: DType::Bf16,
+        rows: 17,
+        outputs: 33,
+        inputs: 80,
+        block_m: 16,
+        block_n: 32,
+        block_k: 32,
+        has_bias: true,
+    };
+    assert_eq!(config.launch_grid().unwrap(), [4, 1, 1]);
+    let ttir = build_nvfp4_linear(config).unwrap();
+    for operation in [
+        "@nvfp4_linear",
+        "scf.for",
+        "arith.shrui",
+        "arith.andi",
+        "math.exp2",
+        "tt.dot",
+        "tt.store",
+    ] {
+        assert!(ttir.contains(operation), "missing {operation}:\n{ttir}");
+    }
+    assert_eq!(ttir.matches("tt.dot").count(), 1, "{ttir}");
+    assert!(
+        ttir.rfind("arith.addf").unwrap() > ttir.find("tt.dot").unwrap(),
+        "bias must be added after the contraction: {ttir}"
+    );
+
+    let bias_free = build_nvfp4_linear(NvFp4LinearConfig {
+        has_bias: false,
+        ..config
+    })
+    .unwrap();
+    let signature = ttir
+        .lines()
+        .find(|line| line.contains("tt.func public @nvfp4_linear"))
+        .unwrap();
+    let bias_free_signature = bias_free
+        .lines()
+        .find(|line| line.contains("tt.func public @nvfp4_linear"))
+        .unwrap();
+    assert_eq!(signature.matches("!tt.ptr<bf16>").count(), 3, "{signature}");
+    assert_eq!(
+        bias_free_signature.matches("!tt.ptr<bf16>").count(),
+        2,
+        "{bias_free_signature}"
+    );
+}
+
+#[test]
+fn nvfp4_embedding_decodes_only_selected_compact_rows() {
+    for index_dtype in [DType::I32, DType::I64] {
+        let config = NvFp4EmbeddingConfig {
+            dtype: DType::Bf16,
+            index_dtype,
+            rows: 7,
+            vocabulary: 33,
+            width: 80,
+            block_m: 16,
+            block_n: 32,
+        };
+        assert_eq!(config.launch_grid().unwrap(), [1, 3, 1]);
+        let ttir = build_nvfp4_embedding(config).unwrap();
+        for operation in [
+            "@nvfp4_embedding",
+            "arith.shrui",
+            "arith.andi",
+            "math.exp2",
+            "tt.load",
+            "tt.store",
+        ] {
+            assert!(ttir.contains(operation), "missing {operation}:\n{ttir}");
+        }
+        assert!(!ttir.contains("tt.dot"), "{ttir}");
+    }
+}
+
+#[test]
+fn nvfp4_grouped_experts_keep_routing_and_decode_inside_verified_kernels() {
+    for dtype in [DType::F16, DType::Bf16] {
+        let gate_up = build_nvfp4_grouped_projection(NvFp4GroupedProjectionConfig {
+            dtype,
+            assignments: 32,
+            input_size: 64,
+            output_size: 128,
+            local_experts: 4,
+            source_row_divisor: 2,
+            block_m: 16,
+            block_n: 32,
+            block_k: 32,
+            role: NvFp4GroupedRole::GateUp,
+        })
+        .unwrap();
+        assert!(gate_up.contains("@nvfp4_grouped_gate_up"), "{gate_up}");
+        assert!(gate_up.contains("arith.shrui"), "{gate_up}");
+        assert!(gate_up.contains("math.exp2"), "{gate_up}");
+        assert_eq!(gate_up.matches("tt.dot").count(), 1, "{gate_up}");
+
+        let down = build_nvfp4_grouped_projection(NvFp4GroupedProjectionConfig {
+            dtype,
+            assignments: 32,
+            input_size: 64,
+            output_size: 64,
+            local_experts: 4,
+            source_row_divisor: 1,
+            block_m: 16,
+            block_n: 32,
+            block_k: 32,
+            role: NvFp4GroupedRole::GptOssDown,
+        })
+        .unwrap();
+        assert!(down.contains("@nvfp4_grouped_down"), "{down}");
+        assert!(down.contains("arith.shrui"), "{down}");
+        assert!(down.contains("math.exp2"), "{down}");
+        assert_eq!(down.matches("tt.dot").count(), 1, "{down}");
+        assert!(
+            down.matches("arith.minnumf").count() >= 2,
+            "GPT-OSS gate/up clamps must remain in the down kernel: {down}"
+        );
+    }
+}
+
+#[test]
+fn microscaling_dot_surface_is_typed_and_verified_by_the_pinned_dialect() {
+    let mut builder = Builder::new("nvfp4_scaled_dot_contract").unwrap();
+    let left = builder.full_integer(&[128, 128], 0, DType::I8).unwrap();
+    let left_scale = builder.full_integer(&[128, 4], 0, DType::I8).unwrap();
+    let right = builder.full_integer(&[64, 128], 0, DType::I8).unwrap();
+    let right_scale = builder.full_integer(&[128, 4], 0, DType::I8).unwrap();
+    let accumulator = builder.full_float(&[128, 128], 0.0, DType::F32).unwrap();
+    let result = builder
+        .dot_scaled(
+            &left,
+            &right,
+            &accumulator,
+            Some(&left_scale),
+            Some(&right_scale),
+            ScaleDotElement::E4M3,
+            ScaleDotElement::E2M1,
+            true,
+            true,
+        )
+        .unwrap();
+    let zero = builder.full_float(&[128, 128], 0.0, DType::F32).unwrap();
+    let _ = builder.add(&result, &zero).unwrap();
+    builder.return_void().unwrap();
+    let ttir = builder.finish().unwrap();
+    assert!(ttir.contains("tt.dot_scaled"), "{ttir}");
+    assert!(ttir.contains("lhs = e4m3 rhs = e2m1"), "{ttir}");
 }
 
 #[test]
@@ -603,6 +759,7 @@ fn non_power_of_two_gqa_uses_padded_masked_head_lanes() {
         block_m: 16,
         sliding_window: None,
         causal: true,
+        learned_sinks: false,
     })
     .unwrap();
     assert!(ttir.contains("arith.constant 3 : i32"), "{ttir}");
@@ -645,6 +802,7 @@ fn sub_tile_head_dimensions_are_not_valid_ttir_specializations() {
         block_m: 2,
         sliding_window: None,
         causal: true,
+        learned_sinks: false,
     });
     assert!(matches!(result, Err(Error::InvalidKernelSpec(_))));
 }
@@ -663,6 +821,7 @@ fn retained_paged_attention_2d_is_complete_verified_ttir() {
         block_m: 16,
         sliding_window: Some(128),
         causal: true,
+        learned_sinks: false,
     })
     .unwrap();
     for operation in [
@@ -691,6 +850,44 @@ fn retained_paged_attention_2d_is_complete_verified_ttir() {
 }
 
 #[test]
+fn paged_attention_2d_initializes_online_softmax_from_learned_sinks() {
+    let config = PagedAttention2dConfig {
+        dtype: DType::Bf16,
+        num_query_heads: 8,
+        queries_per_kv: 4,
+        page_size: 16,
+        tile_size: 16,
+        head_size: 64,
+        padded_head_size: 64,
+        block_q: 4,
+        block_m: 16,
+        sliding_window: Some(128),
+        causal: true,
+        learned_sinks: true,
+    };
+    let ttir = build_paged_attention_2d(config).unwrap();
+    let without_sinks = build_paged_attention_2d(PagedAttention2dConfig {
+        learned_sinks: false,
+        ..config
+    })
+    .unwrap();
+    assert_eq!(
+        ttir.matches("!tt.ptr<bf16>").count(),
+        without_sinks.matches("!tt.ptr<bf16>").count() + 5,
+        "the extra bf16 sink pointer must survive in the function type and its splat/addptr/load operations:\n{ttir}"
+    );
+    assert_eq!(
+        ttir.matches("arith.extf").count(),
+        without_sinks.matches("arith.extf").count() + 1,
+        "the bf16 sink must be promoted to the F32 online-softmax state:\n{ttir}"
+    );
+    assert!(
+        ttir.contains("1.44269502"),
+        "sink logits must enter the kernel's base-two softmax domain:\n{ttir}"
+    );
+}
+
+#[test]
 fn noncausal_sliding_window_has_both_position_bounds() {
     let ttir = build_paged_attention_2d(PagedAttention2dConfig {
         dtype: DType::F16,
@@ -704,6 +901,7 @@ fn noncausal_sliding_window_has_both_position_bounds() {
         block_m: 16,
         sliding_window: Some(17),
         causal: false,
+        learned_sinks: false,
     })
     .unwrap();
     assert!(ttir.contains("arith.constant -17 : i32"), "{ttir}");
@@ -720,6 +918,7 @@ fn split_k_segment_reduction_is_complete_verified_ttir() {
         head_size: 80,
         padded_head_size: 128,
         block_q: 4,
+        learned_sinks: false,
     })
     .unwrap();
     assert!(
@@ -733,6 +932,42 @@ fn split_k_segment_reduction_is_complete_verified_ttir() {
     assert!(ttir.contains("arith.maxsi"), "{ttir}");
     assert!(ttir.contains("arith.cmpf ogt"), "{ttir}");
     assert!(ttir.contains("tt.store"), "{ttir}");
+}
+
+#[test]
+fn split_k_reduction_adds_one_learned_sink_to_the_global_denominator() {
+    let config = SegmentReductionConfig {
+        output_dtype: DType::Bf16,
+        num_query_heads: 8,
+        segments: 16,
+        tile_size: 16,
+        head_size: 80,
+        padded_head_size: 128,
+        block_q: 4,
+        learned_sinks: true,
+    };
+    let ttir = build_segment_reduction(config).unwrap();
+    let without_sinks = build_segment_reduction(SegmentReductionConfig {
+        learned_sinks: false,
+        ..config
+    })
+    .unwrap();
+    assert_eq!(
+        ttir.matches("!tt.ptr<bf16>").count(),
+        without_sinks.matches("!tt.ptr<bf16>").count() + 3,
+        "the extra bf16 sink pointer must survive in the function type and its load/addptr operations:\n{ttir}"
+    );
+    assert_eq!(
+        ttir.matches("arith.maxnumf").count(),
+        without_sinks.matches("arith.maxnumf").count() + 1,
+        "the global maximum must include the learned sink exactly once:\n{ttir}"
+    );
+    assert_eq!(
+        ttir.matches("math.exp2").count(),
+        without_sinks.matches("math.exp2").count() + 1,
+        "the denominator must include the learned sink exactly once:\n{ttir}"
+    );
+    assert!(ttir.contains("1.44269502"), "{ttir}");
 }
 
 #[test]
@@ -750,6 +985,7 @@ fn retained_paged_attention_3d_writes_fp32_segment_state() {
             block_m: 16,
             sliding_window: Some(128),
             causal: true,
+            learned_sinks: false,
         },
         segments: 16,
     })

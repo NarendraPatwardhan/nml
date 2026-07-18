@@ -6,7 +6,8 @@
 //! collapsing into one misleading wall-clock number.
 
 use nml_ir::ProgramBuilder;
-use nml_types::{DType, Shape};
+use nml_parameter::{ComponentRole, Parameter};
+use nml_types::{BFloat16, DType, Shape};
 use std::time::{Duration, Instant};
 
 const BATCH: usize = 64;
@@ -99,6 +100,9 @@ fn representative_execution_has_phase_separated_bounds() {
 
     measure_spatial_workloads(&platform);
     measure_moe_workload(&platform);
+    if env!("NML_PERFORMANCE_BACKEND") == "cuda" {
+        measure_nvfp4_workloads(&platform);
+    }
 }
 
 fn measure_spatial_workloads(platform: &nml::Platform) {
@@ -255,6 +259,363 @@ fn measure_moe_workload(platform: &nml::Platform) {
         download,
     );
     drop(first);
+}
+
+// These are GPT-OSS 20B dimensions, not toy multiples chosen to flatter a
+// kernel. The ordinary CPU performance target deliberately does not run this
+// CUDA acceptance family: its separately tracked CPU product work needs
+// architecture-specific ceilings and must not inherit GPU-shaped claims.
+const GPT_OSS_HIDDEN: usize = 2_880;
+const GPT_OSS_INTERMEDIATE: usize = 2_880;
+const GPT_OSS_EXPERTS: usize = 32;
+const GPT_OSS_ROUTES: usize = 4;
+const GPT_OSS_VOCABULARY: usize = 201_088;
+const NVFP4_SCALE: f32 = 1.0 / 1_024.0;
+
+fn measure_nvfp4_workloads(platform: &nml::Platform) {
+    measure_nvfp4_embedding(platform);
+    measure_nvfp4_linear(platform, 1, "nvfp4_linear_decode_m1_k2880_n2880");
+    measure_nvfp4_linear(platform, 128, "nvfp4_linear_prefill_m128_k2880_n2880");
+    measure_nvfp4_grouped_moe(platform);
+}
+
+fn measure_nvfp4_embedding(platform: &nml::Platform) {
+    const TOKENS: usize = 128;
+    let index_shape = Shape::new(DType::I32, &[TOKENS as i64]).unwrap();
+    let embedding = Parameter::nvfp4(
+        "embedding",
+        "model.embed_tokens.weight",
+        Shape::new(
+            DType::Bf16,
+            &[GPT_OSS_VOCABULARY as i64, GPT_OSS_HIDDEN as i64],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut builder = ProgramBuilder::new();
+    let indices = builder.input("indices", index_shape);
+    let output = builder.token_embedding(&embedding, indices).unwrap();
+    let program = builder
+        .finish_named(&[("output".to_owned(), output)])
+        .unwrap();
+
+    let compile_started = Instant::now();
+    let executable = platform.compile(&program, nml::Sharding::single()).unwrap();
+    let compile = compile_started.elapsed();
+    let indices = (0..TOKENS)
+        .map(|index| ((index * 1_543) % GPT_OSS_VOCABULARY) as i32)
+        .collect::<Vec<_>>();
+    let index_host = nml::Slice::from_typed(index_shape, &indices).unwrap();
+    let embedding_host = patterned_nvfp4(embedding);
+    let upload_started = Instant::now();
+    let index_buffer = platform
+        .upload(&index_host, nml::Sharding::single(), nml::Memory::Default)
+        .unwrap();
+    let loaded_embedding = upload_parameter(platform, &embedding_host);
+    let mut arguments = executable.args();
+    arguments.set("indices", index_buffer).unwrap();
+    arguments
+        .set_parameter(&loaded_embedding)
+        .unwrap()
+        .bake()
+        .unwrap();
+    let upload = upload_started.elapsed();
+    drop(embedding_host);
+
+    let first_started = Instant::now();
+    let first = arguments.call().unwrap();
+    let first_execution = first_started.elapsed();
+    let steady_started = Instant::now();
+    let mut final_results = None;
+    for _ in 0..STEADY_RUNS {
+        final_results = Some(arguments.call().unwrap());
+    }
+    let steady_average = steady_started.elapsed() / STEADY_RUNS;
+    let download_started = Instant::now();
+    assert_bf16_finite(final_results.as_ref().unwrap(), "output");
+    let download = download_started.elapsed();
+    report_phases(
+        platform,
+        "nvfp4_embedding_vocab201088_width2880_tokens128",
+        compile,
+        upload,
+        first_execution,
+        steady_average,
+        download,
+    );
+    drop(first);
+}
+
+fn measure_nvfp4_linear(platform: &nml::Platform, rows: usize, workload: &str) {
+    let input_shape = Shape::new(DType::Bf16, &[rows as i64, GPT_OSS_HIDDEN as i64]).unwrap();
+    let weight = Parameter::nvfp4(
+        "weight",
+        "model.projection.weight",
+        Shape::new(DType::Bf16, &[GPT_OSS_HIDDEN as i64, GPT_OSS_HIDDEN as i64]).unwrap(),
+    )
+    .unwrap();
+    let mut builder = ProgramBuilder::new();
+    let input = builder.input("input", input_shape);
+    let output = builder.linear(input, &weight, None).unwrap();
+    let program = builder
+        .finish_named(&[("output".to_owned(), output)])
+        .unwrap();
+
+    let compile_started = Instant::now();
+    let executable = platform.compile(&program, nml::Sharding::single()).unwrap();
+    let compile = compile_started.elapsed();
+    let input_values = patterned_bf16(rows * GPT_OSS_HIDDEN);
+    let input_host = nml::Slice::from_typed(input_shape, &input_values).unwrap();
+    let weight_host = patterned_nvfp4(weight);
+    let upload_started = Instant::now();
+    let input_buffer = platform
+        .upload(&input_host, nml::Sharding::single(), nml::Memory::Default)
+        .unwrap();
+    let loaded_weight = upload_parameter(platform, &weight_host);
+    let mut arguments = executable.args();
+    arguments.set("input", input_buffer).unwrap();
+    arguments
+        .set_parameter(&loaded_weight)
+        .unwrap()
+        .bake()
+        .unwrap();
+    let upload = upload_started.elapsed();
+    drop(weight_host);
+
+    let first_started = Instant::now();
+    let first = arguments.call().unwrap();
+    let first_execution = first_started.elapsed();
+    let steady_started = Instant::now();
+    let mut final_results = None;
+    for _ in 0..STEADY_RUNS {
+        final_results = Some(arguments.call().unwrap());
+    }
+    let steady_average = steady_started.elapsed() / STEADY_RUNS;
+    let download_started = Instant::now();
+    assert_bf16_finite(final_results.as_ref().unwrap(), "output");
+    let download = download_started.elapsed();
+    report_phases(
+        platform,
+        workload,
+        compile,
+        upload,
+        first_execution,
+        steady_average,
+        download,
+    );
+    drop(first);
+}
+
+fn measure_nvfp4_grouped_moe(platform: &nml::Platform) {
+    const TOKENS: usize = 16;
+    let hidden_shape = Shape::new(DType::Bf16, &[TOKENS as i64, GPT_OSS_HIDDEN as i64]).unwrap();
+    let router_shape = Shape::new(DType::F32, &[TOKENS as i64, GPT_OSS_EXPERTS as i64]).unwrap();
+    let gate = Parameter::nvfp4(
+        "gate_up",
+        "model.experts.gate_up_proj",
+        Shape::new(
+            DType::Bf16,
+            &[
+                GPT_OSS_EXPERTS as i64,
+                GPT_OSS_HIDDEN as i64,
+                (2 * GPT_OSS_INTERMEDIATE) as i64,
+            ],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let down = Parameter::nvfp4(
+        "down",
+        "model.experts.down_proj",
+        Shape::new(
+            DType::Bf16,
+            &[
+                GPT_OSS_EXPERTS as i64,
+                GPT_OSS_INTERMEDIATE as i64,
+                GPT_OSS_HIDDEN as i64,
+            ],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let gate_bias = Parameter::dense(
+        "gate_bias",
+        "model.experts.gate_up_proj_bias",
+        Shape::new(
+            DType::Bf16,
+            &[GPT_OSS_EXPERTS as i64, (2 * GPT_OSS_INTERMEDIATE) as i64],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let down_bias = Parameter::dense(
+        "down_bias",
+        "model.experts.down_proj_bias",
+        Shape::new(
+            DType::Bf16,
+            &[GPT_OSS_EXPERTS as i64, GPT_OSS_HIDDEN as i64],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut builder = ProgramBuilder::new();
+    let hidden = builder.input("hidden", hidden_shape);
+    let router = builder.input("router", router_shape);
+    let output = builder
+        .moe_clamped_swiglu(
+            hidden,
+            router,
+            &gate,
+            &gate_bias,
+            &down,
+            &down_bias,
+            GPT_OSS_ROUTES,
+        )
+        .unwrap();
+    let program = builder
+        .finish_named(&[("output".to_owned(), output)])
+        .unwrap();
+
+    let compile_started = Instant::now();
+    let executable = platform.compile(&program, nml::Sharding::single()).unwrap();
+    let compile = compile_started.elapsed();
+    let hidden = patterned_bf16(TOKENS * GPT_OSS_HIDDEN);
+    let hidden_host = nml::Slice::from_typed(hidden_shape, &hidden).unwrap();
+    let router = (0..TOKENS * GPT_OSS_EXPERTS)
+        .map(|index| ((index * 17 % 101) as f32 - 50.0) / 16.0)
+        .collect::<Vec<_>>();
+    let router_host = nml::Slice::from_typed(router_shape, &router).unwrap();
+    let gate_host = patterned_nvfp4(gate);
+    let gate_bias_host = zero_bf16_parameter(gate_bias);
+    let down_host = patterned_nvfp4(down);
+    let down_bias_host = zero_bf16_parameter(down_bias);
+    let upload_started = Instant::now();
+    let hidden_buffer = platform
+        .upload(&hidden_host, nml::Sharding::single(), nml::Memory::Default)
+        .unwrap();
+    let router_buffer = platform
+        .upload(&router_host, nml::Sharding::single(), nml::Memory::Default)
+        .unwrap();
+    let loaded_gate = upload_parameter(platform, &gate_host);
+    let loaded_gate_bias = upload_parameter(platform, &gate_bias_host);
+    let loaded_down = upload_parameter(platform, &down_host);
+    let loaded_down_bias = upload_parameter(platform, &down_bias_host);
+    let mut arguments = executable.args();
+    arguments.set("hidden", hidden_buffer).unwrap();
+    arguments.set("router", router_buffer).unwrap();
+    for parameter in [loaded_gate, loaded_gate_bias, loaded_down, loaded_down_bias] {
+        arguments.set_parameter(&parameter).unwrap();
+    }
+    arguments.bake().unwrap();
+    let upload = upload_started.elapsed();
+    drop((gate_host, gate_bias_host, down_host, down_bias_host));
+
+    let first_started = Instant::now();
+    let first = arguments.call().unwrap();
+    let first_execution = first_started.elapsed();
+    let steady_started = Instant::now();
+    let mut final_results = None;
+    for _ in 0..3 {
+        final_results = Some(arguments.call().unwrap());
+    }
+    let steady_average = steady_started.elapsed() / 3;
+    let download_started = Instant::now();
+    assert_bf16_finite(final_results.as_ref().unwrap(), "output");
+    let download = download_started.elapsed();
+    report_phases(
+        platform,
+        "nvfp4_grouped_moe_tokens16_experts32_top4_hidden2880_intermediate2880",
+        compile,
+        upload,
+        first_execution,
+        steady_average,
+        download,
+    );
+    drop(first);
+}
+
+struct HostParameter {
+    parameter: Parameter,
+    components: Vec<HostComponent>,
+}
+
+struct HostComponent {
+    shape: Shape,
+    bytes: Vec<u8>,
+}
+
+fn patterned_nvfp4(parameter: Parameter) -> HostParameter {
+    let scale = nml_parameter::nvfp4::encode_e4m3fn_scale(1.0).unwrap();
+    let global = NVFP4_SCALE.to_ne_bytes();
+    let components = parameter
+        .components()
+        .iter()
+        .map(|component| {
+            let bytes = match component.role() {
+                // Both nibbles encode +0.5. A small global factor keeps the
+                // full GPT-OSS contractions finite without changing storage
+                // density or the compact-kernel path under measurement.
+                ComponentRole::Payload => {
+                    vec![0x11; component.storage().shape().element_count().unwrap()]
+                }
+                ComponentRole::BlockScales => {
+                    vec![scale; component.storage().shape().element_count().unwrap()]
+                }
+                ComponentRole::GlobalScale => global.to_vec(),
+                ComponentRole::Values => unreachable!(),
+            };
+            HostComponent {
+                shape: component.storage().shape(),
+                bytes,
+            }
+        })
+        .collect();
+    HostParameter {
+        parameter,
+        components,
+    }
+}
+
+fn zero_bf16_parameter(parameter: Parameter) -> HostParameter {
+    let bytes = vec![0; parameter.shape().element_count().unwrap() * size_of::<BFloat16>()];
+    HostParameter {
+        components: vec![HostComponent {
+            shape: parameter.shape(),
+            bytes,
+        }],
+        parameter,
+    }
+}
+
+fn upload_parameter(platform: &nml::Platform, parameter: &HostParameter) -> nml::LoadedParameter {
+    let buffers = parameter
+        .components
+        .iter()
+        .map(|component| {
+            let host = nml::Slice::from_bytes(component.shape, &component.bytes).unwrap();
+            platform
+                .upload(&host, nml::Sharding::single(), nml::Memory::Default)
+                .unwrap()
+        })
+        .collect();
+    nml::LoadedParameter::new(parameter.parameter.clone(), buffers).unwrap()
+}
+
+fn patterned_bf16(count: usize) -> Vec<BFloat16> {
+    (0..count)
+        .map(|index| BFloat16::from_f32(((index * 13 % 127) as f32 - 63.0) / 64.0))
+        .collect()
+}
+
+fn assert_bf16_finite(results: &nml::exe::Results, name: &str) {
+    let output = results.get(name).unwrap().to_slice().unwrap();
+    let bytes = output.contiguous_bytes().unwrap();
+    assert_eq!(bytes.len() % size_of::<BFloat16>(), 0);
+    assert!(bytes.chunks_exact(2).all(|item| {
+        BFloat16::from_bits(u16::from_ne_bytes(item.try_into().unwrap()))
+            .to_f32()
+            .is_finite()
+    }));
 }
 
 fn assert_finite(results: &nml::exe::Results, name: &str) {

@@ -2176,6 +2176,46 @@ impl Context {
             .build()
     }
 
+    /// Builds one backend-neutral typed-FFI call with explicit row-major ABI
+    /// layouts. Kernel-specific validation remains in the semantic lowering
+    /// and the registered handler; this boundary only spells XLA's ABI.
+    pub fn ffi_custom_call<'context>(
+        &'context self,
+        target: &str,
+        operands: &[Value<'context>],
+        result_types: &[Type<'context>],
+    ) -> Result<Operation<'context>, Error> {
+        if target.is_empty() || result_types.is_empty() {
+            return Err(Error::InvalidOperation {
+                source: "typed FFI requires a target and at least one result".to_owned(),
+            });
+        }
+        let i32_type = self.dtype(DType::I32)?;
+        let operand_layouts = operands
+            .iter()
+            .map(|operand| row_major_layout_for_type(operand.type_()))
+            .map(|layout| self.dense_index_attribute(&layout?))
+            .collect::<Result<Vec<_>, _>>()?;
+        let result_layouts = result_types
+            .iter()
+            .map(|type_| row_major_layout_for_type(*type_))
+            .map(|layout| self.dense_index_attribute(&layout?))
+            .collect::<Result<Vec<_>, _>>()?;
+        Operation::builder(self, "stablehlo.custom_call")
+            .results(result_types)
+            .operands(operands)
+            .attributes(&[
+                self.named_attribute("call_target_name", self.string_attribute(target))?,
+                self.named_attribute("has_side_effect", self.bool_attribute(false))?,
+                self.named_attribute("api_version", self.integer_attribute(i32_type, 4)?)?,
+                self.named_attribute("backend_config", self.dictionary_attribute(&[])?)?,
+                self.named_attribute("operand_layouts", self.array_attribute(&operand_layouts)?)?,
+                self.named_attribute("result_layouts", self.array_attribute(&result_layouts)?)?,
+                self.named_attribute("output_operand_aliases", self.array_attribute(&[])?)?,
+            ])
+            .build()
+    }
+
     pub fn complex<'context>(
         &'context self,
         real: Value<'context>,

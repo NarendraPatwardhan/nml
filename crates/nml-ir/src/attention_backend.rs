@@ -6,6 +6,7 @@
 //! one module prevents dense and paged attention from inventing subtly
 //! different architecture floors.
 
+use crate::device_capabilities::CudaCapabilities;
 use nml_types::DType;
 
 // The retained Triton kernel expresses QK and PV as `tt.dot` operations.  Its
@@ -22,22 +23,19 @@ pub(crate) enum Backend {
     CudaFlash3,
 }
 
-pub(crate) fn dense(
-    dtype: DType,
-    head_dimension: i64,
-    capability_major: u16,
-    capability_minor: u16,
-) -> Backend {
+pub(crate) fn dense(dtype: DType, head_dimension: i64, capabilities: CudaCapabilities) -> Backend {
     if !matches!(dtype, DType::F16 | DType::Bf16)
         || !(1..=256).contains(&head_dimension)
         || head_dimension % 8 != 0
     {
         return Backend::Portable;
     }
-    match capability_major {
-        9 if capability_minor == 0 => Backend::CudaFlash3,
-        8 => Backend::CudaFlash2,
-        _ => Backend::Portable,
+    if capabilities.supports_flash_attention_3() {
+        Backend::CudaFlash3
+    } else if capabilities.supports_flash_attention_2() {
+        Backend::CudaFlash2
+    } else {
+        Backend::Portable
     }
 }
 
@@ -45,12 +43,14 @@ pub(crate) fn paged(
     dtype: DType,
     head_dimension: i64,
     page_size: i64,
-    capability_major: u16,
-    capability_minor: u16,
+    capabilities: CudaCapabilities,
 ) -> Backend {
-    let supported_cuda = capability_major == 8 || (capability_major == 9 && capability_minor == 0);
+    // Triton is the portable CUDA implementation across the retained compiler
+    // capability range. FlashAttention binaries are narrower accelerators
+    // within that range; their absence must not send a supported GPU back to
+    // the StableHLO reference loop.
     if !matches!(dtype, DType::F16 | DType::Bf16 | DType::F32)
-        || !supported_cuda
+        || !capabilities.supports_xla_triton()
         || head_dimension < TRITON_MINIMUM_HEAD_DIMENSION
     {
         return Backend::Portable;
@@ -59,13 +59,13 @@ pub(crate) fn paged(
         && (1..=256).contains(&head_dimension)
         && head_dimension % 8 == 0
     {
-        if capability_major == 9 && capability_minor == 0 {
+        if capabilities.supports_flash_attention_3() {
             return Backend::CudaFlash3;
         }
         // Original-upstream FA2's paged split-K kernel requires physical
         // pages divisible by 256. Smaller NML pages stay on Triton rather than
         // changing the cache representation for one backend.
-        if capability_major == 8 && page_size % 256 == 0 {
+        if capabilities.supports_flash_attention_2() && page_size % 256 == 0 {
             return Backend::CudaFlash2;
         }
     }

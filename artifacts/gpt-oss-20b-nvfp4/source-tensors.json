@@ -1,0 +1,5611 @@
+[
+  {
+    "name": "lm_head.weight",
+    "source_shard": "model-00009-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      201088,
+      2880
+    ],
+    "source_byte_length": 1158266880,
+    "role": "output_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.embed_tokens.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      201088,
+      2880
+    ],
+    "source_byte_length": 1158266880,
+    "role": "embedding",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.0.input_layernorm.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.0.mlp.experts.down_proj",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.0.mlp.experts.down_proj_bias",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.0.mlp.experts.gate_up_proj",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.0.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.0.mlp.router.bias",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.0.mlp.router.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.0.post_attention_layernorm.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.0.self_attn.k_proj.bias",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.0.self_attn.k_proj.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.0.self_attn.o_proj.bias",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.0.self_attn.o_proj.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.0.self_attn.q_proj.bias",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.0.self_attn.q_proj.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.0.self_attn.sinks",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.0.self_attn.v_proj.bias",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.0.self_attn.v_proj.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.1.input_layernorm.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.1.mlp.experts.down_proj",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.1.mlp.experts.down_proj_bias",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.1.mlp.experts.gate_up_proj",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.1.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.1.mlp.router.bias",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.1.mlp.router.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.1.post_attention_layernorm.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.1.self_attn.k_proj.bias",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.1.self_attn.k_proj.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.1.self_attn.o_proj.bias",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.1.self_attn.o_proj.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.1.self_attn.q_proj.bias",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.1.self_attn.q_proj.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.1.self_attn.sinks",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.1.self_attn.v_proj.bias",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.1.self_attn.v_proj.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.10.input_layernorm.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.10.mlp.experts.down_proj",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.10.mlp.experts.down_proj_bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.10.mlp.experts.gate_up_proj",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.10.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.10.mlp.router.bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.10.mlp.router.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.10.post_attention_layernorm.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.10.self_attn.k_proj.bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.10.self_attn.k_proj.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.10.self_attn.o_proj.bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.10.self_attn.o_proj.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.10.self_attn.q_proj.bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.10.self_attn.q_proj.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.10.self_attn.sinks",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.10.self_attn.v_proj.bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.10.self_attn.v_proj.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.11.input_layernorm.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.11.mlp.experts.down_proj",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.11.mlp.experts.down_proj_bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.11.mlp.experts.gate_up_proj",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.11.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.11.mlp.router.bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.11.mlp.router.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.11.post_attention_layernorm.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.11.self_attn.k_proj.bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.11.self_attn.k_proj.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.11.self_attn.o_proj.bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.11.self_attn.o_proj.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.11.self_attn.q_proj.bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.11.self_attn.q_proj.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.11.self_attn.sinks",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.11.self_attn.v_proj.bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.11.self_attn.v_proj.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.12.input_layernorm.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.12.mlp.experts.down_proj",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.12.mlp.experts.down_proj_bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.12.mlp.experts.gate_up_proj",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.12.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.12.mlp.router.bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.12.mlp.router.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.12.post_attention_layernorm.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.12.self_attn.k_proj.bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.12.self_attn.k_proj.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.12.self_attn.o_proj.bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.12.self_attn.o_proj.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.12.self_attn.q_proj.bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.12.self_attn.q_proj.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.12.self_attn.sinks",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.12.self_attn.v_proj.bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.12.self_attn.v_proj.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.13.input_layernorm.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.13.mlp.experts.down_proj",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.13.mlp.experts.down_proj_bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.13.mlp.experts.gate_up_proj",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.13.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.13.mlp.router.bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.13.mlp.router.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.13.post_attention_layernorm.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.13.self_attn.k_proj.bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.13.self_attn.k_proj.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.13.self_attn.o_proj.bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.13.self_attn.o_proj.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.13.self_attn.q_proj.bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.13.self_attn.q_proj.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.13.self_attn.sinks",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.13.self_attn.v_proj.bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.13.self_attn.v_proj.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.14.input_layernorm.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.14.mlp.experts.down_proj",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.14.mlp.experts.down_proj_bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.14.mlp.experts.gate_up_proj",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.14.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.14.mlp.router.bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.14.mlp.router.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.14.post_attention_layernorm.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.14.self_attn.k_proj.bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.14.self_attn.k_proj.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.14.self_attn.o_proj.bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.14.self_attn.o_proj.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.14.self_attn.q_proj.bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.14.self_attn.q_proj.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.14.self_attn.sinks",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.14.self_attn.v_proj.bias",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.14.self_attn.v_proj.weight",
+    "source_shard": "model-00005-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.15.input_layernorm.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.15.mlp.experts.down_proj",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.15.mlp.experts.down_proj_bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.15.mlp.experts.gate_up_proj",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.15.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.15.mlp.router.bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.15.mlp.router.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.15.post_attention_layernorm.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.15.self_attn.k_proj.bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.15.self_attn.k_proj.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.15.self_attn.o_proj.bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.15.self_attn.o_proj.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.15.self_attn.q_proj.bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.15.self_attn.q_proj.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.15.self_attn.sinks",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.15.self_attn.v_proj.bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.15.self_attn.v_proj.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.16.input_layernorm.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.16.mlp.experts.down_proj",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.16.mlp.experts.down_proj_bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.16.mlp.experts.gate_up_proj",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.16.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.16.mlp.router.bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.16.mlp.router.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.16.post_attention_layernorm.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.16.self_attn.k_proj.bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.16.self_attn.k_proj.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.16.self_attn.o_proj.bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.16.self_attn.o_proj.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.16.self_attn.q_proj.bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.16.self_attn.q_proj.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.16.self_attn.sinks",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.16.self_attn.v_proj.bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.16.self_attn.v_proj.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.17.input_layernorm.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.17.mlp.experts.down_proj",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.17.mlp.experts.down_proj_bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.17.mlp.experts.gate_up_proj",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.17.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.17.mlp.router.bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.17.mlp.router.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.17.post_attention_layernorm.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.17.self_attn.k_proj.bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.17.self_attn.k_proj.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.17.self_attn.o_proj.bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.17.self_attn.o_proj.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.17.self_attn.q_proj.bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.17.self_attn.q_proj.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.17.self_attn.sinks",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.17.self_attn.v_proj.bias",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.17.self_attn.v_proj.weight",
+    "source_shard": "model-00006-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.18.input_layernorm.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.18.mlp.experts.down_proj",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.18.mlp.experts.down_proj_bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.18.mlp.experts.gate_up_proj",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.18.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.18.mlp.router.bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.18.mlp.router.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.18.post_attention_layernorm.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.18.self_attn.k_proj.bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.18.self_attn.k_proj.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.18.self_attn.o_proj.bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.18.self_attn.o_proj.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.18.self_attn.q_proj.bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.18.self_attn.q_proj.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.18.self_attn.sinks",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.18.self_attn.v_proj.bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.18.self_attn.v_proj.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.19.input_layernorm.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.19.mlp.experts.down_proj",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.19.mlp.experts.down_proj_bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.19.mlp.experts.gate_up_proj",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.19.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.19.mlp.router.bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.19.mlp.router.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.19.post_attention_layernorm.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.19.self_attn.k_proj.bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.19.self_attn.k_proj.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.19.self_attn.o_proj.bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.19.self_attn.o_proj.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.19.self_attn.q_proj.bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.19.self_attn.q_proj.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.19.self_attn.sinks",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.19.self_attn.v_proj.bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.19.self_attn.v_proj.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.2.input_layernorm.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.2.mlp.experts.down_proj",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.2.mlp.experts.down_proj_bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.2.mlp.experts.gate_up_proj",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.2.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.2.mlp.router.bias",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.2.mlp.router.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.2.post_attention_layernorm.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.2.self_attn.k_proj.bias",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.2.self_attn.k_proj.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.2.self_attn.o_proj.bias",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.2.self_attn.o_proj.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.2.self_attn.q_proj.bias",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.2.self_attn.q_proj.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.2.self_attn.sinks",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.2.self_attn.v_proj.bias",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.2.self_attn.v_proj.weight",
+    "source_shard": "model-00001-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.20.input_layernorm.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.20.mlp.experts.down_proj",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.20.mlp.experts.down_proj_bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.20.mlp.experts.gate_up_proj",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.20.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.20.mlp.router.bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.20.mlp.router.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.20.post_attention_layernorm.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.20.self_attn.k_proj.bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.20.self_attn.k_proj.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.20.self_attn.o_proj.bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.20.self_attn.o_proj.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.20.self_attn.q_proj.bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.20.self_attn.q_proj.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.20.self_attn.sinks",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.20.self_attn.v_proj.bias",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.20.self_attn.v_proj.weight",
+    "source_shard": "model-00007-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.21.input_layernorm.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.21.mlp.experts.down_proj",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.21.mlp.experts.down_proj_bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.21.mlp.experts.gate_up_proj",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.21.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.21.mlp.router.bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.21.mlp.router.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.21.post_attention_layernorm.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.21.self_attn.k_proj.bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.21.self_attn.k_proj.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.21.self_attn.o_proj.bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.21.self_attn.o_proj.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.21.self_attn.q_proj.bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.21.self_attn.q_proj.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.21.self_attn.sinks",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.21.self_attn.v_proj.bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.21.self_attn.v_proj.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.22.input_layernorm.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.22.mlp.experts.down_proj",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.22.mlp.experts.down_proj_bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.22.mlp.experts.gate_up_proj",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.22.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.22.mlp.router.bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.22.mlp.router.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.22.post_attention_layernorm.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.22.self_attn.k_proj.bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.22.self_attn.k_proj.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.22.self_attn.o_proj.bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.22.self_attn.o_proj.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.22.self_attn.q_proj.bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.22.self_attn.q_proj.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.22.self_attn.sinks",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.22.self_attn.v_proj.bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.22.self_attn.v_proj.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.23.input_layernorm.weight",
+    "source_shard": "model-00009-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.23.mlp.experts.down_proj",
+    "source_shard": "model-00009-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.23.mlp.experts.down_proj_bias",
+    "source_shard": "model-00009-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.23.mlp.experts.gate_up_proj",
+    "source_shard": "model-00009-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.23.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00009-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.23.mlp.router.bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.23.mlp.router.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.23.post_attention_layernorm.weight",
+    "source_shard": "model-00009-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.23.self_attn.k_proj.bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.23.self_attn.k_proj.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.23.self_attn.o_proj.bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.23.self_attn.o_proj.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.23.self_attn.q_proj.bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.23.self_attn.q_proj.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.23.self_attn.sinks",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.23.self_attn.v_proj.bias",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.23.self_attn.v_proj.weight",
+    "source_shard": "model-00008-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.3.input_layernorm.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.3.mlp.experts.down_proj",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.3.mlp.experts.down_proj_bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.3.mlp.experts.gate_up_proj",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.3.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.3.mlp.router.bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.3.mlp.router.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.3.post_attention_layernorm.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.3.self_attn.k_proj.bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.3.self_attn.k_proj.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.3.self_attn.o_proj.bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.3.self_attn.o_proj.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.3.self_attn.q_proj.bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.3.self_attn.q_proj.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.3.self_attn.sinks",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.3.self_attn.v_proj.bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.3.self_attn.v_proj.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.4.input_layernorm.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.4.mlp.experts.down_proj",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.4.mlp.experts.down_proj_bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.4.mlp.experts.gate_up_proj",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.4.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.4.mlp.router.bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.4.mlp.router.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.4.post_attention_layernorm.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.4.self_attn.k_proj.bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.4.self_attn.k_proj.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.4.self_attn.o_proj.bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.4.self_attn.o_proj.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.4.self_attn.q_proj.bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.4.self_attn.q_proj.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.4.self_attn.sinks",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.4.self_attn.v_proj.bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.4.self_attn.v_proj.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.5.input_layernorm.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.5.mlp.experts.down_proj",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.5.mlp.experts.down_proj_bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.5.mlp.experts.gate_up_proj",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.5.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.5.mlp.router.bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.5.mlp.router.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.5.post_attention_layernorm.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.5.self_attn.k_proj.bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.5.self_attn.k_proj.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.5.self_attn.o_proj.bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.5.self_attn.o_proj.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.5.self_attn.q_proj.bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.5.self_attn.q_proj.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.5.self_attn.sinks",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.5.self_attn.v_proj.bias",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.5.self_attn.v_proj.weight",
+    "source_shard": "model-00002-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.6.input_layernorm.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.6.mlp.experts.down_proj",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.6.mlp.experts.down_proj_bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.6.mlp.experts.gate_up_proj",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.6.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.6.mlp.router.bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.6.mlp.router.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.6.post_attention_layernorm.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.6.self_attn.k_proj.bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.6.self_attn.k_proj.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.6.self_attn.o_proj.bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.6.self_attn.o_proj.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.6.self_attn.q_proj.bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.6.self_attn.q_proj.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.6.self_attn.sinks",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.6.self_attn.v_proj.bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.6.self_attn.v_proj.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.7.input_layernorm.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.7.mlp.experts.down_proj",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.7.mlp.experts.down_proj_bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.7.mlp.experts.gate_up_proj",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.7.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.7.mlp.router.bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.7.mlp.router.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.7.post_attention_layernorm.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.7.self_attn.k_proj.bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.7.self_attn.k_proj.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.7.self_attn.o_proj.bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.7.self_attn.o_proj.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.7.self_attn.q_proj.bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.7.self_attn.q_proj.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.7.self_attn.sinks",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.7.self_attn.v_proj.bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.7.self_attn.v_proj.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.8.input_layernorm.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.8.mlp.experts.down_proj",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.8.mlp.experts.down_proj_bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.8.mlp.experts.gate_up_proj",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.8.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.8.mlp.router.bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.8.mlp.router.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.8.post_attention_layernorm.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.8.self_attn.k_proj.bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.8.self_attn.k_proj.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.8.self_attn.o_proj.bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.8.self_attn.o_proj.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.8.self_attn.q_proj.bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.8.self_attn.q_proj.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.8.self_attn.sinks",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.8.self_attn.v_proj.bias",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.8.self_attn.v_proj.weight",
+    "source_shard": "model-00003-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.9.input_layernorm.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.9.mlp.experts.down_proj",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      2880
+    ],
+    "source_byte_length": 530841600,
+    "role": "expert_down_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.9.mlp.experts.down_proj_bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.9.mlp.experts.gate_up_proj",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880,
+      5760
+    ],
+    "source_byte_length": 1061683200,
+    "role": "expert_gate_up_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.9.mlp.experts.gate_up_proj_bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      5760
+    ],
+    "source_byte_length": 368640,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.9.mlp.router.bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32
+    ],
+    "source_byte_length": 64,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.9.mlp.router.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      32,
+      2880
+    ],
+    "source_byte_length": 184320,
+    "role": "router",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.9.post_attention_layernorm.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.9.self_attn.k_proj.bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.9.self_attn.k_proj.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.9.self_attn.o_proj.bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.9.self_attn.o_proj.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880,
+      4096
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.9.self_attn.q_proj.bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096
+    ],
+    "source_byte_length": 8192,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.9.self_attn.q_proj.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      4096,
+      2880
+    ],
+    "source_byte_length": 23592960,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.layers.9.self_attn.sinks",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      64
+    ],
+    "source_byte_length": 128,
+    "role": "attention_sink",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.9.self_attn.v_proj.bias",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512
+    ],
+    "source_byte_length": 1024,
+    "role": "bias",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  },
+  {
+    "name": "model.layers.9.self_attn.v_proj.weight",
+    "source_shard": "model-00004-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      512,
+      2880
+    ],
+    "source_byte_length": 2949120,
+    "role": "attention_projection",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "nvfp4"
+  },
+  {
+    "name": "model.norm.weight",
+    "source_shard": "model-00009-of-00009.safetensors",
+    "source_dtype": "BF16",
+    "logical_shape": [
+      2880
+    ],
+    "source_byte_length": 5760,
+    "role": "normalization",
+    "logical_mapping": "identity",
+    "transpose": false,
+    "target_representation": "dense"
+  }
+]

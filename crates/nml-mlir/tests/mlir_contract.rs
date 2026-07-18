@@ -1,6 +1,6 @@
 use nml_mlir::{
-    stablehlo_current_version, Block, Context, Error, IndexCastKind, OutputOperandAlias, Region,
-    ShardyDimension, TritonCustomCall,
+    Block, Context, Error, IndexCastKind, OutputOperandAlias, Region, ShardyDimension,
+    TritonCustomCall, stablehlo_current_version,
 };
 use nml_types::DType;
 
@@ -14,9 +14,11 @@ fn canonical_dtypes_and_index_have_distinct_mlir_contracts() {
         );
     }
     assert_eq!(context.index_type().text(), "index");
-    assert!(!DType::ALL
-        .iter()
-        .any(|dtype| dtype.stablehlo_spelling() == "index"));
+    assert!(
+        !DType::ALL
+            .iter()
+            .any(|dtype| dtype.stablehlo_spelling() == "index")
+    );
 }
 
 #[test]
@@ -614,6 +616,55 @@ fn triton_custom_call_has_xla_typed_ffi_contract() {
     assert!(text.contains("grid_x = 1 : i32"), "{text}");
     assert!(text.contains("operand_layouts"), "{text}");
     assert!(text.contains("result_layouts"), "{text}");
+}
+
+#[test]
+fn backend_neutral_ffi_custom_call_has_explicit_row_major_contract() {
+    let context = Context::new();
+    let activation = context.ranked_tensor_type(DType::Bf16, &[2, 16]).unwrap();
+    let payload = context.ranked_tensor_type(DType::U8, &[4, 8]).unwrap();
+    let scales = context.ranked_tensor_type(DType::U8, &[4, 1]).unwrap();
+    let global = context.ranked_tensor_type(DType::F32, &[]).unwrap();
+    let output = context.ranked_tensor_type(DType::Bf16, &[2, 4]).unwrap();
+    let argument_types = [activation, payload, scales, global];
+    let mut block = Block::new(&context, &argument_types).unwrap();
+    let arguments = (0..argument_types.len())
+        .map(|index| block.argument(index).unwrap())
+        .collect::<Vec<_>>();
+    let call = context
+        .ffi_custom_call("nml.nvfp4.linear", &arguments, &[output])
+        .unwrap();
+    let result = call.result(0).unwrap();
+    block.append_operation(call).unwrap();
+    block
+        .append_operation(context.return_operation(&[result]).unwrap())
+        .unwrap();
+    let mut body = Region::new(&context).unwrap();
+    body.append_block(block).unwrap();
+    let function = context
+        .function("nvfp4_linear", &argument_types, &[output], body)
+        .unwrap();
+    let mut module = context.empty_module().unwrap();
+    module.append_operation(function).unwrap();
+    module.verify().unwrap();
+
+    let text = module.text();
+    assert!(text.contains("nml.nvfp4.linear"), "{text}");
+    assert!(text.contains("api_version = 4 : i32"), "{text}");
+    assert!(text.contains("operand_layouts = [dense<[1, 0]>"), "{text}");
+    assert!(text.contains("dense<> : tensor<0xindex>"), "{text}");
+    assert!(text.contains("result_layouts = [dense<[1, 0]>"), "{text}");
+    assert!(text.contains("backend_config = {}"), "{text}");
+    assert!(!text.contains("output_operand_aliases"), "{text}");
+
+    assert!(matches!(
+        context.ffi_custom_call("", &arguments, &[output]),
+        Err(Error::InvalidOperation { .. })
+    ));
+    assert!(matches!(
+        context.ffi_custom_call("nml.invalid", &arguments, &[]),
+        Err(Error::InvalidOperation { .. })
+    ));
 }
 
 #[test]

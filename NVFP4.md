@@ -190,19 +190,19 @@ this substrate rather than reintroducing a parallel quantized model stack.
 | Area | Current state | Remaining NVFP4 work |
 | --- | --- | --- |
 | Ordinary types | `DType` and `Shape` describe one fixed-width scalar tensor. | Keep this invariant. Do not add NVFP4 to `DType`. |
-| Host tensor storage | `Slice` remains one ordinary dense value; encoded components have an independent `StorageSpec`. | Add checked packed-E2M1 and E4M3-bit component encodings without weakening `Slice`. |
-| SafeTensors registry | `TensorRegistry` owns bounded artifact records; `ParameterSet` binds those records to logical parameters and streams physical components. | Admit the selected artifact's encoded component records and exact representation metadata. |
-| Parameter model | Immutable `Parameter` and `LoadedParameter` own logical identity and physical component buffers; dense is the one-component representation. | Add the closed `NvFp4` representation and its payload, scale, and global-factor components. |
-| Structural loading | `ParameterTree` maps parameter leaves to loaded-parameter leaves across nested product structure. The former dense-only traversal is gone. | Validate and account multi-component reconstruction transactionally; no second quantized traversal is permitted. |
+| Host tensor storage | `Slice` remains one ordinary dense value; encoded components use checked packed-E2M1x2 and E4M3FN-bit storage specs. | Preserve this separation when adding prepared native layouts. |
+| SafeTensors registry | `TensorRegistry` owns bounded artifact records; `ParameterSet` binds the selected artifact's exact physical components and streams them directly. | Add independent layer/generation fixtures, not another loader path. |
+| Parameter model | Immutable `Parameter` and `LoadedParameter` own logical identity and physical component buffers; dense is the one-component case and `NvFp4` is the closed three-component case. | Extend only when a genuinely different recipe is admitted. |
+| Structural loading | `ParameterTree` maps parameter leaves to loaded-parameter leaves across nested product structure, transactionally accounting compact components. The former dense-only traversal is gone. | Preserve one traversal; no quantized side channel is permitted. |
 | Runtime buffer | `Buffer` remains one ordinary physical tensor with one `Shape` and PJRT shards. | Keep this boundary; NVFP4 is a bundle of component buffers, never a `Buffer` variant. |
-| Sharded loading | Component upload is physical-spec driven, while the current dense sharding path still assumes ordinary row slices. | Derive component spans from representation geometry and require block-aligned shards or deterministic padding/repacking. |
-| Graph IR | Semantic linear, embedding, and MoE operations consume `Parameter`; executable manifests flatten and validate physical component bindings. | Define NVFP4 semantics and representation-aware lowerings, rejecting unsupported operations before MLIR construction. |
-| Compiler target | CUDA lowering receives core count and compute capability. | Replace scattered integer tests with an internal capability value containing named predicates. |
-| Triton builder | Typed TTIR supports ordinary integer/floating values and `tt.dot`, but not E2M1/E4M3/`tt.dot_scaled`. | Expose the required pinned Triton operations and types; keep the builder private and verified. |
+| Sharded loading | Component upload derives co-sharded payload/scale spans from logical ranges and rejects non-block-aligned geometry before allocation. | Add a versioned prepared-layout transform only when a backend requires one. |
+| Graph IR | Semantic linear, embedding, and grouped-MoE operations consume `Parameter`; executable manifests flatten and validate physical component bindings. CPU, SM75, and SM80+ lowering preserve one semantic graph. | Add native Blackwell lowering and complete product execution evidence. |
+| Compiler target | CUDA lowering uses one private named `CudaCapabilities` value for attention and compact-weight dispatch. | Add native-layout predicates when the native path lands. |
+| Triton builder | Typed verified TTIR owns packed NVFP4 emulation kernels and the pinned XLA custom-call boundary. | Add the exact `tt.dot_scaled` surface needed by native Blackwell execution. |
 | Triton dependency | XLA's pinned Triton commit is `c05aa65087a9a1a6b8a08fdbb474aba834d5cddf`. It contains E2M1, `tt.dot_scaled`, SM90 FP4 upcast/decomposition, NVFP4 helpers, and Blackwell lowering. | Lift only the missing typed bindings/builder surface. Do not introduce another Triton pin or Python dependency. |
-| CUDA custom calls | XLA/PJRT custom-call lifecycle and real SM86/SM90 execution are established. | Reuse the lifecycle for any hand-written SM75/native vendor adapter; register only product kernels. |
-| MoE | Portable and grouped Triton expert projections already execute. | Add quantized grouped projections; GPT-OSS cannot be accepted with per-expert host loops or persistent dequantization. |
-| Model identity | Serving identity stores a weak representation string. | Use an immutable structured representation identity including artifact revision and transform version. |
+| CUDA custom calls | The process-lifetime typed XLA/PJRT lifecycle registers product SM75 linear, embedding, and grouped-expert adapters on the PJRT stream. | Reuse it only if native Blackwell needs a vendor adapter. |
+| MoE | CPU, schedule-driven SM75 WMMA, and grouped SM80+ Triton paths execute compact gate/up/down weights without a host expert loop or dense conversion. | Measure and tune real model shapes; prove multi-GPU expert sharding. |
+| Model identity | The selected artifact manifest and parameter representation identity are immutable, but future prepared-layout/cache keys are not complete. | Carry recipe and transform identity into prepared-weight and cache keys. |
 
 The foundational redesign is complete. The next change is not another API
 redesign or a `DType` variant; it is the exact NVFP4 representation added to
@@ -1032,21 +1032,31 @@ demonstration.
 
 NVFP4 may be marked complete only when every applicable item is true:
 
-- [ ] One GPT-OSS 20B artifact and immutable manifest are selected.
-- [ ] Payload, scale, global factor, layout, padding, and transform algebra are
+- [x] One GPT-OSS 20B artifact and immutable manifest are selected.
+- [x] Payload, scale, global factor, layout, padding, and transform algebra are
   completely specified.
-- [ ] The parameter/storage redesign replaces dense-only assumptions without a
+- [x] The parameter/storage redesign replaces dense-only assumptions without a
   compatibility fork.
-- [ ] Packed host and device storage never retains a full dense copy.
-- [ ] CPU codec, embedding, linear, and grouped MoE execute correctly.
+- [x] Packed host and device storage never retains a full dense copy.
+- [x] CPU codec, embedding, linear, and grouped MoE execute correctly.
 - [ ] CPU has a measured optimized path on x86-64 and a retained AArch64 design.
-- [ ] SM75 fused emulation launches and passes on the local GPU.
-- [ ] SM8x fused emulation launches and passes on a real suitable GPU.
-- [ ] SM90 fused emulation launches and passes on a real suitable GPU.
+- [x] SM75 fused emulation launches and passes on the local GPU.
+- [x] SM8x fused emulation launches and passes on a real suitable GPU. The
+  immutable full contract image at digest
+  `sha256:17040fd252bac543bb3b02e9abc253d309d05a7b64cf6ee7b8c6cc8b64c426b4`
+  passed on an RTX A6000 (SM86) in RunPod lease
+  `1c30d217-cd03-4a61-bd8c-2d5ce10d1eb3`.
+- [x] SM90 fused emulation launches and passes on a real suitable GPU. The same
+  digest and contract selection passed on an H100 80GB HBM3 (SM90a) in RunPod
+  lease `09de1c2c-6304-44f5-bb03-81d9d64cf4c1`.
 - [ ] SM100+ native execution launches, passes, and proves native instructions.
-- [ ] Ordinary and grouped projection performance is measured by phase and
-  shape family.
-- [ ] Logical Shardy placement maps correctly to physical payload/scale shards.
+- [x] Ordinary and grouped projection performance is measured by phase and
+  shape family on local SM75, rented SM86, and rented SM90. The immutable
+  performance image digest is
+  `sha256:4f4619f040bd8c59549b90e5b3606c930bc063389aee4e280a25853c15fdf0ff`;
+  detailed GPT-OSS-sized phase baselines and lease identities are retained in
+  `TASKS.md`.
+- [x] Logical Shardy placement maps correctly to physical payload/scale shards.
 - [ ] The complete GPT-OSS 20B model matches the independent artifact oracle.
 - [ ] Checkpoint, resident, workspace, compilation, prefill, and decode costs
   are reported separately.

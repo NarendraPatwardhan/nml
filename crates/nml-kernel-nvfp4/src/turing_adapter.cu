@@ -1,0 +1,624 @@
+#include "nml_nvfp4.h"
+
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <mma.h>
+
+#include <cstdio>
+#include <limits>
+
+namespace {
+
+constexpr int32_t kInvalidArgument = 1;
+constexpr int32_t kLaunchFailure = 2;
+constexpr int kWmmaTile = 16;
+
+int32_t fail(int32_t code, const char *message, char *output, size_t capacity) {
+  if (output != nullptr && capacity != 0) {
+    std::snprintf(output, capacity, "%s", message);
+  }
+  return code;
+}
+
+__device__ __forceinline__ float decode_e2m1(uint8_t code) {
+  constexpr float magnitudes[8] = {0.0f, 0.5f, 1.0f, 1.5f,
+                                   2.0f, 3.0f, 4.0f, 6.0f};
+  const float magnitude = magnitudes[code & 0x07];
+  return (code & 0x08) == 0 ? magnitude : -magnitude;
+}
+
+__device__ __forceinline__ float decode_e4m3fn(uint8_t bits) {
+  const int exponent = (bits >> 3) & 0x0f;
+  const int fraction = bits & 0x07;
+  if (exponent == 0) {
+    return static_cast<float>(fraction) * 0x1p-9f;
+  }
+  return (1.0f + static_cast<float>(fraction) * 0.125f) *
+         exp2f(static_cast<float>(exponent - 7));
+}
+
+template <typename T> __device__ __forceinline__ float load_float(T value);
+template <> __device__ __forceinline__ float load_float(__half value) {
+  return __half2float(value);
+}
+template <> __device__ __forceinline__ float load_float(__nv_bfloat16 value) {
+  return __bfloat162float(value);
+}
+
+template <typename T>
+__device__ __forceinline__ void store_float(T *output, int64_t index,
+                                            float value);
+template <>
+__device__ __forceinline__ void store_float(__half *output, int64_t index,
+                                            float value) {
+  output[index] = __float2half_rn(value);
+}
+template <>
+__device__ __forceinline__ void store_float(__nv_bfloat16 *output,
+                                            int64_t index, float value) {
+  output[index] = __float2bfloat16(value);
+}
+
+template <typename Element>
+__global__ void linear_kernel(const Element *__restrict__ activation,
+                              const uint8_t *__restrict__ payload,
+                              const uint8_t *__restrict__ block_scales,
+                              const float *__restrict__ global_scale,
+                              const Element *__restrict__ bias,
+                              Element *__restrict__ output, int64_t rows,
+                              int64_t outputs, int64_t inputs) {
+  // One warp owns one 16x16 output tile. BF16 inputs are explicitly converted
+  // tile-locally to F16 because Turing exposes no BF16 tensor-core operand.
+  __shared__ __align__(16) __half left[kWmmaTile * kWmmaTile];
+  __shared__ __align__(16) __half right[kWmmaTile * kWmmaTile];
+  __shared__ __align__(16) float completed[kWmmaTile * kWmmaTile];
+
+  const int64_t row_base = static_cast<int64_t>(blockIdx.y) * kWmmaTile;
+  const int64_t output_base = static_cast<int64_t>(blockIdx.x) * kWmmaTile;
+  const int lane = threadIdx.x;
+  const int64_t packed_width = (inputs + 1) / 2;
+  const int64_t scale_width = (inputs + 15) / 16;
+
+  nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kWmmaTile, kWmmaTile,
+                         kWmmaTile, float>
+      accumulator;
+  nvcuda::wmma::fill_fragment(accumulator, 0.0f);
+
+  for (int64_t start = 0; start < inputs; start += kWmmaTile) {
+    for (int index = lane; index < kWmmaTile * kWmmaTile; index += 32) {
+      const int tile_row = index / kWmmaTile;
+      const int tile_column = index % kWmmaTile;
+      const int64_t row = row_base + tile_row;
+      const int64_t activation_column = start + tile_column;
+      left[index] = row < rows && activation_column < inputs
+                        ? __float2half_rn(load_float(
+                              activation[row * inputs + activation_column]))
+                        : __float2half(0.0f);
+
+      // WMMA's column-major B tile uses [K, N]. The checkpoint owns [N, K],
+      // so its natural logical row is already the required matrix column.
+      const int64_t output_column = output_base + tile_column;
+      const int64_t weight_column = start + tile_row;
+      float weight = 0.0f;
+      if (output_column < outputs && weight_column < inputs) {
+        const uint8_t packed =
+            payload[output_column * packed_width + weight_column / 2];
+        const uint8_t code =
+            static_cast<uint8_t>((packed >> ((weight_column & 1) * 4)) & 0x0f);
+        const uint8_t scale_bits =
+            block_scales[output_column * scale_width + weight_column / 16];
+        weight = decode_e2m1(code) * decode_e4m3fn(scale_bits) *
+                 global_scale[0];
+      }
+      right[tile_column * kWmmaTile + tile_row] = __float2half_rn(weight);
+    }
+    __syncwarp();
+
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kWmmaTile, kWmmaTile,
+                           kWmmaTile, __half, nvcuda::wmma::row_major>
+        left_fragment;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kWmmaTile, kWmmaTile,
+                           kWmmaTile, __half, nvcuda::wmma::col_major>
+        right_fragment;
+    nvcuda::wmma::load_matrix_sync(left_fragment, left, kWmmaTile);
+    nvcuda::wmma::load_matrix_sync(right_fragment, right, kWmmaTile);
+    nvcuda::wmma::mma_sync(accumulator, left_fragment, right_fragment,
+                           accumulator);
+    __syncwarp();
+  }
+
+  nvcuda::wmma::store_matrix_sync(completed, accumulator, kWmmaTile,
+                                  nvcuda::wmma::mem_row_major);
+  __syncwarp();
+  for (int index = lane; index < kWmmaTile * kWmmaTile; index += 32) {
+    const int64_t row = row_base + index / kWmmaTile;
+    const int64_t column = output_base + index % kWmmaTile;
+    if (row < rows && column < outputs) {
+      const float value = completed[index] +
+                          (bias == nullptr ? 0.0f : load_float(bias[column]));
+      store_float(output, row * outputs + column, value);
+    }
+  }
+}
+
+template <typename Index, typename Element>
+__global__ void embedding_kernel(
+    const Index *__restrict__ indices, const uint8_t *__restrict__ payload,
+    const uint8_t *__restrict__ block_scales,
+    const float *__restrict__ global_scale, Element *__restrict__ output,
+    int64_t rows, int64_t vocabulary, int64_t width) {
+  const int64_t element = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                          static_cast<int64_t>(threadIdx.x);
+  const int64_t extent = rows * width;
+  if (element >= extent) {
+    return;
+  }
+  const int64_t row = element / width;
+  const int64_t column = element % width;
+  const int64_t token = static_cast<int64_t>(indices[row]);
+  if (token < 0 || token >= vocabulary) {
+    // Host-side semantic validation cannot inspect device-resident indices.
+    // Write a deterministic value; the semantic graph requires valid token IDs
+    // and product callers validate them before upload.
+    store_float(output, element, 0.0f);
+    return;
+  }
+  const int64_t packed_width = (width + 1) / 2;
+  const int64_t scale_width = (width + 15) / 16;
+  const uint8_t packed = payload[token * packed_width + column / 2];
+  const uint8_t code =
+      static_cast<uint8_t>((packed >> ((column & 1) * 4)) & 0x0f);
+  const uint8_t scale_bits =
+      block_scales[token * scale_width + column / 16];
+  store_float(output, element,
+              decode_e2m1(code) * decode_e4m3fn(scale_bits) *
+                  global_scale[0]);
+}
+
+__device__ __forceinline__ float compact_value(
+    const uint8_t *payload, const uint8_t *block_scales,
+    const float *global_scale, int64_t row, int64_t column, int64_t width) {
+  const int64_t packed_width = (width + 1) / 2;
+  const int64_t scale_width = (width + 15) / 16;
+  const uint8_t packed = payload[row * packed_width + column / 2];
+  const uint8_t code =
+      static_cast<uint8_t>((packed >> ((column & 1) * 4)) & 0x0f);
+  return decode_e2m1(code) *
+         decode_e4m3fn(block_scales[row * scale_width + column / 16]) *
+         global_scale[0];
+}
+
+template <typename Element>
+__global__ void expert_gate_up_kernel(
+    const Element *__restrict__ hidden,
+    const int32_t *__restrict__ sorted_assignments,
+    const int32_t *__restrict__ block_experts,
+    const uint8_t *__restrict__ payload,
+    const uint8_t *__restrict__ block_scales,
+    const float *__restrict__ global_scale,
+    const Element *__restrict__ bias, Element *__restrict__ activated,
+    int64_t assignments, int64_t schedule_positions, int64_t hidden_size,
+    int64_t intermediate_size, int64_t experts, int64_t experts_per_token) {
+  __shared__ __align__(16) __half left[kWmmaTile * kWmmaTile];
+  __shared__ __align__(16) __half gate_right[kWmmaTile * kWmmaTile];
+  __shared__ __align__(16) __half up_right[kWmmaTile * kWmmaTile];
+  __shared__ __align__(16) float gate_complete[kWmmaTile * kWmmaTile];
+  __shared__ __align__(16) float up_complete[kWmmaTile * kWmmaTile];
+
+  const int lane = threadIdx.x;
+  const int64_t schedule_base = static_cast<int64_t>(blockIdx.y) * kWmmaTile;
+  const int64_t output_base = static_cast<int64_t>(blockIdx.x) * kWmmaTile;
+  const int32_t expert = block_experts[blockIdx.y];
+  const int64_t logical_width = 2 * intermediate_size;
+  nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kWmmaTile, kWmmaTile,
+                         kWmmaTile, float>
+      gate_accumulator;
+  nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kWmmaTile, kWmmaTile,
+                         kWmmaTile, float>
+      up_accumulator;
+  nvcuda::wmma::fill_fragment(gate_accumulator, 0.0f);
+  nvcuda::wmma::fill_fragment(up_accumulator, 0.0f);
+
+  for (int64_t start = 0; start < hidden_size; start += kWmmaTile) {
+    for (int index = lane; index < kWmmaTile * kWmmaTile; index += 32) {
+      const int tile_row = index / kWmmaTile;
+      const int tile_column = index % kWmmaTile;
+      const int64_t slot = schedule_base + tile_row;
+      const int32_t assignment =
+          slot < schedule_positions ? sorted_assignments[slot] : -1;
+      const int64_t input_column = start + tile_column;
+      left[index] = assignment >= 0 && assignment < assignments &&
+                            input_column < hidden_size
+                        ? __float2half_rn(load_float(
+                              hidden[(assignment / experts_per_token) *
+                                         hidden_size +
+                                     input_column]))
+                        : __float2half(0.0f);
+
+      const int64_t intermediate = output_base + tile_column;
+      const int64_t weight_input = start + tile_row;
+      float gate_weight = 0.0f;
+      float up_weight = 0.0f;
+      if (expert >= 0 && expert < experts && intermediate < intermediate_size &&
+          weight_input < hidden_size) {
+        const int64_t weight_row =
+            static_cast<int64_t>(expert) * hidden_size + weight_input;
+        gate_weight = compact_value(payload, block_scales, global_scale,
+                                    weight_row, 2 * intermediate,
+                                    logical_width);
+        up_weight = compact_value(payload, block_scales, global_scale,
+                                  weight_row, 2 * intermediate + 1,
+                                  logical_width);
+      }
+      const int right_index = tile_column * kWmmaTile + tile_row;
+      gate_right[right_index] = __float2half_rn(gate_weight);
+      up_right[right_index] = __float2half_rn(up_weight);
+    }
+    __syncwarp();
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kWmmaTile, kWmmaTile,
+                           kWmmaTile, __half, nvcuda::wmma::row_major>
+        left_fragment;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kWmmaTile, kWmmaTile,
+                           kWmmaTile, __half, nvcuda::wmma::col_major>
+        gate_fragment;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kWmmaTile, kWmmaTile,
+                           kWmmaTile, __half, nvcuda::wmma::col_major>
+        up_fragment;
+    nvcuda::wmma::load_matrix_sync(left_fragment, left, kWmmaTile);
+    nvcuda::wmma::load_matrix_sync(gate_fragment, gate_right, kWmmaTile);
+    nvcuda::wmma::load_matrix_sync(up_fragment, up_right, kWmmaTile);
+    nvcuda::wmma::mma_sync(gate_accumulator, left_fragment, gate_fragment,
+                           gate_accumulator);
+    nvcuda::wmma::mma_sync(up_accumulator, left_fragment, up_fragment,
+                           up_accumulator);
+    __syncwarp();
+  }
+  nvcuda::wmma::store_matrix_sync(gate_complete, gate_accumulator, kWmmaTile,
+                                  nvcuda::wmma::mem_row_major);
+  nvcuda::wmma::store_matrix_sync(up_complete, up_accumulator, kWmmaTile,
+                                  nvcuda::wmma::mem_row_major);
+  __syncwarp();
+  for (int index = lane; index < kWmmaTile * kWmmaTile; index += 32) {
+    const int64_t slot = schedule_base + index / kWmmaTile;
+    const int32_t assignment =
+        slot < schedule_positions ? sorted_assignments[slot] : -1;
+    const int64_t intermediate = output_base + index % kWmmaTile;
+    if (assignment >= 0 && assignment < assignments &&
+        intermediate < intermediate_size && expert >= 0 && expert < experts) {
+      const int64_t bias_base = static_cast<int64_t>(expert) * logical_width;
+      const float gate = fminf(
+          gate_complete[index] + load_float(bias[bias_base + 2 * intermediate]),
+          7.0f);
+      const float up = fminf(
+          fmaxf(up_complete[index] +
+                    load_float(bias[bias_base + 2 * intermediate + 1]),
+                -7.0f),
+          7.0f);
+      const float swish = gate / (1.0f + expf(-1.702f * gate));
+      store_float(activated, static_cast<int64_t>(assignment) *
+                                 intermediate_size + intermediate,
+                  (up + 1.0f) * swish);
+    }
+  }
+}
+
+template <typename Element>
+__global__ void expert_down_kernel(
+    const Element *__restrict__ activated,
+    const int32_t *__restrict__ sorted_assignments,
+    const int32_t *__restrict__ block_experts,
+    const uint8_t *__restrict__ payload,
+    const uint8_t *__restrict__ block_scales,
+    const float *__restrict__ global_scale,
+    const Element *__restrict__ bias,
+    const Element *__restrict__ routing_weights,
+    Element *__restrict__ weighted_output, int64_t assignments,
+    int64_t schedule_positions, int64_t intermediate_size,
+    int64_t hidden_size, int64_t experts) {
+  __shared__ __align__(16) __half left[kWmmaTile * kWmmaTile];
+  __shared__ __align__(16) __half right[kWmmaTile * kWmmaTile];
+  __shared__ __align__(16) float completed[kWmmaTile * kWmmaTile];
+  const int lane = threadIdx.x;
+  const int64_t schedule_base = static_cast<int64_t>(blockIdx.y) * kWmmaTile;
+  const int64_t output_base = static_cast<int64_t>(blockIdx.x) * kWmmaTile;
+  const int32_t expert = block_experts[blockIdx.y];
+  nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kWmmaTile, kWmmaTile,
+                         kWmmaTile, float>
+      accumulator;
+  nvcuda::wmma::fill_fragment(accumulator, 0.0f);
+  for (int64_t start = 0; start < intermediate_size; start += kWmmaTile) {
+    for (int index = lane; index < kWmmaTile * kWmmaTile; index += 32) {
+      const int tile_row = index / kWmmaTile;
+      const int tile_column = index % kWmmaTile;
+      const int64_t slot = schedule_base + tile_row;
+      const int32_t assignment =
+          slot < schedule_positions ? sorted_assignments[slot] : -1;
+      const int64_t input_column = start + tile_column;
+      left[index] = assignment >= 0 && assignment < assignments &&
+                            input_column < intermediate_size
+                        ? __float2half_rn(load_float(
+                              activated[static_cast<int64_t>(assignment) *
+                                            intermediate_size +
+                                        input_column]))
+                        : __float2half(0.0f);
+      const int64_t output_column = output_base + tile_column;
+      const int64_t weight_input = start + tile_row;
+      float weight = 0.0f;
+      if (expert >= 0 && expert < experts && output_column < hidden_size &&
+          weight_input < intermediate_size) {
+        const int64_t weight_row =
+            static_cast<int64_t>(expert) * intermediate_size + weight_input;
+        weight = compact_value(payload, block_scales, global_scale, weight_row,
+                               output_column, hidden_size);
+      }
+      right[tile_column * kWmmaTile + tile_row] = __float2half_rn(weight);
+    }
+    __syncwarp();
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, kWmmaTile, kWmmaTile,
+                           kWmmaTile, __half, nvcuda::wmma::row_major>
+        left_fragment;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, kWmmaTile, kWmmaTile,
+                           kWmmaTile, __half, nvcuda::wmma::col_major>
+        right_fragment;
+    nvcuda::wmma::load_matrix_sync(left_fragment, left, kWmmaTile);
+    nvcuda::wmma::load_matrix_sync(right_fragment, right, kWmmaTile);
+    nvcuda::wmma::mma_sync(accumulator, left_fragment, right_fragment,
+                           accumulator);
+    __syncwarp();
+  }
+  nvcuda::wmma::store_matrix_sync(completed, accumulator, kWmmaTile,
+                                  nvcuda::wmma::mem_row_major);
+  __syncwarp();
+  for (int index = lane; index < kWmmaTile * kWmmaTile; index += 32) {
+    const int64_t slot = schedule_base + index / kWmmaTile;
+    const int32_t assignment =
+        slot < schedule_positions ? sorted_assignments[slot] : -1;
+    const int64_t output_column = output_base + index % kWmmaTile;
+    if (assignment >= 0 && assignment < assignments &&
+        output_column < hidden_size && expert >= 0 && expert < experts) {
+      const float value =
+          (completed[index] +
+           load_float(bias[static_cast<int64_t>(expert) * hidden_size +
+                           output_column])) *
+          load_float(routing_weights[assignment]);
+      store_float(weighted_output,
+                  static_cast<int64_t>(assignment) * hidden_size +
+                      output_column,
+                  value);
+    }
+  }
+}
+
+bool valid_geometry(int64_t first, int64_t second, int64_t third) {
+  return first > 0 && second > 0 && third > 0 &&
+         first <= std::numeric_limits<int32_t>::max() &&
+         second <= std::numeric_limits<int32_t>::max() &&
+         third <= std::numeric_limits<int32_t>::max();
+}
+
+int32_t require_turing(char *message, size_t capacity) {
+  int device = 0;
+  cudaError_t status = cudaGetDevice(&device);
+  if (status != cudaSuccess) {
+    return fail(kLaunchFailure, cudaGetErrorString(status), message, capacity);
+  }
+  cudaDeviceProp properties{};
+  status = cudaGetDeviceProperties(&properties, device);
+  if (status != cudaSuccess) {
+    return fail(kLaunchFailure, cudaGetErrorString(status), message, capacity);
+  }
+  if (properties.major != 7 || properties.minor != 5) {
+    return fail(kInvalidArgument,
+                "the NVFP4 Turing adapter requires compute capability 7.5",
+                message, capacity);
+  }
+  return 0;
+}
+
+int32_t launch_result(char *message, size_t capacity) {
+  const cudaError_t status = cudaPeekAtLastError();
+  return status == cudaSuccess
+             ? 0
+             : fail(kLaunchFailure, cudaGetErrorString(status), message,
+                    capacity);
+}
+
+} // namespace
+
+extern "C" int32_t nml_nvfp4_turing_linear(
+    const NmlNvFp4Linear *request, char *error_message,
+    size_t error_message_capacity) {
+  if (request == nullptr || request->struct_size < sizeof(NmlNvFp4Linear)) {
+    return fail(kInvalidArgument, "truncated NVFP4 linear request",
+                error_message, error_message_capacity);
+  }
+  if (request->activation == nullptr || request->payload == nullptr ||
+      request->block_scales == nullptr || request->global_scale == nullptr ||
+      request->output == nullptr || request->stream == nullptr ||
+      !valid_geometry(request->rows, request->outputs, request->inputs)) {
+    return fail(kInvalidArgument, "invalid NVFP4 linear request",
+                error_message, error_message_capacity);
+  }
+  if (const int32_t status =
+          require_turing(error_message, error_message_capacity)) {
+    return status;
+  }
+  const dim3 grid(static_cast<uint32_t>((request->outputs + 15) / 16),
+                  static_cast<uint32_t>((request->rows + 15) / 16));
+  cudaStream_t stream = static_cast<cudaStream_t>(request->stream);
+  if (request->dtype == NML_NVFP4_F16) {
+    linear_kernel<<<grid, 32, 0, stream>>>(
+        static_cast<const __half *>(request->activation), request->payload,
+        request->block_scales, request->global_scale,
+        static_cast<const __half *>(request->bias),
+        static_cast<__half *>(request->output), request->rows, request->outputs,
+        request->inputs);
+  } else if (request->dtype == NML_NVFP4_BF16) {
+    linear_kernel<<<grid, 32, 0, stream>>>(
+        static_cast<const __nv_bfloat16 *>(request->activation),
+        request->payload, request->block_scales, request->global_scale,
+        static_cast<const __nv_bfloat16 *>(request->bias),
+        static_cast<__nv_bfloat16 *>(request->output), request->rows,
+        request->outputs, request->inputs);
+  } else {
+    return fail(kInvalidArgument, "NVFP4 linear supports F16 and BF16 only",
+                error_message, error_message_capacity);
+  }
+  return launch_result(error_message, error_message_capacity);
+}
+
+extern "C" int32_t nml_nvfp4_turing_embedding(
+    const NmlNvFp4Embedding *request, char *error_message,
+    size_t error_message_capacity) {
+  if (request == nullptr ||
+      request->struct_size < sizeof(NmlNvFp4Embedding)) {
+    return fail(kInvalidArgument, "truncated NVFP4 embedding request",
+                error_message, error_message_capacity);
+  }
+  if (request->indices == nullptr || request->payload == nullptr ||
+      request->block_scales == nullptr || request->global_scale == nullptr ||
+      request->output == nullptr || request->stream == nullptr ||
+      !valid_geometry(request->rows, request->vocabulary, request->width)) {
+    return fail(kInvalidArgument, "invalid NVFP4 embedding request",
+                error_message, error_message_capacity);
+  }
+  if (request->rows > std::numeric_limits<int64_t>::max() / request->width) {
+    return fail(kInvalidArgument, "NVFP4 embedding output extent overflows",
+                error_message, error_message_capacity);
+  }
+  if (const int32_t status =
+          require_turing(error_message, error_message_capacity)) {
+    return status;
+  }
+  const int64_t extent = request->rows * request->width;
+  const uint32_t blocks = static_cast<uint32_t>((extent + 255) / 256);
+  cudaStream_t stream = static_cast<cudaStream_t>(request->stream);
+#define NML_LAUNCH_EMBEDDING(Index, Element)                                  \
+  embedding_kernel<<<blocks, 256, 0, stream>>>(                              \
+      static_cast<const Index *>(request->indices), request->payload,         \
+      request->block_scales, request->global_scale,                           \
+      static_cast<Element *>(request->output), request->rows,                 \
+      request->vocabulary, request->width)
+  if (request->dtype == NML_NVFP4_F16 && request->indices_are_i64 == 0) {
+    NML_LAUNCH_EMBEDDING(int32_t, __half);
+  } else if (request->dtype == NML_NVFP4_F16) {
+    NML_LAUNCH_EMBEDDING(int64_t, __half);
+  } else if (request->dtype == NML_NVFP4_BF16 &&
+             request->indices_are_i64 == 0) {
+    NML_LAUNCH_EMBEDDING(int32_t, __nv_bfloat16);
+  } else if (request->dtype == NML_NVFP4_BF16) {
+    NML_LAUNCH_EMBEDDING(int64_t, __nv_bfloat16);
+  } else {
+    return fail(kInvalidArgument,
+                "NVFP4 embedding supports F16 and BF16 only", error_message,
+                error_message_capacity);
+  }
+#undef NML_LAUNCH_EMBEDDING
+  return launch_result(error_message, error_message_capacity);
+}
+
+extern "C" int32_t nml_nvfp4_turing_expert_gate_up(
+    const NmlNvFp4ExpertGateUp *request, char *error_message,
+    size_t error_message_capacity) {
+  if (request == nullptr ||
+      request->struct_size < sizeof(NmlNvFp4ExpertGateUp) ||
+      request->hidden == nullptr || request->sorted_assignments == nullptr ||
+      request->block_experts == nullptr || request->payload == nullptr ||
+      request->block_scales == nullptr || request->global_scale == nullptr ||
+      request->bias == nullptr || request->activated == nullptr ||
+      request->stream == nullptr || request->block_size != kWmmaTile ||
+      !valid_geometry(request->assignments, request->hidden_size,
+                      request->intermediate_size) ||
+      request->tokens <= 0 || request->experts <= 0 ||
+      request->experts_per_token <= 0 ||
+      request->tokens > std::numeric_limits<int64_t>::max() /
+                            request->experts_per_token ||
+      request->assignments != request->tokens * request->experts_per_token ||
+      request->schedule_blocks <= 0 ||
+      request->schedule_blocks >
+          std::numeric_limits<int64_t>::max() / kWmmaTile ||
+      request->schedule_positions != request->schedule_blocks * kWmmaTile) {
+    return fail(kInvalidArgument, "invalid NVFP4 expert gate/up request",
+                error_message, error_message_capacity);
+  }
+  if (const int32_t status =
+          require_turing(error_message, error_message_capacity)) {
+    return status;
+  }
+  const dim3 grid(
+      static_cast<uint32_t>((request->intermediate_size + 15) / 16),
+      static_cast<uint32_t>(request->schedule_blocks));
+  cudaStream_t stream = static_cast<cudaStream_t>(request->stream);
+#define NML_LAUNCH_GATE_UP(Element)                                            \
+  expert_gate_up_kernel<<<grid, 32, 0, stream>>>(                             \
+      static_cast<const Element *>(request->hidden),                           \
+      request->sorted_assignments, request->block_experts, request->payload,   \
+      request->block_scales, request->global_scale,                            \
+      static_cast<const Element *>(request->bias),                             \
+      static_cast<Element *>(request->activated), request->assignments,        \
+      request->schedule_positions, request->hidden_size,                       \
+      request->intermediate_size, request->experts,                            \
+      request->experts_per_token)
+  if (request->dtype == NML_NVFP4_F16) {
+    NML_LAUNCH_GATE_UP(__half);
+  } else if (request->dtype == NML_NVFP4_BF16) {
+    NML_LAUNCH_GATE_UP(__nv_bfloat16);
+  } else {
+    return fail(kInvalidArgument, "NVFP4 experts support F16 and BF16 only",
+                error_message, error_message_capacity);
+  }
+#undef NML_LAUNCH_GATE_UP
+  return launch_result(error_message, error_message_capacity);
+}
+
+extern "C" int32_t nml_nvfp4_turing_expert_down(
+    const NmlNvFp4ExpertDown *request, char *error_message,
+    size_t error_message_capacity) {
+  if (request == nullptr ||
+      request->struct_size < sizeof(NmlNvFp4ExpertDown) ||
+      request->activated == nullptr ||
+      request->sorted_assignments == nullptr ||
+      request->block_experts == nullptr || request->payload == nullptr ||
+      request->block_scales == nullptr || request->global_scale == nullptr ||
+      request->bias == nullptr || request->routing_weights == nullptr ||
+      request->weighted_output == nullptr || request->stream == nullptr ||
+      request->block_size != kWmmaTile ||
+      !valid_geometry(request->assignments, request->intermediate_size,
+                      request->hidden_size) ||
+      request->experts <= 0 || request->experts_per_token <= 0 ||
+      request->schedule_blocks <= 0 ||
+      request->schedule_blocks >
+          std::numeric_limits<int64_t>::max() / kWmmaTile ||
+      request->schedule_positions != request->schedule_blocks * kWmmaTile) {
+    return fail(kInvalidArgument, "invalid NVFP4 expert down request",
+                error_message, error_message_capacity);
+  }
+  if (const int32_t status =
+          require_turing(error_message, error_message_capacity)) {
+    return status;
+  }
+  const dim3 grid(static_cast<uint32_t>((request->hidden_size + 15) / 16),
+                  static_cast<uint32_t>(request->schedule_blocks));
+  cudaStream_t stream = static_cast<cudaStream_t>(request->stream);
+#define NML_LAUNCH_DOWN(Element)                                               \
+  expert_down_kernel<<<grid, 32, 0, stream>>>(                                \
+      static_cast<const Element *>(request->activated),                        \
+      request->sorted_assignments, request->block_experts, request->payload,   \
+      request->block_scales, request->global_scale,                            \
+      static_cast<const Element *>(request->bias),                             \
+      static_cast<const Element *>(request->routing_weights),                  \
+      static_cast<Element *>(request->weighted_output), request->assignments,  \
+      request->schedule_positions, request->intermediate_size,                 \
+      request->hidden_size, request->experts)
+  if (request->dtype == NML_NVFP4_F16) {
+    NML_LAUNCH_DOWN(__half);
+  } else if (request->dtype == NML_NVFP4_BF16) {
+    NML_LAUNCH_DOWN(__nv_bfloat16);
+  } else {
+    return fail(kInvalidArgument, "NVFP4 experts support F16 and BF16 only",
+                error_message, error_message_capacity);
+  }
+#undef NML_LAUNCH_DOWN
+  return launch_result(error_message, error_message_capacity);
+}

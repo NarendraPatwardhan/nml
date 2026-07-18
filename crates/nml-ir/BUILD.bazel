@@ -6,8 +6,11 @@ nml_rust_library(
     name = "nml_ir",
     srcs = [
         "src/attention_backend.rs",
+        "src/attention_sink.rs",
+        "src/device_capabilities.rs",
         "src/lib.rs",
         "src/moe_backend.rs",
+        "src/nvfp4_backend.rs",
         "src/ordinary_attention.rs",
         "src/paged_attention.rs",
     ],

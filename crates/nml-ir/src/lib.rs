@@ -6,7 +6,10 @@
 #![forbid(unsafe_code)]
 
 mod attention_backend;
+mod attention_sink;
+mod device_capabilities;
 mod moe_backend;
+mod nvfp4_backend;
 mod ordinary_attention;
 mod paged_attention;
 
@@ -16,7 +19,10 @@ use nml_mlir::{
     StableHloBinary, StableHloComparison, StableHloComparisonType, StableHloFftType,
     StableHloUnary, Type as MlirType, Value as MlirValue,
 };
-use nml_parameter::{ComponentRole, Parameter, RepresentationId, StorageEncoding, StorageSpec};
+use nml_parameter::{
+    ComponentRole, ComponentSpec, Parameter, RepresentationId, RepresentationSpec, StorageEncoding,
+    StorageSpec,
+};
 use nml_sharding::Sharding;
 use nml_tensor::{Element, Slice};
 use nml_types::{
@@ -27,6 +33,8 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::device_capabilities::DeviceCapabilities;
 
 static NEXT_PROGRAM_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -131,6 +139,9 @@ pub enum RopeScaling {
         beta_slow: f64,
         original_context: usize,
         truncate: bool,
+        /// Optional post-RoPE amplitude. When absent, YaRN's published
+        /// `0.1 * ln(factor) + 1` mscale is used for factors above one.
+        attention_factor: Option<f64>,
     },
 }
 
@@ -204,6 +215,11 @@ pub enum Error {
     UnsupportedDType {
         operation: &'static str,
         dtype: DType,
+    },
+    UnsupportedTarget {
+        operation: &'static str,
+        target: String,
+        requirement: &'static str,
     },
     ElementCountMismatch {
         operation: &'static str,
@@ -330,6 +346,14 @@ impl fmt::Display for Error {
             Self::UnsupportedDType { operation, dtype } => {
                 write!(formatter, "{operation} does not support {dtype:?}")
             }
+            Self::UnsupportedTarget {
+                operation,
+                target,
+                requirement,
+            } => write!(
+                formatter,
+                "{operation} cannot be lowered for {target}: {requirement}"
+            ),
             Self::ElementCountMismatch {
                 operation,
                 input,
@@ -483,7 +507,13 @@ impl ProgramBuilder {
     /// available for ordinary operations such as normalization whose parameter
     /// semantics require dense storage.
     pub fn parameter_value(&mut self, parameter: &Parameter) -> Result<Tensor, Error> {
-        let component = parameter.dense_component();
+        let component = parameter.dense_component().ok_or_else(|| {
+            Error::InvalidParameter(format!(
+                "parameter {:?} uses {:?}; this operation currently requires dense storage",
+                parameter.name(),
+                parameter.representation_id().kind()
+            ))
+        })?;
         let storage = component.storage();
         if storage.encoding() != StorageEncoding::Dense(parameter.shape().dtype())
             || storage.shape() != parameter.shape()
@@ -493,6 +523,15 @@ impl ProgramBuilder {
                 parameter.name()
             )));
         }
+        self.parameter_component_value(parameter, component)
+    }
+
+    fn parameter_component_value(
+        &mut self,
+        parameter: &Parameter,
+        component: &ComponentSpec,
+    ) -> Result<Tensor, Error> {
+        let storage = component.storage();
         if let Some((value, declared)) = self.parameter_components.get(component.binding_name()) {
             if declared != parameter {
                 return Err(Error::InvalidParameter(format!(
@@ -1200,6 +1239,175 @@ impl ProgramBuilder {
             experts_per_token,
             MoeActivation::Silu,
         )
+    }
+
+    /// GPT-OSS clamped, interleaved residual SwiGLU experts.
+    ///
+    /// Gate/up and down weights use input-major logical shapes
+    /// `[experts, hidden, 2 * intermediate]` and
+    /// `[experts, intermediate, hidden]`. Biases remain ordinary dense
+    /// parameters. Dense and NVFP4 weights share this exact routing and
+    /// activation contract; representation selects only the private
+    /// contraction lowering.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_clamped_swiglu(
+        &mut self,
+        hidden: Tensor,
+        router_logits: Tensor,
+        gate_up_weights: &Parameter,
+        gate_up_bias: &Parameter,
+        down_weights: &Parameter,
+        down_bias: &Parameter,
+        experts_per_token: usize,
+    ) -> Result<Tensor, Error> {
+        self.require_local(hidden)?;
+        self.require_local(router_logits)?;
+        self.require_float(hidden, "clamped_swiglu_moe")?;
+        self.require_float(router_logits, "clamped_swiglu_moe")?;
+        let gate_shape = gate_up_weights.shape();
+        let down_shape = down_weights.shape();
+        let gate_bias_shape = gate_up_bias.shape();
+        let down_bias_shape = down_bias.shape();
+        if hidden.shape.rank() != 2
+            || router_logits.shape.rank() != 2
+            || gate_shape.rank() != 3
+            || down_shape.rank() != 3
+            || gate_bias_shape.rank() != 2
+            || down_bias_shape.rank() != 2
+        {
+            return Err(Error::InvalidMoe(
+                "clamped SwiGLU expects hidden [tokens, hidden], router [tokens, experts], gate/up [experts, hidden, 2*intermediate], gate/up bias [experts, 2*intermediate], down [experts, intermediate, hidden], and down bias [experts, hidden]",
+            ));
+        }
+        let tokens = hidden.shape.dimensions()[0];
+        let hidden_size = hidden.shape.dimensions()[1];
+        let experts = router_logits.shape.dimensions()[1];
+        let doubled_intermediate = gate_shape.dimensions()[2];
+        if tokens != router_logits.shape.dimensions()[0]
+            || experts != gate_shape.dimensions()[0]
+            || experts != down_shape.dimensions()[0]
+            || gate_shape.dimensions()[1] != hidden_size
+            || doubled_intermediate <= 0
+            || doubled_intermediate % 2 != 0
+            || down_shape.dimensions()[1] != doubled_intermediate / 2
+            || down_shape.dimensions()[2] != hidden_size
+            || gate_bias_shape.dimensions() != [experts, doubled_intermediate]
+            || down_bias_shape.dimensions() != [experts, hidden_size]
+        {
+            return Err(Error::InvalidMoe(
+                "clamped SwiGLU expert parameter dimensions are inconsistent",
+            ));
+        }
+        for parameter in [gate_up_weights, gate_up_bias, down_weights, down_bias] {
+            if parameter.shape().dtype() != hidden.shape.dtype() {
+                return Err(Error::InvalidMoe(
+                    "clamped SwiGLU weights, biases, and hidden states must use one dtype",
+                ));
+            }
+        }
+        if !matches!(gate_up_bias.representation(), RepresentationSpec::Dense(_))
+            || !matches!(down_bias.representation(), RepresentationSpec::Dense(_))
+        {
+            return Err(Error::InvalidMoe(
+                "clamped SwiGLU expert biases must use dense storage",
+            ));
+        }
+        if hidden.shape.axis_tags()[0] != router_logits.shape.axis_tags()[0]
+            || hidden.shape.partitions()[0] != router_logits.shape.partitions()[0]
+        {
+            return Err(Error::InvalidMoe(
+                "hidden and router token axes must carry identical metadata",
+            ));
+        }
+        if gate_shape.partitions()[0] != down_shape.partitions()[0]
+            || gate_shape.partitions()[0] != gate_bias_shape.partitions()[0]
+            || gate_shape.partitions()[0] != down_bias_shape.partitions()[0]
+        {
+            return Err(Error::InvalidMoe(
+                "all expert parameters must use identical expert-axis partitioning",
+            ));
+        }
+        if matches!(router_logits.shape.partitions()[1], Partition::Sharded(_)) {
+            return Err(Error::InvalidMoe(
+                "router logits stay replicated so top-k selection is global",
+            ));
+        }
+        let expert_count = usize::try_from(experts)
+            .map_err(|_| Error::InvalidMoe("expert count does not fit usize"))?;
+        if experts_per_token == 0 || experts_per_token > expert_count {
+            return Err(Error::InvalidMoe(
+                "experts per token must be positive and not exceed the expert count",
+            ));
+        }
+
+        let probabilities = self.softmax(router_logits, 1)?;
+        let (routing_weights, expert_ids) =
+            self.top_k(probabilities, 1, experts_per_token, true)?;
+        let normalizer = self.reduce_sum(routing_weights, &[1])?;
+        let epsilon = self.scalar_for(
+            routing_weights.shape.dtype(),
+            if routing_weights.shape.dtype() == DType::F64 {
+                f64::EPSILON
+            } else {
+                f64::from(f32::EPSILON)
+            },
+        )?;
+        let normalizer = self.maximum(normalizer, epsilon)?;
+        let normalizer = self.broadcast_in_dim(normalizer, routing_weights.shape, &[0])?;
+        let routing_weights = self.divide(routing_weights, normalizer)?;
+        let routing_weights = self.convert(routing_weights, hidden.shape.dtype())?;
+        match (
+            gate_up_weights.representation(),
+            down_weights.representation(),
+        ) {
+            (RepresentationSpec::Dense(_), RepresentationSpec::Dense(_)) => self
+                .dense_clamped_swiglu_experts(
+                    hidden,
+                    expert_ids,
+                    routing_weights,
+                    gate_up_weights,
+                    gate_up_bias,
+                    down_weights,
+                    down_bias,
+                ),
+            (RepresentationSpec::NvFp4(_), RepresentationSpec::NvFp4(_)) => {
+                let assignment_plan = self.moe_assignment_plan(expert_ids, expert_count, 16)?;
+                let [gate_payload, gate_scales, gate_global] =
+                    require_nvfp4_components(gate_up_weights)?;
+                let [down_payload, down_scales, down_global] =
+                    require_nvfp4_components(down_weights)?;
+                let gate_payload = self.parameter_component_value(gate_up_weights, gate_payload)?;
+                let gate_scales = self.parameter_component_value(gate_up_weights, gate_scales)?;
+                let gate_global = self.parameter_component_value(gate_up_weights, gate_global)?;
+                let gate_bias = self.parameter_value(gate_up_bias)?;
+                let down_payload = self.parameter_component_value(down_weights, down_payload)?;
+                let down_scales = self.parameter_component_value(down_weights, down_scales)?;
+                let down_global = self.parameter_component_value(down_weights, down_global)?;
+                let down_bias = self.parameter_value(down_bias)?;
+                let result = self.push_value("clamped_swiglu_moe", hidden.shape);
+                self.operations.push(Operation::NvFp4GptOssExperts {
+                    hidden: hidden.value,
+                    expert_ids: expert_ids.value,
+                    routing_weights: routing_weights.value,
+                    gate_payload: gate_payload.value,
+                    gate_scales: gate_scales.value,
+                    gate_global: gate_global.value,
+                    gate_bias: gate_bias.value,
+                    down_payload: down_payload.value,
+                    down_scales: down_scales.value,
+                    down_global: down_global.value,
+                    down_bias: down_bias.value,
+                    sorted_assignments: assignment_plan.sorted_assignments.value,
+                    block_experts: assignment_plan.block_experts.value,
+                    block_size: assignment_plan.block_size,
+                    result: result.value,
+                });
+                Ok(result)
+            }
+            _ => Err(Error::InvalidMoe(
+                "gate/up and down expert weights must use one representation",
+            )),
+        }
     }
 
     pub fn moe_geglu(
@@ -2441,11 +2649,50 @@ impl ProgramBuilder {
         weight: &Parameter,
         indices: Tensor,
     ) -> Result<Tensor, Error> {
-        let weight = self.parameter_value(weight)?;
-        self.require_rank(weight, "token embedding weight", 2)?;
+        match weight.representation() {
+            RepresentationSpec::Dense(_) => {
+                let weight = self.parameter_value(weight)?;
+                self.require_rank(weight, "token embedding weight", 2)?;
+                self.require_local(indices)?;
+                require_index_dtype(indices.shape.dtype())?;
+                self.gather(weight, indices, 0)
+            }
+            RepresentationSpec::NvFp4(_) => self.nvfp4_embedding(weight, indices),
+        }
+    }
+
+    fn nvfp4_embedding(&mut self, weight: &Parameter, indices: Tensor) -> Result<Tensor, Error> {
         self.require_local(indices)?;
         require_index_dtype(indices.shape.dtype())?;
-        self.gather(weight, indices, 0)
+        let logical = weight.shape();
+        if logical.rank() != 2 {
+            return Err(Error::InvalidParameter(format!(
+                "NVFP4 embedding weight {:?} must have rank two",
+                weight.name()
+            )));
+        }
+        let [payload, scales, global] = require_nvfp4_components(weight)?;
+        let payload = self.parameter_component_value(weight, payload)?;
+        let scales = self.parameter_component_value(weight, scales)?;
+        let global = self.parameter_component_value(weight, global)?;
+        let mut dimensions = indices.shape.dimensions().to_vec();
+        dimensions.push(logical.dimensions()[1]);
+        let mut axis_tags = indices.shape.axis_tags().to_vec();
+        axis_tags.push(logical.axis_tags()[1]);
+        let mut partitions = indices.shape.partitions().to_vec();
+        partitions.push(logical.partitions()[1]);
+        let shape = Shape::new(logical.dtype(), &dimensions)?
+            .with_axis_tags(&axis_tags)?
+            .with_partitions(&partitions)?;
+        let result = self.push_value("nvfp4_embedding", shape);
+        self.operations.push(Operation::NvFp4Embedding {
+            indices: indices.value,
+            payload: payload.value,
+            block_scales: scales.value,
+            global_scale: global.value,
+            result: result.value,
+        });
+        Ok(result)
     }
 
     fn gather_impl(
@@ -3719,7 +3966,7 @@ impl ProgramBuilder {
         };
         let rotary = options.rotary_dimensions as i64;
         let half = rotary / 2;
-        let frequencies = rope_frequencies(options)?;
+        let (frequencies, attention_factor) = rope_frequencies(options)?;
         let frequency_shape = Shape::new(DType::F32, &[half])?;
         let frequency_slice = Slice::from_typed(frequency_shape, &frequencies)?;
         let frequencies = self.constant(&frequency_slice)?;
@@ -3728,8 +3975,13 @@ impl ProgramBuilder {
         let positions = self.broadcast_in_dim(positions, angle_shape, &[0, 1])?;
         let frequencies = self.broadcast_in_dim(frequencies, angle_shape, &[2])?;
         let angles = self.multiply(positions, frequencies)?;
-        let cosine = self.cos(angles)?;
-        let sine = self.sin(angles)?;
+        let mut cosine = self.cos(angles)?;
+        let mut sine = self.sin(angles)?;
+        if attention_factor != 1.0 {
+            let factor = self.scalar(attention_factor)?;
+            cosine = self.multiply(cosine, factor)?;
+            sine = self.multiply(sine, factor)?;
+        }
 
         let input_f32 = self.convert(input, DType::F32)?;
         let rotary_input = self.slice(
@@ -3821,6 +4073,7 @@ impl ProgramBuilder {
         value: Tensor,
         query_positions: Tensor,
         key_positions: Tensor,
+        sinks: Option<Tensor>,
         options: AttentionOptions,
     ) -> Result<Tensor, Error> {
         for tensor in [query, key, value] {
@@ -3873,6 +4126,18 @@ impl ProgramBuilder {
                 "position tensors must match query and key sequence shapes",
             ));
         }
+        if let Some(sinks) = sinks {
+            self.require_local(sinks)?;
+            self.require_float(sinks, "attention sinks")?;
+            self.require_rank(sinks, "attention sinks", 1)?;
+            if sinks.shape.dtype() != query.shape.dtype()
+                || sinks.shape.dimensions() != &[*query_heads]
+            {
+                return Err(Error::InvalidAttention(
+                    "attention sinks must match the query dtype and query-head count",
+                ));
+            }
+        }
         if options.sliding_window.is_some_and(|window| window <= 0) {
             return Err(Error::InvalidAttention(
                 "sliding window must be positive when specified",
@@ -3895,6 +4160,7 @@ impl ProgramBuilder {
             value: value.value,
             query_positions: query_positions.value,
             key_positions: key_positions.value,
+            sinks: sinks.map(|tensor| tensor.value),
             result: result.value,
             options: AttentionOptions {
                 scale: Some(scale),
@@ -3915,6 +4181,7 @@ impl ProgramBuilder {
         page_table: Tensor,
         sequence_lengths: Tensor,
         query_positions: Tensor,
+        sinks: Option<Tensor>,
         options: AttentionOptions,
     ) -> Result<Tensor, Error> {
         for tensor in [query, key_cache, value_cache] {
@@ -3977,6 +4244,18 @@ impl ProgramBuilder {
                 "page table must contain at least one logical page",
             ));
         }
+        if let Some(sinks) = sinks {
+            self.require_local(sinks)?;
+            self.require_float(sinks, "paged attention sinks")?;
+            self.require_rank(sinks, "paged attention sinks", 1)?;
+            if sinks.shape.dtype() != query.shape.dtype()
+                || sinks.shape.dimensions() != &[*query_heads]
+            {
+                return Err(Error::InvalidAttention(
+                    "paged attention sinks must match the query dtype and query-head count",
+                ));
+            }
+        }
         page_table.shape.dimensions()[1]
             .checked_mul(*page_size)
             .ok_or(Error::InvalidAttention(
@@ -4004,6 +4283,7 @@ impl ProgramBuilder {
             page_table: page_table.value,
             sequence_lengths: sequence_lengths.value,
             query_positions: query_positions.value,
+            sinks: sinks.map(|tensor| tensor.value),
             result: result.value,
             options: AttentionOptions {
                 scale: Some(scale),
@@ -4020,16 +4300,21 @@ impl ProgramBuilder {
         weight: &Parameter,
         bias: Option<&Parameter>,
     ) -> Result<Tensor, Error> {
-        let weight = self.parameter_value(weight)?;
         self.require_local(input)?;
         if input.shape.rank() == 0 {
             return Err(Error::InvalidLinearAlgebra(
                 "linear input requires at least one dimension",
             ));
         }
-        self.require_rank(weight, "linear weight", 2)?;
-        let input_axis = input.shape.rank() - 1;
-        let product = self.dot_general(input, weight, &[], &[], &[input_axis], &[1])?;
+        let product = match weight.representation() {
+            RepresentationSpec::Dense(_) => {
+                let weight = self.parameter_value(weight)?;
+                self.require_rank(weight, "linear weight", 2)?;
+                let input_axis = input.shape.rank() - 1;
+                self.dot_general(input, weight, &[], &[], &[input_axis], &[1])?
+            }
+            RepresentationSpec::NvFp4(_) => return self.nvfp4_linear(input, weight, bias),
+        };
         let Some(bias) = bias else {
             return Ok(product);
         };
@@ -4046,6 +4331,93 @@ impl ProgramBuilder {
         }
         let bias = self.broadcast_in_dim(bias, product.shape, &[output_axis])?;
         self.add(product, bias)
+    }
+
+    fn nvfp4_linear(
+        &mut self,
+        input: Tensor,
+        weight: &Parameter,
+        bias: Option<&Parameter>,
+    ) -> Result<Tensor, Error> {
+        let logical = weight.shape();
+        if logical.rank() != 2 {
+            return Err(Error::InvalidParameter(format!(
+                "NVFP4 linear weight {:?} must have rank two",
+                weight.name()
+            )));
+        }
+        if input.shape.dtype() != logical.dtype() {
+            return Err(Error::DTypeMismatch {
+                left: input.shape.dtype(),
+                right: logical.dtype(),
+            });
+        }
+        let input_axis = input.shape.rank() - 1;
+        if input.shape.dimensions()[input_axis] != logical.dimensions()[1] {
+            return Err(Error::DimensionMismatch {
+                left_axis: input_axis,
+                right_axis: 1,
+                left: input.shape.dimensions()[input_axis],
+                right: logical.dimensions()[1],
+            });
+        }
+        let [payload, scales, global] = require_nvfp4_components(weight)?;
+        let payload = self.parameter_component_value(weight, payload)?;
+        let scales = self.parameter_component_value(weight, scales)?;
+        let global = self.parameter_component_value(weight, global)?;
+        let mut dimensions = input.shape.dimensions().to_vec();
+        dimensions[input_axis] = logical.dimensions()[0];
+        let mut axis_tags = input.shape.axis_tags().to_vec();
+        axis_tags[input_axis] = logical.axis_tags()[0];
+        let mut partitions = input.shape.partitions().to_vec();
+        partitions[input_axis] = logical.partitions()[0];
+        let shape = Shape::new(input.shape.dtype(), &dimensions)?
+            .with_axis_tags(&axis_tags)?
+            .with_partitions(&partitions)?;
+
+        // Bias belongs to the compact contraction epilogue. Validate its
+        // complete semantic contract before authoring the NVFP4 operation so a
+        // failed call cannot leave a partially formed compact projection in the
+        // program. Dense linear intentionally retains its ordinary broadcast +
+        // add lowering above.
+        let bias = match bias {
+            Some(bias) => {
+                let bias_shape = bias.shape();
+                if bias_shape.rank() != 1 {
+                    return Err(Error::RankMismatch {
+                        operation: "linear bias",
+                        expected: 1,
+                        actual: bias_shape.rank(),
+                    });
+                }
+                if bias_shape.dtype() != shape.dtype() {
+                    return Err(Error::DTypeMismatch {
+                        left: shape.dtype(),
+                        right: bias_shape.dtype(),
+                    });
+                }
+                if bias_shape.dimensions()[0] != shape.dimensions()[input_axis] {
+                    return Err(Error::DimensionMismatch {
+                        left_axis: 0,
+                        right_axis: input_axis,
+                        left: bias_shape.dimensions()[0],
+                        right: shape.dimensions()[input_axis],
+                    });
+                }
+                Some(self.parameter_value(bias)?)
+            }
+            None => None,
+        };
+        let result = self.push_value("nvfp4_linear", shape);
+        self.operations.push(Operation::NvFp4Linear {
+            input: input.value,
+            payload: payload.value,
+            block_scales: scales.value,
+            global_scale: global.value,
+            bias: bias.map(|bias| bias.value),
+            result: result.value,
+        });
+        Ok(result)
     }
 
     pub fn dot_general(
@@ -4418,6 +4790,82 @@ impl ProgramBuilder {
     fn integer_unary(&mut self, input: Tensor, operation: Unary) -> Result<Tensor, Error> {
         self.require_integer(input, operation.name())?;
         self.unary(input, operation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dense_clamped_swiglu_experts(
+        &mut self,
+        hidden: Tensor,
+        expert_ids: Tensor,
+        routing_weights: Tensor,
+        gate_up_weights: &Parameter,
+        gate_up_bias: &Parameter,
+        down_weights: &Parameter,
+        down_bias: &Parameter,
+    ) -> Result<Tensor, Error> {
+        let gate_up = self.parameter_value(gate_up_weights)?;
+        let gate_bias = self.parameter_value(gate_up_bias)?;
+        let down = self.parameter_value(down_weights)?;
+        let down_bias = self.parameter_value(down_bias)?;
+        let tokens = hidden.shape.dimensions()[0];
+        let experts = gate_up.shape.dimensions()[0];
+        let projected = self.dot_general(hidden, gate_up, &[], &[], &[1], &[1])?;
+        let gate_bias = self.broadcast_in_dim(gate_bias, projected.shape, &[1, 2])?;
+        let projected = self.add(projected, gate_bias)?;
+        let starts = vec![0; projected.shape.rank()];
+        let limits = projected.shape.dimensions().to_vec();
+        let mut strides = vec![1; projected.shape.rank()];
+        strides[projected.shape.rank() - 1] = 2;
+        let gate = self.slice(projected, &starts, &limits, &strides)?;
+        let mut up_starts = starts;
+        up_starts[projected.shape.rank() - 1] = 1;
+        let up = self.slice(projected, &up_starts, &limits, &strides)?;
+        let negative_seven = self.scalar_for(hidden.shape.dtype(), -7.0)?;
+        let seven = self.scalar_for(hidden.shape.dtype(), 7.0)?;
+        let gate = self.minimum(gate, seven)?;
+        let up = self.clamp(up, negative_seven, seven)?;
+        let scale = self.scalar_for(hidden.shape.dtype(), 1.702)?;
+        let scaled_gate = self.multiply(scale, gate)?;
+        let swish = self.sigmoid(scaled_gate)?;
+        let swish = self.multiply(gate, swish)?;
+        let one = self.scalar_for(hidden.shape.dtype(), 1.0)?;
+        let up = self.add(up, one)?;
+        let activated = self.multiply(up, swish)?;
+
+        let expert_outputs = self.dot_general(activated, down, &[1], &[0], &[2], &[1])?;
+        let expert_outputs = self.transpose(expert_outputs, &[1, 0, 2])?;
+        let down_bias = self.broadcast_in_dim(down_bias, expert_outputs.shape, &[1, 2])?;
+        let expert_outputs = self.add(expert_outputs, down_bias)?;
+
+        let expert_partition = gate_up.shape.partitions()[0];
+        let expert_tag = gate_up.shape.axis_tags()[0];
+        let all_ids_shape = Shape::new(DType::I32, &[experts])?
+            .with_axis_tags(&[expert_tag])?
+            .with_partitions(&[expert_partition])?;
+        let all_ids = self.iota(all_ids_shape, 0)?;
+        let routes = expert_ids.shape.dimensions()[1];
+        let selection_shape = Shape::new(DType::I32, &[tokens, routes, experts])?
+            .with_axis_tags(&[
+                expert_ids.shape.axis_tags()[0],
+                expert_ids.shape.axis_tags()[1],
+                expert_tag,
+            ])?
+            .with_partitions(&[
+                expert_ids.shape.partitions()[0],
+                expert_ids.shape.partitions()[1],
+                expert_partition,
+            ])?;
+        let all_ids = self.broadcast_in_dim(all_ids, selection_shape, &[2])?;
+        let selected_ids = self.broadcast_in_dim(expert_ids, selection_shape, &[0, 1])?;
+        let selected = self.equal(selected_ids, all_ids)?;
+        let routing_shape = selection_shape.with_dtype(hidden.shape.dtype());
+        let selected_weights = self.broadcast_in_dim(routing_weights, routing_shape, &[0, 1])?;
+        let zero = self.scalar_for(hidden.shape.dtype(), 0.0)?;
+        let selected_weights = self.select(selected, selected_weights, zero)?;
+        let dense_routing = self.reduce_sum(selected_weights, &[1])?;
+        let routing = self.broadcast_in_dim(dense_routing, expert_outputs.shape, &[0, 1])?;
+        let weighted = self.multiply(expert_outputs, routing)?;
+        self.reduce_sum(weighted, &[1])
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5258,11 +5706,12 @@ impl Default for ProgramBuilder {
     }
 }
 
-fn rope_frequencies(options: RopeOptions) -> Result<Vec<f32>, Error> {
+fn rope_frequencies(options: RopeOptions) -> Result<(Vec<f32>, f32), Error> {
     let half = options.rotary_dimensions / 2;
     let mut frequencies = (0..half)
         .map(|index| options.base.powf(-(index as f64) / half as f64))
         .collect::<Vec<_>>();
+    let mut attention_factor = 1.0;
     match options.scaling {
         RopeScaling::Default => {}
         RopeScaling::Linear { factor } => {
@@ -5319,6 +5768,7 @@ fn rope_frequencies(options: RopeOptions) -> Result<Vec<f32>, Error> {
             beta_slow,
             original_context,
             truncate,
+            attention_factor: configured_attention_factor,
         } => {
             validate_extended_rope(factor, beta_fast, beta_slow, original_context)?;
             let context = original_context as f64;
@@ -5342,9 +5792,29 @@ fn rope_frequencies(options: RopeOptions) -> Result<Vec<f32>, Error> {
                     *frequency *= interpolation + (1.0 - interpolation) * downscale;
                 }
             }
+            attention_factor = configured_attention_factor.unwrap_or_else(|| {
+                if factor <= 1.0 {
+                    1.0
+                } else {
+                    0.1 * factor.ln() + 1.0
+                }
+            });
+            let factor_f32 = attention_factor as f32;
+            if !attention_factor.is_finite()
+                || attention_factor <= 0.0
+                || !factor_f32.is_finite()
+                || factor_f32 <= 0.0
+            {
+                return Err(Error::InvalidRope(
+                    "Yarn attention factor must be representable as positive finite F32",
+                ));
+            }
         }
     }
-    Ok(frequencies.into_iter().map(|value| value as f32).collect())
+    Ok((
+        frequencies.into_iter().map(|value| value as f32).collect(),
+        attention_factor as f32,
+    ))
 }
 
 fn validate_extended_rope(
@@ -5427,7 +5897,7 @@ impl Program {
         context: &'context Context,
         sharding: &Sharding,
     ) -> Result<Module<'context>, Error> {
-        self.module_with_sharding_target(context, sharding, None)
+        self.module_with_sharding_target(context, sharding, DeviceCapabilities::Cpu)
     }
 
     #[doc(hidden)]
@@ -5442,7 +5912,7 @@ impl Program {
         self.module_with_sharding_target(
             context,
             sharding,
-            Some((core_count, capability_major, capability_minor)),
+            DeviceCapabilities::cuda(core_count, capability_major, capability_minor),
         )
     }
 
@@ -5450,7 +5920,7 @@ impl Program {
         &self,
         context: &'context Context,
         sharding: &Sharding,
-        cuda: Option<(usize, u16, u16)>,
+        capabilities: DeviceCapabilities,
     ) -> Result<Module<'context>, Error> {
         for value in &self.values {
             sharding.validate_shape(value.shape)?;
@@ -5477,6 +5947,233 @@ impl Program {
         }
 
         for (operation_index, operation) in self.operations.iter().enumerate() {
+            if let Operation::NvFp4GptOssExperts {
+                hidden,
+                expert_ids,
+                routing_weights,
+                gate_payload,
+                gate_scales,
+                gate_global,
+                gate_bias,
+                down_payload,
+                down_scales,
+                down_global,
+                down_bias,
+                sorted_assignments,
+                block_experts,
+                block_size,
+                result,
+            } = operation
+            {
+                if let Some(cuda) = capabilities.cuda_capabilities() {
+                    let operands = [
+                        mlir_value(&values, *hidden),
+                        mlir_value(&values, *routing_weights),
+                        mlir_value(&values, *gate_payload),
+                        mlir_value(&values, *gate_scales),
+                        mlir_value(&values, *gate_global),
+                        mlir_value(&values, *gate_bias),
+                        mlir_value(&values, *down_payload),
+                        mlir_value(&values, *down_scales),
+                        mlir_value(&values, *down_global),
+                        mlir_value(&values, *down_bias),
+                        mlir_value(&values, *sorted_assignments),
+                        mlir_value(&values, *block_experts),
+                    ];
+                    let shapes = [
+                        self.values[*hidden].shape,
+                        self.values[*routing_weights].shape,
+                        self.values[*gate_payload].shape,
+                        self.values[*gate_scales].shape,
+                        self.values[*gate_global].shape,
+                        self.values[*gate_bias].shape,
+                        self.values[*down_payload].shape,
+                        self.values[*down_scales].shape,
+                        self.values[*down_global].shape,
+                        self.values[*down_bias].shape,
+                        self.values[*sorted_assignments].shape,
+                        self.values[*block_experts].shape,
+                    ];
+                    let lowered = match shapes[2].partitions()[0] {
+                        Partition::Sharded(expert_axis) => lower_expert_parallel(
+                            context,
+                            &mut block,
+                            sharding,
+                            &operands,
+                            &shapes,
+                            types[*result],
+                            self.values[*result].shape,
+                            expert_axis,
+                            2,
+                            operation_index,
+                            |local_block, local_inputs, local_shapes, local_result, offset| {
+                                nvfp4_backend::lower_gpt_oss_experts(
+                                    context,
+                                    local_block,
+                                    nvfp4_expert_inputs(
+                                        local_inputs,
+                                        local_shapes,
+                                        local_result,
+                                        *block_size,
+                                        Some(offset),
+                                    ),
+                                    cuda,
+                                )
+                            },
+                        )?,
+                        _ => nvfp4_backend::lower_gpt_oss_experts(
+                            context,
+                            &mut block,
+                            nvfp4_expert_inputs(
+                                &operands,
+                                &shapes,
+                                types[*result],
+                                *block_size,
+                                None,
+                            ),
+                            cuda,
+                        )?,
+                    };
+                    values[*result] = Some(constrain_compound_result(
+                        context,
+                        &mut block,
+                        lowered,
+                        types[*result],
+                        sharding,
+                        self.values[*result].shape,
+                    )?);
+                    continue;
+                }
+                // The portable CPU handler consumes route IDs directly. The
+                // deterministic padded schedule is retained in the semantic
+                // operation for CUDA grouped lowering and deliberately does
+                // not become a second public routing API.
+                let _ = (sorted_assignments, block_experts);
+                let call = context.ffi_custom_call(
+                    "nml.nvfp4.gpt_oss_experts",
+                    &[
+                        mlir_value(&values, *hidden),
+                        mlir_value(&values, *expert_ids),
+                        mlir_value(&values, *routing_weights),
+                        mlir_value(&values, *gate_payload),
+                        mlir_value(&values, *gate_scales),
+                        mlir_value(&values, *gate_global),
+                        mlir_value(&values, *gate_bias),
+                        mlir_value(&values, *down_payload),
+                        mlir_value(&values, *down_scales),
+                        mlir_value(&values, *down_global),
+                        mlir_value(&values, *down_bias),
+                    ],
+                    &[types[*result]],
+                )?;
+                values[*result] = Some(call.result(0)?);
+                block.append_operation(call)?;
+                continue;
+            }
+            if let Operation::NvFp4Embedding {
+                indices,
+                payload,
+                block_scales,
+                global_scale,
+                result,
+            } = operation
+            {
+                if let Some(cuda) = capabilities.cuda_capabilities() {
+                    let lowered = nvfp4_backend::lower_embedding(
+                        context,
+                        &mut block,
+                        nvfp4_backend::EmbeddingInputs {
+                            indices: mlir_value(&values, *indices),
+                            payload: mlir_value(&values, *payload),
+                            block_scales: mlir_value(&values, *block_scales),
+                            global_scale: mlir_value(&values, *global_scale),
+                            indices_shape: self.values[*indices].shape,
+                            payload_shape: self.values[*payload].shape,
+                            block_scales_shape: self.values[*block_scales].shape,
+                            global_scale_shape: self.values[*global_scale].shape,
+                            result_shape: self.values[*result].shape,
+                            result_type: types[*result],
+                        },
+                        cuda,
+                    )?;
+                    values[*result] = Some(constrain_compound_result(
+                        context,
+                        &mut block,
+                        lowered,
+                        types[*result],
+                        sharding,
+                        self.values[*result].shape,
+                    )?);
+                    continue;
+                }
+                let call = context.ffi_custom_call(
+                    "nml.nvfp4.embedding",
+                    &[
+                        mlir_value(&values, *indices),
+                        mlir_value(&values, *payload),
+                        mlir_value(&values, *block_scales),
+                        mlir_value(&values, *global_scale),
+                    ],
+                    &[types[*result]],
+                )?;
+                values[*result] = Some(call.result(0)?);
+                block.append_operation(call)?;
+                continue;
+            }
+            if let Operation::NvFp4Linear {
+                input,
+                payload,
+                block_scales,
+                global_scale,
+                bias,
+                result,
+            } = operation
+            {
+                if let Some(cuda) = capabilities.cuda_capabilities() {
+                    let lowered = nvfp4_backend::lower_linear(
+                        context,
+                        &mut block,
+                        nvfp4_backend::LinearInputs {
+                            activation: mlir_value(&values, *input),
+                            payload: mlir_value(&values, *payload),
+                            block_scales: mlir_value(&values, *block_scales),
+                            global_scale: mlir_value(&values, *global_scale),
+                            bias: bias.map(|bias| mlir_value(&values, bias)),
+                            activation_shape: self.values[*input].shape,
+                            payload_shape: self.values[*payload].shape,
+                            block_scales_shape: self.values[*block_scales].shape,
+                            global_scale_shape: self.values[*global_scale].shape,
+                            bias_shape: bias.map(|bias| self.values[bias].shape),
+                            result_shape: self.values[*result].shape,
+                            result_type: types[*result],
+                        },
+                        cuda,
+                    )?;
+                    values[*result] = Some(constrain_compound_result(
+                        context,
+                        &mut block,
+                        lowered,
+                        types[*result],
+                        sharding,
+                        self.values[*result].shape,
+                    )?);
+                    continue;
+                }
+                let mut operands = vec![
+                    mlir_value(&values, *input),
+                    mlir_value(&values, *payload),
+                    mlir_value(&values, *block_scales),
+                    mlir_value(&values, *global_scale),
+                ];
+                if let Some(bias) = bias {
+                    operands.push(mlir_value(&values, *bias));
+                }
+                let call =
+                    context.ffi_custom_call("nml.nvfp4.linear", &operands, &[types[*result]])?;
+                values[*result] = Some(call.result(0)?);
+                block.append_operation(call)?;
+                continue;
+            }
             if let Operation::MoeDispatch {
                 hidden,
                 routing_weights,
@@ -5495,8 +6192,8 @@ impl Program {
                 // The semantic graph is the CPU implementation. CUDA may
                 // replace this private boundary with grouped expert kernels;
                 // no backend selector enters the model-authoring API.
-                if let Some((_, capability_major, _)) = cuda {
-                    if moe_backend::supported(self.values[*hidden].shape.dtype(), capability_major)
+                if let Some(cuda) = capabilities.cuda_capabilities() {
+                    if moe_backend::supported(self.values[*hidden].shape.dtype(), cuda)
                         && self.values[*hidden].shape.dimensions()[0] > 0
                     {
                         let lowered = match self.values[*gate_up_weights].shape.partitions()[0] {
@@ -5622,6 +6319,7 @@ impl Program {
                 value,
                 query_positions,
                 key_positions,
+                sinks,
                 result,
                 options,
             } = operation
@@ -5632,6 +6330,7 @@ impl Program {
                     value: mlir_value(&values, *value),
                     query_positions: mlir_value(&values, *query_positions),
                     key_positions: mlir_value(&values, *key_positions),
+                    sinks: sinks.map(|sink| mlir_value(&values, sink)),
                     query_shape: self.values[*query].shape,
                     key_shape: self.values[*key].shape,
                     query_positions_dtype: self.values[*query_positions].shape.dtype(),
@@ -5639,8 +6338,8 @@ impl Program {
                     result_type: types[*result],
                     options: *options,
                 };
-                let lowered = if let Some((_, major, minor)) = cuda {
-                    ordinary_attention::lower_cuda(context, &mut block, inputs, major, minor)?
+                let lowered = if let Some(cuda) = capabilities.cuda_capabilities() {
+                    ordinary_attention::lower_cuda(context, &mut block, inputs, cuda)?
                 } else {
                     ordinary_attention::lower(context, &mut block, inputs)?
                 };
@@ -5821,6 +6520,7 @@ impl Program {
                 page_table,
                 sequence_lengths,
                 query_positions,
+                sinks,
                 result,
                 options,
             } = operation
@@ -5832,6 +6532,7 @@ impl Program {
                     page_table: mlir_value(&values, *page_table),
                     sequence_lengths: mlir_value(&values, *sequence_lengths),
                     query_positions: mlir_value(&values, *query_positions),
+                    sinks: sinks.map(|sink| mlir_value(&values, sink)),
                     query_shape: self.values[*query].shape,
                     cache_shape: self.values[*key_cache].shape,
                     page_table_shape: self.values[*page_table].shape,
@@ -5841,10 +6542,8 @@ impl Program {
                     result_type: types[*result],
                     options: *options,
                 };
-                let lowered = if let Some((core_count, major, minor)) = cuda {
-                    paged_attention::lower_triton(
-                        context, &mut block, inputs, core_count, major, minor,
-                    )?
+                let lowered = if let Some(cuda) = capabilities.cuda_capabilities() {
+                    paged_attention::lower_triton(context, &mut block, inputs, cuda)?
                 } else {
                     paged_attention::lower(context, &mut block, inputs)?
                 };
@@ -6556,6 +7255,11 @@ impl Program {
                         "multi-result operations are lowered before single-result operations"
                     )
                 }
+                Operation::NvFp4Linear { .. }
+                | Operation::NvFp4Embedding { .. }
+                | Operation::NvFp4GptOssExperts { .. } => {
+                    unreachable!("NVFP4 operation is lowered before scalar operations")
+                }
             };
             values[result_index] = Some(result.result(0)?);
             block.append_operation(result)?;
@@ -6625,6 +7329,38 @@ struct Value {
 
 #[derive(Debug)]
 enum Operation {
+    NvFp4GptOssExperts {
+        hidden: usize,
+        expert_ids: usize,
+        routing_weights: usize,
+        gate_payload: usize,
+        gate_scales: usize,
+        gate_global: usize,
+        gate_bias: usize,
+        down_payload: usize,
+        down_scales: usize,
+        down_global: usize,
+        down_bias: usize,
+        sorted_assignments: usize,
+        block_experts: usize,
+        block_size: usize,
+        result: usize,
+    },
+    NvFp4Embedding {
+        indices: usize,
+        payload: usize,
+        block_scales: usize,
+        global_scale: usize,
+        result: usize,
+    },
+    NvFp4Linear {
+        input: usize,
+        payload: usize,
+        block_scales: usize,
+        global_scale: usize,
+        bias: Option<usize>,
+        result: usize,
+    },
     Cholesky {
         input: usize,
         result: usize,
@@ -6808,6 +7544,7 @@ enum Operation {
         value: usize,
         query_positions: usize,
         key_positions: usize,
+        sinks: Option<usize>,
         result: usize,
         options: AttentionOptions,
     },
@@ -6818,6 +7555,7 @@ enum Operation {
         page_table: usize,
         sequence_lengths: usize,
         query_positions: usize,
+        sinks: Option<usize>,
         result: usize,
         options: AttentionOptions,
     },
@@ -7961,6 +8699,67 @@ fn lower_expert_parallel_moe<'context>(
     block_size: usize,
     operation_index: usize,
 ) -> Result<MlirValue<'context>, Error> {
+    lower_expert_parallel(
+        context,
+        block,
+        sharding,
+        &inputs,
+        &shapes,
+        result_type,
+        result_shape,
+        expert_axis,
+        2,
+        operation_index,
+        |local_block, local_inputs, local_shapes, local_result_type, expert_offset| {
+            moe_backend::lower(
+                context,
+                local_block,
+                moe_backend::Inputs {
+                    hidden: local_inputs[0],
+                    routing_weights: local_inputs[1],
+                    gate_up_weights: local_inputs[2],
+                    down_weights: local_inputs[3],
+                    sorted_assignments: local_inputs[4],
+                    block_experts: local_inputs[5],
+                    expert_offset: Some(expert_offset),
+                    hidden_shape: local_shapes[0],
+                    gate_up_shape: local_shapes[2],
+                    down_shape: local_shapes[3],
+                    schedule_shape: local_shapes[4],
+                    block_experts_shape: local_shapes[5],
+                    result_type: local_result_type,
+                    activation,
+                    experts_per_token,
+                    block_size,
+                },
+            )
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_expert_parallel<'context, F>(
+    context: &'context Context,
+    block: &mut Block<'context>,
+    sharding: &Sharding,
+    inputs: &[MlirValue<'context>],
+    shapes: &[Shape],
+    result_type: MlirType<'context>,
+    result_shape: Shape,
+    expert_axis: AxisTag,
+    expert_component_index: usize,
+    operation_index: usize,
+    lower: F,
+) -> Result<MlirValue<'context>, Error>
+where
+    F: FnOnce(
+        &mut Block<'context>,
+        &[MlirValue<'context>],
+        &[Shape],
+        MlirType<'context>,
+        MlirValue<'context>,
+    ) -> Result<MlirValue<'context>, Error>,
+{
     let mesh_axes = sharding.mesh_axes().collect::<Vec<_>>();
     let expert_axis_index = mesh_axes
         .iter()
@@ -8022,7 +8821,7 @@ fn lower_expert_parallel_moe<'context>(
             partition_type,
         )?,
     )?;
-    let local_experts = usize::try_from(local_shapes[2].dimensions()[0])
+    let local_experts = usize::try_from(local_shapes[expert_component_index].dimensions()[0])
         .map_err(|_| Error::InvalidMoe("local expert count exceeds usize"))?;
     let local_experts_value = unsigned_scalar(context, &mut local_block, local_experts)?;
     let expert_offset = append_mlir_result(
@@ -8040,27 +8839,12 @@ fn lower_expert_parallel_moe<'context>(
         context.convert(expert_offset, scalar_i32)?,
     )?;
 
-    let partial = moe_backend::lower(
-        context,
+    let partial = lower(
         &mut local_block,
-        moe_backend::Inputs {
-            hidden: local_inputs[0],
-            routing_weights: local_inputs[1],
-            gate_up_weights: local_inputs[2],
-            down_weights: local_inputs[3],
-            sorted_assignments: local_inputs[4],
-            block_experts: local_inputs[5],
-            expert_offset: Some(expert_offset),
-            hidden_shape: local_shapes[0],
-            gate_up_shape: local_shapes[2],
-            down_shape: local_shapes[3],
-            schedule_shape: local_shapes[4],
-            block_experts_shape: local_shapes[5],
-            result_type: local_result_type,
-            activation,
-            experts_per_token,
-            block_size,
-        },
+        &local_inputs,
+        &local_shapes,
+        local_result_type,
+        expert_offset,
     )?;
     let replica_groups = expert_replica_groups(&mesh_axes, expert_axis_index)?;
     let reduce = context.all_reduce(
@@ -8379,6 +9163,66 @@ fn mlir_value<'context>(
     index: usize,
 ) -> MlirValue<'context> {
     values[index].expect("validated NML operation order must define every operand")
+}
+
+fn nvfp4_expert_inputs<'context>(
+    operands: &[MlirValue<'context>],
+    shapes: &[Shape],
+    result_type: MlirType<'context>,
+    block_size: usize,
+    expert_offset: Option<MlirValue<'context>>,
+) -> nvfp4_backend::ExpertInputs<'context> {
+    debug_assert_eq!(operands.len(), 12);
+    debug_assert_eq!(shapes.len(), 12);
+    nvfp4_backend::ExpertInputs {
+        hidden: operands[0],
+        routing_weights: operands[1],
+        gate_payload: operands[2],
+        gate_scales: operands[3],
+        gate_global: operands[4],
+        gate_bias: operands[5],
+        down_payload: operands[6],
+        down_scales: operands[7],
+        down_global: operands[8],
+        down_bias: operands[9],
+        sorted_assignments: operands[10],
+        block_experts: operands[11],
+        expert_offset,
+        hidden_shape: shapes[0],
+        routing_shape: shapes[1],
+        gate_payload_shape: shapes[2],
+        gate_scales_shape: shapes[3],
+        gate_global_shape: shapes[4],
+        gate_bias_shape: shapes[5],
+        down_payload_shape: shapes[6],
+        down_scales_shape: shapes[7],
+        down_global_shape: shapes[8],
+        down_bias_shape: shapes[9],
+        schedule_shape: shapes[10],
+        block_experts_shape: shapes[11],
+        result_type,
+        block_size,
+    }
+}
+
+fn require_nvfp4_components(parameter: &Parameter) -> Result<[&ComponentSpec; 3], Error> {
+    let components = parameter.components();
+    let [payload, block_scales, global_scale] = components else {
+        return Err(Error::InvalidParameter(format!(
+            "NVFP4 parameter {:?} has an invalid component contract",
+            parameter.name()
+        )));
+    };
+    if payload.role() != ComponentRole::Payload
+        || block_scales.role() != ComponentRole::BlockScales
+        || global_scale.role() != ComponentRole::GlobalScale
+    {
+        return Err(Error::InvalidParameter(format!(
+            "NVFP4 parameter {:?} has an invalid component contract",
+            parameter.name()
+        )));
+    }
+    Ok([payload, block_scales, global_scale])
 }
 
 fn axes_i64(axes: &[usize]) -> Vec<i64> {

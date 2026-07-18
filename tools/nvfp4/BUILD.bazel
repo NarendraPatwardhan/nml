@@ -1,0 +1,38 @@
+"""Deterministic artifact-production tools for GPT-OSS 20B NVFP4."""
+
+load("@rules_python//python:defs.bzl", "py_binary")
+
+py_binary(
+    name = "audit_published_artifact",
+    srcs = ["audit_published.py"],
+    data = ["//artifacts/gpt-oss-20b-nvfp4:manifest"],
+    main = "audit_published.py",
+    python_version = "3.12",
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "extract_execution_fixture",
+    srcs = ["extract_fixture.py"],
+    data = ["//artifacts/gpt-oss-20b-nvfp4:manifest"],
+    main = "extract_fixture.py",
+    python_version = "3.12",
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "convert_on_runpod",
+    srcs = [
+        "run_on_runpod.py",
+        "worker.py",
+    ],
+    data = [
+        "//artifacts/gpt-oss-20b-nvfp4:manifest",
+        "convert.py",
+        "requirements.txt",
+    ],
+    main = "run_on_runpod.py",
+    deps = ["//tools/runpod:runpod_lib"],
+    python_version = "3.12",
+    visibility = ["//visibility:public"],
+)

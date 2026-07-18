@@ -142,27 +142,30 @@ there.
 
 ### A. Select and freeze one artifact
 
-- [ ] Audit trustworthy GPT-OSS 20B NVFP4 artifacts by immutable revision,
+- [x] Audit trustworthy GPT-OSS 20B NVFP4 artifacts by immutable revision,
   license, source/conversion provenance, actual SafeTensors inventory,
   configuration, tokenizer/Harmony assets, and independent runtime support.
-- [ ] Select exactly one artifact. Record every file hash and every tensor's
+- [x] Select exactly one artifact. Record every file hash and every tensor's
   physical dtype, shape, byte extent, role, logical mapping, and transpose.
-- [ ] Specify E2M1 nibble order, E4M3 variant, block/global scale algebra,
+- [x] Specify E2M1 nibble order, E4M3 variant, block/global scale algebra,
   block axis, padding, swizzle, 1D/2D scaling, and higher-precision exceptions.
-- [ ] Pin an independent loader/oracle and permanent decoded-value, layer, and
-  generation fixtures. If no distributed artifact is acceptable, explicitly
-  select one dense source and freeze one deterministic NML conversion recipe;
-  never relabel MXFP4.
+- [x] Freeze permanent decoded-value and projection fixtures from widely
+  separated rows of the immutable published artifact. A bounded-range
+  extractor verifies publication/inventory identity and records original
+  compact bytes, decoded F32 hashes and samples, and independent F64 results.
+- [ ] Pin independent representative layer and generation fixtures against the
+  exact same revision. Never substitute self-generated weights or relabel
+  MXFP4 evidence.
 
 ### B. Replace the dense-only parameter/storage model
 
 - [x] Separate bounded physical checkpoint records and component storage specs
   from logical parameter shapes; dense storage now flows through that boundary.
-- [ ] Add private validated packed-E2M1x2 and E4M3-bit storage encodings without
+- [x] Add private validated packed-E2M1x2 and E4M3-bit storage encodings without
   adding `DType::NvFp4` or public general FP8 arithmetic.
 - [x] Introduce one logical `Parameter` and runtime `LoadedParameter` boundary;
   dense parameters use the same one-component representation and binding path.
-- [ ] Add the closed NVFP4 representation whose parameter owns payload, local
+- [x] Add the closed NVFP4 representation whose parameter owns payload, local
   scales, global factor, and exact artifact-selected metadata.
 - [x] Replace `TensorStore`'s one-record-to-one-`Tensor` assumption and the
   dense-only `NmlStruct`/`Bufferized` leaf mapping. Keep one structural traversal
@@ -172,10 +175,13 @@ there.
   boundary, with deterministic names and checked representation identity.
 - [x] Replace logical-shape checkpoint upload with direct physical-component
   streaming and retain bounded CPU/CUDA transfer accounting.
-- [ ] Add transactional multi-component cleanup, exact
-  resident/source/prepared accounting, and versioned one-time layout
-  preparation. Prohibit a persistent full BF16/FP16 expansion.
-- [ ] Derive physical payload/scale shards from logical Shardy ranges. Validate
+- [x] Make multi-component loading transactional and account exact source,
+  resident, prepared, and bounded staging bytes. Source-layout execution owns
+  only compact components and cannot create a persistent BF16/FP16 expansion.
+- [ ] Add versioned one-time layout preparation when the first backend actually
+  requires a distinct prepared representation; account it separately and
+  release superseded source buffers only after verified transactional commit.
+- [x] Derive physical payload/scale shards from logical Shardy ranges. Validate
   block/tile alignment, padding, expert-axis slicing, and component co-sharding
   before allocation.
 - [x] Port the permanent dense Qwen regression model and all CPU product
@@ -187,14 +193,26 @@ there.
 
 ### C. Establish exact and performant CPU execution
 
-- [ ] Implement exhaustive E2M1 and artifact-selected E4M3 decoding, scale
+- [x] Implement exhaustive E2M1 and artifact-selected E4M3 decoding, scale
   algebra, padding validation, and checked physical extent calculations.
-- [ ] Add semantic parameter-aware embedding, linear, and grouped expert
+- [x] Implement bounded portable CPU embedding, conventional linear,
+  input-major grouped projection, and exact GPT-OSS routed expert semantics over
+  compact components. Compare them with an independently decoded F64 oracle,
+  including odd widths and uneven/empty expert routing.
+- [x] Add semantic parameter-aware embedding, linear, and grouped expert
   operations. Reject NVFP4 parameters from operations without defined
-  quantized semantics before MLIR construction.
-- [ ] Implement a blockwise CPU oracle that expands only bounded tiles, then an
+  quantized semantics before MLIR construction. The shared dense/compact API,
+  StableHLO typed-FFI boundary, registered CPU handlers, and F16/BF16 CPU PJRT
+  execution contracts cover all three operations. Supported SM80+ CUDA targets
+  lower the same semantics to fused compact-weight Triton kernels. SM75 linear,
+  embedding, and schedule-driven routed experts lower to dedicated typed CUDA
+  custom calls and pass the unchanged complete numerical contract locally.
+- [x] Implement a blockwise CPU oracle that expands only bounded tiles, then an
   optimized x86-64 path with vectorized unpack/scale and cache-aware
-  contraction. Preserve a portable/AArch64-capable implementation.
+  contraction. Preserve a portable/AArch64-capable implementation. Runtime
+  dispatch selects an AVX2 register-only nibble unpack, scale application,
+  dot, and AXPY path; the allocation-free scalar block implementation remains
+  the exact fallback on AArch64 and non-AVX2 x86.
 - [ ] Permanently compare embedding, decode GEMV, prefill GEMM, gate/up/down
   projections, uneven/empty grouped experts, epilogues, and logical shards
   against an independently decoded F32/F64 oracle.
@@ -203,25 +221,75 @@ there.
 
 ### D. Implement fused pre-Blackwell CUDA execution
 
-- [ ] Replace scattered compute-capability integer checks with one private
+- [x] Replace scattered compute-capability integer checks with one private
   named capability value used by semantic lowering and structured diagnostics.
-- [ ] Extend the typed Rust TTIR builder only with the pinned Triton surface
+- [x] Extend the typed Rust TTIR builder only with the pinned Triton surface
   needed for E2M1/scale handling, packed operations, and `tt.dot_scaled`.
   Continue to reparse and verify complete TTIR before StableHLO embedding.
-- [ ] Implement SM8x fused W4A16 decode/prefill linear kernels over compact
-  weights, applying local/global scales inside the K tile and accumulating F32.
-- [ ] Implement SM90 fused W4A16 kernels using the pinned compiler's FP4
-  upcast/decomposition and Hopper MMA path. Evaluate FP8-assisted execution
-  only after the W4A16 baseline and retain it only if it is correct and faster.
-- [ ] Implement the SM75 CUDA custom-call path with register/tile-local E2M1
-  decode and Turing half-precision contraction; do not route it through an
-  unproven XLA Triton configuration.
-- [ ] Implement quantized grouped gate/up/down expert projections with uneven
+- [x] Implement SM8x fused compact W4A16 embedding and decode/prefill linear
+  kernels. E2M1 payload and E4M3 block/global scales are decoded inside each
+  tile, the source representation is never persistently expanded, contractions
+  accumulate in F32, and optional bias is added inside the compact projection
+  epilogue on both CPU FFI and CUDA rather than launching a second graph op.
+- [x] Implement the SM90 lowering through the same fused compact W4A16 Triton
+  contract with Hopper-aware launch geometry. This is deliberately labeled
+  emulation through ordinary tensor-core dot lowering, not native Blackwell
+  block-scaled FP4 execution.
+- [x] Implement SM75 linear and embedding CUDA custom calls. Projection decodes
+  packed E2M1 and E4M3FN scales into one F16 WMMA tile, performs Turing
+  half-precision contraction with F32 accumulation, fuses optional bias, and
+  explicitly converts BF16 tiles as required by the governing design. Embedding
+  decodes only selected rows. Neither path enters the unproven SM75 Triton
+  pipeline or creates a persistent dense weight.
+- [x] Implement the SM75 fused routed-expert CUDA custom call with exact
+  clamped/residual SwiGLU, uneven/empty routing, and no per-expert host loop.
+- [x] Implement quantized grouped gate/up/down expert projections with uneven
   routing, empty experts, exact GPT-OSS activation semantics, and expert-axis
-  sharding. Per-expert host loops are not an accepted implementation.
-- [ ] Execute permanent numerical and phase-separated performance contracts on
-  local SM75, rented SM8x, and rented SM90 through normal capability dispatch.
-  A successful compile is not execution evidence.
+  sharding. Compact components stay inside grouped Triton calls; no per-expert
+  host loop or persistent dense conversion is used.
+- [x] Execute the permanent numerical contract on local SM75, rented SM8x, and
+  rented SM90 through normal capability dispatch. The complete FP16/BF16
+  linear, embedding, and routed-expert contract passed locally on SM75 in
+  BuildBuddy invocation `e1b483ce-a933-4c19-a387-87d3ea7e5b26`. The unchanged
+  OCI contract at
+  `ghcr.io/narendrapatwardhan/nml@sha256:17040fd252bac543bb3b02e9abc253d309d05a7b64cf6ee7b8c6cc8b64c426b4`
+  then passed on an RTX A6000 (SM86, driver `550.127.08`) in lease
+  `1c30d217-cd03-4a61-bd8c-2d5ce10d1eb3` and an H100 80GB HBM3 (SM90a,
+  driver `580.126.09`) in lease `09de1c2c-6304-44f5-bb03-81d9d64cf4c1`.
+  Both Pods reached authenticated readiness, returned the permanent runner's
+  structured success result, and had termination confirmed.
+- [x] Execute phase-separated NVFP4 performance contracts on local SM75,
+  rented SM8x, and rented SM90. The contract uses GPT-OSS 20B dimensions:
+  width/intermediate 2880, vocabulary 201088, 32 experts, and top-4 routing.
+  Host preparation is excluded from upload time, and compact payload/scales
+  remain compact throughout every measured CUDA path. The immutable remote
+  image was
+  `ghcr.io/narendrapatwardhan/nml@sha256:4f4619f040bd8c59549b90e5b3606c930bc063389aee4e280a25853c15fdf0ff`.
+  It passed on an RTX A6000 (SM86, driver `550.54.15`) in lease
+  `e9413e85-7205-46df-b790-0b557986627c` and an H100 80GB HBM3 (SM90a,
+  driver `580.126.09`) in lease
+  `d3122c7b-c398-49b4-b68a-3ebd5f819695`; both Pods terminated with cleanup
+  confirmed. Local SM75 evidence is BuildBuddy invocation
+  `c38202f9-02be-4cb9-a9b3-61f2f7fd9dc2`.
+
+  | Device/workload | compile ms | upload ms | first ms | steady ms | download ms |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | SM75 embedding, 128 tokens | 11.838 | 546.207 | 334.700 | 1.710 | 178.576 |
+  | SM75 decode, M=1 | 12.730 | 1.958 | 1.748 | 1.607 | 1.264 |
+  | SM75 prefill, M=128 | 11.354 | 2.955 | 4.766 | 4.785 | 199.251 |
+  | SM75 grouped MoE, 16 tokens | 2085.209 | 102.849 | 60.376 | 53.540 | 19.209 |
+  | SM86 embedding, 128 tokens | 134.856 | 290.125 | 0.450 | 0.113 | 99.918 |
+  | SM86 decode, M=1 | 205.951 | 4.038 | 0.490 | 0.253 | 1.068 |
+  | SM86 prefill, M=128 | 235.905 | 1.699 | 0.761 | 0.548 | 112.507 |
+  | SM86 grouped MoE, 16 tokens | 1837.742 | 60.560 | 7.264 | 5.246 | 12.648 |
+  | SM90 embedding, 128 tokens | 181.832 | 213.848 | 0.416 | 0.107 | 114.512 |
+  | SM90 decode, M=1 | 267.667 | 1.950 | 0.477 | 0.238 | 1.245 |
+  | SM90 prefill, M=128 | 278.127 | 2.279 | 0.604 | 0.287 | 156.511 |
+  | SM90 grouped MoE, 16 tokens | 1859.218 | 83.080 | 5.987 | 3.187 | 13.606 |
+
+  These are single-run acceptance baselines, not a broad benchmark study.
+  Numerical-contract or whole-process wall time is not kernel-performance
+  evidence; comparisons use the named phase and identical workload shape.
 
 ### E. Implement native Blackwell execution
 
@@ -242,18 +310,38 @@ there.
 
 ### F. Complete the GPT-OSS 20B model vertical
 
-- [ ] Parse and validate the exact selected configuration: layer/expert counts,
+- [x] Parse and validate the exact selected configuration: layer/expert counts,
   head geometry, attention schedule, context/YaRN parameters, normalization,
-  activation, tokenizer identity, and output-weight policy.
-- [ ] Declare every embedding, attention, router, expert, normalization,
+  activation, and output-weight policy. Nearby variants and unknown fields are
+  rejected by the package-private GPT-OSS model target.
+- [x] Declare every embedding, attention, router, expert, normalization,
   attention-sink, and output parameter from the checked representation
-  manifest. Do not guess aliases, alternate names, or transposes.
-- [ ] Build the private model graph from RMSNorm, GQA, RoPE/YaRN,
-  dense/sliding attention, top-k routing, quantized grouped experts, residual,
-  sampling, and Shardy primitives.
-- [ ] Add learned attention-sink denominator bias, exact clamped/residual
-  SwiGLU, and alternating full/128-token-window attention. Optimized attention
-  dispatch is used only when its ABI preserves these semantics.
+  manifest. The structured 411-parameter tree matches all 703 physical
+  components without aliases, guessed transposes, or persistent expansion.
+- [x] Build the package-private, batch-one model graph from exact RMSNorm, GQA,
+  learned-sink attention, YaRN, alternating full/sliding attention, top-k
+  routing, quantized grouped experts, residuals, and the compact output
+  projection. The donated contiguous cache is exposed through a one-page
+  identity view and the semantic paged operation retains capability-selected
+  Triton/FA2/FA3 dispatch. Its permanent graph contract consumes all 703
+  physical parameter components and produces `[1, 201088]` last-token logits.
+- [x] Define the finite prefill/decode graph family and keep greedy sampling on
+  device. Prefill derives positions internally; decode accepts one scalar
+  position; both return one I32 token plus 48 donated cache buffers without a
+  second parameter owner.
+- [ ] Integrate that graph family and the declared Shardy placement with the
+  model-neutral engine after the exact Harmony protocol owner is available.
+- [x] Add learned attention-sink denominator bias to ordinary and paged
+  online-softmax semantics. FA2 and FA3 remain selected and consume their F32
+  log-normalizer through an exact StableHLO correction epilogue. Triton 2D
+  initializes its online state from the sink, while split-K adds the sink once
+  in global reduction. Permanent lowering contracts prohibit a sink-induced
+  portable path, and CPU contracts compare both cache representations in F32,
+  F16, and BF16.
+- [x] Wire exact interleaved, clamped/residual SwiGLU and alternating
+  full/128-token-window attention into the model graph. YaRN's frequency
+  interpolation and attention amplitude have permanent CPU numerical coverage;
+  every retained optimized attention backend preserves learned-sink semantics.
 - [ ] Validate `o200k_harmony` through the IREE tokenizer boundary and implement
   versioned Harmony rendering/incremental parsing for roles, channels, tool
   calls, and tool results.
@@ -297,6 +385,15 @@ the execution envelope is completed.
   BuildBuddy.
 - [x] Publish public images to `ghcr.io/narendrapatwardhan/nml` through the OCI
   Registry API. GitHub CLI is not part of publication or administration.
+- [ ] Move routine publication onto a BuildBuddy remote runner so completed
+  OCI layers move directly from the colocated cache to GHCR. Store only
+  `GHCR_USERNAME` and a least-scope `GHCR_TOKEN` as encrypted BuildBuddy
+  organization secrets and inject exactly those names with `env-secrets`.
+  Create an owner-only runner-local registry-auth file or credential-helper
+  bridge for `rules_img`, remove it after the publisher exits, disable automatic
+  retry for the mutating publish command, and independently resolve the
+  resulting public tag to its immutable registry digest. Local `bb run`
+  publication through Docker's credential store remains recovery-only.
 - [ ] Make exact digest references mandatory in local and RunPod acceptance
   commands. Mutable tags may exist only for discovery and must resolve to the
   recorded digest before execution.
@@ -380,10 +477,9 @@ All unchecked BF16 product work is deferred; it does not precede NVFP4.
 - [ ] Build the private GPT-OSS block graph from existing RMSNorm, GQA,
   RoPE/YaRN, dense/sliding attention, top-k MoE, grouped expert, residual, and
   Shardy primitives.
-- [ ] Add learned attention-sink denominator bias to portable ordinary and
-  paged online softmax. Optimized backends may be used only where their ABI can
-  preserve the exact semantics; otherwise dispatch must choose the portable
-  path truthfully.
+- [x] Add learned attention-sink denominator bias to ordinary and paged
+  online softmax. Portable StableHLO, Triton 2D/split-K, FA2, and FA3 now
+  preserve the exact semantics without changing backend selection.
 - [ ] Implement the exact clamped/residual SwiGLU composite and alternating
   full-attention/128-token-window schedule, including boundary and long-position
   contracts.

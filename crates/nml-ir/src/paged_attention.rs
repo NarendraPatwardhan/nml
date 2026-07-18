@@ -1,10 +1,15 @@
-//! Internal lowering for the portable paged-attention product path.
+//! Internal lowering for the paged-attention product path.
 //!
 //! This operation is deliberately compound. Keeping its loop state private
 //! avoids exposing StableHLO control-flow details through NML's model-authoring
-//! API, while the emitted graph still uses ordinary, portable StableHLO.
+//! API. Target lowering selects complete StableHLO, retained Triton, FA2, or
+//! FA3 under exact capability contracts. Learned sinks are native Triton state
+//! and use FlashAttention's F32 LSE for an exact correction epilogue.
 
-use crate::{AttentionOptions, Error, attention_backend};
+use crate::{
+    AttentionOptions, Error, attention_backend, attention_sink,
+    device_capabilities::CudaCapabilities,
+};
 use nml_kernel_triton::{
     AttentionGeometry, AttentionLaunch, DType as KernelDType, KernelLaunch, KernelSpec,
     PagedAttention2dConfig, PagedAttention3dConfig, SegmentReductionConfig, TensorSpec,
@@ -24,6 +29,7 @@ pub(crate) struct Inputs<'context> {
     pub page_table: Value<'context>,
     pub sequence_lengths: Value<'context>,
     pub query_positions: Value<'context>,
+    pub sinks: Option<Value<'context>>,
     pub query_shape: Shape,
     pub cache_shape: Shape,
     pub page_table_shape: Shape,
@@ -41,20 +47,12 @@ pub(crate) fn lower_triton<'context>(
     context: &'context Context,
     block: &mut Block<'context>,
     inputs: Inputs<'context>,
-    core_count: usize,
-    capability_major: u16,
-    capability_minor: u16,
+    capabilities: CudaCapabilities,
 ) -> Result<Value<'context>, Error> {
     let query_dtype = inputs.query_shape.dtype();
     let head_dimension = inputs.query_shape.dimensions()[3];
     let page_size = inputs.cache_shape.dimensions()[1];
-    let backend = attention_backend::paged(
-        query_dtype,
-        head_dimension,
-        page_size,
-        capability_major,
-        capability_minor,
-    );
+    let backend = attention_backend::paged(query_dtype, head_dimension, page_size, capabilities);
     // Both retained CUDA ABIs use I32 logical indices. Static geometries
     // outside that envelope remain valid NML graphs and therefore use the
     // I64 portable path instead of truncating a dimension in a kernel call.
@@ -65,14 +63,26 @@ pub(crate) fn lower_triton<'context>(
         attention_backend::Backend::Portable => return lower(context, block, inputs),
         attention_backend::Backend::CudaTriton => {}
         attention_backend::Backend::CudaFlash2 => {
-            return lower_flash_or_triton(context, block, inputs, core_count, FlashVersion::Two);
+            return lower_flash_or_triton(
+                context,
+                block,
+                inputs,
+                capabilities.core_count(),
+                FlashVersion::Two,
+            );
         }
         attention_backend::Backend::CudaFlash3 => {
-            return lower_flash_or_triton(context, block, inputs, core_count, FlashVersion::Three);
+            return lower_flash_or_triton(
+                context,
+                block,
+                inputs,
+                capabilities.core_count(),
+                FlashVersion::Three,
+            );
         }
     }
 
-    lower_triton_kernel(context, block, inputs, core_count)
+    lower_triton_kernel(context, block, inputs, capabilities.core_count())
 }
 
 fn cuda_index_geometry_supported(inputs: &Inputs<'_>) -> bool {
@@ -236,7 +246,8 @@ fn lower_triton_kernel<'context>(
 
     let common_config = |block_m: usize,
                          block_q: usize,
-                         tile_size: usize|
+                         tile_size: usize,
+                         learned_sinks: bool|
      -> Result<PagedAttention2dConfig, Error> {
         Ok(PagedAttention2dConfig {
             dtype: kernel_dtype,
@@ -250,6 +261,7 @@ fn lower_triton_kernel<'context>(
             block_m: kernel_i64(block_m, "CUDA attention row block")?,
             sliding_window,
             causal: inputs.options.causal,
+            learned_sinks,
         })
     };
     let tensor = |dtype, shape: &[i64]| TensorSpec::new(dtype, shape).map_err(kernel_error);
@@ -261,8 +273,11 @@ fn lower_triton_kernel<'context>(
     let positions_spec = tensor(KernelDType::I32, &[batch, query_len])?;
     let starts_spec = tensor(KernelDType::I32, &[batch + 1])?;
 
-    let base_operands = vec![
-        inputs.query,
+    let mut base_operands = vec![inputs.query];
+    if let Some(sinks) = inputs.sinks {
+        base_operands.push(sinks);
+    }
+    base_operands.extend([
         inputs.key_cache,
         inputs.value_cache,
         page_table,
@@ -272,7 +287,7 @@ fn lower_triton_kernel<'context>(
         block_table_stride,
         query_stride_0,
         query_stride_1,
-    ];
+    ]);
     let cache_operands = [
         key_stride_0,
         key_stride_1,
@@ -281,8 +296,11 @@ fn lower_triton_kernel<'context>(
         value_stride_1,
         value_stride_2,
     ];
-    let base_specs = vec![
-        query_spec.clone(),
+    let mut base_specs = vec![query_spec.clone()];
+    if inputs.sinks.is_some() {
+        base_specs.push(tensor(kernel_dtype, &[query_heads])?);
+    }
+    base_specs.extend([
         cache_spec.clone(),
         cache_spec.clone(),
         page_table_spec,
@@ -292,7 +310,7 @@ fn lower_triton_kernel<'context>(
         scalar(KernelDType::I64)?,
         scalar(KernelDType::I64)?,
         scalar(KernelDType::I64)?,
-    ];
+    ]);
 
     match launch {
         AttentionLaunch::TwoDimensional {
@@ -304,7 +322,7 @@ fn lower_triton_kernel<'context>(
             stages,
             ..
         } => {
-            let config = common_config(block_m, block_q, tile_size)?;
+            let config = common_config(block_m, block_q, tile_size, inputs.sinks.is_some())?;
             let ir = build_paged_attention_2d(config).map_err(kernel_error)?;
             let mut operands = base_operands;
             operands.extend([output_stride_0, output_stride_1]);
@@ -342,7 +360,7 @@ fn lower_triton_kernel<'context>(
             reduction_stages,
             ..
         } => {
-            let config = common_config(block_m, block_q, tile_size)?;
+            let config = common_config(block_m, block_q, tile_size, false)?;
             let ir = build_paged_attention_3d(PagedAttention3dConfig {
                 attention: config,
                 segments: kernel_i64(segments, "CUDA attention segment count")?,
@@ -397,28 +415,35 @@ fn lower_triton_kernel<'context>(
                 head_size: head_dim,
                 padded_head_size,
                 block_q: kernel_i64(block_q, "CUDA attention query block")?,
+                learned_sinks: inputs.sinks.is_some(),
             })
             .map_err(kernel_error)?;
-            let reduction_operands = [
-                segment_values,
-                segment_maxima,
-                segment_sums,
+            let mut reduction_operands = vec![segment_values, segment_maxima, segment_sums];
+            if let Some(sinks) = inputs.sinks {
+                reduction_operands.push(sinks);
+            }
+            reduction_operands.extend([
                 sequence_lengths,
                 sequence_count,
                 output_stride_0,
                 output_stride_1,
                 query_starts,
-            ];
-            let reduction_specs = vec![
+            ]);
+            let mut reduction_specs = vec![
                 segment_values_spec,
                 segment_statistics_spec.clone(),
                 segment_statistics_spec,
+            ];
+            if inputs.sinks.is_some() {
+                reduction_specs.push(tensor(kernel_dtype, &[query_heads])?);
+            }
+            reduction_specs.extend([
                 lengths_spec,
                 scalar(KernelDType::I32)?,
                 scalar(KernelDType::I64)?,
                 scalar(KernelDType::I64)?,
                 starts_spec,
-            ];
+            ]);
             let reduction = KernelSpec::new(
                 "paged_attention_segment_reduction",
                 reduction_ir,
@@ -571,8 +596,21 @@ fn append_paged_flash<'context>(
         )?,
     };
     let output = call.result(0)?;
+    let softmax_lse = call.result(1)?;
     block.append_operation(call)?;
-    Ok(output)
+    attention_sink::correct_flash_output(
+        context,
+        block,
+        output,
+        softmax_lse,
+        inputs.sinks,
+        inputs.query_shape.dtype(),
+        *batch,
+        *query_length,
+        *query_heads,
+        *head_dimension,
+        inputs.result_type,
+    )
 }
 
 fn canonical_flash_positions<'context>(
@@ -645,6 +683,7 @@ fn clone_inputs<'context>(inputs: &Inputs<'context>) -> Inputs<'context> {
         page_table: inputs.page_table,
         sequence_lengths: inputs.sequence_lengths,
         query_positions: inputs.query_positions,
+        sinks: inputs.sinks,
         query_shape: inputs.query_shape,
         cache_shape: inputs.cache_shape,
         page_table_shape: inputs.page_table_shape,
@@ -809,14 +848,30 @@ pub(crate) fn lower<'context>(
     )?;
 
     let counter = constant(context, block, scalar_i64, "0")?;
-    let running_max = splat(
-        context,
-        block,
-        scalar_f32,
-        statistic_type,
-        "-3.4028234663852886e+38",
-    )?;
-    let running_sum = splat(context, block, scalar_f32, statistic_type, "0.0")?;
+    let (running_max, running_sum) = match inputs.sinks {
+        Some(sinks) => (
+            sink_statistics(
+                context,
+                block,
+                sinks,
+                inputs.query_shape.dtype(),
+                *kv_heads,
+                groups,
+                statistic_type,
+            )?,
+            splat(context, block, scalar_f32, statistic_type, "1.0")?,
+        ),
+        None => (
+            splat(
+                context,
+                block,
+                scalar_f32,
+                statistic_type,
+                "-3.4028234663852886e+38",
+            )?,
+            splat(context, block, scalar_f32, statistic_type, "0.0")?,
+        ),
+    };
     let accumulator = splat(context, block, scalar_f32, accumulator_type, "0.0")?;
 
     let state_types = [
@@ -920,6 +975,31 @@ pub(crate) fn lower<'context>(
     } else {
         append_value(block, context.convert(normalized, inputs.result_type)?).map_err(Into::into)
     }
+}
+
+fn sink_statistics<'context>(
+    context: &'context Context,
+    block: &mut Block<'context>,
+    sinks: Value<'context>,
+    dtype: DType,
+    key_value_heads: i64,
+    groups: i64,
+    statistic_type: Type<'context>,
+) -> Result<Value<'context>, Error> {
+    let query_heads = key_value_heads
+        .checked_mul(groups)
+        .ok_or(Error::InvalidAttention(
+            "attention sink head geometry overflows",
+        ))?;
+    let dense_type = context.ranked_tensor_type(DType::F32, &[query_heads])?;
+    let sinks = convert_if_needed(context, block, sinks, dtype, DType::F32, dense_type)?;
+    let grouped_type = context.ranked_tensor_type(DType::F32, &[key_value_heads, groups])?;
+    let sinks = append_value(block, context.reshape(sinks, grouped_type)?)?;
+    append_value(
+        block,
+        context.broadcast_in_dim(sinks, statistic_type, &[1, 2])?,
+    )
+    .map_err(Into::into)
 }
 
 #[derive(Clone, Copy)]

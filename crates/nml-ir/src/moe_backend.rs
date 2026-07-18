@@ -5,7 +5,7 @@
 //! expert contributions with ordinary StableHLO. This keeps backend policy out
 //! of model code and gives XLA a single explicit custom-call boundary per GEMM.
 
-use crate::{Error, MoeActivation};
+use crate::{Error, MoeActivation, device_capabilities::CudaCapabilities};
 use nml_kernel_triton::{
     DType as KernelDType, GatedActivation, GroupedProjectionConfig, KernelLaunch, KernelSpec,
     TensorSpec, build_grouped_projection,
@@ -32,8 +32,8 @@ pub(crate) struct Inputs<'context> {
     pub block_size: usize,
 }
 
-pub(crate) fn supported(dtype: DType, capability_major: u16) -> bool {
-    capability_major >= 8 && matches!(dtype, DType::F16 | DType::Bf16 | DType::F32)
+pub(crate) fn supported(dtype: DType, capabilities: CudaCapabilities) -> bool {
+    capabilities.supports_grouped_moe() && matches!(dtype, DType::F16 | DType::Bf16 | DType::F32)
 }
 
 pub(crate) fn lower<'context>(

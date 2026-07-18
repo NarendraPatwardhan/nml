@@ -18,6 +18,7 @@ _CONTRACTS = [
     "//crates/nml:linear_cuda_contract_test",
     "//crates/nml:attention_cuda_contract_test",
     "//crates/nml:neural_ops_cuda_contract_test",
+    "//crates/nml:nvfp4_cuda_contract_test",
     "//crates/nml:execution_performance_cuda_contract_test",
 ]
 
@@ -37,6 +38,7 @@ _RUNNER_ENV = {
     "NML_FLASH_ATTENTION_CAPABILITY_CONTRACT": "$(rlocationpath //crates/nml-kernel-flash-attention:flash_attention_device_capability_contract_test)",
     "NML_LINEAR_CONTRACT": "$(rlocationpath //crates/nml:linear_cuda_contract_test)",
     "NML_NEURAL_OPS_CONTRACT": "$(rlocationpath //crates/nml:neural_ops_cuda_contract_test)",
+    "NML_NVFP4_CONTRACT": "$(rlocationpath //crates/nml:nvfp4_cuda_contract_test)",
 }
 
 nml_rust_library(

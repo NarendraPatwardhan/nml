@@ -48,6 +48,58 @@ nml_rust_test(
     ],
 )
 
+# Compact parameters cross every permanent boundary here: representation,
+# PJRT buffers, StableHLO typed FFI, runtime registration, and CPU execution.
+nml_rust_test(
+    name = "nvfp4_cpu_contract_test",
+    size = "large",
+    srcs = ["tests/nvfp4_contract.rs"],
+    crate_root = "tests/nvfp4_contract.rs",
+    rustc_env = {"NML_NVFP4_BACKEND": "cpu"},
+    deps = [
+        ":nml",
+        "//crates/nml-ir:nml_ir",
+        "//crates/nml-parameter:nml_parameter",
+        "//crates/nml-types:nml_types",
+    ],
+)
+
+# This is the same complete numerical product contract as the CPU target, not
+# a kernel-construction check. Capability dispatch selects the dedicated SM75
+# adapter or the SM80+ Triton path; unsupported devices fail during lowering
+# rather than changing representation or semantics.
+nml_rust_test(
+    name = "nvfp4_cuda_contract_test",
+    size = "large",
+    srcs = ["tests/nvfp4_contract.rs"],
+    crate_root = "tests/nvfp4_contract.rs",
+    local = True,
+    rustc_env = {"NML_NVFP4_BACKEND": "cuda"},
+    tags = [
+        "exclusive",
+        "external",
+        "requires-gpu",
+    ],
+    data = ["//platforms/cuda:runtime_system_driver"],
+    env = {
+        "NML_CUDA_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime_system_driver)",
+    },
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": ["@platforms//os:linux"],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":nml",
+        "//crates/nml-ir:nml_ir",
+        "//crates/nml-parameter:nml_parameter",
+        "//crates/nml-types:nml_types",
+    ],
+    visibility = [
+        "//:__pkg__",
+        "//tools/device-contracts:__pkg__",
+    ],
+)
+
 nml_rust_test(
     name = "linear_cuda_contract_test",
     size = "large",
@@ -189,6 +241,7 @@ nml_rust_test(
     deps = [
         ":nml",
         "//crates/nml-ir:nml_ir",
+        "//crates/nml-parameter:nml_parameter",
         "//crates/nml-types:nml_types",
     ],
 )
@@ -217,6 +270,7 @@ nml_rust_test(
     deps = [
         ":nml",
         "//crates/nml-ir:nml_ir",
+        "//crates/nml-parameter:nml_parameter",
         "//crates/nml-types:nml_types",
     ],
     visibility = [
@@ -238,6 +292,13 @@ filegroup(
 filegroup(
     name = "attention_cuda_contract_binary",
     srcs = [":attention_cuda_contract_test"],
+    testonly = True,
+    visibility = ["//:__pkg__"],
+)
+
+filegroup(
+    name = "nvfp4_cuda_contract_binary",
+    srcs = [":nvfp4_cuda_contract_test"],
     testonly = True,
     visibility = ["//:__pkg__"],
 )

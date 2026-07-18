@@ -154,6 +154,77 @@ fn primary_names_win_and_multiple_fallback_aliases_are_ambiguous() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn nvfp4_resolution_requires_one_complete_shape_exact_component_set() {
+    let root = temporary_directory("nvfp4-components");
+    std::fs::create_dir_all(&root).unwrap();
+    let payload = TensorData {
+        dtype: Dtype::U8,
+        shape: vec![2, 9],
+        bytes: vec![0; 18],
+    };
+    let block_scales = TensorData {
+        dtype: Dtype::U8,
+        shape: vec![2, 2],
+        bytes: vec![0; 4],
+    };
+    let global_scale = TensorData {
+        dtype: Dtype::F32,
+        shape: vec![],
+        bytes: 1.0f32.to_le_bytes().to_vec(),
+    };
+    write_file(
+        &root.join("model.safetensors"),
+        [
+            ("projection.payload", &payload),
+            ("projection.block_scales", &block_scales),
+            ("projection.global_scale", &global_scale),
+        ],
+    );
+    let registry = TensorRegistry::from_path(&root).unwrap();
+    let parameters = nml_checkpoint::io::ParameterSet::new(registry);
+    let parameter = parameters
+        .nvfp4(
+            "model.projection",
+            Shape::new(DType::Bf16, &[2, 17]).unwrap(),
+            &["projection"],
+        )
+        .unwrap();
+    assert_eq!(
+        parameter
+            .components()
+            .iter()
+            .map(|component| component.artifact_name())
+            .collect::<Vec<_>>(),
+        [
+            "projection.payload",
+            "projection.block_scales",
+            "projection.global_scale",
+        ]
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+
+    let root = temporary_directory("nvfp4-partial");
+    std::fs::create_dir_all(&root).unwrap();
+    write_file(
+        &root.join("model.safetensors"),
+        [("projection.payload", &payload)],
+    );
+    let registry = TensorRegistry::from_path(&root).unwrap();
+    let parameters = nml_checkpoint::io::ParameterSet::new(registry);
+    assert!(
+        parameters
+            .nvfp4(
+                "model.projection",
+                Shape::new(DType::Bf16, &[2, 17]).unwrap(),
+                &["projection"],
+            )
+            .is_err()
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 fn write_file<'a>(
     path: &std::path::Path,
     tensors: impl IntoIterator<Item = (&'a str, &'a TensorData)>,

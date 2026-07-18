@@ -10,7 +10,10 @@ py_library(
         "lease.py",
     ],
     imports = ["."],
-    visibility = [":__pkg__"],
+    visibility = [
+        ":__pkg__",
+        "//tools/nvfp4:__pkg__",
+    ],
 )
 
 py_binary(

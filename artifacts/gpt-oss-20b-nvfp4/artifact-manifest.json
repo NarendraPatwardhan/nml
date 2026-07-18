@@ -1,0 +1,31 @@
+{
+  "files": [
+    {"path": "README.md", "sha256": "4c6230b2ae7accbad8776af621409cf916c73d87ff1c5460401d400002e97dfa", "size": 760},
+    {"path": "chat_template.jinja", "sha256": "445c3a7c29d9cf61860179de179f60b6cf24834518b491016993eba63c8b1ecc", "size": 15078},
+    {"path": "config.json", "sha256": "1f2cdaf00d4c53dac6250cd435e31b3dafb7ce60b7dc5e7622ee292d57861975", "size": 1623},
+    {"path": "generation_config.json", "sha256": "f75e6dde6e9ba405e496be663ab747517e765377ab6a37a5416cb9dfdac941e9", "size": 165},
+    {"path": "model-00001-of-00009.safetensors", "sha256": "aaca31cde3d9185e7d99d044c9a9dc4e46d7ed2ac4662a6a3e2045475c17c23e", "size": 1268087092},
+    {"path": "model-00002-of-00009.safetensors", "sha256": "45003fd943c3f1577395e6dd8af97511d54d0daef80379168e4c7cd14ba0b625", "size": 1390787472},
+    {"path": "model-00003-of-00009.safetensors", "sha256": "f006475ce02673458d01f8290b0d39a18a479ec027dcb453bb0178d2d196c105", "size": 1390787472},
+    {"path": "model-00004-of-00009.safetensors", "sha256": "cd15e936fb5377edd9d77b332759c5dcc93cb4b97ae74dd56f5645269638cb85", "size": 1390787480},
+    {"path": "model-00005-of-00009.safetensors", "sha256": "6b8dd586adcb6d3fed8357c37c7767e494b62df1e75a4c8b68610567f39ca4e4", "size": 1390787560},
+    {"path": "model-00006-of-00009.safetensors", "sha256": "bfefe0f4e4999e381953e86b7c75130fd183cd60ef6586bf700360db3a5dfb5a", "size": 1390787560},
+    {"path": "model-00007-of-00009.safetensors", "sha256": "3dc4685ab728b32bdc8a4a3401521c22c7ac61b01b25979b3eb859d6cecae378", "size": 1390787560},
+    {"path": "model-00008-of-00009.safetensors", "sha256": "e8ba58087e4a37def73def85a6a1114b8eaa2b1a86d7781a7e10b616b5c508bb", "size": 1390787560},
+    {"path": "model-00009-of-00009.safetensors", "sha256": "7fd57ce2a86842d16cdd3d81ce08836d2495b7937b6aee8fd4c3cc07e63ae575", "size": 774231996},
+    {"path": "model.safetensors.index.json", "sha256": "80968dfe3ebf90d350f924c9aefc050b786fa39851368952fc5fbf295a2b9e9b", "size": 62593},
+    {"path": "nml-nvfp4-recipe.json", "sha256": "ca5335749edbee2bf45b2220195b8e7f4551a4217cd8b99184cc772fb3d21014", "size": 1742},
+    {"path": "nml-source-tensors.json", "sha256": "fd7c6833d00eca158bc1145dc2577ad8d38d8f4ed977ef3e3dfc0c2a72ea5cae", "size": 144586},
+    {"path": "nml-source.json", "sha256": "4f9fd730e12e0535cf6788a11a9b1604749f4520738a5c7ea643e27bf4b5ccb1", "size": 2779},
+    {"path": "special_tokens_map.json", "sha256": "8464cabd6eda239fe46ebf8ae63b46c417721784a961a022f6b59174a2cda0e2", "size": 440},
+    {"path": "tokenizer.json", "sha256": "0614fe83cadab421296e664e1f48f4261fa8fef6e03e63bb75c20f38e37d07d3", "size": 27868174},
+    {"path": "tokenizer_config.json", "sha256": "9279e942392b742d633c7adbb89ebe002c98399db8926a7af5125c726f404070", "size": 4200}
+  ],
+  "recipe": "nml-nvfp4-weight-v1",
+  "recipe_sha256": "ca5335749edbee2bf45b2220195b8e7f4551a4217cd8b99184cc772fb3d21014",
+  "schema_version": 1,
+  "source_manifest_sha256": "4f9fd730e12e0535cf6788a11a9b1604749f4520738a5c7ea643e27bf4b5ccb1",
+  "source_repository": "unsloth/gpt-oss-20b-BF16",
+  "source_revision": "cc89b3e7fd423253264883a80a4fa5abc619649f",
+  "tensor_manifest_sha256": "fd7c6833d00eca158bc1145dc2577ad8d38d8f4ed977ef3e3dfc0c2a72ea5cae"
+}

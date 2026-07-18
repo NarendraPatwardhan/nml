@@ -283,13 +283,24 @@ Optimized attention dispatch follows the kernel actually built:
 | Device | Ordinary attention | Paged attention | Grouped MoE |
 | --- | --- | --- | --- |
 | SM75 | Portable XLA CUDA | Portable blockwise XLA CUDA | Portable XLA CUDA |
-| SM80-SM89 | FA2 where geometry permits, otherwise portable | FA2 for compatible pages/positions, otherwise Triton or portable | Triton where supported, otherwise portable |
-| SM90 | FA3 where geometry permits, otherwise portable | FA3 where supported, otherwise Triton or portable | Triton where supported, otherwise portable |
+| SM80-SM89 | FA2 where geometry permits, otherwise portable | FA2 for its exact ABI, otherwise Triton | Triton where supported, otherwise portable |
+| SM90 | FA3 where geometry permits, otherwise portable | FA3 for its exact ABI, otherwise Triton | Triton where supported, otherwise portable |
+| SM91+ | Portable until an ordinary-attention adapter is retained | Triton | Triton where supported, otherwise portable |
 
 Explicitly requesting an incompatible optimized kernel is an error. Automatic
-dispatch may select a semantically complete portable fallback. A statically
-large index geometry that cannot enter an I32 kernel ABI stays on the portable
-I64 graph instead of truncating values.
+dispatch chooses exactly one implementation from semantic features, physical
+representation, geometry, and device capability. An optimized-lowering error
+is never caught and retried as portable execution. Portable lowering is chosen
+only when the graph lies outside a retained accelerator contract; for example,
+a statically large index geometry that cannot enter an I32 kernel ABI stays on
+the portable I64 graph instead of truncating values.
+
+GPT-OSS authors paged attention even while the single-request engine owns one
+contiguous donated cache buffer. The graph views that buffer as one identity
+page and supplies the logical sequence length, so its supported CUDA geometry
+always selects FA2, FA3, or Triton rather than an ordinary-attention runtime
+branch over unused cache capacity. Continuous batching can replace the page
+table and cache owner without changing model semantics.
 
 ## 7. Sharding and distributed execution
 
@@ -483,10 +494,11 @@ SM80/SM90 compilation, linking, TTIR, registration, and dispatch are verified.
 Real SM86 and SM90 acceptance runs additionally execute FA2/FA3 ordinary
 attention, unified paged attention, and grouped expert projections through the
 retained FlashAttention and Triton paths. The phase-separated performance
-contract also executes grouped Triton MoE. Dedicated optimized-attention
-performance/tuning and homogeneous multi-GPU execution remain explicit
-hardware debt. Compilation is required evidence, but is never reported as
-device execution.
+contract executes GPT-OSS-sized compact embedding, decode, prefill, and grouped
+Triton MoE on SM86 and SM90, with a corresponding SM75 custom-call baseline.
+Dedicated optimized-attention performance/tuning and homogeneous multi-GPU
+execution remain explicit hardware debt. Compilation is required evidence, but
+is never reported as device execution.
 
 ## 11. MoE and operation substrate
 
@@ -602,18 +614,25 @@ BuildBuddy construction, deterministic layout, digest output, Linux x86-64 and
 AArch64 images, local loading, registry pushing, and incremental transfer.
 
 BuildBuddy builds and caches the expensive image closure. Local Docker loading
-is eager: Bazel downloads only the completed compressed OCI layers through its
+is eager: `bb` downloads only the completed compressed OCI layers through its
 authenticated BuildBuddy connection, then hands them to the daemon. This keeps
 credentials out of post-build loaders and does not materialize the LLVM/XLA/CUDA
 action cache. A Docker daemon using its legacy image store rewrites the local
 manifest during `docker load`; that local image ID is execution convenience,
 not the canonical OCI digest used for publication or remote acceptance.
-The trusted publication step is allowed to materialize completed compressed
-layers but never intermediate compiler outputs. It executes the rules_img
-publisher with registry credentials held by the coordinator's Docker credential
-store. If BuildBuddy's event sidecar disconnects after a successful build, the
-already-built publisher may be executed directly; registry inspection by exact
-digest is the authority, not a missing terminal event.
+
+Normal publication is one-hop: a BuildBuddy remote runner materializes the
+completed compressed layers beside the remote cache and executes the
+`rules_img` publisher there. Only that runner receives the named
+`GHCR_USERNAME` and `GHCR_TOKEN` organization secrets, restricted with
+`env-secrets`. A runner-local, owner-only registry-auth file or credential
+helper bridges those values into `rules_img` and is removed when publication
+ends; it is never a Bazel input or remotely executed action environment. The
+publish operation disables automatic remote-run retries.
+Local `bb run` publication through Docker's credential store is retained only
+as an operator recovery path because it transfers the completed layers through
+the laptop twice. Registry inspection by exact digest is the authority after
+either path, not a missing terminal event or mutable tag.
 
 CUDA product images expose `/usr/local/lib/nml` as the one dynamic-loader
 boundary. A platform-selected symlink there resolves rules_cuda's hermetic
@@ -632,9 +651,11 @@ supported administration use the versioned GitHub REST API. The GitHub CLI is
 not part of this workflow. GitHub does not currently expose package-visibility
 mutation through its Packages REST surface, so changing the first published
 package from its private default to public is a one-time web control-plane
-action. A classic PAT with only the required package scopes is entered into
-Docker's credential store and never passed through Bazel, source files, command
-arguments, or RunPod.
+action. A classic PAT with only the required package scopes is stored as the
+encrypted BuildBuddy organization secret `GHCR_TOKEN`; its matching username
+is `GHCR_USERNAME`. The recovery-only local publisher may use Docker's
+credential store. Neither credential enters Bazel inputs, source files,
+ordinary environment properties, logs, OCI layers, or RunPod.
 
 ### 12.2 RunPod control-plane boundary
 
@@ -700,7 +721,8 @@ Verification is divided by the machine that can truthfully own the resource:
     hermetic distribution and system-driver runtime closure integrity
 
 //:cuda_device_contracts
-    real NVIDIA execution, local or rented, unsandboxed and never result-cached
+    real NVIDIA execution, including the complete compact NVFP4 contract from
+    SM75 onward, local or rented, unsandboxed and never result-cached
 
 OCI CUDA device-contract image
     exact distributable userspace and permanent contract runner used on local
@@ -724,13 +746,25 @@ and `/dev/nvidia*` state are external singleton resources. Hosted workflows do
 not schedule them. Package tests, by contrast, are hermetic file-closure tests
 and belong on BuildBuddy.
 
-BuildBuddy remains the compilation, CPU-execution, CUDA-remote, package, and
-OCI-image construction venue. A trusted coordinator publishes the completed
-image without making registry credentials remotely cacheable compilation
-inputs. Local and RunPod GPU executors pull the same digest and run the same
-in-image contract selection; neither recompiles NML, runs Bazel, nor carries a
-source checkout. Provisioning a paid external Pod is an explicit `bazel run`
-or equivalent operator action, never a hermetic or cacheable `bazel test`.
+BuildBuddy remains the compilation, CPU-execution, CUDA-remote, package, OCI
+image construction, and registry-publication venue. Publication runs on a
+BuildBuddy remote runner so the image layers stay colocated with the remote
+cache instead of being downloaded to an operator machine and uploaded again.
+The runner receives only the named `GHCR_USERNAME` and `GHCR_TOKEN`
+organization secrets through its `env-secrets` execution property. Registry
+credentials must never be Bazel inputs, command-line values, ordinary action
+environment variables, cached outputs, or log content. The publication action
+is deliberately non-retrying because pushing a tag is an external mutation;
+completion is established by independently resolving the public tag to its
+immutable registry digest.
+
+Local publication through `bb run` and the Docker credential store is a
+recovery path, not the normal data path, because it requires downloading the
+large remotely built OCI layers. Local and RunPod GPU executors pull the same
+digest and run the same in-image contract selection; neither recompiles NML,
+runs Bazel, nor carries a source checkout. Provisioning a paid external Pod is
+an explicit `bb run` or equivalent operator action, never a hermetic or
+cacheable `bb test`.
 
 Every OCI GPU result records the NML commit, image digest, contract selection,
 GPU model and UUID when available, compute capability, driver, execution
@@ -754,9 +788,9 @@ material, but NML's requirements and this document now govern new work.
 
 The remaining validation debt is explicit:
 
-- extend the established SM86/SM90 FA2, FA3, Triton paged-attention, and
-  grouped-MoE numerical evidence with representative optimized-kernel
-  performance coverage;
+- extend the established SM86/SM90 FA2, FA3, and Triton paged-attention
+  numerical evidence with representative optimized-attention performance
+  coverage; grouped compact-MoE phase coverage is established separately;
 - execute and measure multi-GPU CUDA Shardy placement and collectives;
 - run native Linux AArch64 CPU/CUDA contracts, including DGX Spark;
 - run native Apple Silicon CPU contracts.

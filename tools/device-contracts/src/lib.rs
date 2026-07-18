@@ -25,30 +25,46 @@ const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
 const MAX_CONTRACT_TIMEOUT_SECONDS: u64 = 60 * 60;
 const MAX_TOTAL_TIMEOUT_SECONDS: u64 = 3 * 60 * 60;
 
-const CONTRACTS: [ContractDefinition; 6] = [
+const CONTRACTS: [ContractDefinition; 7] = [
     ContractDefinition {
         name: "flash_attention_device_capability",
         rlocation: env!("NML_FLASH_ATTENTION_CAPABILITY_CONTRACT"),
+        arguments: &[],
     },
     ContractDefinition {
         name: "cuda_runtime",
         rlocation: env!("NML_CUDA_RUNTIME_CONTRACT"),
+        arguments: &[],
     },
     ContractDefinition {
         name: "linear",
         rlocation: env!("NML_LINEAR_CONTRACT"),
+        arguments: &[],
     },
     ContractDefinition {
         name: "attention",
         rlocation: env!("NML_ATTENTION_CONTRACT"),
+        arguments: &[],
     },
     ContractDefinition {
         name: "neural_ops",
         rlocation: env!("NML_NEURAL_OPS_CONTRACT"),
+        arguments: &[],
     },
     ContractDefinition {
         name: "execution_performance",
         rlocation: env!("NML_EXECUTION_PERFORMANCE_CONTRACT"),
+        // This executable is a Rust test binary. Device contracts invoke test
+        // executables directly rather than through Bazel's test wrapper, so
+        // the harness argument is part of the immutable contract definition.
+        // Keeping it here ensures phase measurements survive into the lease
+        // result instead of being swallowed by the harness's output capture.
+        arguments: &["--nocapture"],
+    },
+    ContractDefinition {
+        name: "nvfp4",
+        rlocation: env!("NML_NVFP4_CONTRACT"),
+        arguments: &[],
     },
 ];
 
@@ -56,6 +72,7 @@ const CONTRACTS: [ContractDefinition; 6] = [
 struct ContractDefinition {
     name: &'static str,
     rlocation: &'static str,
+    arguments: &'static [&'static str],
 }
 
 #[derive(Clone)]
@@ -79,6 +96,7 @@ struct Configuration {
 struct ResolvedContract {
     name: &'static str,
     path: PathBuf,
+    arguments: &'static [&'static str],
 }
 
 enum ExecutionState {
@@ -279,6 +297,7 @@ impl Configuration {
                 Ok(ResolvedContract {
                     name: definition.name,
                     path,
+                    arguments: definition.arguments,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -550,6 +569,7 @@ async fn execute_contract(
     let started = Instant::now();
     let mut command = Command::new(&contract.path);
     command
+        .args(contract.arguments)
         .env("RUNFILES_DIR", &configuration.runfiles_directory)
         .env("JAVA_RUNFILES", &configuration.runfiles_directory)
         .env(
@@ -892,6 +912,21 @@ mod tests {
     }
 
     #[test]
+    fn performance_contract_preserves_phase_output() {
+        let performance = CONTRACTS
+            .iter()
+            .find(|contract| contract.name == "execution_performance")
+            .expect("performance contract is permanent");
+        assert_eq!(performance.arguments, ["--nocapture"]);
+        assert!(
+            CONTRACTS
+                .iter()
+                .filter(|contract| contract.name != "execution_performance")
+                .all(|contract| contract.arguments.is_empty())
+        );
+    }
+
+    #[test]
     fn selection_is_allowlisted_unique_and_bounded() {
         let configuration = Configuration {
             lease_token: "x".repeat(32),
@@ -905,6 +940,7 @@ mod tests {
             contracts: vec![ResolvedContract {
                 name: "cuda_runtime",
                 path: PathBuf::from("/contract"),
+                arguments: &[],
             }],
             hardware: Err("not consulted by request validation".to_owned()),
         };

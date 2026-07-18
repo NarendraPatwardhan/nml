@@ -438,7 +438,39 @@ pub mod io {
         reads: usize,
         allocations: usize,
         uploads: usize,
+        source_bytes: usize,
+        resident_bytes: usize,
+        prepared_bytes: usize,
         peak_staging_bytes: usize,
+    }
+
+    /// Owns every persistent buffer until the complete logical model has been
+    /// reconstructed successfully. Any error drops the transaction and PJRT's
+    /// buffer owners release all completed components; only `commit` permits
+    /// their ownership to escape into `LoadedParameter` values.
+    struct LoadTransaction {
+        components: BTreeMap<String, Buffer>,
+    }
+
+    impl LoadTransaction {
+        fn new() -> Self {
+            Self {
+                components: BTreeMap::new(),
+            }
+        }
+
+        fn insert(&mut self, artifact: String, buffer: Buffer) {
+            let previous = self.components.insert(artifact, buffer);
+            debug_assert!(previous.is_none(), "load plan contains unique artifacts");
+        }
+
+        fn component(&self, artifact: &str) -> Option<&Buffer> {
+            self.components.get(artifact)
+        }
+
+        fn commit(self) -> BTreeMap<String, Buffer> {
+            self.components
+        }
     }
 
     impl ParameterSet {
@@ -507,6 +539,58 @@ pub mod io {
                 .map_err(super::Error::Parameter)
         }
 
+        /// Resolves the three physical records of NML NVFP4 recipe v1.
+        ///
+        /// A base `<name>` owns `<name>.payload`, `<name>.block_scales`, and
+        /// `<name>.global_scale`. Partially present bases are rejected rather
+        /// than treated as a missing alias, because mixing components from two
+        /// conversions would violate the parameter's representation identity.
+        pub fn nvfp4(
+            &self,
+            name: &str,
+            logical_shape: nml_types::Shape,
+            aliases: &[&str],
+        ) -> Result<Parameter, super::Error> {
+            let logical_name = join(&self.prefix, name);
+            let mut bases = Vec::with_capacity(aliases.len() + 1);
+            bases.push(logical_name.clone());
+            bases.extend(aliases.iter().map(|alias| join(&self.prefix, alias)));
+
+            let mut complete = Vec::new();
+            for base in bases {
+                let parameter = Parameter::nvfp4(&logical_name, &base, logical_shape)
+                    .map_err(super::Error::Parameter)?;
+                let present = parameter
+                    .components()
+                    .iter()
+                    .filter(|component| self.registry.contains(component.artifact_name()))
+                    .count();
+                if present == parameter.components().len() {
+                    complete.push(parameter);
+                } else if present != 0 {
+                    return Err(super::Error::IncompleteParameterComponents(base));
+                }
+            }
+
+            let parameter = match complete.as_slice() {
+                [] => return Err(super::Error::MissingTensor(logical_name)),
+                [only] => only.clone(),
+                _ => return Err(super::Error::AmbiguousAlias(logical_name)),
+            };
+            for component in parameter.components() {
+                let actual = self.registry.shape(component.artifact_name())?;
+                let expected = component.storage().shape();
+                if !super::safetensors::storage_compatible(actual, expected) {
+                    return Err(super::Error::ShapeMismatch {
+                        name: component.artifact_name().to_owned(),
+                        expected,
+                        actual,
+                    });
+                }
+            }
+            Ok(parameter)
+        }
+
         pub fn load<T: ParameterTree>(
             &self,
             model: &T,
@@ -542,6 +626,10 @@ pub mod io {
                     None => {
                         logical_parameters.insert(parameter.name().to_owned(), parameter.clone());
                     }
+                }
+                if let Err(error) = parameter.validate_sharding(&options.sharding) {
+                    validation_error = Some(super::Error::Parameter(error));
+                    return;
                 }
                 for component in parameter.components() {
                     let artifact = component.artifact_name();
@@ -615,10 +703,16 @@ pub mod io {
             };
             let mut accounting = LoadAccounting {
                 planned: records.len(),
+                source_bytes: record_bytes
+                    .iter()
+                    .try_fold(0usize, |total, bytes| total.checked_add(*bytes))
+                    .ok_or(super::Error::InvalidLoadOption(
+                        "source byte accounting overflows",
+                    ))?,
                 peak_staging_bytes,
                 ..LoadAccounting::default()
             };
-            let mut loaded = BTreeMap::<String, Buffer>::new();
+            let mut transaction = LoadTransaction::new();
 
             if platform.name() == "cuda" {
                 for (completed, (artifact, storage)) in records.iter().enumerate() {
@@ -636,7 +730,13 @@ pub mod io {
                     accounting.reads += 1;
                     accounting.allocations += 1;
                     accounting.uploads += 1;
-                    loaded.insert(artifact.clone(), buffer);
+                    accounting.resident_bytes = accounting
+                        .resident_bytes
+                        .checked_add(buffer.byte_count().map_err(super::Error::Runtime)?)
+                        .ok_or(super::Error::InvalidLoadOption(
+                            "resident byte accounting overflows",
+                        ))?;
+                    transaction.insert(artifact.clone(), buffer);
                     if let Some(progress) = &options.progress {
                         progress(completed + 1, records.len());
                     }
@@ -683,7 +783,13 @@ pub mod io {
                             .map_err(super::Error::Runtime)?;
                         accounting.allocations += 1;
                         accounting.uploads += 1;
-                        loaded.insert(artifact, buffer);
+                        accounting.resident_bytes = accounting
+                            .resident_bytes
+                            .checked_add(buffer.byte_count().map_err(super::Error::Runtime)?)
+                            .ok_or(super::Error::InvalidLoadOption(
+                                "resident byte accounting overflows",
+                            ))?;
+                        transaction.insert(artifact, buffer);
                         if let Some(progress) = &options.progress {
                             progress(completed + 1, records.len());
                         }
@@ -695,19 +801,27 @@ pub mod io {
             debug_assert_eq!(accounting.reads, accounting.planned);
             debug_assert_eq!(accounting.allocations, accounting.planned);
             debug_assert_eq!(accounting.uploads, accounting.planned);
+            // Source-layout execution performs no one-time repacking. Future
+            // prepared layouts must account their additional persistent bytes
+            // separately instead of hiding them in resident source storage.
+            debug_assert_eq!(accounting.prepared_bytes, 0);
             let loaded_model = model.load_parameters("", &mut |_path, parameter| {
                 let components = parameter
                     .components()
                     .iter()
                     .map(|component| {
-                        loaded
-                            .get(component.artifact_name())
+                        transaction
+                            .component(component.artifact_name())
                             .expect("validated physical component was loaded")
                             .clone()
                     })
                     .collect();
                 LoadedParameter::new(parameter.clone(), components).map_err(super::Error::Runtime)
             })?;
+            // This explicit commit documents the transactional ownership
+            // boundary. The map's handles are tied-component owners and are
+            // intentionally released after the loaded model holds its clones.
+            drop(transaction.commit());
             Ok((loaded_model, accounting))
         }
     }
@@ -874,6 +988,9 @@ pub mod io {
             assert_eq!(accounting.reads, 1);
             assert_eq!(accounting.allocations, 1);
             assert_eq!(accounting.uploads, 1);
+            assert_eq!(accounting.source_bytes, 8);
+            assert_eq!(accounting.resident_bytes, 8);
+            assert_eq!(accounting.prepared_bytes, 0);
             assert_eq!(accounting.peak_staging_bytes, 8);
             let first = loaded.first.components().next().unwrap().1;
             let second = loaded.second.components().next().unwrap().1;
@@ -936,6 +1053,7 @@ pub enum Error {
         second: nml_parameter::StorageSpec,
     },
     InconsistentParameterDefinition(String),
+    IncompleteParameterComponents(String),
     InvalidLoadOption(&'static str),
     LoaderWorkerFailed,
 }
@@ -1001,6 +1119,10 @@ impl std::fmt::Display for Error {
             Self::InconsistentParameterDefinition(name) => write!(
                 f,
                 "logical parameter {name:?} is declared with inconsistent representation or artifact binding"
+            ),
+            Self::IncompleteParameterComponents(name) => write!(
+                f,
+                "NVFP4 artifact base {name:?} has only some required physical components"
             ),
             Self::InvalidLoadOption(message) => write!(f, "invalid load option: {message}"),
             Self::LoaderWorkerFailed => {

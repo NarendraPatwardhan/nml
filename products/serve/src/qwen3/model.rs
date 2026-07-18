@@ -212,6 +212,7 @@ pub(crate) fn build_graph(
                 value,
                 positions,
                 positions,
+                None,
                 nml::attention::Options::default(),
             ))?,
             GraphKind::Decode { capacity, .. } => {
@@ -225,6 +226,7 @@ pub(crate) fn build_graph(
                     value_cache,
                     positions,
                     key_positions,
+                    None,
                     nml::attention::Options::default(),
                 ))?
             }

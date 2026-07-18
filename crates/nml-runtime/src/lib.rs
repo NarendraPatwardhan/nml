@@ -46,6 +46,11 @@ impl Platform {
                 value: device_count as i64,
             }])
             .map_err(Error::Pjrt)?;
+        let platform_name = client.platform_name().map_err(Error::Pjrt)?;
+        let ffi = plugin.ffi().map_err(Error::Pjrt)?.ok_or_else(|| {
+            Error::Platform("CPU PJRT plugin does not expose typed FFI".to_owned())
+        })?;
+        nml_kernel_nvfp4::register_cpu(&ffi, &platform_name).map_err(Error::Pjrt)?;
         Ok(Self {
             backend: Backend::Cpu,
             client,
@@ -64,12 +69,15 @@ impl Platform {
         let runtime = unsafe { nml_pjrt_cuda::Runtime::load() }
             .map_err(|error| Error::Platform(error.to_string()))?;
         #[cfg(nml_cuda)]
-        nml_kernel_flash_attention::register(
-            &runtime
+        {
+            let custom_calls = runtime
                 .custom_calls()
-                .map_err(|error| Error::Platform(error.to_string()))?,
-        )
-        .map_err(|error| Error::Platform(error.to_string()))?;
+                .map_err(|error| Error::Platform(error.to_string()))?;
+            nml_kernel_flash_attention::register(&custom_calls)
+                .map_err(|error| Error::Platform(error.to_string()))?;
+            nml_kernel_nvfp4::register_cuda(&custom_calls)
+                .map_err(|error| Error::Platform(error.to_string()))?;
+        }
         let client = runtime
             .create_client(nml_pjrt_cuda::ClientOptions::default())
             .map_err(|error| Error::Platform(error.to_string()))?;

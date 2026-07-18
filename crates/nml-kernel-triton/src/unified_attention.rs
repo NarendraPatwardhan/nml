@@ -2,9 +2,11 @@
 //!
 //! This is the whole-sequence kernel used for prefill and sufficiently wide
 //! decode launches. It follows the pinned ZML algorithm while removing FP8,
-//! ALiBi, sink, soft-cap, and oneAPI branches that are outside NML's retained
-//! contract. Cache pages remain physical and are never materialized as a dense
-//! logical K/V tensor.
+//! ALiBi, soft-cap, and oneAPI branches that are outside NML's retained
+//! contract. Learned sinks are part of the online-softmax state: the 2D kernel
+//! initializes from them, while split-K adds them exactly once during global
+//! reduction. Cache pages remain physical and are never materialized as a
+//! dense logical K/V tensor.
 
 use super::{ArgumentKind, Builder, Comparison, DType, Error, Reduction, Value};
 
@@ -31,6 +33,7 @@ pub struct PagedAttention2dConfig {
     pub block_m: i64,
     pub sliding_window: Option<i64>,
     pub causal: bool,
+    pub learned_sinks: bool,
 }
 
 impl PagedAttention2dConfig {
@@ -80,6 +83,10 @@ pub fn build_paged_attention_2d(config: PagedAttention2dConfig) -> Result<String
     let config = config.validate()?;
     let mut builder = Builder::new("paged_attention_2d")?;
     let query = pointer(&mut builder, "query", config.dtype)?;
+    let sinks = config
+        .learned_sinks
+        .then(|| pointer(&mut builder, "sinks", config.dtype))
+        .transpose()?;
     let key_cache = pointer(&mut builder, "key_cache", config.dtype)?;
     let value_cache = pointer(&mut builder, "value_cache", config.dtype)?;
     let block_tables = pointer(&mut builder, "block_tables", DType::I32)?;
@@ -141,6 +148,7 @@ pub fn build_paged_attention_2d(config: PagedAttention2dConfig) -> Result<String
             kernel,
             config,
             &query,
+            sinks.as_ref(),
             &key_cache,
             &value_cache,
             &block_tables,
@@ -180,7 +188,8 @@ pub struct PagedAttention3dConfig {
 
 pub fn build_paged_attention_3d(config: PagedAttention3dConfig) -> Result<String, Error> {
     let attention = config.attention.validate()?;
-    if config.segments <= 0
+    if attention.learned_sinks
+        || config.segments <= 0
         || !(config.segments as u64).is_power_of_two()
         || i32::try_from(config.segments).is_err()
         || config
@@ -189,7 +198,7 @@ pub fn build_paged_attention_3d(config: PagedAttention3dConfig) -> Result<String
             .is_none_or(|value| i32::try_from(value).is_err())
     {
         return Err(Error::InvalidKernelSpec(
-            "invalid split-K attention segment geometry",
+            "split-K producers require sink-free segment geometry and a valid segment count",
         ));
     }
     let mut builder = Builder::new("paged_attention_3d")?;
@@ -272,6 +281,7 @@ pub fn build_paged_attention_3d(config: PagedAttention3dConfig) -> Result<String
             kernel,
             attention,
             &query,
+            None,
             &key_cache,
             &value_cache,
             &block_tables,
@@ -326,6 +336,7 @@ fn emit_valid_block(
     kernel: &mut Builder,
     config: PagedAttention2dConfig,
     query: &Value,
+    sinks: Option<&Value>,
     key_cache: &Value,
     value_cache: &Value,
     block_tables: &Value,
@@ -400,6 +411,18 @@ fn emit_valid_block(
     let block_table_base = kernel.multiply(&sequence_i64, block_table_stride)?;
     let block_table = kernel.add_pointer(block_tables, &block_table_base)?;
     let minus_infinity = kernel.full_float(&[config.block_m], f64::NEG_INFINITY, DType::F32)?;
+    let log2_e = kernel.float(LOG2_E, DType::F32)?;
+    let initial_maximum = match sinks {
+        Some(sinks) => {
+            let sink_addresses = kernel.add_pointer(sinks, &query_heads)?;
+            let sink_other =
+                kernel.full_float(&[config.block_m], f64::NEG_INFINITY, config.dtype)?;
+            let sinks = kernel.load_masked(&sink_addresses, &query_head_mask_1d, &sink_other)?;
+            let sinks = kernel.cast(&sinks, DType::F32)?;
+            kernel.multiply(&sinks, &log2_e)?
+        }
+        None => minus_infinity,
+    };
     let denominator = kernel.full_float(&[config.block_m], 1.0, DType::F32)?;
     let accumulator =
         kernel.full_float(&[config.block_m, config.padded_head_size], 0.0, DType::F32)?;
@@ -432,14 +455,13 @@ fn emit_valid_block(
         }
         AttentionOutput::Final { .. } => (zero_i32.clone(), tile_count.clone()),
     };
-    let log2_e = kernel.float(LOG2_E, DType::F32)?;
     let qk_scale = kernel.multiply(scale, &log2_e)?;
     let loop_step = integer(kernel, 1, DType::I32)?;
     let carried = kernel.for_loop(
         &tile_start,
         &tile_end,
         &loop_step,
-        &[minus_infinity, denominator, accumulator],
+        &[initial_maximum, denominator, accumulator],
         |body, tile_index, carried| {
             let maximum = &carried[0];
             let denominator = &carried[1];
@@ -692,6 +714,7 @@ pub struct SegmentReductionConfig {
     pub head_size: i64,
     pub padded_head_size: i64,
     pub block_q: i64,
+    pub learned_sinks: bool,
 }
 
 impl SegmentReductionConfig {
@@ -735,6 +758,10 @@ pub fn build_segment_reduction(config: SegmentReductionConfig) -> Result<String,
     let segment_output = pointer(&mut builder, "segment_output", DType::F32)?;
     let segment_maximum = pointer(&mut builder, "segment_maximum", DType::F32)?;
     let segment_sum = pointer(&mut builder, "segment_sum", DType::F32)?;
+    let sinks = config
+        .learned_sinks
+        .then(|| pointer(&mut builder, "sinks", config.output_dtype))
+        .transpose()?;
     let sequence_lengths = pointer(&mut builder, "sequence_lengths", DType::I32)?;
     let sequence_count_pointer = pointer(&mut builder, "sequence_count", DType::I32)?;
     let output_stride_0_pointer = pointer(&mut builder, "output_stride_0", DType::I64)?;
@@ -802,16 +829,37 @@ pub fn build_segment_reduction(config: SegmentReductionConfig) -> Result<String,
     let maxima = builder.load_masked(&maximum_addresses, &segment_mask, &maximum_other)?;
     let overall_maximum = builder.reduce(Reduction::Maximum, &maxima, 0)?;
     let negative_infinity = builder.float(f64::NEG_INFINITY, DType::F32)?;
-    let finite = builder.compare(Comparison::Greater, &overall_maximum, &negative_infinity)?;
     let zero = builder.float(0.0, DType::F32)?;
-    let overall_maximum = builder.select(&finite, &overall_maximum, &zero)?;
+    let sink_log2 = match sinks {
+        Some(sinks) => {
+            let sink_address = builder.add_pointer(&sinks, &query_head)?;
+            let sink = builder.load(&sink_address)?;
+            let sink = builder.cast(&sink, DType::F32)?;
+            let log2_e = builder.float(LOG2_E, DType::F32)?;
+            Some(builder.multiply(&sink, &log2_e)?)
+        }
+        None => None,
+    };
+    let overall_maximum = match &sink_log2 {
+        Some(sink) => builder.maximum(&overall_maximum, sink)?,
+        None => {
+            let finite =
+                builder.compare(Comparison::Greater, &overall_maximum, &negative_infinity)?;
+            builder.select(&finite, &overall_maximum, &zero)?
+        }
+    };
     let sum_addresses = builder.add_pointer(&segment_sum, &segment_offset)?;
     let sum_other = builder.full_float(&[config.segments], 0.0, DType::F32)?;
     let sums = builder.load_masked(&sum_addresses, &segment_mask, &sum_other)?;
     let maximum_delta = builder.subtract(&maxima, &overall_maximum)?;
     let rescale = builder.exp2(&maximum_delta)?;
     let sums = builder.multiply(&sums, &rescale)?;
-    let overall_sum = builder.reduce(Reduction::Sum, &sums, 0)?;
+    let mut overall_sum = builder.reduce(Reduction::Sum, &sums, 0)?;
+    if let Some(sink) = sink_log2 {
+        let sink_delta = builder.subtract(&sink, &overall_maximum)?;
+        let sink_weight = builder.exp2(&sink_delta)?;
+        overall_sum = builder.add(&overall_sum, &sink_weight)?;
+    }
 
     let output_token_stride = integer(
         &mut builder,

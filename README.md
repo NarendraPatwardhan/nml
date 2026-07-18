@@ -95,6 +95,17 @@ Rust model and tensor program
 This gives portable compiled semantics for every supported device while still
 allowing private CUDA kernels where they provide a material advantage.
 
+Bringing NVFP4 to pre-Blackwell GPUs is attractive because the weights remain
+compact from checkpoint through device memory—roughly 3.5 times smaller than
+BF16 after block scales—rather than being expanded into a hidden persistent
+BF16 copy. NML decodes and scales each packed tile inside the embedding or
+contraction kernel, immediately consumes it, and accumulates into an ordinary
+activation type; there is no full-model dequantization pass or extra dense
+weight traffic. These GPUs do not gain native FP4 arithmetic, and speedups
+remain workload-dependent, but users still gain materially lower memory use
+and bandwidth demand, making larger models, batches, and contexts practical on
+hardware they already own.
+
 ### Sharding is part of the graph
 
 Logical axis tags and partition metadata survive reshape, transpose,

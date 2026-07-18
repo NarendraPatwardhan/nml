@@ -374,6 +374,74 @@ pub struct GpuCustomCallHandlers {
     pub execute: GpuCustomCallHandler,
 }
 
+/// An opaque XLA typed-FFI handler entry point.
+#[derive(Clone, Copy, Debug)]
+pub struct FfiHandler(NonNull<c_void>);
+
+impl FfiHandler {
+    /// Wraps a process-lifetime `XLA_FFI_Handler` address.
+    ///
+    /// # Safety
+    ///
+    /// The address must remain valid for the plugin lifetime and implement the
+    /// exact `XLA_FFI_Handler(XLA_FFI_CallFrame*)` ABI from the pinned XLA
+    /// headers, including the metadata-registration call.
+    pub unsafe fn from_address(address: NonNull<c_void>) -> Self {
+        Self(address)
+    }
+
+    fn as_ptr(self) -> *mut c_void {
+        self.0.as_ptr()
+    }
+}
+
+/// A validated backend-neutral PJRT typed-FFI registration extension.
+pub struct Ffi {
+    plugin: Plugin,
+    register_fn: FfiRegisterFn,
+}
+
+type FfiRegisterFn =
+    unsafe extern "C" fn(*mut sys::PJRT_FFI_Register_Handler_Args) -> *mut sys::PJRT_Error;
+
+impl Ffi {
+    pub fn plugin_identity(&self) -> usize {
+        self.plugin.api.as_ptr() as usize
+    }
+
+    /// Registers one typed handler for the platform spelling reported by PJRT.
+    ///
+    /// # Safety
+    ///
+    /// `handler` must satisfy [`FfiHandler::from_address`] and must correctly
+    /// interpret every buffer/attribute contract emitted for `target_name`.
+    pub unsafe fn register(
+        &self,
+        target_name: &str,
+        platform_name: &str,
+        handler: FfiHandler,
+        command_buffer_compatible: bool,
+    ) -> Result<(), Error> {
+        // SAFETY: zero initializes the reserved extension pointer and traits.
+        let mut args: sys::PJRT_FFI_Register_Handler_Args = unsafe { zeroed() };
+        args.struct_size = sys::PJRT_FFI_Register_Handler_Args_STRUCT_SIZE as usize;
+        args.target_name = target_name.as_ptr().cast();
+        args.target_name_size = target_name.len();
+        args.handler = handler.as_ptr();
+        args.platform_name = platform_name.as_ptr().cast();
+        args.platform_name_size = platform_name.len();
+        args.traits = if command_buffer_compatible {
+            sys::PJRT_FFI_Handler_TraitsBits_PJRT_FFI_HANDLER_TRAITS_COMMAND_BUFFER_COMPATIBLE
+        } else {
+            0
+        };
+        // SAFETY: the extension function and handler were validated by the
+        // caller; all borrowed strings remain alive for the synchronous call.
+        let error = unsafe { (self.register_fn)(&mut args) };
+        self.plugin.into_result(error)
+    }
+}
+
 /// A validated GPU custom-call extension borrowed from a loaded plugin.
 pub struct GpuCustomCalls {
     plugin: Plugin,
@@ -590,6 +658,49 @@ impl Plugin {
                     .custom_call
                     .ok_or(Error::MissingFunction("PJRT_Gpu_Register_Custom_Call"))?;
                 return Ok(Some(GpuCustomCalls {
+                    plugin: self.clone(),
+                    register_fn,
+                }));
+            }
+            current = base.next;
+        }
+        Ok(None)
+    }
+
+    /// Finds and validates PJRT's backend-neutral typed-FFI extension.
+    pub fn ffi(&self) -> Result<Option<Ffi>, Error> {
+        // SAFETY: extension_start is in the size-checked PJRT_Api prefix.
+        let mut current = unsafe { addr_of!((*self.api.as_ptr()).extension_start).read() };
+        let mut visited = HashSet::new();
+        while let Some(extension) = NonNull::new(current) {
+            if !visited.insert(extension.as_ptr() as usize) {
+                return Err(Error::CyclicExtensionChain);
+            }
+            // SAFETY: the loaded plugin owns this extension chain.
+            let base = unsafe { extension.as_ref() };
+            let base_required = sys::PJRT_Extension_Base_STRUCT_SIZE as usize;
+            if base.struct_size < base_required {
+                return Err(Error::TruncatedExtension {
+                    extension: "base",
+                    required: base_required,
+                    actual: base.struct_size,
+                });
+            }
+            if base.type_ == sys::PJRT_Extension_Type_PJRT_Extension_Type_FFI {
+                let required = sys::PJRT_FFI_Extension_STRUCT_SIZE as usize;
+                if base.struct_size < required {
+                    return Err(Error::TruncatedExtension {
+                        extension: "FFI",
+                        required,
+                        actual: base.struct_size,
+                    });
+                }
+                // SAFETY: the type tag and complete size identify PJRT_FFI.
+                let ffi = unsafe { &*extension.as_ptr().cast::<sys::PJRT_FFI_Extension>() };
+                let register_fn = ffi
+                    .register_handler
+                    .ok_or(Error::MissingFunction("PJRT_FFI_Register_Handler"))?;
+                return Ok(Some(Ffi {
                     plugin: self.clone(),
                     register_fn,
                 }));
