@@ -1,9 +1,339 @@
-//! Exact GPT-OSS 20B NVFP4 product model.
+//! GPT-OSS 20B product ownership.
+//!
+//! Artifact identity, Harmony, checkpoint structure, component graphs, and the
+//! transformer schedule live here. Framework crates know only tensors,
+//! parameters, compilation, buffers, and reusable executable slots.
 
 #![forbid(unsafe_code)]
 
-#[path = "gpt_oss/config.rs"]
-pub mod config;
+mod checkpoint;
+mod config;
+mod execution;
+mod graph;
+pub(crate) mod protocol;
 
-#[path = "gpt_oss/model.rs"]
-pub mod model;
+use checkpoint::{BoxError, Result};
+use config::Config;
+use execution::{CompiledModel, PreparedRequest, RunMetrics, StartupMetrics};
+use nml::io::ParameterSet;
+use nml::safetensors::TensorRegistry;
+use protocol::{Conversation, HarmonyProtocol, Message, SystemContent};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+pub(crate) const MODEL_NAME: &str = "GPT-OSS 20B NVFP4";
+const ARTIFACT_MANIFEST: &str = "nml-artifact-manifest.json";
+const CHECKPOINT_INDEX: &str = "model.safetensors.index.json";
+const DIRECT_CHECKPOINT: &str = "model.safetensors";
+const ARTIFACT_MANIFEST_SHA256: &str =
+    "ab4c8cbd4424c8fec95bf683c0efd04c9cd350ec2a26737408b5500e61003207";
+const ARTIFACT_FILE_COUNT: usize = 20;
+const ARTIFACT_TOTAL_BYTES: u64 = 11_805_933_892;
+const ARTIFACT_RECIPE: &str = "nml-nvfp4-weight-v1";
+const SOURCE_REPOSITORY: &str = "unsloth/gpt-oss-20b-BF16";
+const SOURCE_REVISION: &str = "cc89b3e7fd423253264883a80a4fa5abc619649f";
+
+/// Persistent product model. Loading, uploaded parameters, and compiled
+/// component families are reused by every request sent to this owner.
+pub(crate) struct Generator<'platform> {
+    protocol: HarmonyProtocol,
+    model: CompiledModel<'platform>,
+}
+
+pub(crate) struct ProductReport {
+    pub(crate) prompt_tokens: usize,
+    pub(crate) generated_tokens: Vec<u32>,
+    pub(crate) cache_capacity: usize,
+    pub(crate) physical_parameter_components: usize,
+    pub(crate) parameter_source_bytes: usize,
+    pub(crate) parameter_resident_bytes: usize,
+    pub(crate) parameter_prepared_bytes: usize,
+    pub(crate) parameter_peak_staging_bytes: usize,
+    pub(crate) cache_storage_bytes: usize,
+    pub(crate) cache_metadata_bytes: usize,
+    pub(crate) timings: ProductTimings,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProductTimings {
+    pub(crate) tokenization: Duration,
+    pub(crate) artifact_validation: Duration,
+    pub(crate) prefill_compilation: Duration,
+    pub(crate) decode_compilation: Duration,
+    pub(crate) parameter_upload: Duration,
+    pub(crate) cache_allocation: Duration,
+    pub(crate) prompt_upload: Duration,
+    pub(crate) prefill_execution: Duration,
+    pub(crate) prefill_download: Duration,
+    pub(crate) decode_state_initialization: Duration,
+    pub(crate) first_decode_execution: Duration,
+    pub(crate) steady_decode_execution: Duration,
+    pub(crate) decode_download: Duration,
+}
+
+impl<'platform> Generator<'platform> {
+    pub(crate) fn load(platform: &'platform nml::Platform, model_directory: &Path) -> Result<Self> {
+        let validation_started = Instant::now();
+        validate_artifact(model_directory).map_err(boxed)?;
+        let artifact_validation = validation_started.elapsed();
+        let config = Config::from_file(model_directory.join("config.json")).map_err(boxed)?;
+        let protocol = HarmonyProtocol::load(model_directory).map_err(boxed)?;
+        let registry = TensorRegistry::from_path(model_directory.join(CHECKPOINT_INDEX))
+            .map_err(boxed)?;
+        let model = CompiledModel::load(
+            platform,
+            config,
+            ParameterSet::new(registry),
+            artifact_validation,
+        )?;
+        Ok(Self { protocol, model })
+    }
+
+    pub(crate) fn generate(
+        &mut self,
+        prompt: String,
+        max_new_tokens: usize,
+        cache_capacity: Option<usize>,
+        mut emit: impl FnMut(protocol::Event) -> Result<()>,
+    ) -> Result<ProductReport> {
+        let tokenization_started = Instant::now();
+        let conversation = Conversation::new([
+            Message::System(SystemContent::default()),
+            Message::user(prompt),
+        ]);
+        let tokens = self
+            .protocol
+            .render_for_completion(&conversation)
+            .map_err(boxed)?;
+        let tokenization = tokenization_started.elapsed();
+        let request = PreparedRequest::new(
+            tokens,
+            max_new_tokens,
+            cache_capacity,
+            self.model.config().context_limit(),
+            tokenization,
+        )?;
+        let prompt_tokens = request.tokens.len();
+        let selected_cache_capacity = request.cache_capacity;
+        let mut parser = self.protocol.parser();
+        let run = self.model.generate(&request, |token, _is_stop| {
+            for event in parser.process(token).map_err(boxed)? {
+                emit(event)?;
+            }
+            Ok(())
+        })?;
+        if run.stopped {
+            parser.finish().map_err(boxed)?;
+        } else {
+            for event in parser.truncate().map_err(boxed)? {
+                emit(event)?;
+            }
+        }
+        let startup = self.model.startup();
+        Ok(ProductReport {
+            prompt_tokens,
+            generated_tokens: run.generated_tokens,
+            cache_capacity: selected_cache_capacity,
+            physical_parameter_components: startup.physical_parameter_components,
+            parameter_source_bytes: startup.parameter_source_bytes,
+            parameter_resident_bytes: startup.parameter_resident_bytes,
+            parameter_prepared_bytes: startup.parameter_prepared_bytes,
+            parameter_peak_staging_bytes: startup.parameter_peak_staging_bytes,
+            cache_storage_bytes: run.cache_storage_bytes,
+            cache_metadata_bytes: run.cache_metadata_bytes,
+            timings: timings(request.tokenization, startup, run.metrics),
+        })
+    }
+}
+
+fn timings(
+    tokenization: Duration,
+    startup: StartupMetrics,
+    run: RunMetrics,
+) -> ProductTimings {
+    ProductTimings {
+        tokenization,
+        artifact_validation: startup.artifact_validation,
+        prefill_compilation: run.prefill_compilation,
+        decode_compilation: run.decode_compilation,
+        parameter_upload: startup.parameter_upload,
+        cache_allocation: run.cache_allocation,
+        prompt_upload: run.prompt_upload,
+        prefill_execution: run.prefill_execution,
+        prefill_download: run.prefill_download,
+        decode_state_initialization: run.decode_state_initialization,
+        first_decode_execution: run.first_decode_execution,
+        steady_decode_execution: run.steady_decode_execution,
+        decode_download: run.decode_download,
+    }
+}
+
+fn validate_artifact(model_directory: &Path) -> std::result::Result<(), ArtifactError> {
+    let manifest_path = model_directory.join(ARTIFACT_MANIFEST);
+    let manifest_hash = sha256(&manifest_path)?;
+    if manifest_hash != ARTIFACT_MANIFEST_SHA256 {
+        return Err(ArtifactError(format!(
+            "artifact manifest SHA-256 is {manifest_hash}, expected {ARTIFACT_MANIFEST_SHA256}"
+        )));
+    }
+    let manifest: ArtifactManifest =
+        serde_json::from_reader(BufReader::new(File::open(&manifest_path)?)).map_err(|error| {
+            ArtifactError(format!("artifact manifest is invalid JSON: {error}"))
+        })?;
+    if manifest.schema_version != 1
+        || manifest.recipe != ARTIFACT_RECIPE
+        || manifest.source_repository != SOURCE_REPOSITORY
+        || manifest.source_revision != SOURCE_REVISION
+        || manifest.files.len() != ARTIFACT_FILE_COUNT
+    {
+        return Err(ArtifactError(
+            "artifact manifest identity does not match the selected GPT-OSS revision".to_owned(),
+        ));
+    }
+    validate_checkpoint_entries(
+        &manifest.files,
+        model_directory.join(DIRECT_CHECKPOINT).is_file(),
+    )?;
+    let mut total = 0u64;
+    for file in manifest.files {
+        let path = model_directory.join(&file.path);
+        let size = path.metadata()?.len();
+        if size != file.size {
+            return Err(ArtifactError(format!(
+                "artifact file {:?} is {size} bytes, expected {}",
+                file.path, file.size
+            )));
+        }
+        let actual = sha256(&path)?;
+        if actual != file.sha256 {
+            return Err(ArtifactError(format!(
+                "artifact file {:?} SHA-256 is {actual}, expected {}",
+                file.path, file.sha256
+            )));
+        }
+        total = total
+            .checked_add(size)
+            .ok_or_else(|| ArtifactError("artifact byte count overflows u64".to_owned()))?;
+    }
+    if total != ARTIFACT_TOTAL_BYTES {
+        return Err(ArtifactError(format!(
+            "artifact files total {total} bytes, expected {ARTIFACT_TOTAL_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_entries(
+    files: &[ArtifactFile],
+    direct_checkpoint_exists: bool,
+) -> std::result::Result<(), ArtifactError> {
+    if !files.iter().any(|file| file.path == CHECKPOINT_INDEX) {
+        return Err(ArtifactError(
+            "artifact manifest does not list model.safetensors.index.json".to_owned(),
+        ));
+    }
+    if direct_checkpoint_exists && !files.iter().any(|file| file.path == DIRECT_CHECKPOINT) {
+        return Err(ArtifactError(
+            "artifact contains an unlisted model.safetensors".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn sha256(path: &Path) -> std::result::Result<String, ArtifactError> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+#[derive(Deserialize)]
+struct ArtifactManifest {
+    schema_version: u32,
+    recipe: String,
+    source_repository: String,
+    source_revision: String,
+    files: Vec<ArtifactFile>,
+}
+
+#[derive(Deserialize)]
+struct ArtifactFile {
+    path: String,
+    sha256: String,
+    size: u64,
+}
+
+#[derive(Debug)]
+struct ArtifactError(String);
+
+impl From<std::io::Error> for ArtifactError {
+    fn from(error: std::io::Error) -> Self {
+        Self(error.to_string())
+    }
+}
+
+impl std::fmt::Display for ArtifactError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ArtifactError {}
+
+fn boxed<E>(error: E) -> BoxError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    Box::new(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(path: &str) -> ArtifactFile {
+        ArtifactFile {
+            path: path.to_owned(),
+            sha256: String::new(),
+            size: 0,
+        }
+    }
+
+    #[test]
+    fn checkpoint_selection_requires_the_manifest_index() {
+        let error = validate_checkpoint_entries(&[], false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "artifact manifest does not list model.safetensors.index.json",
+        );
+    }
+
+    #[test]
+    fn checkpoint_selection_rejects_an_unlisted_direct_file() {
+        let error = validate_checkpoint_entries(&[entry(CHECKPOINT_INDEX)], true).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "artifact contains an unlisted model.safetensors",
+        );
+    }
+
+    #[test]
+    fn checkpoint_selection_accepts_the_listed_index_without_a_direct_file() {
+        validate_checkpoint_entries(&[entry(CHECKPOINT_INDEX)], false).unwrap();
+    }
+}

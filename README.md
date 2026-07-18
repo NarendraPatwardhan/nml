@@ -56,10 +56,10 @@ convolutional or transformer front end, maintain a paged KV cache, route tokens
 through experts, sample the next token, and reuse the same compiled executable
 with fresh buffers.
 
-NML is an acceleration substrate, not a turnkey model-serving service. The
-Qwen3 product includes tokenizer, checkpoint, prefill, decode, and generation
-integration; request scheduling, continuous batching, network APIs, and server
-policy remain application concerns outside the substrate.
+NML is an acceleration substrate, not a turnkey model-serving service.
+`products/serve` is a separate GPT-OSS product built on that substrate; request
+scheduling, continuous batching, network APIs, and server policy remain
+product concerns and do not enter the framework crates.
 
 ## Why NML
 
@@ -105,6 +105,10 @@ weight traffic. These GPUs do not gain native FP4 arithmetic, and speedups
 remain workload-dependent, but users still gain materially lower memory use
 and bandwidth demand, making larger models, batches, and contexts practical on
 hardware they already own.
+
+NML is among the earliest open systems to execute compact NVFP4 models
+efficiently across Turing, Ampere, and Hopper, using fused
+architecture-specific W4A16 paths without persistent dense-weight expansion.
 
 ### Sharding is part of the graph
 
@@ -155,12 +159,12 @@ bb test --config=buildbuddy --config=cuda \
   //:cuda_remote_contracts //:cuda_package_contracts
 ```
 
-On a supported local NVIDIA GPU, execute the real device contracts:
-
-```sh
-bb test --config=buildbuddy --config=cuda --cache_test_results=no \
-  //:cuda_device_contracts
-```
+Real GPU acceptance does not run on BuildBuddy's CPU workers. BuildBuddy builds
+the immutable substrate or product contract image; an explicitly selected local
+or rented NVIDIA venue pulls that exact digest and runs the in-image contract
+service. The product image accepts model and oracle paths only as product-owned
+mounted inputs, while the reusable runner and RunPod controller remain
+model-agnostic.
 
 The CPU suite is intentionally substantial: it creates four logical CPU
 devices so sharded placement and collectives execute numerically instead of
@@ -224,23 +228,22 @@ manifest once, then accepts fresh activation buffers on each call.
 |---|---|
 | CPU execution | Product path; real numerical, lifecycle, sharding, collective, and performance contracts run on a four-device Linux CPU topology. |
 | CUDA execution | Product path from SM75 upward; portable XLA CUDA is exercised on a GTX 1660 Ti. Unsupported GPUs fail during platform creation. |
-| Ordinary attention | Portable CPU/CUDA path complete. FA2 SM80-SM89 and FA3 SM90 paths are built into the CUDA product graph. |
-| Paged attention | Portable blockwise CPU/CUDA path complete; Triton optimized paths are built for compatible SM80/SM90 GPUs. |
-| MoE | Portable CPU/CUDA execution complete; four-device CPU expert sharding executes numerically; grouped Triton kernels are compiled for SM80 and newer. |
+| Ordinary attention | Portable CPU/CUDA path complete. FA2 executed numerically on SM86 and FA3 executed numerically on SM90 through ordinary dispatch. |
+| Paged attention | Portable blockwise CPU/CUDA path complete; optimized Triton execution passed on SM86 and SM90. |
+| MoE | Portable CPU/CUDA execution complete; four-device CPU expert sharding executes numerically; grouped Triton execution passed on SM86 and SM90. |
 | Distributed execution | Real Shardy placement and collectives are verified on CPU. Multi-GPU CUDA execution remains hardware-deferred. |
-| Quantization | W4A16, W8A8, and NVFP4 are designed product goals but have not been implemented. |
+| Quantization | NVFP4 recipe v1 has compact checkpoint, CPU, SM75 CUDA, and SM80+ Triton execution paths. W4A16 and W8A8 remain independent future verticals. |
 | Training | No autograd engine and no supplied analytic backward graph library yet. |
 
-The SM80/SM90 attention and grouped-MoE binaries are present and verified at
-the compilation, linking, TTIR, custom-call, and dispatch layers. Their runtime
-numerical and performance contracts remain explicitly deferred until matching
-GPU hardware is rented; they are not counted as executed capabilities today.
+The SM80-class and SM90 attention and grouped-MoE paths have real suitable-GPU
+numerical evidence. Dedicated end-to-end performance characterization remains
+separate work and is not inferred from those correctness runs.
 
 ## Supported Platforms
 
 | Host | CPU target | NVIDIA CUDA target | Current runtime evidence |
 |---|---:|---:|---|
-| Linux x86-64 | Yes | Yes | Four-device CPU and SM75 CUDA |
+| Linux x86-64 | Yes | Yes | Four-device CPU plus SM75, SM86, and SM90 CUDA |
 | Linux AArch64 | Yes | Yes | Host and package-selection contracts; native execution pending |
 | macOS Apple Silicon | Yes | No | Host contract present; native execution pending |
 | Windows | No | No | Outside the product scope |
@@ -258,7 +261,7 @@ the tensor-program API.
 | [`crates/nml-ir`](./crates/nml-ir) | Typed tensor-program construction and StableHLO lowering |
 | [`crates/nml-runtime`](./crates/nml-runtime) | Platforms, persistent buffers, executables, arguments, results, and KV-cache ownership |
 | [`crates/nml-checkpoint`](./crates/nml-checkpoint) | SafeTensors discovery, model declarations, loading, and graph-facing model construction |
-| [`products/serve`](./products/serve) | Qwen model execution and the planned continuous-batching serving control plane |
+| [`products/serve`](./products/serve) | Persistent GPT-OSS model execution and the future continuous-batching serving control plane |
 
 ## Acknowledgements
 

@@ -23,7 +23,7 @@ pub struct NvFp4LinearConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NvFp4GroupedRole {
     GateUp,
-    GptOssDown,
+    ClampedSwiGluDown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -357,11 +357,11 @@ pub fn build_nvfp4_embedding(config: NvFp4EmbeddingConfig) -> Result<String, Err
     builder.finish()
 }
 
-/// Builds one compact, input-major GPT-OSS expert projection.
+/// Builds one compact, input-major routed expert projection.
 ///
 /// Routing is represented by the deterministic padded assignment schedule
 /// authored in StableHLO. Gate/up writes interleaved biased channels. Down
-/// consumes those channels, applies GPT-OSS's exact clamped residual SwiGLU,
+/// consumes those channels, applies the selected clamped residual SwiGLU,
 /// adds the per-expert bias, and applies the route weight.
 pub fn build_nvfp4_grouped_projection(
     config: NvFp4GroupedProjectionConfig,
@@ -369,7 +369,7 @@ pub fn build_nvfp4_grouped_projection(
     let config = config.validate()?;
     let name = match config.role {
         NvFp4GroupedRole::GateUp => "nvfp4_grouped_gate_up",
-        NvFp4GroupedRole::GptOssDown => "nvfp4_grouped_down",
+        NvFp4GroupedRole::ClampedSwiGluDown => "nvfp4_grouped_down",
     };
     let mut builder = Builder::new(name)?;
     let input = pointer(&mut builder, "input", config.dtype)?;
@@ -380,7 +380,7 @@ pub fn build_nvfp4_grouped_projection(
     let global_scale = pointer(&mut builder, "global_scale", DType::F32)?;
     let bias = pointer(&mut builder, "bias", config.dtype)?;
     let expert_offset_pointer = pointer(&mut builder, "expert_offset", DType::I32)?;
-    let routing_weights = matches!(config.role, NvFp4GroupedRole::GptOssDown)
+    let routing_weights = matches!(config.role, NvFp4GroupedRole::ClampedSwiGluDown)
         .then(|| pointer(&mut builder, "routing_weights", config.dtype))
         .transpose()?;
     let output = pointer(&mut builder, "output", config.dtype)?;
@@ -424,12 +424,12 @@ pub fn build_nvfp4_grouped_projection(
     let source_rows = builder.cast(&source_rows, DType::I64)?;
     let input_stride_value = match config.role {
         NvFp4GroupedRole::GateUp => config.input_size,
-        NvFp4GroupedRole::GptOssDown => {
+        NvFp4GroupedRole::ClampedSwiGluDown => {
             config
                 .input_size
                 .checked_mul(2)
                 .ok_or(Error::InvalidKernelSpec(
-                    "GPT-OSS activation stride overflows",
+                    "clamped SwiGLU activation stride overflows",
                 ))?
         }
     };
@@ -480,7 +480,7 @@ pub fn build_nvfp4_grouped_projection(
 
             let input_columns = match config.role {
                 NvFp4GroupedRole::GateUp => body.expand_dimension(&k_i64, 0)?,
-                NvFp4GroupedRole::GptOssDown => {
+                NvFp4GroupedRole::ClampedSwiGluDown => {
                     let two = body.integer(2, DType::I64)?;
                     let interleaved = body.multiply(&k_i64, &two)?;
                     body.expand_dimension(&interleaved, 0)?
@@ -489,12 +489,12 @@ pub fn build_nvfp4_grouped_projection(
             let input_offsets = body.add(&source_bases, &input_columns)?;
             let input_addresses = body.add_pointer(&input, &input_offsets)?;
             let mut input_tile = body.load_masked(&input_addresses, &input_mask, &input_zero)?;
-            if matches!(config.role, NvFp4GroupedRole::GptOssDown) {
+            if matches!(config.role, NvFp4GroupedRole::ClampedSwiGluDown) {
                 let one = body.integer(1, DType::I64)?;
                 let up_offsets = body.add(&input_offsets, &one)?;
                 let up_addresses = body.add_pointer(&input, &up_offsets)?;
                 let up = body.load_masked(&up_addresses, &input_mask, &input_zero)?;
-                input_tile = gpt_oss_activation(body, input_tile, up, config.dtype)?;
+                input_tile = clamped_residual_swiglu(body, input_tile, up, config.dtype)?;
             }
 
             let k_i64 = body.expand_dimension(&k_i64, 1)?;
@@ -574,7 +574,7 @@ pub fn build_nvfp4_grouped_projection(
     builder.finish()
 }
 
-fn gpt_oss_activation(
+fn clamped_residual_swiglu(
     builder: &mut Builder,
     gate: super::Value,
     up: super::Value,

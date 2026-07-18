@@ -432,8 +432,13 @@ pub mod io {
         prefix: String,
     }
 
+    /// Exact physical-transfer accounting for one transactional parameter load.
+    ///
+    /// Logical parameter count is deliberately absent: tied parameters and
+    /// structured representations share physical components, while this report
+    /// describes the bytes and operations that actually crossed the loader.
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-    struct LoadAccounting {
+    pub struct LoadAccounting {
         planned: usize,
         reads: usize,
         allocations: usize,
@@ -442,6 +447,28 @@ pub mod io {
         resident_bytes: usize,
         prepared_bytes: usize,
         peak_staging_bytes: usize,
+    }
+
+    impl LoadAccounting {
+        pub const fn physical_components(self) -> usize {
+            self.planned
+        }
+
+        pub const fn source_bytes(self) -> usize {
+            self.source_bytes
+        }
+
+        pub const fn resident_bytes(self) -> usize {
+            self.resident_bytes
+        }
+
+        pub const fn prepared_bytes(self) -> usize {
+            self.prepared_bytes
+        }
+
+        pub const fn peak_staging_bytes(self) -> usize {
+            self.peak_staging_bytes
+        }
     }
 
     /// Owns every persistent buffer until the complete logical model has been
@@ -600,7 +627,7 @@ pub mod io {
             Ok(self.load_accounted(model, platform, options)?.0)
         }
 
-        fn load_accounted<T: ParameterTree>(
+        pub fn load_accounted<T: ParameterTree>(
             &self,
             model: &T,
             platform: &Platform,
@@ -826,7 +853,8 @@ pub mod io {
         }
     }
 
-    /// Bounded loader policy without exposing private plans or accounting.
+    /// Bounded loader policy; physical plans remain private while their exact
+    /// aggregate accounting is returned by `ParameterSet::load_accounted`.
     pub struct LoadOptions {
         sharding: Sharding,
         memory: Memory,

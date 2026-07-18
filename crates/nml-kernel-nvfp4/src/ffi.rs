@@ -1,6 +1,6 @@
 //! XLA typed-FFI adapter for the portable CPU linear kernel.
 
-use crate::{Weight, embedding, gpt_oss_experts, linear};
+use crate::{Weight, embedding, linear, routed_clamped_swiglu};
 use nml_pjrt::{Ffi, FfiHandler};
 use nml_pjrt_sys as sys;
 use nml_types::{BFloat16, DType, F16, Shape};
@@ -12,7 +12,7 @@ use std::sync::{Mutex, OnceLock};
 
 const LINEAR_TARGET: &str = "nml.nvfp4.linear";
 const EMBEDDING_TARGET: &str = "nml.nvfp4.embedding";
-const GPT_OSS_EXPERTS_TARGET: &str = "nml.nvfp4.gpt_oss_experts";
+const ROUTED_SWIGLU_TARGET: &str = "nml.nvfp4.routed_swiglu";
 static REGISTERED: OnceLock<Mutex<HashSet<(usize, &'static str)>>> = OnceLock::new();
 
 // Bindgen leaves this runtime-owned table opaque. The handler needs only the
@@ -37,7 +37,7 @@ pub fn register_cpu(ffi: &Ffi, platform_name: &str) -> Result<(), nml_pjrt::Erro
     for (target, handler) in [
         (LINEAR_TARGET, cpu_linear as *const ()),
         (EMBEDDING_TARGET, cpu_embedding as *const ()),
-        (GPT_OSS_EXPERTS_TARGET, cpu_gpt_oss_experts as *const ()),
+        (ROUTED_SWIGLU_TARGET, cpu_routed_swiglu as *const ()),
     ] {
         let key = (ffi.plugin_identity(), target);
         if registered.contains(&key) {
@@ -86,7 +86,7 @@ unsafe extern "C" fn cpu_embedding(raw: *mut sys::XLA_FFI_CallFrame) -> *mut sys
     }
 }
 
-unsafe extern "C" fn cpu_gpt_oss_experts(
+unsafe extern "C" fn cpu_routed_swiglu(
     raw: *mut sys::XLA_FFI_CallFrame,
 ) -> *mut sys::XLA_FFI_Error {
     let Some(frame) = (unsafe { raw.as_mut() }) else {
@@ -95,7 +95,7 @@ unsafe extern "C" fn cpu_gpt_oss_experts(
     if metadata_query(frame) {
         return null_mut();
     }
-    match unsafe { execute_gpt_oss_experts(frame) } {
+    match unsafe { execute_routed_swiglu(frame) } {
         Ok(()) => null_mut(),
         Err((code, message)) => ffi_error(frame, code, &message),
     }
@@ -225,7 +225,7 @@ unsafe fn execute_linear(frame: &mut sys::XLA_FFI_CallFrame) -> Result<(), Handl
     Ok(())
 }
 
-unsafe fn execute_gpt_oss_experts(
+unsafe fn execute_routed_swiglu(
     frame: &mut sys::XLA_FFI_CallFrame,
 ) -> Result<(), HandlerFailure> {
     require_struct(
@@ -235,7 +235,7 @@ unsafe fn execute_gpt_oss_experts(
     )?;
     if frame.stage != sys::XLA_FFI_ExecutionStage_XLA_FFI_ExecutionStage_EXECUTE {
         return Err(invalid(
-            "NVFP4 GPT-OSS experts were called outside execute stage",
+            "NVFP4 routed clamped SwiGLU was called outside execute stage",
         ));
     }
     let hidden = unsafe { argument(frame, 0, 11)? };
@@ -271,7 +271,7 @@ unsafe fn execute_gpt_oss_experts(
         || dimensions(routing_weights)? != routing_dimensions
         || output_dimensions != hidden_dimensions
     {
-        return Err(invalid("NVFP4 GPT-OSS experts received invalid ranks"));
+        return Err(invalid("NVFP4 routed clamped SwiGLU received invalid ranks"));
     }
     let tokens = to_usize(hidden_dimensions[0], "token count")?;
     let hidden_size = to_usize(hidden_dimensions[1], "hidden size")?;
@@ -280,7 +280,7 @@ unsafe fn execute_gpt_oss_experts(
     let doubled_intermediate = to_usize(gate_bias_dimensions[1], "gate/up output width")?;
     if doubled_intermediate == 0 || doubled_intermediate % 2 != 0 {
         return Err(invalid(
-            "NVFP4 GPT-OSS gate/up output width must be positive and even",
+            "NVFP4 clamped SwiGLU gate/up width must be positive and even",
         ));
     }
     let intermediate = doubled_intermediate / 2;
@@ -308,13 +308,13 @@ unsafe fn execute_gpt_oss_experts(
         || down_bias_dimensions != [gate_payload_dimensions[0], hidden_size as i64]
     {
         return Err(invalid(
-            "NVFP4 GPT-OSS expert component shapes are inconsistent",
+            "NVFP4 routed clamped SwiGLU component shapes are inconsistent",
         ));
     }
     for buffer in [gate_payload, gate_scales, down_payload, down_scales] {
         if buffer.dtype != sys::XLA_FFI_DataType_XLA_FFI_DataType_U8 {
             return Err(invalid(
-                "NVFP4 GPT-OSS payloads and block scales must use U8 buffers",
+                "NVFP4 routed SwiGLU payloads and block scales must use U8 buffers",
             ));
         }
     }
@@ -324,7 +324,7 @@ unsafe fn execute_gpt_oss_experts(
             || global.data.is_null()
         {
             return Err(invalid(
-                "NVFP4 GPT-OSS global scales must be non-null F32 scalars",
+                "NVFP4 routed SwiGLU global scales must be non-null F32 scalars",
             ));
         }
     }
@@ -339,36 +339,36 @@ unsafe fn execute_gpt_oss_experts(
         )
     {
         return Err(invalid(
-            "NVFP4 GPT-OSS activations and biases must share F16 or BF16",
+            "NVFP4 routed SwiGLU activations and biases must share F16 or BF16",
         ));
     }
 
     let route_count = element_count(routing_dimensions, "routing")?;
     let hidden_count = tokens
         .checked_mul(hidden_size)
-        .ok_or_else(|| invalid("NVFP4 GPT-OSS hidden extent overflows"))?;
+        .ok_or_else(|| invalid("NVFP4 routed SwiGLU hidden extent overflows"))?;
     let gate_payload_count = experts
         .checked_mul(gate_inputs)
         .and_then(|value| value.checked_mul(doubled_intermediate.div_ceil(2)))
-        .ok_or_else(|| invalid("NVFP4 GPT-OSS gate/up payload extent overflows"))?;
+        .ok_or_else(|| invalid("NVFP4 routed SwiGLU gate/up payload extent overflows"))?;
     let gate_scale_count = experts
         .checked_mul(gate_inputs)
         .and_then(|value| value.checked_mul(doubled_intermediate.div_ceil(16)))
-        .ok_or_else(|| invalid("NVFP4 GPT-OSS gate/up scale extent overflows"))?;
+        .ok_or_else(|| invalid("NVFP4 routed SwiGLU gate/up scale extent overflows"))?;
     let gate_bias_count = experts
         .checked_mul(doubled_intermediate)
-        .ok_or_else(|| invalid("NVFP4 GPT-OSS gate/up bias extent overflows"))?;
+        .ok_or_else(|| invalid("NVFP4 routed SwiGLU gate/up bias extent overflows"))?;
     let down_payload_count = experts
         .checked_mul(intermediate)
         .and_then(|value| value.checked_mul(hidden_size.div_ceil(2)))
-        .ok_or_else(|| invalid("NVFP4 GPT-OSS down payload extent overflows"))?;
+        .ok_or_else(|| invalid("NVFP4 routed SwiGLU down payload extent overflows"))?;
     let down_scale_count = experts
         .checked_mul(intermediate)
         .and_then(|value| value.checked_mul(hidden_size.div_ceil(16)))
-        .ok_or_else(|| invalid("NVFP4 GPT-OSS down scale extent overflows"))?;
+        .ok_or_else(|| invalid("NVFP4 routed SwiGLU down scale extent overflows"))?;
     let down_bias_count = experts
         .checked_mul(hidden_size)
-        .ok_or_else(|| invalid("NVFP4 GPT-OSS down bias extent overflows"))?;
+        .ok_or_else(|| invalid("NVFP4 routed SwiGLU down bias extent overflows"))?;
 
     let dtype = if hidden.dtype == sys::XLA_FFI_DataType_XLA_FFI_DataType_F16 {
         DType::F16
@@ -409,7 +409,7 @@ unsafe fn execute_gpt_oss_experts(
     let gate_bias = read_activation(gate_bias, gate_bias_count)?;
     let down_bias = read_activation(down_bias, down_bias_count)?;
     let mut computed = vec![0.0f32; hidden_count];
-    gpt_oss_experts(
+    routed_clamped_swiglu(
         &hidden,
         tokens,
         &indices,

@@ -25,54 +25,26 @@ const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
 const MAX_CONTRACT_TIMEOUT_SECONDS: u64 = 60 * 60;
 const MAX_TOTAL_TIMEOUT_SECONDS: u64 = 3 * 60 * 60;
 
-const CONTRACTS: [ContractDefinition; 7] = [
-    ContractDefinition {
-        name: "flash_attention_device_capability",
-        rlocation: env!("NML_FLASH_ATTENTION_CAPABILITY_CONTRACT"),
-        arguments: &[],
-    },
-    ContractDefinition {
-        name: "cuda_runtime",
-        rlocation: env!("NML_CUDA_RUNTIME_CONTRACT"),
-        arguments: &[],
-    },
-    ContractDefinition {
-        name: "linear",
-        rlocation: env!("NML_LINEAR_CONTRACT"),
-        arguments: &[],
-    },
-    ContractDefinition {
-        name: "attention",
-        rlocation: env!("NML_ATTENTION_CONTRACT"),
-        arguments: &[],
-    },
-    ContractDefinition {
-        name: "neural_ops",
-        rlocation: env!("NML_NEURAL_OPS_CONTRACT"),
-        arguments: &[],
-    },
-    ContractDefinition {
-        name: "execution_performance",
-        rlocation: env!("NML_EXECUTION_PERFORMANCE_CONTRACT"),
-        // This executable is a Rust test binary. Device contracts invoke test
-        // executables directly rather than through Bazel's test wrapper, so
-        // the harness argument is part of the immutable contract definition.
-        // Keeping it here ensures phase measurements survive into the lease
-        // result instead of being swallowed by the harness's output capture.
-        arguments: &["--nocapture"],
-    },
-    ContractDefinition {
-        name: "nvfp4",
-        rlocation: env!("NML_NVFP4_CONTRACT"),
-        arguments: &[],
-    },
-];
+#[derive(Clone, Copy)]
+pub struct RunnerDefinition {
+    pub service: &'static str,
+    pub cuda_runtime_rlocation: &'static str,
+    pub contracts: &'static [ContractDefinition],
+    pub isolated_environment: &'static [&'static str],
+}
 
 #[derive(Clone, Copy)]
-struct ContractDefinition {
-    name: &'static str,
-    rlocation: &'static str,
-    arguments: &'static [&'static str],
+pub struct ContractDefinition {
+    pub name: &'static str,
+    pub rlocation: &'static str,
+    pub arguments: &'static [&'static str],
+    pub environment: &'static [ChildEnvironmentDefinition],
+}
+
+#[derive(Clone, Copy)]
+pub struct ChildEnvironmentDefinition {
+    pub name: &'static str,
+    pub required: bool,
 }
 
 #[derive(Clone)]
@@ -84,10 +56,12 @@ struct AppState {
 }
 
 struct Configuration {
+    service: &'static str,
     lease_token: String,
     identity: ArtifactIdentity,
     runfiles_directory: PathBuf,
     runtime_rlocation: &'static str,
+    isolated_environment: &'static [&'static str],
     contracts: Vec<ResolvedContract>,
     hardware: Result<Vec<GpuIdentity>, String>,
 }
@@ -97,6 +71,14 @@ struct ResolvedContract {
     name: &'static str,
     path: PathBuf,
     arguments: &'static [&'static str],
+    environment: Vec<ResolvedChildEnvironment>,
+}
+
+#[derive(Clone)]
+struct ResolvedChildEnvironment {
+    name: &'static str,
+    required: bool,
+    value: Option<OsString>,
 }
 
 enum ExecutionState {
@@ -222,8 +204,15 @@ struct ErrorResponse {
     error: String,
 }
 
-pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
-    let configuration = Arc::new(Configuration::from_environment()?);
+/// Serves one immutable, build-time allowlist of device contracts.
+///
+/// The runner owns lifecycle, authentication, deadlines, process isolation,
+/// and result capture. The caller owns contract identity and any required
+/// inputs. This keeps model and product policy out of the reusable runner.
+pub async fn serve(
+    definition: &'static RunnerDefinition,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let configuration = Arc::new(Configuration::from_environment(definition)?);
     let listen: SocketAddr = std::env::var("NML_CONTRACT_LISTEN")
         .unwrap_or_else(|_| "0.0.0.0:8080".to_owned())
         .parse()?;
@@ -266,7 +255,10 @@ async fn shutdown_signal() {
 }
 
 impl Configuration {
-    fn from_environment() -> Result<Self, Box<dyn std::error::Error>> {
+    fn from_environment(
+        definition: &'static RunnerDefinition,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        validate_definition(definition)?;
         let lease_token = required_environment("NML_CONTRACT_LEASE_TOKEN")?;
         if lease_token.len() < 32 {
             return Err("NML_CONTRACT_LEASE_TOKEN must contain at least 32 bytes".into());
@@ -278,7 +270,8 @@ impl Configuration {
         };
         let runfiles = Runfiles::create()?;
         let runfiles_directory = runfiles_directory()?;
-        let contracts = CONTRACTS
+        let contracts = definition
+            .contracts
             .iter()
             .map(|definition| {
                 let path = runfiles.rlocation(definition.rlocation).ok_or_else(|| {
@@ -298,25 +291,36 @@ impl Configuration {
                     name: definition.name,
                     path,
                     arguments: definition.arguments,
+                    environment: definition
+                        .environment
+                        .iter()
+                        .map(|variable| ResolvedChildEnvironment {
+                            name: variable.name,
+                            required: variable.required,
+                            value: std::env::var_os(variable.name),
+                        })
+                        .collect(),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
         let runtime = runfiles
-            .rlocation(env!("NML_CUDA_RUNTIME"))
+            .rlocation(definition.cuda_runtime_rlocation)
             .ok_or_else(|| {
                 format!(
                     "CUDA runtime has no runfiles entry {:?}",
-                    env!("NML_CUDA_RUNTIME")
+                    definition.cuda_runtime_rlocation
                 )
             })?;
         if !runtime.exists() {
             return Err(format!("CUDA runtime is absent at {}", runtime.display()).into());
         }
         Ok(Self {
+            service: definition.service,
             lease_token,
             identity,
             runfiles_directory,
-            runtime_rlocation: env!("NML_CUDA_RUNTIME"),
+            runtime_rlocation: definition.cuda_runtime_rlocation,
+            isolated_environment: definition.isolated_environment,
             contracts,
             hardware: query_hardware(),
         })
@@ -330,10 +334,72 @@ impl Configuration {
     }
 }
 
-async fn live() -> Json<LiveResponse> {
+fn validate_definition(
+    definition: &RunnerDefinition,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if definition.service.is_empty() || definition.cuda_runtime_rlocation.is_empty() {
+        return Err("runner service and CUDA runtime rlocation must be non-empty".into());
+    }
+    if definition.contracts.is_empty() {
+        return Err("runner must contain at least one contract".into());
+    }
+    for (index, name) in definition.isolated_environment.iter().enumerate() {
+        validate_environment_name(name)?;
+        if definition.isolated_environment[..index].contains(name) {
+            return Err(format!("isolated environment contains duplicate {name:?}").into());
+        }
+    }
+    for (index, contract) in definition.contracts.iter().enumerate() {
+        if contract.name.is_empty() || contract.rlocation.is_empty() {
+            return Err("contract names and rlocations must be non-empty".into());
+        }
+        if definition.contracts[..index]
+            .iter()
+            .any(|candidate| candidate.name == contract.name)
+        {
+            return Err(format!("runner contains duplicate contract {:?}", contract.name).into());
+        }
+        for (environment_index, variable) in contract.environment.iter().enumerate() {
+            validate_environment_name(variable.name)?;
+            if contract.environment[..environment_index]
+                .iter()
+                .any(|candidate| candidate.name == variable.name)
+            {
+                return Err(format!(
+                    "contract {:?} contains duplicate environment variable {:?}",
+                    contract.name, variable.name
+                )
+                .into());
+            }
+            if !definition.isolated_environment.contains(&variable.name) {
+                return Err(format!(
+                    "contract {:?} environment variable {:?} is absent from the runner isolation set",
+                    contract.name, variable.name
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_environment_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut bytes = name.bytes();
+    if !name.starts_with("NML_")
+        || !bytes
+        .next()
+        .is_some_and(|byte| byte == b'_' || byte.is_ascii_uppercase())
+        || !bytes.all(|byte| byte == b'_' || byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        return Err(format!("invalid child environment name {name:?}").into());
+    }
+    Ok(())
+}
+
+async fn live(State(state): State<AppState>) -> Json<LiveResponse> {
     Json(LiveResponse {
         schema_version: SCHEMA_VERSION,
-        service: "nml-device-contract-runner",
+        service: state.configuration.service,
     })
 }
 
@@ -487,6 +553,16 @@ fn validate_request(
             .iter()
             .find(|contract| contract.name == name)
             .ok_or_else(|| format!("contract {name:?} is not in the build-time allowlist"))?;
+        if let Some(variable) = contract
+            .environment
+            .iter()
+            .find(|variable| variable.required && variable.value.is_none())
+        {
+            return Err(format!(
+                "contract {name:?} requires runner environment variable {}",
+                variable.name
+            ));
+        }
         selection.push(contract.clone());
     }
     Ok(selection)
@@ -568,6 +644,18 @@ async fn execute_contract(
 ) -> ContractResult {
     let started = Instant::now();
     let mut command = Command::new(&contract.path);
+    // The runner itself receives operator-provided mount paths. Remove every
+    // allowlisted child-only variable from the inherited environment before
+    // selectively restoring the variables declared by this exact contract.
+    // Generic CUDA contracts therefore cannot observe product model paths.
+    for name in configuration.isolated_environment {
+        command.env_remove(name);
+    }
+    for variable in &contract.environment {
+        if let Some(value) = &variable.value {
+            command.env(variable.name, value);
+        }
+    }
     command
         .args(contract.arguments)
         .env("RUNFILES_DIR", &configuration.runfiles_directory)
@@ -875,6 +963,33 @@ fn unix_milliseconds() -> u128 {
 mod tests {
     use super::*;
 
+    const REQUIRED_INPUT: ChildEnvironmentDefinition = ChildEnvironmentDefinition {
+        name: "NML_TEST_INPUT",
+        required: true,
+    };
+    const TEST_CONTRACTS: &[ContractDefinition] = &[
+        ContractDefinition {
+            name: "plain",
+            rlocation: "plain/runfile",
+            arguments: &[],
+            environment: &[],
+        },
+        ContractDefinition {
+            name: "measured",
+            rlocation: "measured/runfile",
+            arguments: &["--nocapture"],
+            environment: &[REQUIRED_INPUT],
+        },
+    ];
+    const TEST_DEFINITION: RunnerDefinition = RunnerDefinition {
+        service: "test-device-contracts",
+        cuda_runtime_rlocation: "cuda/runtime",
+        contracts: TEST_CONTRACTS,
+        isolated_environment: &["NML_TEST_INPUT"],
+    };
+    const DUPLICATE_CONTRACTS: &[ContractDefinition] =
+        &[TEST_CONTRACTS[0], TEST_CONTRACTS[0]];
+
     #[test]
     fn output_tail_retains_only_the_declared_suffix() {
         let mut tail = VecDeque::new();
@@ -912,23 +1027,25 @@ mod tests {
     }
 
     #[test]
-    fn performance_contract_preserves_phase_output() {
-        let performance = CONTRACTS
-            .iter()
-            .find(|contract| contract.name == "execution_performance")
-            .expect("performance contract is permanent");
-        assert_eq!(performance.arguments, ["--nocapture"]);
-        assert!(
-            CONTRACTS
-                .iter()
-                .filter(|contract| contract.name != "execution_performance")
-                .all(|contract| contract.arguments.is_empty())
-        );
+    fn runner_definitions_are_closed_unique_and_isolated() {
+        validate_definition(&TEST_DEFINITION).unwrap();
+        assert_eq!(TEST_CONTRACTS[1].arguments, ["--nocapture"]);
+
+        let missing_isolation = RunnerDefinition {
+            isolated_environment: &[],
+            ..TEST_DEFINITION
+        };
+        assert!(validate_definition(&missing_isolation).is_err());
+        let duplicate_contract = RunnerDefinition {
+            contracts: DUPLICATE_CONTRACTS,
+            ..TEST_DEFINITION
+        };
+        assert!(validate_definition(&duplicate_contract).is_err());
     }
 
     #[test]
     fn selection_is_allowlisted_unique_and_bounded() {
-        let configuration = Configuration {
+        let mut configuration = Configuration {
             lease_token: "x".repeat(32),
             identity: ArtifactIdentity {
                 image_digest: format!("sha256:{}", "a".repeat(64)),
@@ -937,32 +1054,69 @@ mod tests {
             },
             runfiles_directory: PathBuf::from("/runfiles"),
             runtime_rlocation: "runtime",
-            contracts: vec![ResolvedContract {
-                name: "cuda_runtime",
-                path: PathBuf::from("/contract"),
-                arguments: &[],
-            }],
+            contracts: vec![
+                ResolvedContract {
+                    name: "plain",
+                    path: PathBuf::from("/contract"),
+                    arguments: &[],
+                    environment: Vec::new(),
+                },
+                ResolvedContract {
+                    name: "requires_input",
+                    path: PathBuf::from("/input-contract"),
+                    arguments: &["--nocapture"],
+                    environment: vec![
+                        ResolvedChildEnvironment {
+                            name: "NML_TEST_INPUT",
+                            required: true,
+                            value: None,
+                        },
+                        ResolvedChildEnvironment {
+                            name: "NML_SECOND_TEST_INPUT",
+                            required: true,
+                            value: None,
+                        },
+                    ],
+                },
+            ],
             hardware: Err("not consulted by request validation".to_owned()),
+            service: "test-device-contracts",
+            isolated_environment: &["NML_TEST_INPUT", "NML_SECOND_TEST_INPUT"],
         };
         let request = |contracts: Vec<&str>, per_contract, total| RunRequest {
             contracts: contracts.into_iter().map(str::to_owned).collect(),
             per_contract_timeout_seconds: per_contract,
             total_timeout_seconds: total,
         };
-        assert!(validate_request(&configuration, &request(vec!["cuda_runtime"], 10, 20)).is_ok());
+        assert!(validate_request(&configuration, &request(vec!["plain"], 10, 20)).is_ok());
         assert!(validate_request(&configuration, &request(vec!["unknown"], 10, 20)).is_err());
+        let missing_input = validate_request(
+            &configuration,
+            &request(vec!["requires_input"], 10, 20),
+        )
+        .err()
+            .expect("the contract requires its declared input");
+        assert!(missing_input.contains("NML_TEST_INPUT"));
+        configuration.contracts[1].environment[0].value = Some(OsString::from("/input"));
+        let missing_second_input = validate_request(
+            &configuration,
+            &request(vec!["requires_input"], 10, 20),
+        )
+        .err()
+            .expect("the contract requires every declared input");
+        assert!(missing_second_input.contains("NML_SECOND_TEST_INPUT"));
         assert!(
             validate_request(
                 &configuration,
-                &request(vec!["cuda_runtime", "cuda_runtime"], 10, 20),
+                &request(vec!["plain", "plain"], 10, 20),
             )
             .is_err()
         );
-        assert!(validate_request(&configuration, &request(vec!["cuda_runtime"], 0, 20)).is_err());
+        assert!(validate_request(&configuration, &request(vec!["plain"], 0, 20)).is_err());
         assert!(
             validate_request(
                 &configuration,
-                &request(vec!["cuda_runtime"], 10, MAX_TOTAL_TIMEOUT_SECONDS + 1),
+                &request(vec!["plain"], 10, MAX_TOTAL_TIMEOUT_SECONDS + 1),
             )
             .is_err()
         );

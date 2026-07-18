@@ -182,7 +182,7 @@ Authoritative format references:
 ## 4. Current NML assessment
 
 NML now has the representation-neutral parameter boundary needed by compact
-weights. Dense Qwen uses that boundary as the one-component case; NVFP4 still
+weights. Dense parameters use that boundary as the one-component case; NVFP4 still
 requires its exact artifact schema, packed encodings, sharding rules, semantic
 operations, and capability-selected kernels. The implementation must extend
 this substrate rather than reintroducing a parallel quantized model stack.
@@ -799,6 +799,25 @@ must use component physical extents rather than logical `Shape::byte_count`.
 Each component retains bounded chunking, staging ownership, exact reads, and
 failure cleanup.
 
+### 12.1 Product composition and executable reuse
+
+NVFP4 representation code does not own a transformer. The selected GPT-OSS
+product declares its exact checkpoint and builds four bounded executables for
+each finite request shape family: embedding, a reusable sliding-attention
+layer, a reusable full-attention layer, and the final head. The product binds
+each loaded decoder layer to the matching representative executable slots only
+after the runtime verifies logical shapes, representation identity, component
+roles and physical storage, platform, placement, and compiled bindings.
+
+The product enqueues these components through PJRT readiness dependencies.
+Hidden state and K/V storage are donated between calls, while the host waits
+only at the token observation boundary. Uploaded parameters and compiled shape
+families are process-persistent; tokens, positions, the shared I32 page table,
+and K/V buffers are request-local. GPT-OSS names, Harmony, attention schedules,
+and artifact identities never enter representation, kernel, IR, checkpoint, or
+runtime crates. The framework operation used by the model is the semantic
+`routed_clamped_swiglu`, not a model-named escape hatch.
+
 ## 13. Correctness contract
 
 ### 13.1 Representation tests
@@ -970,7 +989,7 @@ Exit: every bit required to reconstruct every logical weight is unambiguous.
 - Delete superseded one-record/one-buffer compatibility paths instead of
   preserving aliases.
 
-Exit: dense Qwen remains supported through the new one-component parameter
+Exit: dense parameter execution remains supported through the new one-component parameter
 case, and an NVFP4 parameter loads without expansion.
 
 ### Phase C: establish exact CPU execution

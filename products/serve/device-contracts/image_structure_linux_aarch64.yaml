@@ -1,0 +1,47 @@
+schemaVersion: "2.0.0"
+
+metadataTest:
+  envVars:
+    - key: NVIDIA_DRIVER_CAPABILITIES
+      value: compute,utility
+  labels:
+    - key: org.opencontainers.image.title
+      value: nml-gpt-oss-device-contracts
+    - key: org.opencontainers.image.source
+      value: https://github.com/NarendraPatwardhan/nml
+    - key: org.opencontainers.image.description
+      value: NML GPT-OSS 20B NVFP4 CUDA product acceptance
+  entrypoint:
+    - /usr/local/bin/nml-gpt-oss-device-contracts
+  cmd: []
+  exposedPorts:
+    - "8080/tcp"
+  workdir: /usr/local/bin/nml-gpt-oss-device-contracts.runfiles/_main
+
+fileExistenceTests:
+  - name: product contract runner is executable
+    path: /usr/local/bin/nml-gpt-oss-device-contracts
+    shouldExist: true
+    isExecutableBy: owner
+    uid: 0
+    gid: 0
+  - name: generation contract is packaged
+    path: /.shared_runfiles/_main/products/serve/gpt_oss_20b_nvfp4_cuda_generation_test
+    shouldExist: true
+    isExecutableBy: owner
+  - name: independent acceptance contract is packaged
+    path: /.shared_runfiles/_main/products/serve/gpt_oss_20b_nvfp4_cuda_contract_test
+    shouldExist: true
+    isExecutableBy: owner
+  - name: CUDA PJRT plugin is packaged
+    path: /.shared_runfiles/+cuda_packages+libpjrt_cuda_linux_arm64/runtime/lib/libpjrt_cuda.so
+    shouldExist: true
+  - name: model weights are externally mounted
+    path: /workspace/models
+    shouldExist: false
+  - name: image has no shell
+    path: /bin/sh
+    shouldExist: false
+  - name: image has no package manager
+    path: /usr/bin/apt-get
+    shouldExist: false

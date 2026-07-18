@@ -167,6 +167,7 @@ use_repo(cuda_compiler, "cuda")
 # archive does not contain git submodules, so its exact CUTLASS gitlink is a
 # second explicit repository rather than an ambient checkout or system input.
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
 git_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
 
 # Pin the complete multi-platform index rather than architecture-specific tags.
@@ -203,6 +204,17 @@ git_repository(
     ],
 )
 
+# The permanent Harmony contract uses the exact tokenizer from the selected
+# GPT-OSS source revision. This is a bounded, hash-verified product fixture;
+# serving still loads the same tokenizer.json from the local model artifact and
+# performs no network acquisition at runtime.
+http_file(
+    name = "gpt_oss_harmony_tokenizer",
+    downloaded_file_path = "tokenizer.json",
+    sha256 = "0614fe83cadab421296e664e1f48f4261fa8fef6e03e63bb75c20f38e37d07d3",
+    urls = ["https://huggingface.co/unsloth/gpt-oss-20b-BF16/resolve/cc89b3e7fd423253264883a80a4fa5abc619649f/tokenizer.json"],
+)
+
 http_archive(
     name = "flash_attention",
     build_file = "//third_party/flash_attention:flash_attention.BUILD.bazel",
@@ -230,7 +242,7 @@ crate.spec(package = "proc-macro2", version = "=1.0.106")
 crate.spec(package = "quote", version = "=1.0.46")
 crate.spec(package = "safetensors", version = "=0.8.0")
 crate.spec(package = "serde", features = ["derive"], version = "=1.0.228")
-crate.spec(package = "serde_json", version = "=1.0.150")
+crate.spec(package = "serde_json", features = ["preserve_order"], version = "=1.0.150")
 crate.spec(package = "sha2", version = "=0.10.9")
 crate.spec(package = "syn", features = ["full"], version = "=2.0.118")
 crate.spec(

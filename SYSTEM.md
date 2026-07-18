@@ -2,7 +2,7 @@
 
 Status: authoritative system document
 
-Last architectural review: 2026-07-16
+Last architectural review: 2026-07-18
 
 NML is a Rust acceleration substrate for CPU and NVIDIA CUDA. It lets a product
 describe tensor programs and persistent state in Rust, lowers those programs
@@ -102,7 +102,7 @@ individual PJRT shards, launch records, and MLIR objects remain private.
 | `crates/nml-kernel-triton` | Private typed TTIR construction and optimized CUDA kernels. |
 | `crates/nml-kernel-flash-attention` | FlashAttention custom-call adapters and lifecycle registration. |
 | `crates/nml-tokenizer*` | Safe IREE tokenizer ownership and its narrow C ABI. |
-| `products/serve` | Model execution and the serving control plane built above the substrate; GPT-OSS 20B is the intended default product model and Qwen remains a regression model. |
+| `products/serve` | GPT-OSS artifact, protocol, model execution, and the serving control plane built above the substrate. |
 
 Raw PJRT, MLIR, XLA, CUDA, and tokenizer ABIs remain internal. Unsafe code is
 kept at narrow FFI and device-pointer boundaries, while safe owners encode
@@ -365,40 +365,50 @@ Text tokenization uses IREE's tokenizer runtime at pinned commit
 `4d4e97d00f099a21f38eeff26f82a6d9e3643a11`. A narrow C bridge owns IREE
 status and buffer lifecycles; one safe Rust `Tokenizer` owns encoding,
 decoding, incremental decoding, reset, partial consumption, and UTF-8 fragment
-behavior. The tokenizer dependency is built from the original IREE repository
-with audited local compatibility patches.
+behavior. Ordinary-text encoding explicitly disables special-token matching so
+protocol delimiters can only be introduced from validated structural IDs. The
+tokenizer dependency is built from the original IREE repository with audited
+local compatibility patches.
 
-`products/serve` owns model execution and the serving product. A private
-model-engine boundary separates model definition from prompt protocol. A model
-adapter owns configuration and checkpoint validation, graph construction,
-token semantics, cache geometry, and placement. Its protocol owner retains the
-model-specific tokenizer, rendering/parsing rules, and incremental decoder;
-the engine accepts prepared token IDs and does not prescribe a string prompt
-or tokenizer implementation. The engine owns persistent parameter buffers, a
-finite prefill/decode executable family, request-shape validation,
-request-local cache allocation, and token-ID execution. The separate
-prompt-protocol owner allows later requests to be prepared without reloading
-model parameters. None of these types enlarge the public `nml` facade or
-create a public model taxonomy.
+`products/serve` owns GPT-OSS model execution and serving policy. Its
+package-private `gpt_oss` owner contains the exact artifact contract,
+configuration, checkpoint schema, Harmony protocol, bounded component graphs,
+and request execution. The public product surface is one persistent
+`Generator`: loading validates the artifact, constructs the tokenizer, uploads
+parameters once, and retains compiled shape families; generation owns only one
+request's tokens, parser, positions, page metadata, and K/V storage.
 
-The current Qwen3 adapter implements BF16 checkpoint validation, tied
-embeddings, Q/K normalization, RoPE, causal GQA, SwiGLU, persistent per-layer
-K/V state, prompt-specific prefill, static single-token decode, greedy
-selection, and incremental text decoding. Its public one-shot generation
-function is a compatibility adapter over the private engine, not the eventual
-server lifecycle. The current executable family has one exact prompt shape,
-one batch-one decode shape, and a dense cache owned by one request. Batch and
-cache capacities are explicit contracts, and unsupported batch capacity is a
-hard error. Track 4 replaces those compatibility limits with bucketed prefill,
-fixed-capacity batched decode, and a global paged arena; the present boundary
-does not falsely claim continuous batching or cross-request cache reuse.
+Framework crates do not contain a model adapter, model registry, protocol, or
+checkpoint-family taxonomy. They expose semantic tensor operations, closed
+parameter representations, compilation, reusable executable slots, buffers,
+and asynchronous PJRT dependency chaining. A model product composes those
+mechanisms directly. This direction of dependency is strict: framework crates
+must never import `products`, artifact identities, Harmony, or GPT-OSS layer
+types. Product-specific math becomes a framework operation only when it has a
+model-independent semantic name and complete portable/specialized contracts.
 
-The official `Qwen/Qwen3-0.6B` revision
-`c1899de289a04d12100db370d81485cdf75e47ca` remains a permanent regression and
-substrate-integration artifact; serving policy must not remain coupled to Qwen
-types merely because Qwen was the first complete model.
+The versioned GPT-OSS protocol identity is
+`openai-harmony-gpt-oss-v1` over `o200k_harmony`. Its package-private owner
+validates the exact required token spellings and IDs when it opens the local
+artifact's `tokenizer.json`; renders system, developer, user, assistant,
+function-call, and function-result messages; and parses assistant output one
+token at a time into UTF-8-safe channel, text, tool-call, and terminal events.
+Structural IDs are appended directly and all caller-controlled content uses
+ordinary-text encoding. Invalid roles, channels, content types, JSON calls,
+stop transitions, trailing tokens, or incomplete output fail deterministically.
+The protocol returns a parsed tool request but never executes it.
 
-GPT-OSS 20B is the intended default serving model. NML does not infer support
+NML deliberately reimplements this narrow product boundary instead of
+depending on the `openai-harmony` crate. The official crate at reference commit
+`abd677f7ac962629c808197caa1feb9e3e95d2b0` owns a tiktoken `CoreBPE`, supports
+runtime tokenizer acquisition/caching, unconditionally brings broader CLI,
+HTTP, and image dependencies, and also carries optional Python/Wasm bindings.
+Those concerns conflict with NML's one IREE tokenizer, local artifact, hermetic
+OCI, and Bazel-owned runtime. NML retains byte-compatible decoded fixtures and
+exact streaming token fixtures from that Apache-2.0 reference; the adapted
+JSON-Schema-to-TypeScript rendering remains traceable in source.
+
+GPT-OSS 20B is the selected serving model. NML does not infer support
 for its architecture or checkpoint representation from a model-family name.
 The first GPT-OSS product vertical uses one exact NVFP4 artifact selected and
 pinned by distributor, revision, file hashes, configuration, tensor records,
@@ -408,13 +418,37 @@ GPT-OSS checkpoint variants are rejected rather than interpreted
 heuristically. [`NVFP4.md`](./NVFP4.md) owns the complete representation,
 kernel, hardware, and acceptance architecture.
 
-The GPT-OSS model vertical will reuse the existing RMSNorm, GQA, RoPE/YaRN,
+The GPT-OSS model vertical reuses the existing RMSNorm, GQA, RoPE/YaRN,
 dense and sliding-window attention, paged cache, top-k MoE, grouped expert,
-Shardy, sampling, and runtime substrate. It must separately implement and
-verify the selected artifact's exact configuration and tensor mapping,
+Shardy, sampling, and runtime substrate. It implements the selected artifact's
+exact configuration and tensor mapping,
 attention-sink denominator bias, clamped/residual SwiGLU semantics, alternating
 dense/window attention schedule, `o200k_harmony` tokenization behavior, Harmony
-roles/channels, and end-to-end output contract. A BF16 artifact adds no new
+roles/channels, and end-to-end output contract. The private adapter validates
+the byte-exact artifact manifest before opening its manifest-selected
+SafeTensors index and declares 411 logical parameters over 703 compact physical
+components. Each finite prefill/decode shape family contains four bounded
+executables: embedding, one reusable sliding-attention layer, one reusable
+full-attention layer, and the final normalization/output head. Structural
+parameter-slot binding applies the appropriate loaded layer to either reusable
+layer executable after verifying logical shape, representation, component
+roles, physical storage, platform, and placement.
+
+Execution enqueues embedding, the 24 layer invocations, and the head through
+PJRT readiness dependencies, synchronizing the host only when the selected
+token is needed. Hidden state and every per-layer K/V pair use explicit output
+aliasing; one request-owned I32 page table describes all layer caches. Prefill
+and cache capacities use finite power-of-two/page buckets so compiled families
+are reusable across requests without making XLA compile a monolithic 24-layer
+module. This lifecycle does not claim continuous batching or cross-request
+cache sharing; those require the separate server-owned arena and scheduler.
+
+Readable full-checkpoint generation and independent-oracle acceptance are two
+explicit executions of the same product contract. Both require the immutable
+model and enforce structural, memory, cache, event, and timing invariants. The
+acceptance target additionally requires an independently produced token/event
+fixture; absence of that fixture can never silently downgrade acceptance into
+generation. A BF16 artifact adds no new
 quantization format but carries its full memory cost; it may be used as a
 bounded independent oracle or conversion source when explicitly selected, but
 it is no longer a prerequisite product milestone. The NVFP4 artifact is
@@ -545,7 +579,8 @@ include:
 - original-upstream FlashAttention and IREE sources plus narrow audited local
   patches;
 - exact source/runtime toolchain pins and SHA-256-pinned binary archives;
-- no dependency on `references/zml` or any ZML Bazel target.
+- no dependency on `references/zml`, `references/harmony`, or their Bazel/Cargo
+  targets.
 
 Two ZML-derived inputs remain deliberate and traceable: the local
 `cuda-root-path-local-defines.patch` adapted against original OpenXLA, and
@@ -586,9 +621,12 @@ CUDA/PJRT user-space closure, entrypoint, and selected contract set. They do
 not standardize the kernel driver, physical GPU, compute capability, or device
 state, so an image build or pull is never GPU execution evidence.
 
-NML produces separate production-serving and CUDA-device-contract images over
-the same versioned CUDA/PJRT runtime contract. Production images do not contain
-test binaries; device-contract images do not become serving images. Each image
+NML produces three distinct CUDA artifacts over the same versioned CUDA/PJRT
+runtime contract: the production-serving image, a substrate-contract image,
+and a GPT-OSS product-contract image. Production images contain no test
+binaries. The substrate image contains no product code or product input names.
+The product-contract image owns only GPT-OSS acceptance executables and their
+closed mounted-input contract. Each image
 groups its slowly changing runfiles closure separately from its executable and
 configuration. That grouping makes an application-only edit a small layer
 change without claiming that the serving and contract closures are identical
@@ -624,8 +662,9 @@ not the canonical OCI digest used for publication or remote acceptance.
 Normal publication is one-hop: a BuildBuddy remote runner materializes the
 completed compressed layers beside the remote cache and executes the
 `rules_img` publisher there. Only that runner receives the named
-`GHCR_USERNAME` and `GHCR_TOKEN` organization secrets, restricted with
-`env-secrets`. A runner-local, owner-only registry-auth file or credential
+least-scope `GHCR_TOKEN` organization secret, restricted with `env-secrets`.
+The public owner name `NarendraPatwardhan` is configuration, not secret
+material. A runner-local, owner-only registry-auth file or credential
 helper bridges those values into `rules_img` and is removed when publication
 ends; it is never a Bazel input or remotely executed action environment. The
 publish operation disables automatic remote-run retries.
@@ -652,8 +691,8 @@ not part of this workflow. GitHub does not currently expose package-visibility
 mutation through its Packages REST surface, so changing the first published
 package from its private default to public is a one-time web control-plane
 action. A classic PAT with only the required package scopes is stored as the
-encrypted BuildBuddy organization secret `GHCR_TOKEN`; its matching username
-is `GHCR_USERNAME`. The recovery-only local publisher may use Docker's
+encrypted BuildBuddy organization secret `GHCR_TOKEN`; its matching public
+username is fixed by the repository owner. The recovery-only local publisher may use Docker's
 credential store. Neither credential enters Bazel inputs, source files,
 ordinary environment properties, logs, OCI layers, or RunPod.
 
@@ -687,7 +726,7 @@ environment, and volume fields still match; drift is a hard error rather than
 an implicit mutation. Every execution uses an immutable image digest, bounded
 GPU fallback list, deadline, and cleanup policy. RunPod
 credentials and model-access tokens remain outside Bazel action inputs and
-repository state; model tokens are passed only through named RunPod secrets.
+repository state. Public model artifacts require no runtime access token.
 Lease records live under the user's state directory, support concurrent Pods,
 and retain enough information to identify and terminate a possibly billable
 orphan after partial failure. Normal completion, test failure, timeout, signal,
@@ -695,13 +734,25 @@ and readiness failure all attempt termination. The current controller does not
 offer retention; any future retention policy must be explicit and bounded by a
 maximum deadline.
 
-The device-contract image starts one authenticated Rust service and never
-contains Bazel, a shell, or SSH. It discovers hardware through `nvidia-smi`,
-reports exact artifact and GPU identity at readiness, accepts one build-time
-allowlisted serial contract set, enforces contract and total deadlines, kills
-children on interruption, and retains one immutable bounded terminal result.
-The same digest and protocol are used through local Docker `--gpus all` and
-RunPod; only hardware and control-plane evidence differ.
+Persistent full-model runs attach the explicitly selected network volume in
+its owning data center and mount it at `/workspace`. RunPod tooling transports
+only a sorted map of canonical, absolute `NML_*` contract-input paths below
+that mount; it does not know model names, artifact schemas, or which inputs are
+required together. The product-owned runner definition supplies those names
+and requirements. The controller records the opaque input map with volume,
+data-center, and mount identity in the durable lease and terminal result.
+Before every child launch the reusable runner removes the complete product
+input set, then restores only the inputs declared by that exact contract.
+
+Each device-contract image starts the same authenticated, model-agnostic Rust
+runner and never contains Bazel, a shell, or SSH. A tiny image-owned binary
+provides the closed contract allowlist, runfile identities, arguments, and
+isolated inputs. The runner discovers hardware through `nvidia-smi`, reports
+exact artifact and GPU identity at readiness, accepts one serial contract set,
+enforces contract and total deadlines, kills children on interruption, and
+retains one immutable bounded terminal result. The same digest and protocol
+are used through local Docker `--gpus all` and RunPod; only hardware and
+control-plane evidence differ.
 
 ## 13. Verification topology
 
@@ -725,8 +776,8 @@ Verification is divided by the machine that can truthfully own the resource:
     SM75 onward, local or rented, unsandboxed and never result-cached
 
 OCI CUDA device-contract image
-    exact distributable userspace and permanent contract runner used on local
-    Docker/Podman and RunPod GPUs
+    separate substrate and GPT-OSS acceptance envelopes, sharing only the
+    reusable runner and CUDA userspace closure
 ```
 
 The standard commands are:
@@ -736,9 +787,12 @@ bb test --config=buildbuddy --config=cpu //:cpu_contracts
 bb test --config=buildbuddy --config=cuda //:cuda_remote_contracts
 bb build --config=buildbuddy --config=cuda //:cuda_contract_binaries
 bb test --config=buildbuddy --config=cuda //:cuda_package_contracts
-bb test --config=buildbuddy --config=cuda --cache_test_results=no \
-  //:cuda_device_contracts
 ```
+
+The final device gate is not a BuildBuddy test command: BuildBuddy workers do
+not own an NVIDIA device. An operator publishes the exact contract-image
+digest and asks the repository RunPod controller—or an explicitly approved
+local OCI runtime with `--gpus all`—to run the image's allowlisted contract.
 
 Remote CUDA compilation is not CUDA execution evidence. Device tests are
 `exclusive`, unsandboxed, and non-cacheable because the installed GPU, driver,
@@ -750,8 +804,8 @@ BuildBuddy remains the compilation, CPU-execution, CUDA-remote, package, OCI
 image construction, and registry-publication venue. Publication runs on a
 BuildBuddy remote runner so the image layers stay colocated with the remote
 cache instead of being downloaded to an operator machine and uploaded again.
-The runner receives only the named `GHCR_USERNAME` and `GHCR_TOKEN`
-organization secrets through its `env-secrets` execution property. Registry
+The runner receives only the named `GHCR_TOKEN` organization secret through
+its `env-secrets` execution property. Registry
 credentials must never be Bazel inputs, command-line values, ordinary action
 environment variables, cached outputs, or log content. The publication action
 is deliberately non-retrying because pushing a tag is an external mutation;
@@ -910,13 +964,13 @@ table is a compact compatibility index, not a migration checklist.
 | D-036 | FlashAttention's CUDA 12.8 source compiler and the CUDA 13.1 PJRT runtime are separate compatible contracts. |
 | D-037 | Bazel target platforms describe products; execution platforms describe action machines. |
 | D-038 | SM80/SM90 optimized kernels remain mandatory build inputs; suitable-device execution accepts an implementation path rather than every GPU SKU. SM86 proves FA2 plus Triton, SM90 proves FA3 plus Triton, and both prove grouped-MoE numerics. Dedicated optimized-attention performance/tuning and multi-GPU execution remain explicit debt and are never fabricated. |
-| D-039 | IREE tokenization and dense Qwen3 BF16 generation are product capabilities over local pinned model artifacts. |
+| D-039 | IREE tokenization is a framework service; model protocols and product token semantics remain product-owned. |
 | D-040 | `products/serve` owns a model-neutral serving control plane; Tokio tasks communicate through bounded channels with one dedicated PJRT engine owner. |
 | D-041 | OCI images are the shared Linux CUDA userspace envelope for local and RunPod execution; hardware and driver evidence remains venue-specific. |
 | D-042 | BuildBuddy owns compilation, CPU execution, GPU-independent/package contracts, and OCI construction; GPU execution consumes the immutable image elsewhere. |
 | D-043 | RunPod templates use REST where reliable, while Pod placement, lifecycle, runtime/SSH mapping, and termination remain GraphQL-owned; application readiness is independent. |
 | D-044 | RunPod orchestration is a rewritten standard-library Python 3.12 `rules_python` tool; `rules_uv` is absent until accepted third-party dependencies require locking. |
-| D-045 | GPT-OSS 20B with one exact trustworthy NVFP4 artifact is the intended default model; Qwen3 remains a permanent dense regression model. |
+| D-045 | GPT-OSS 20B with one exact trustworthy NVFP4 artifact is the sole selected serving model. |
 | D-046 | The selected GPT-OSS checkpoint vertical is NVFP4; BF16 is optional oracle/source evidence, MXFP4 is not implied, and unknown recipes hard-fail. |
 | D-047 | Model weights remain outside OCI layers and are mounted or revision-pinned into an optional model cache. |
 | D-048 | `rules_img` is NML's sole OCI rule set; `rules_oci` and parallel image graphs are prohibited. |
@@ -925,8 +979,13 @@ table is a compact compatibility index, not a migration checklist.
 | D-051 | NML is pre-alpha and has no backward-compatibility obligation; obstructive APIs and internals are replaced without legacy adapters when a better verified design is available. |
 | D-052 | Ordinary `Tensor`/`Buffer` values remain single-shape dense values; one logical `Parameter`/loaded-parameter boundary owns dense or structured physical components. `TensorStore`, `NmlStruct`, `Bufferized<T>`, dense-only parameter input markers, and logical-shape checkpoint upload are deleted rather than adapted. |
 | D-053 | NVFP4 dispatch is truthful by capability: CPU and pre-Blackwell devices consume compact weights through exact/fused emulation, while only proven SM100+ block-scaled execution is called native NVFP4. |
+| D-054 | GPT-OSS uses one package-private `openai-harmony-gpt-oss-v1` protocol owner over IREE `o200k_harmony`; NML reimplements the narrow wire contract and does not consume the broader `openai-harmony` crate or execute user tools. |
+| D-055 | Framework crates expose model-independent mechanisms only; GPT-OSS artifact, architecture, protocol, scheduling, and lifecycle policy remain under `products/serve`. |
+| D-056 | GPT-OSS shape families compose bounded embedding, reusable layer-kind, and head executables through asynchronous PJRT dependencies; a full transformer is not one compiler module. |
 
-## 16. Provenance and relationship to ZML
+## 16. Provenance and reference relationships
+
+### ZML
 
 NML is an opinionated, source-informed fork of
 [ZML](https://github.com/zml/zml). The read-only snapshot at
@@ -945,6 +1004,18 @@ traceable and retain applicable notices.
 NML now owns its architecture. ZML remains a mature open-source project that we
 continue to study and learn from, but new NML work is selected by NML product
 requirements, the invariants in this document, and evidence in `TASKS.md`.
+
+### OpenAI Harmony
+
+The official [OpenAI Harmony](https://github.com/openai/harmony) repository is
+cloned read-only at `references/harmony`, commit
+`abd677f7ac962629c808197caa1feb9e3e95d2b0`. It is an Apache-2.0 protocol and
+fixture reference, never a build or runtime dependency. NML stays compatible
+with the GPT-OSS subset while owning tokenizer lifetime, artifact validation,
+failure behavior, and incremental serving events in Rust. Any future Harmony
+feature must be justified by an actual serving consumer and added to this one
+versioned owner rather than introducing a parallel renderer, parser, tokenizer,
+or dependency graph.
 
 ## 17. North star
 

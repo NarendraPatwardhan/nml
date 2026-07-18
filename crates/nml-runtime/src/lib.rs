@@ -1137,7 +1137,11 @@ impl Exe {
         }
     }
 
-    pub fn results(&self, buffers: Vec<Buffer>) -> Result<exe::Results, Error> {
+    fn results(
+        &self,
+        buffers: Vec<Buffer>,
+        completion: Vec<nml_pjrt::Event>,
+    ) -> Result<exe::Results, Error> {
         if buffers.len() != self.outputs.len() {
             return Err(Error::ResultCount {
                 expected: self.outputs.len(),
@@ -1151,12 +1155,13 @@ impl Exe {
                 .map(|output| output.name.clone())
                 .collect(),
             buffers,
+            completion,
         })
     }
 }
 
 pub mod exe {
-    use super::{Buffer, Error, Exe, LoadedParameter};
+    use super::{Buffer, Error, Exe, LoadedParameter, Parameter};
 
     pub struct Arguments<'exe> {
         pub(super) executable: &'exe Exe,
@@ -1204,8 +1209,48 @@ pub mod exe {
         /// Binds every physical component of one logical parameter and checks
         /// the executable's representation-aware component manifest.
         pub fn set_parameter(&mut self, parameter: &LoadedParameter) -> Result<&mut Self, Error> {
-            let mut assignments = Vec::with_capacity(parameter.parameter().components().len());
-            for (component, buffer) in parameter.components() {
+            self.set_parameter_slot(parameter.parameter(), parameter)
+        }
+
+        /// Binds loaded storage to a semantically compatible compiled slot.
+        ///
+        /// Checkpoint paths identify persistent storage, while slots identify
+        /// roles in a reusable executable. Repeated blocks may therefore have
+        /// distinct parameter names while sharing a slot contract. Rebinding is
+        /// accepted only when logical shape, representation, component roles,
+        /// physical storage, placement, and platform all agree.
+        pub fn set_parameter_slot(
+            &mut self,
+            slot: &Parameter,
+            parameter: &LoadedParameter,
+        ) -> Result<&mut Self, Error> {
+            if slot.shape() != parameter.parameter().shape()
+                || slot.representation_id() != parameter.parameter().representation_id()
+                || slot.components().len() != parameter.parameter().components().len()
+            {
+                return Err(Error::ParameterSlotContract {
+                    slot: slot.name().to_owned(),
+                    parameter: parameter.parameter().name().to_owned(),
+                });
+            }
+
+            let mut assignments = Vec::with_capacity(slot.components().len());
+            for component in slot.components() {
+                let Some((actual, buffer)) = parameter
+                    .components()
+                    .find(|(actual, _)| actual.role() == component.role())
+                else {
+                    return Err(Error::ParameterSlotContract {
+                        slot: slot.name().to_owned(),
+                        parameter: parameter.parameter().name().to_owned(),
+                    });
+                };
+                if actual.storage() != component.storage() {
+                    return Err(Error::ParameterSlotContract {
+                        slot: slot.name().to_owned(),
+                        parameter: parameter.parameter().name().to_owned(),
+                    });
+                }
                 let index = self
                     .executable
                     .inputs
@@ -1218,13 +1263,13 @@ pub mod exe {
                         component.binding_name().to_owned(),
                     ));
                 };
-                if contract.parameter() != parameter.parameter().name()
-                    || contract.representation() != parameter.parameter().representation_id()
+                if contract.parameter() != slot.name()
+                    || contract.representation() != slot.representation_id()
                     || contract.role() != component.role()
                     || contract.storage() != component.storage()
                 {
                     return Err(Error::ParameterContract {
-                        parameter: parameter.parameter().name().to_owned(),
+                        parameter: slot.name().to_owned(),
                         component: component.binding_name().to_owned(),
                     });
                 }
@@ -1233,7 +1278,7 @@ pub mod exe {
                     .any(|(assigned, _): &(usize, Buffer)| *assigned == index)
                 {
                     return Err(Error::ParameterContract {
-                        parameter: parameter.parameter().name().to_owned(),
+                        parameter: slot.name().to_owned(),
                         component: component.binding_name().to_owned(),
                     });
                 }
@@ -1261,7 +1306,10 @@ pub mod exe {
             Ok(self)
         }
 
-        pub fn call(&mut self) -> Result<Results, Error> {
+        /// Enqueues execution and returns dependency-carrying device buffers
+        /// without synchronizing the host. Returned buffers can be supplied to
+        /// another enqueue immediately; PJRT preserves readiness dependencies.
+        pub fn enqueue(&mut self) -> Result<Results, Error> {
             for (index, binding) in self.executable.inputs.iter().enumerate() {
                 if self.slots[index].is_none() {
                     return Err(Error::MissingArgument(binding.name.clone()));
@@ -1333,9 +1381,7 @@ pub mod exe {
                 .loaded
                 .execute(&raw_slices)
                 .map_err(Error::Pjrt)?;
-            for event in execution.complete {
-                event.wait().map_err(Error::Pjrt)?;
-            }
+            let completion = execution.complete;
             let mut outputs = (0..self.executable.outputs.len())
                 .map(|_| Vec::with_capacity(self.executable.device_count))
                 .collect::<Vec<_>>();
@@ -1373,16 +1419,30 @@ pub mod exe {
                     self.slots[input] = None;
                 }
             }
-            self.executable.results(buffers)
+            self.executable.results(buffers, completion)
+        }
+
+        /// Executes and waits for all addressable devices to complete.
+        pub fn call(&mut self) -> Result<Results, Error> {
+            self.enqueue()?.wait()
         }
     }
 
     pub struct Results {
         pub(super) names: Vec<String>,
         pub(super) buffers: Vec<Buffer>,
+        pub(super) completion: Vec<nml_pjrt::Event>,
     }
 
     impl Results {
+        pub fn wait(mut self) -> Result<Self, Error> {
+            for event in &self.completion {
+                event.wait().map_err(Error::Pjrt)?;
+            }
+            self.completion.clear();
+            Ok(self)
+        }
+
         pub fn get(&self, name: &str) -> Option<&Buffer> {
             self.names
                 .iter()
@@ -1426,6 +1486,10 @@ pub enum Error {
     ParameterContract {
         parameter: String,
         component: String,
+    },
+    ParameterSlotContract {
+        slot: String,
+        parameter: String,
     },
     ParameterComponentCount {
         parameter: String,
@@ -1497,6 +1561,10 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "loaded parameter {parameter:?} does not satisfy component binding {component:?}"
+            ),
+            Self::ParameterSlotContract { slot, parameter } => write!(
+                f,
+                "loaded parameter {parameter:?} is incompatible with executable slot {slot:?}"
             ),
             Self::ParameterComponentCount {
                 parameter,

@@ -78,6 +78,71 @@ fn persistent_linear_parameters_execute_repeatedly_from_real_checkpoints() {
     tied_parameters_load_once_and_share_storage(&platform);
     truncated_checkpoint_releases_in_flight_transfers(&platform);
     activation_donation_aliases_the_output(&platform);
+    reusable_parameter_slots_chain_without_host_synchronization(&platform);
+}
+
+fn reusable_parameter_slots_chain_without_host_synchronization(platform: &nml::Platform) {
+    let shape = Shape::new(DType::F32, &[4]).unwrap();
+    let placement = nml::Sharding::replicated();
+    let slot = nml::Parameter::dense("slot.weight", "slot.weight", shape).unwrap();
+    let actual = nml::Parameter::dense("layer.17.weight", "layer.17.weight", shape).unwrap();
+
+    let mut first_graph = nml::Graph::new();
+    let input = first_graph.input("input", shape);
+    let weight = first_graph.parameter_value(&slot).unwrap();
+    let weighted = first_graph.multiply(input, weight).unwrap();
+    let first_program = first_graph
+        .finish_named(&[("weighted".to_owned(), weighted)])
+        .unwrap();
+    let first_executable = platform.compile(&first_program, placement.clone()).unwrap();
+
+    let mut second_graph = nml::Graph::new();
+    let weighted = second_graph.input("weighted", shape);
+    let output = second_graph.negate(weighted).unwrap();
+    let second_program = second_graph
+        .finish_named(&[("output".to_owned(), output)])
+        .unwrap();
+    let second_executable = platform
+        .compile(&second_program, placement.clone())
+        .unwrap();
+
+    let input = platform
+        .upload(
+            &nml::Slice::from_typed(shape, &[1.0f32, 2.0, 3.0, 4.0]).unwrap(),
+            placement.clone(),
+            nml::Memory::Default,
+        )
+        .unwrap();
+    let weight = platform
+        .upload(
+            &nml::Slice::from_typed(shape, &[2.0f32, 3.0, 4.0, 5.0]).unwrap(),
+            placement,
+            nml::Memory::Default,
+        )
+        .unwrap();
+    let loaded = nml::LoadedParameter::new(actual, vec![weight]).unwrap();
+
+    let mut first = first_executable.args();
+    first.set("input", input).unwrap();
+    assert!(first.set_parameter(&loaded).is_err());
+    first.set_parameter_slot(&slot, &loaded).unwrap();
+    first.bake().unwrap();
+    let mut weighted = first.enqueue().unwrap().into_buffers();
+    assert_eq!(weighted.len(), 1);
+
+    let mut second = second_executable.args();
+    second.set("weighted", weighted.remove(0)).unwrap();
+    let results = second.enqueue().unwrap().wait().unwrap();
+    assert_eq!(
+        results
+            .get("output")
+            .unwrap()
+            .to_slice()
+            .unwrap()
+            .items::<f32>()
+            .unwrap(),
+        &[-2.0, -6.0, -12.0, -20.0],
+    );
 }
 
 fn rank_three_linear_executes(platform: &nml::Platform, dtype: DType) {

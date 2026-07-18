@@ -84,6 +84,8 @@ _COMMON_CONTRACTS = [
     "//crates/nml:execution_performance_cpu_contract_test",
     "//crates/nml:structural_contract_test",
     "//products/serve:serve_contract_test",
+    "//tools/device-contracts:device_contract_runner_contract_test",
+    "//tools/runpod:runpod_contract_test",
 ]
 
 _CUDA_DEVICE_CONTRACTS = [
@@ -98,10 +100,20 @@ _CUDA_DEVICE_CONTRACTS = [
 
 _CUDA_PACKAGE_CONTRACTS = [
     "//crates/nml-pjrt-cuda:cuda_package_contract_test",
+    "//products/serve/device-contracts:image_structure_test",
+    "//tools/device-contracts:device_contract_image_structure_test",
 ]
 
 _CUDA_REMOTE_CONTRACTS = [
     "//crates/nml-kernel-flash-attention:flash_attention_adapter_contract_test",
+]
+
+# Full-checkpoint product acceptance is deliberately opt-in. It requires an
+# operator-mounted immutable model volume and executes through the owned device
+# runner; it must never be pulled into generic CUDA or repository-wide suites.
+_CUDA_PRODUCT_CONTRACTS = [
+    "//products/serve:gpt_oss_20b_nvfp4_cuda_contract_test",
+    "//products/serve:gpt_oss_20b_nvfp4_cuda_generation_test",
 ]
 
 # These suites encode where a contract can truthfully execute. They do not
@@ -139,6 +151,12 @@ test_suite(
     visibility = ["//visibility:public"],
 )
 
+test_suite(
+    name = "cuda_product_contracts",
+    tests = _CUDA_PRODUCT_CONTRACTS,
+    visibility = ["//visibility:public"],
+)
+
 # `filegroup` deliberately propagates exact CUDA executables rather than their
 # runfiles. A remote builder can therefore populate every code-generation and
 # linker action needed by the NVIDIA host without copying the CUDA runtime into
@@ -156,6 +174,8 @@ filegroup(
         "//crates/nml:neural_ops_cuda_contract_binary",
         "//crates/nml:execution_performance_cuda_contract_binary",
         "//crates/nml:nvfp4_cuda_contract_binary",
+        "//products/serve:gpt_oss_20b_nvfp4_cuda_contract_test",
+        "//products/serve:gpt_oss_20b_nvfp4_cuda_generation_test",
         "//products/serve:serve",
     ],
     testonly = True,

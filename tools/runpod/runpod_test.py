@@ -8,16 +8,26 @@ from pathlib import Path
 
 from api import (
     ApiError,
+    NETWORK_VOLUME_MOUNT_PATH,
+    RunPodClient,
     TemplateSpec,
     create_pod_document,
     create_ssh_job_pod_document,
     is_capacity_failure,
+    require_contract_inputs,
+    require_workspace_path,
     same_exact_image,
     ssh_endpoint,
     validate_template,
 )
-from controller import validate_result_identity, validate_runner_identity
+from controller import (
+    record_network_volume_result,
+    validate_result_identity,
+    validate_runner_identity,
+)
 from lease import Lease, LeaseStore
+
+DATA_CENTER = "US-WA-1"
 
 
 class RunPodContract(unittest.TestCase):
@@ -34,12 +44,157 @@ class RunPodContract(unittest.TestCase):
         self.assertIn("templateId: $templateId", templated)
         self.assertNotIn("imageName: $image", templated)
 
+        volume_backed = create_pod_document("SECURE", True, False, True)
+        self.assertIn("$networkVolumeId: String!", volume_backed)
+        self.assertIn("networkVolumeId: $networkVolumeId", volume_backed)
+        self.assertIn(
+            f'volumeMountPath: "{NETWORK_VOLUME_MOUNT_PATH}"', volume_backed
+        )
+        self.assertIn("dataCenterId: $dataCenter", volume_backed)
+        self.assertNotIn("HF_TOKEN", volume_backed)
+        self.assertNotIn("MODEL", volume_backed)
+
+        input_backed = create_pod_document(
+            "SECURE", True, False, True, ("NML_MODEL", "NML_ORACLE")
+        )
+        self.assertIn("$contractInput0: String!", input_backed)
+        self.assertIn("$contractInput1: String!", input_backed)
+        self.assertIn(
+            '{key: "NML_MODEL", value: $contractInput0}', input_backed
+        )
+        self.assertIn('{key: "NML_ORACLE", value: $contractInput1}', input_backed)
+        with self.assertRaises(ValueError):
+            create_pod_document("SECURE", False, False, True)
+        with self.assertRaises(ValueError):
+            create_pod_document("SECURE", True, False, False, ("NML_MODEL",))
+        with self.assertRaises(ValueError):
+            create_pod_document(
+                "SECURE", True, False, True, ("NML_SOURCE_COMMIT",)
+            )
+
+        ephemeral = create_pod_document("SECURE", True)
+        self.assertNotIn("networkVolumeId", ephemeral)
+
         ssh_job = create_ssh_job_pod_document("COMMUNITY", True)
         self.assertIn("imageName: $image", ssh_job)
         self.assertIn("startSsh: true", ssh_job)
         self.assertIn('ports: "22/tcp"', ssh_job)
         self.assertIn("dataCenterId: $dataCenter", ssh_job)
         self.assertNotIn("HF_TOKEN", ssh_job)
+
+    def test_device_contract_pod_passes_existing_volume_as_graphql_variable(
+        self,
+    ) -> None:
+        image = "ghcr.io/example/nml@sha256:" + "a" * 64
+
+        class RecordingClient(RunPodClient):
+            def __init__(self) -> None:
+                super().__init__("api-key")
+                self.document = ""
+                self.variables: dict[str, object] = {}
+
+            def graphql(
+                self, operation: str, document: str, variables: dict[str, object]
+            ) -> dict[str, object]:
+                self.document = document
+                self.variables = variables
+                return {
+                    "podFindAndDeployOnDemand": {
+                        "id": "pod-123",
+                        "imageName": image,
+                        "machineId": "machine-123",
+                    }
+                }
+
+        client = RecordingClient()
+        client.create_device_contract_pod(
+            name="nml-contracts-test",
+            image=image,
+            gpu_types=["GPU"],
+            gpu_count=1,
+            cloud="SECURE",
+            container_disk_gb=20,
+            lease_token="lease-token",
+            image_digest="sha256:" + "a" * 64,
+            source_commit="b" * 40,
+            source_dirty=False,
+            data_center=DATA_CENTER,
+            template_id=None,
+            network_volume_id="volume-123",
+            contract_inputs={
+                "NML_MODEL": "/workspace/models/selected",
+                "NML_ORACLE": "/workspace/fixtures/generation.json",
+            },
+        )
+        self.assertEqual(client.variables["dataCenter"], DATA_CENTER)
+        self.assertEqual(client.variables["networkVolumeId"], "volume-123")
+        self.assertEqual(
+            client.variables["contractInput0"],
+            "/workspace/models/selected",
+        )
+        self.assertIn("networkVolumeId: $networkVolumeId", client.document)
+        self.assertIn("NML_MODEL", client.document)
+        self.assertEqual(
+            client.variables["contractInput1"],
+            "/workspace/fixtures/generation.json",
+        )
+        self.assertIn("NML_ORACLE", client.document)
+        self.assertNotIn("HF_TOKEN", client.document)
+
+        with self.assertRaises(ValueError):
+            client.create_device_contract_pod(
+                name="nml-contracts-test",
+                image=image,
+                gpu_types=["GPU"],
+                gpu_count=1,
+                cloud="SECURE",
+                container_disk_gb=20,
+                lease_token="lease-token",
+                image_digest="sha256:" + "a" * 64,
+                source_commit="b" * 40,
+                source_dirty=False,
+                data_center=DATA_CENTER,
+                template_id=None,
+                network_volume_id=None,
+                contract_inputs={"NML_INPUT": "/workspace/fixtures/value.json"},
+            )
+
+        with self.assertRaises(ValueError):
+            client.create_device_contract_pod(
+                name="nml-contracts-test",
+                image=image,
+                gpu_types=["GPU"],
+                gpu_count=1,
+                cloud="SECURE",
+                container_disk_gb=20,
+                lease_token="lease-token",
+                image_digest="sha256:" + "a" * 64,
+                source_commit="b" * 40,
+                source_dirty=False,
+                data_center=None,
+                template_id=None,
+                network_volume_id="volume-123",
+            )
+
+    def test_contract_inputs_are_canonical_and_belong_to_the_volume_mount(self) -> None:
+        input_path = "/workspace/models/selected"
+        self.assertEqual(require_workspace_path("input path", input_path), input_path)
+        self.assertEqual(
+            require_contract_inputs({"NML_MODEL": input_path}),
+            {"NML_MODEL": input_path},
+        )
+        for invalid in (
+            "models/selected",
+            "/workspace",
+            "/workspace/../secrets",
+            "/tmp/model",
+            "/workspace/models/",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                require_workspace_path("input path", invalid)
+        for name in ("lowercase", "9INVALID", "NML-SPLIT", "NML_SOURCE_DIRTY"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                require_contract_inputs({name: input_path})
 
     def test_ssh_endpoint_requires_the_dynamic_public_tcp_mapping(self) -> None:
         pod = {
@@ -112,11 +267,38 @@ class RunPodContract(unittest.TestCase):
                 requested_gpus=["GPU A", "GPU B"],
                 deadline_at=datetime.now(UTC) + timedelta(minutes=10),
                 lease_token="secret-token",
+                network_volume_id="volume-123",
+                network_volume_data_center=DATA_CENTER,
+                network_volume_mount_path=NETWORK_VOLUME_MOUNT_PATH,
+                contract_inputs={
+                    "NML_MODEL": "/workspace/models/example",
+                    "NML_ORACLE": "/workspace/fixtures/example.json",
+                },
             )
             path = store.save(lease)
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             self.assertEqual(store.load(lease.lease_id), lease)
             self.assertEqual(list(path.parent.glob("*.tmp")), [])
+            self.assertEqual(
+                lease.network_volume_identity(),
+                {
+                    "id": "volume-123",
+                    "data_center": DATA_CENTER,
+                    "mount_path": NETWORK_VOLUME_MOUNT_PATH,
+                    "contract_inputs": {
+                        "NML_MODEL": "/workspace/models/example",
+                        "NML_ORACLE": "/workspace/fixtures/example.json",
+                    },
+                },
+            )
+            public = lease.public_record()
+            self.assertEqual(public["network_volume_id"], "volume-123")
+            self.assertEqual(public["network_volume"], lease.network_volume_identity())
+            self.assertNotIn("lease_token", public)
+
+            result: dict[str, object] = {"status": "succeeded"}
+            record_network_volume_result(lease, result)
+            self.assertEqual(result["network_volume"], lease.network_volume_identity())
 
     def test_runner_identity_must_match_the_exact_lease(self) -> None:
         lease = Lease.create(

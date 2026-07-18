@@ -1,0 +1,499 @@
+//! Bounded GPT-OSS component graphs.
+//!
+//! The compiler sees one natural fusion domain at a time: embedding, one full
+//! transformer layer, or final projection/sampling. Layer repetition remains an
+//! execution-plan concern and never duplicates kernel bodies in StableHLO.
+
+use super::checkpoint::{BoxError, Checkpoint, DecoderLayer, Result, message};
+use super::config::{AttentionKind, Config};
+use nml::{DataType, Graph, Shape, Tensor};
+
+pub(super) const CACHE_PAGE_SIZE: usize = 256;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) enum Phase {
+    Prefill,
+    Decode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) struct ShapeFamily {
+    phase: Phase,
+    sequence: usize,
+    cache_capacity: usize,
+}
+
+impl ShapeFamily {
+    pub(super) fn prefill(sequence: usize, cache_capacity: usize) -> Result<Self> {
+        Self::new(Phase::Prefill, sequence, cache_capacity)
+    }
+
+    pub(super) fn decode(cache_capacity: usize) -> Result<Self> {
+        Self::new(Phase::Decode, 1, cache_capacity)
+    }
+
+    fn new(phase: Phase, sequence: usize, cache_capacity: usize) -> Result<Self> {
+        if sequence == 0 || cache_capacity == 0 {
+            return Err(message("GPT-OSS execution dimensions must be nonzero"));
+        }
+        if sequence > cache_capacity {
+            return Err(message("GPT-OSS prefill bucket exceeds cache capacity"));
+        }
+        if cache_capacity > i32::MAX as usize {
+            return Err(message("GPT-OSS cache capacity exceeds the I32 index domain"));
+        }
+        if !cache_capacity.is_multiple_of(CACHE_PAGE_SIZE) {
+            return Err(message("GPT-OSS cache capacity must contain complete pages"));
+        }
+        Ok(Self {
+            phase,
+            sequence,
+            cache_capacity,
+        })
+    }
+
+    pub(super) const fn phase(self) -> Phase {
+        self.phase
+    }
+
+    pub(super) const fn sequence(self) -> usize {
+        self.sequence
+    }
+
+    pub(super) const fn cache_capacity(self) -> usize {
+        self.cache_capacity
+    }
+
+    pub(super) const fn page_count(self) -> usize {
+        self.cache_capacity / CACHE_PAGE_SIZE
+    }
+}
+
+pub(super) fn build_embedding(
+    graph: &mut Graph,
+    checkpoint: &Checkpoint,
+    config: &Config,
+    family: ShapeFamily,
+) -> Result<Vec<(String, Tensor)>> {
+    let tokens = graph.input(
+        "tokens",
+        shape(DataType::I32, &[1, dimension(family.sequence())?])?,
+    );
+    let hidden = nml(graph.token_embedding(&checkpoint.model.embed_tokens.weight, tokens))?;
+    require_shape(
+        hidden,
+        DataType::Bf16,
+        &[1, dimension(family.sequence())?, dimension(config.hidden_size())?],
+    )?;
+    Ok(vec![("hidden".to_owned(), hidden)])
+}
+
+pub(super) fn build_layer(
+    graph: &mut Graph,
+    layer: &DecoderLayer,
+    config: &Config,
+    family: ShapeFamily,
+    attention_kind: AttentionKind,
+) -> Result<Vec<(String, Tensor)>> {
+    let sequence = dimension(family.sequence())?;
+    let hidden_size = dimension(config.hidden_size())?;
+    let query_heads = dimension(config.query_heads())?;
+    let key_value_heads = dimension(config.key_value_heads())?;
+    let head_dim = dimension(config.head_dim())?;
+    let page_count = dimension(family.page_count())?;
+    let page_size = dimension(CACHE_PAGE_SIZE)?;
+    let hidden_shape = shape(DataType::Bf16, &[1, sequence, hidden_size])?;
+    let cache_shape = shape(
+        DataType::Bf16,
+        &[page_count, page_size, key_value_heads, head_dim],
+    )?;
+
+    let hidden_input = graph.input("hidden", hidden_shape);
+    let position = graph.input("position", shape(DataType::I32, &[])?);
+    let sequence_lengths = match family.phase() {
+        Phase::Prefill => graph.input("sequence_lengths", shape(DataType::I32, &[1])?),
+        Phase::Decode => {
+            let one = nml(graph.scalar(1_i32))?;
+            let length = nml(graph.add(position, one))?;
+            nml(graph.reshape(length, shape(DataType::I32, &[1])?))?
+        }
+    };
+    let page_table = graph.input("page_table", shape(DataType::I32, &[1, page_count])?);
+    let key_input = graph.input("cache.key", cache_shape);
+    let value_input = graph.input("cache.value", cache_shape);
+    let zero = nml(graph.scalar(0_i32))?;
+
+    let token_shape = shape(DataType::I32, &[1, sequence])?;
+    let offsets = nml(graph.iota(token_shape, 1))?;
+    let position_vector = nml(graph.broadcast_in_dim(position, token_shape, &[]))?;
+    let positions = nml(graph.add(offsets, position_vector))?;
+
+    let residual = hidden_input;
+    let input_norm = nml(graph.parameter_value(&layer.input_layernorm.weight))?;
+    let mut hidden = nml(graph.rms_norm(
+        hidden_input,
+        Some(input_norm),
+        2,
+        config.rms_norm_epsilon(),
+    ))?;
+    let query = nml(graph.linear(
+        hidden,
+        &layer.self_attn.q_proj.weight,
+        Some(&layer.self_attn.q_proj.bias),
+    ))?;
+    let key = nml(graph.linear(
+        hidden,
+        &layer.self_attn.k_proj.weight,
+        Some(&layer.self_attn.k_proj.bias),
+    ))?;
+    let value = nml(graph.linear(
+        hidden,
+        &layer.self_attn.v_proj.weight,
+        Some(&layer.self_attn.v_proj.bias),
+    ))?;
+    let query = nml(graph.reshape(
+        query,
+        shape(DataType::Bf16, &[1, sequence, query_heads, head_dim])?,
+    ))?;
+    let key = nml(graph.reshape(
+        key,
+        shape(
+            DataType::Bf16,
+            &[1, sequence, key_value_heads, head_dim],
+        )?,
+    ))?;
+    let value = nml(graph.reshape(
+        value,
+        shape(
+            DataType::Bf16,
+            &[1, sequence, key_value_heads, head_dim],
+        )?,
+    ))?;
+    let rope = nml::attention::RopeOptions {
+        base: config.rope_theta(),
+        rotary_dimensions: config.head_dim(),
+        layout: nml::attention::RopeLayout::Sequential,
+        scaling: nml::attention::RopeScaling::Yarn {
+            factor: config.rope_factor(),
+            beta_fast: config.rope_beta_fast(),
+            beta_slow: config.rope_beta_slow(),
+            original_context: config.initial_context_length(),
+            truncate: false,
+            attention_factor: None,
+        },
+    };
+    let query = nml(graph.rope(query, positions, rope))?;
+    let key = nml(graph.rope(key, positions, rope))?;
+
+    let dense_cache_shape = shape(
+        DataType::Bf16,
+        &[
+            1,
+            dimension(family.cache_capacity())?,
+            key_value_heads,
+            head_dim,
+        ],
+    )?;
+    let dense_key = nml(graph.reshape(key_input, dense_cache_shape))?;
+    let dense_value = nml(graph.reshape(value_input, dense_cache_shape))?;
+    let dense_key = nml(graph.dynamic_update_slice(
+        dense_key,
+        key,
+        &[zero, position, zero, zero],
+    ))?;
+    let dense_value = nml(graph.dynamic_update_slice(
+        dense_value,
+        value,
+        &[zero, position, zero, zero],
+    ))?;
+    let key_cache = nml(graph.reshape(dense_key, cache_shape))?;
+    let value_cache = nml(graph.reshape(dense_value, cache_shape))?;
+    let key_cache = nml(graph.reuse_buffer(key_cache, key_input))?;
+    let value_cache = nml(graph.reuse_buffer(value_cache, value_input))?;
+
+    let sinks = nml(graph.parameter_value(&layer.self_attn.sinks))?;
+    let sliding_window = match attention_kind {
+        AttentionKind::SlidingAttention => Some(config.sliding_window()),
+        AttentionKind::FullAttention => None,
+    };
+    let attention = nml(graph.paged_attention(
+        query,
+        key_cache,
+        value_cache,
+        page_table,
+        sequence_lengths,
+        positions,
+        Some(sinks),
+        nml::attention::Options {
+            causal: true,
+            sliding_window,
+            scale: None,
+        },
+    ))?;
+    let attention = nml(graph.reshape(
+        attention,
+        shape(
+            DataType::Bf16,
+            &[1, sequence, dimension(config.query_width())?],
+        )?,
+    ))?;
+    let attention = nml(graph.linear(
+        attention,
+        &layer.self_attn.o_proj.weight,
+        Some(&layer.self_attn.o_proj.bias),
+    ))?;
+    hidden = nml(graph.add(residual, attention))?;
+
+    let residual = hidden;
+    let post_norm = nml(graph.parameter_value(&layer.post_attention_layernorm.weight))?;
+    hidden = nml(graph.rms_norm(
+        hidden,
+        Some(post_norm),
+        2,
+        config.rms_norm_epsilon(),
+    ))?;
+    let routed = nml(graph.reshape(
+        hidden,
+        shape(DataType::Bf16, &[sequence, hidden_size])?,
+    ))?;
+    let router_logits = nml(graph.linear(
+        routed,
+        &layer.mlp.router.weight,
+        Some(&layer.mlp.router.bias),
+    ))?;
+    let routed = nml(graph.routed_clamped_swiglu(
+        routed,
+        router_logits,
+        &layer.mlp.experts.gate_up_proj,
+        &layer.mlp.experts.gate_up_proj_bias,
+        &layer.mlp.experts.down_proj,
+        &layer.mlp.experts.down_proj_bias,
+        config.experts_per_token(),
+    ))?;
+    let routed = nml(graph.reshape(routed, hidden_shape))?;
+    hidden = nml(graph.add(residual, routed))?;
+    let hidden = nml(graph.reuse_buffer(hidden, hidden_input))?;
+
+    Ok(vec![
+        ("hidden".to_owned(), hidden),
+        ("cache.key".to_owned(), key_cache),
+        ("cache.value".to_owned(), value_cache),
+    ])
+}
+
+pub(super) fn build_head(
+    graph: &mut Graph,
+    checkpoint: &Checkpoint,
+    config: &Config,
+    family: ShapeFamily,
+) -> Result<Vec<(String, Tensor)>> {
+    let sequence = dimension(family.sequence())?;
+    let hidden_size = dimension(config.hidden_size())?;
+    let hidden = graph.input(
+        "hidden",
+        shape(DataType::Bf16, &[1, sequence, hidden_size])?,
+    );
+    let last_index = graph.input("last_index", shape(DataType::I32, &[])?);
+    let zero = nml(graph.scalar(0_i32))?;
+    let last = nml(graph.dynamic_slice(
+        hidden,
+        &[zero, last_index, zero],
+        &[1, 1, hidden_size],
+    ))?;
+    let final_norm = nml(graph.parameter_value(&checkpoint.model.norm.weight))?;
+    let last = nml(graph.rms_norm(
+        last,
+        Some(final_norm),
+        2,
+        config.rms_norm_epsilon(),
+    ))?;
+    let last = nml(graph.reshape(last, shape(DataType::Bf16, &[1, hidden_size])?))?;
+    let logits = nml(graph.linear(last, &checkpoint.lm_head.weight, None))?;
+    let (_, token) = nml(graph.argmax(logits, 1))?;
+    let token = nml(graph.reshape(token, shape(DataType::I32, &[1, 1])?))?;
+    let mut outputs = vec![("token".to_owned(), token)];
+    if family.phase() == Phase::Decode {
+        let position = graph.input("position", shape(DataType::I32, &[])?);
+        let one = nml(graph.scalar(1_i32))?;
+        outputs.push(("position".to_owned(), nml(graph.add(position, one))?));
+    }
+    Ok(outputs)
+}
+
+pub(super) fn cache_shape(config: &Config, family: ShapeFamily) -> Result<Shape> {
+    shape(
+        DataType::Bf16,
+        &[
+            dimension(family.page_count())?,
+            dimension(CACHE_PAGE_SIZE)?,
+            dimension(config.key_value_heads())?,
+            dimension(config.head_dim())?,
+        ],
+    )
+}
+
+pub(super) fn page_table_shape(family: ShapeFamily) -> Result<Shape> {
+    shape(
+        DataType::I32,
+        &[1, dimension(family.page_count())?],
+    )
+}
+
+fn require_shape(tensor: Tensor, dtype: DataType, dimensions: &[i64]) -> Result<()> {
+    if tensor.shape().dtype() != dtype || tensor.shape().dimensions() != dimensions {
+        return Err(message("GPT-OSS component produced an unexpected shape"));
+    }
+    Ok(())
+}
+
+fn dimension(value: usize) -> Result<i64> {
+    i64::try_from(value).map_err(|_| message("GPT-OSS dimension exceeds I64"))
+}
+
+fn shape(dtype: DataType, dimensions: &[i64]) -> Result<Shape> {
+    Shape::new(dtype, dimensions).map_err(|error| Box::new(error) as BoxError)
+}
+
+fn nml<T, E>(result: std::result::Result<T, E>) -> Result<T>
+where
+    E: StdError + Send + Sync + 'static,
+{
+    result.map_err(|error| Box::new(error) as BoxError)
+}
+
+use std::error::Error as StdError;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpt_oss::checkpoint::{declare_with, representative_layer};
+    use std::path::Path;
+
+    macro_rules! finish {
+        ($build:expr) => {{
+            let mut graph = Graph::new();
+            let outputs = $build(&mut graph).unwrap();
+            graph.finish_named(&outputs).unwrap()
+        }};
+    }
+
+    macro_rules! assert_contract {
+        ($program:expr, $activations:expr, $parameters:expr, $outputs:expr, $aliases:expr $(,)?) => {{
+            let program = &$program;
+            assert_eq!(
+                program
+                    .inputs()
+                    .filter(|(_, _, binding)| !binding.is_parameter_component())
+                    .count(),
+                $activations,
+            );
+            assert_eq!(
+                program
+                    .inputs()
+                    .filter(|(_, _, binding)| binding.is_parameter_component())
+                    .count(),
+                $parameters,
+            );
+            assert_eq!(program.outputs().count(), $outputs);
+            assert_eq!(program.output_aliases().collect::<Vec<_>>(), $aliases);
+        }};
+    }
+
+    macro_rules! assert_single_layer_identity {
+        ($program:expr, $layer:expr) => {{
+            let expected = format!("model.layers.{}.", $layer);
+            let layer_names = $program
+                .input_names()
+                .filter(|name| name.starts_with("model.layers."))
+                .collect::<Vec<_>>();
+            assert!(!layer_names.is_empty());
+            assert!(layer_names.iter().all(|name| name.starts_with(&expected)));
+        }};
+    }
+
+    #[test]
+    fn component_programs_keep_model_depth_out_of_the_compiler_abi() {
+        let config = selected_config();
+        let checkpoint = synthetic_checkpoint(&config);
+        let prefill = ShapeFamily::prefill(32, 512).unwrap();
+        let decode = ShapeFamily::decode(512).unwrap();
+
+        let embedding = finish!(|graph| build_embedding(graph, &checkpoint, &config, prefill));
+        assert_contract!(embedding, 1, 3, 1, &[None]);
+
+        let sliding = representative_layer(
+            &checkpoint,
+            &config,
+            AttentionKind::SlidingAttention,
+        )
+        .unwrap();
+        let prefill_layer = finish!(|graph| {
+            build_layer(
+                graph,
+                sliding,
+                &config,
+                prefill,
+                AttentionKind::SlidingAttention,
+            )
+        });
+        assert_contract!(
+            prefill_layer,
+            6,
+            29,
+            3,
+            &[Some(0), Some(4), Some(5)],
+        );
+        assert!(prefill_layer.input_names().any(|name| name == "sequence_lengths"));
+        assert_single_layer_identity!(prefill_layer, 0);
+
+        let full = representative_layer(&checkpoint, &config, AttentionKind::FullAttention)
+            .unwrap();
+        let decode_layer = finish!(|graph| {
+            build_layer(
+                graph,
+                full,
+                &config,
+                decode,
+                AttentionKind::FullAttention,
+            )
+        });
+        assert_contract!(
+            decode_layer,
+            5,
+            29,
+            3,
+            &[Some(0), Some(3), Some(4)],
+        );
+        assert!(!decode_layer.input_names().any(|name| name == "sequence_lengths"));
+        assert_single_layer_identity!(decode_layer, 1);
+
+        let prefill_head = finish!(|graph| build_head(graph, &checkpoint, &config, prefill));
+        assert_contract!(prefill_head, 2, 4, 1, &[None]);
+        let decode_head = finish!(|graph| build_head(graph, &checkpoint, &config, decode));
+        assert_contract!(decode_head, 3, 4, 2, &[None, None]);
+    }
+
+    fn selected_config() -> Config {
+        let runfiles = std::env::var_os("TEST_SRCDIR").expect("Bazel provides TEST_SRCDIR");
+        Config::from_file(
+            Path::new(&runfiles).join("_main/artifacts/gpt-oss-20b-nvfp4/config.json"),
+        )
+        .unwrap()
+    }
+
+    fn synthetic_checkpoint(config: &Config) -> Checkpoint {
+        declare_with(
+            config,
+            &mut |name, shape| {
+                nml::Parameter::dense(name, name, shape)
+                    .map_err(|error| Box::new(error) as BoxError)
+            },
+            &mut |name, shape| {
+                nml::Parameter::nvfp4(name, name, shape)
+                    .map_err(|error| Box::new(error) as BoxError)
+            },
+        )
+        .unwrap()
+    }
+
+}

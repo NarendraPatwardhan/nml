@@ -323,13 +323,14 @@ pub fn grouped_projection(
     Ok(())
 }
 
-/// Exact GPT-OSS routed expert MLP over compact gate/up and down weights.
+/// Routed clamped residual SwiGLU over compact gate/up and down weights.
 ///
 /// Gate/up channels are interleaved. Gate values clamp only above `limit`, up
 /// values clamp symmetrically, and the residual multiplicand is `(up + 1)`.
 /// Routing weights are applied after the dense expert output and accumulated
-/// into the owning token, matching the pinned GPT-OSS implementation.
-pub fn gpt_oss_experts(
+/// into the owning token. The activation is an explicit kernel contract rather
+/// than a model identity, so products can reuse it without entering this crate.
+pub fn routed_clamped_swiglu(
     hidden: &[f32],
     token_count: usize,
     router_indices: &[usize],
@@ -340,8 +341,8 @@ pub fn gpt_oss_experts(
     down_bias: &[f32],
     output: &mut [f32],
 ) -> Result<(), Error> {
-    require_rank(gate_up, "GPT-OSS gate/up", 3)?;
-    require_rank(down, "GPT-OSS down", 3)?;
+    require_rank(gate_up, "clamped SwiGLU gate/up", 3)?;
+    require_rank(down, "clamped SwiGLU down", 3)?;
     let experts = gate_up.dimensions[0];
     let hidden_size = gate_up.dimensions[1];
     let doubled_intermediate = gate_up.dimensions[2];
@@ -364,7 +365,7 @@ pub fn gpt_oss_experts(
         .ok_or(Error::ExtentOverflow)?;
     if gate_up_bias.len() != gate_bias_extent {
         return Err(Error::BiasExtent {
-            operation: "GPT-OSS gate/up",
+            operation: "clamped SwiGLU gate/up",
             expected: gate_bias_extent,
             actual: gate_up_bias.len(),
         });
@@ -374,13 +375,13 @@ pub fn gpt_oss_experts(
         .ok_or(Error::ExtentOverflow)?;
     if down_bias.len() != down_bias_extent {
         return Err(Error::BiasExtent {
-            operation: "GPT-OSS down",
+            operation: "clamped SwiGLU down",
             expected: down_bias_extent,
             actual: down_bias.len(),
         });
     }
     require_output(
-        "GPT-OSS experts",
+        "routed clamped SwiGLU",
         output,
         token_count
             .checked_mul(hidden_size)
@@ -628,7 +629,7 @@ impl fmt::Display for Error {
                 )
             }
             Self::IncompatibleExpertWeights => {
-                formatter.write_str("GPT-OSS gate/up and down NVFP4 weight shapes are incompatible")
+                formatter.write_str("clamped SwiGLU gate/up and down weight shapes are incompatible")
             }
             Self::BiasExtent {
                 operation,
@@ -639,7 +640,7 @@ impl fmt::Display for Error {
                 "{operation} bias extent mismatch: expected {expected}, received {actual}"
             ),
             Self::RoutingExtent => formatter
-                .write_str("GPT-OSS routing tensors do not match the token and hidden extents"),
+                .write_str("routing tensors do not match the token and hidden extents"),
         }
     }
 }

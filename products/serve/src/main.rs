@@ -1,4 +1,5 @@
-use nml_serve::qwen3::{GenerationOptions, Timings};
+use nml_serve::{Event, GenerationOptions, Timings};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -12,7 +13,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let Command::Run(cli) = Cli::parse(std::env::args().skip(1))? else {
         println!("{}", usage());
         return Ok(());
@@ -26,22 +27,53 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let mut stdout = std::io::stdout().lock();
-    let report = nml_serve::qwen3::generate(
-        &platform,
-        &GenerationOptions {
-            model_directory: cli.model,
+    let mut generator = nml_serve::Generator::load(&platform, &cli.model)?;
+    let report = generator.generate(
+        GenerationOptions {
             prompt: cli.prompt,
             max_new_tokens: cli.max_new_tokens,
             cache_capacity: cli.cache_capacity,
         },
-        &mut stdout,
+        |event| -> std::io::Result<()> {
+            match event {
+                Event::ContentDelta { text, .. } => {
+                    stdout.write_all(text.as_bytes())?;
+                    stdout.flush()?;
+                }
+                Event::ToolCall {
+                    recipient,
+                    arguments,
+                } => {
+                    write!(
+                        stdout,
+                        "\n{{\"recipient\":{recipient:?},\"arguments\":{arguments}}}"
+                    )?;
+                    stdout.flush()?;
+                }
+                Event::Done { .. } => {}
+            }
+            Ok(())
+        },
     )?;
     eprintln!();
     eprintln!(
-        "serve: {} prompt tokens, {} generated tokens, cache capacity {}",
+        "serve: model {}, {} prompt tokens, {} generated tokens, cache capacity {}",
+        report.model,
         report.prompt_tokens,
         report.generated_tokens.len(),
         report.cache_capacity
+    );
+    eprintln!(
+        "serve: {} physical parameter components, source {} bytes, resident {} bytes, prepared {} bytes, peak staging {} bytes",
+        report.physical_parameter_components,
+        report.parameter_source_bytes,
+        report.parameter_resident_bytes,
+        report.parameter_prepared_bytes,
+        report.parameter_peak_staging_bytes,
+    );
+    eprintln!(
+        "serve: cache storage {} bytes, metadata {} bytes",
+        report.cache_storage_bytes, report.cache_metadata_bytes,
     );
     print_timings(&report.timings);
     eprintln!("serve: token IDs {:?}", report.generated_tokens);
@@ -51,15 +83,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn print_timings(timings: &Timings) {
     for (name, duration) in [
         ("tokenization", timings.tokenization),
+        ("artifact validation", timings.artifact_validation),
         ("prefill compilation", timings.prefill_compilation),
         ("decode compilation", timings.decode_compilation),
         ("parameter upload", timings.parameter_upload),
         ("cache allocation", timings.cache_allocation),
-        ("cache metadata upload", timings.cache_metadata_upload),
         ("prompt upload", timings.prompt_upload),
         ("prefill execution", timings.prefill_execution),
         ("prefill download", timings.prefill_download),
-        ("decode upload", timings.decode_upload),
+        (
+            "decode state initialization",
+            timings.decode_state_initialization,
+        ),
         ("first decode execution", timings.first_decode_execution),
         ("steady decode execution", timings.steady_decode_execution),
         ("decode download", timings.decode_download),

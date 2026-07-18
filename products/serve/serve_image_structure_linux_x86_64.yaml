@@ -12,7 +12,7 @@ metadataTest:
     - key: org.opencontainers.image.source
       value: https://github.com/NarendraPatwardhan/nml
     - key: org.opencontainers.image.description
-      value: NML Qwen inference over the CPU and CUDA acceleration substrate
+      value: NML GPT-OSS 20B NVFP4 inference over the CPU and CUDA acceleration substrate
   entrypoint:
     - /usr/local/bin/nml-serve
   cmd: []

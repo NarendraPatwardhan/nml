@@ -7,7 +7,7 @@ load("@rules_img//img:load.bzl", "image_load")
 load("@rules_img//img:push.bzl", "image_push")
 load("@rules_img//img:test.bzl", "image_structure_test")
 
-# Every target in this package exists to execute product acceptance contracts.
+# Every target in this package exists to execute immutable device contracts.
 # The package default also covers rules_img's private intermediate layer and
 # manifest targets, which cannot inherit `testonly` through the macro surface.
 package(default_testonly = True)
@@ -45,25 +45,24 @@ nml_rust_library(
     name = "device_contract_runner",
     srcs = ["src/lib.rs"],
     crate_root = "src/lib.rs",
-    data = _CONTRACTS + ["//platforms/cuda:runtime"],
     deps = _RUST_DEPS + ["@rules_rust//rust/runfiles"],
-    rustc_env = _RUNNER_ENV,
-    target_compatible_with = select({
-        "//platforms:cuda.enabled": ["@platforms//os:linux"],
-        "//conditions:default": ["@platforms//:incompatible"],
-    }),
     testonly = True,
-    visibility = [":__pkg__"],
+    visibility = [
+        ":__pkg__",
+        "//products/serve/device-contracts:__pkg__",
+    ],
 )
 
 nml_rust_binary(
     name = "run_device_contracts",
     srcs = ["src/main.rs"],
     crate_root = "src/main.rs",
+    data = _CONTRACTS + ["//platforms/cuda:runtime"],
     deps = [
         ":device_contract_runner",
         "@rust_crates//tokio",
     ],
+    rustc_env = _RUNNER_ENV,
     target_compatible_with = select({
         "//platforms:cuda.enabled": ["@platforms//os:linux"],
         "//conditions:default": ["@platforms//:incompatible"],
@@ -85,20 +84,13 @@ nml_rust_test(
     name = "device_contract_runner_contract_test",
     srcs = ["src/lib.rs"],
     crate_root = "src/lib.rs",
-    data = _CONTRACTS + ["//platforms/cuda:runtime"],
     deps = _RUST_DEPS + ["@rules_rust//rust/runfiles"],
-    rustc_env = _RUNNER_ENV,
-    target_compatible_with = select({
-        "//platforms:cuda.enabled": ["@platforms//os:linux"],
-        "//conditions:default": ["@platforms//:incompatible"],
-    }),
 )
 
 # This image is the permanent remote execution envelope for GPU contracts. It
-# deliberately excludes the serving product and model data: an acceptance Pod
-# can prove the CUDA substrate without inheriting a model server's lifecycle or
-# writable state. The runner's data edges preserve every contract executable,
-# its runfiles, and the complete compatibility-capable PJRT runtime.
+# deliberately excludes every product, model input, and serving process. The
+# runner's data edges preserve each substrate contract executable, its
+# runfiles, and the complete compatibility-capable PJRT runtime.
 image_from_binary(
     name = "device_contract_image",
     base = "@distroless_cc_debian12",

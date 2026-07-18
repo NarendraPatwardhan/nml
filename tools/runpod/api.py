@@ -7,6 +7,7 @@ import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any
 
 
@@ -14,6 +15,16 @@ REST_URL = "https://rest.runpod.io/v1"
 GRAPHQL_URL = "https://api.runpod.io/graphql"
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 EXACT_IMAGE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
+NETWORK_VOLUME_MOUNT_PATH = "/workspace"
+ENVIRONMENT_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+RESERVED_RUNNER_ENVIRONMENT = frozenset(
+    {
+        "NML_CONTRACT_LEASE_TOKEN",
+        "NML_IMAGE_DIGEST",
+        "NML_SOURCE_COMMIT",
+        "NML_SOURCE_DIRTY",
+    }
+)
 
 POD_QUERY = """
 query NmlPod($podId: String!) {
@@ -52,6 +63,8 @@ mutation NmlCreatePod(
   $sourceDirty: String!
   {template_variable}
   {data_center_variable}
+  {network_volume_variable}
+  {contract_input_variables}
 ) {{
   podFindAndDeployOnDemand(input: {{
     name: $name
@@ -61,7 +74,8 @@ mutation NmlCreatePod(
     cloudType: {cloud}
     containerDiskInGb: $containerDisk
     volumeInGb: 0
-    volumeMountPath: "/workspace"
+    volumeMountPath: "{volume_mount_path}"
+    {network_volume_field}
     dockerArgs: ""
     ports: "8080/http"
     supportPublicIp: true
@@ -71,6 +85,7 @@ mutation NmlCreatePod(
       {{key: "NML_IMAGE_DIGEST", value: $imageDigest}}
       {{key: "NML_SOURCE_COMMIT", value: $sourceCommit}}
       {{key: "NML_SOURCE_DIRTY", value: $sourceDirty}}
+      {contract_input_env}
     ]
   }}) {{
     id
@@ -191,9 +206,24 @@ class RunPodClient:
         source_dirty: bool,
         data_center: str | None,
         template_id: str | None,
+        network_volume_id: str | None = None,
+        contract_inputs: dict[str, str] | None = None,
     ) -> CreatedPod:
         if not gpu_types:
             raise ValueError("at least one GPU type is required")
+        if network_volume_id is not None:
+            require_network_volume_id(network_volume_id)
+            if (
+                data_center is None
+                or not data_center.strip()
+                or data_center != data_center.strip()
+            ):
+                raise ValueError(
+                    "network-volume data center must be non-empty without surrounding whitespace"
+                )
+        inputs = require_contract_inputs(contract_inputs or {})
+        if inputs and network_volume_id is None:
+            raise ValueError("contract inputs require an attached network volume")
         failures: list[str] = []
         for gpu_type in gpu_types:
             try:
@@ -203,6 +233,8 @@ class RunPodClient:
                         cloud,
                         data_center is not None,
                         template_id is not None,
+                        network_volume_id is not None,
+                        tuple(inputs),
                     ),
                     {
                         "name": name,
@@ -219,6 +251,15 @@ class RunPodClient:
                             else {"image": image}
                         ),
                         **({"dataCenter": data_center} if data_center else {}),
+                        **(
+                            {"networkVolumeId": network_volume_id}
+                            if network_volume_id
+                            else {}
+                        ),
+                        **{
+                            f"contractInput{index}": value
+                            for index, (_, value) in enumerate(inputs.items())
+                        },
                     },
                 )
             except CapacityError as error:
@@ -400,10 +441,21 @@ class RunPodClient:
 
 
 def create_pod_document(
-    cloud: str, with_data_center: bool, with_template: bool = False
+    cloud: str,
+    with_data_center: bool,
+    with_template: bool = False,
+    with_network_volume: bool = False,
+    contract_inputs: tuple[str, ...] = (),
 ) -> str:
     if cloud not in {"SECURE", "COMMUNITY", "ALL"}:
         raise ValueError(f"unsupported cloud policy {cloud!r}")
+    if with_network_volume and not with_data_center:
+        raise ValueError("network volume requires explicit data-center placement")
+    if len(set(contract_inputs)) != len(contract_inputs):
+        raise ValueError("contract input environment names must be unique")
+    names = tuple(require_contract_inputs({name: "/workspace/input" for name in contract_inputs}))
+    if names and not with_network_volume:
+        raise ValueError("contract inputs require an attached network volume")
     return _CREATE_POD.format(
         cloud=cloud,
         image_variable="" if with_template else "$image: String!",
@@ -413,6 +465,20 @@ def create_pod_document(
         ),
         data_center_variable="$dataCenter: String!" if with_data_center else "",
         data_center_field="dataCenterId: $dataCenter" if with_data_center else "",
+        network_volume_variable=(
+            "$networkVolumeId: String!" if with_network_volume else ""
+        ),
+        network_volume_field=(
+            "networkVolumeId: $networkVolumeId" if with_network_volume else ""
+        ),
+        contract_input_variables="\n  ".join(
+            f"$contractInput{index}: String!" for index, _ in enumerate(names)
+        ),
+        contract_input_env="\n      ".join(
+            f'{{key: "{name}", value: $contractInput{index}}}'
+            for index, name in enumerate(names)
+        ),
+        volume_mount_path=NETWORK_VOLUME_MOUNT_PATH,
     )
 
 
@@ -424,6 +490,40 @@ def create_ssh_job_pod_document(cloud: str, with_data_center: bool) -> str:
         data_center_variable="$dataCenter: String!" if with_data_center else "",
         data_center_field="dataCenterId: $dataCenter" if with_data_center else "",
     )
+
+
+def require_network_volume_id(value: str) -> str:
+    if not value or value != value.strip():
+        raise ValueError(
+            "network volume id must be non-empty without surrounding whitespace"
+        )
+    return value
+
+
+def require_contract_inputs(values: dict[str, str]) -> dict[str, str]:
+    """Validates opaque, volume-backed inputs without knowing product policy."""
+    normalized: dict[str, str] = {}
+    for name in sorted(values):
+        if not name.startswith("NML_") or ENVIRONMENT_NAME.fullmatch(name) is None:
+            raise ValueError(f"invalid contract input environment name {name!r}")
+        if name in RESERVED_RUNNER_ENVIRONMENT:
+            raise ValueError(f"contract input may not override runner identity {name!r}")
+        normalized[name] = require_workspace_path(f"contract input {name}", values[name])
+    return normalized
+
+
+def require_workspace_path(name: str, value: str | None) -> str:
+    if not value or value != value.strip():
+        raise ValueError(f"{name} must be non-empty without surrounding whitespace")
+    path = PurePosixPath(value)
+    workspace = PurePosixPath(NETWORK_VOLUME_MOUNT_PATH)
+    if not path.is_absolute() or path == workspace or workspace not in path.parents:
+        raise ValueError(
+            f"{name} must be an absolute child of {NETWORK_VOLUME_MOUNT_PATH}"
+        )
+    if ".." in path.parts or str(path) != value:
+        raise ValueError(f"{name} must be canonical and must not contain '..'")
+    return value
 
 
 def ssh_endpoint(pod: dict[str, Any]) -> tuple[str, int] | None:

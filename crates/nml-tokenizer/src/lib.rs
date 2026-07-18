@@ -54,9 +54,33 @@ impl Tokenizer {
 
     /// Encodes one complete input without imposing a prompt-length bound.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, Error> {
+        self.encode_with_special_matching(text, true)
+    }
+
+    /// Encodes text while treating every special-token spelling as ordinary input.
+    ///
+    /// Protocol renderers use this for caller-controlled content and append their
+    /// validated structural token IDs separately. This is IREE's equivalent of
+    /// tiktoken's `encode_ordinary` and prevents delimiter injection.
+    pub fn encode_ordinary(&self, text: &str) -> Result<Vec<u32>, Error> {
+        self.encode_with_special_matching(text, false)
+    }
+
+    fn encode_with_special_matching(
+        &self,
+        text: &str,
+        match_special_tokens: bool,
+    ) -> Result<Vec<u32>, Error> {
         let mut raw = std::ptr::null_mut();
         // SAFETY: the tokenizer outlives the encoder and `raw` is writable.
-        let code = unsafe { ffi::nml_iree_encoder_create(self.raw.as_ptr(), text.len(), &mut raw) };
+        let code = unsafe {
+            ffi::nml_iree_encoder_create(
+                self.raw.as_ptr(),
+                text.len(),
+                match_special_tokens,
+                &mut raw,
+            )
+        };
         check(code)?;
         let raw = NonNull::new(raw).ok_or(Error::NullResult("encoder"))?;
         let mut encoder = Encoder { raw };

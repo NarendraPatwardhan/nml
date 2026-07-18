@@ -147,7 +147,7 @@ pub(crate) fn lower_linear<'context>(
     Ok(result)
 }
 
-pub(crate) fn lower_gpt_oss_experts<'context>(
+pub(crate) fn lower_routed_swiglu<'context>(
     context: &'context Context,
     block: &mut Block<'context>,
     inputs: ExpertInputs<'context>,
@@ -157,14 +157,14 @@ pub(crate) fn lower_gpt_oss_experts<'context>(
     if use_turing_adapter {
         if inputs.expert_offset.is_some() {
             return Err(Error::UnsupportedTarget {
-                operation: "NVFP4 GPT-OSS experts",
+                operation: "NVFP4 routed clamped SwiGLU",
                 target: "sharded CUDA SM75 execution".to_owned(),
                 requirement: "the Turing grouped adapter currently owns one complete local expert set",
             });
         }
         require_unsharded_experts(&inputs)?;
     } else {
-        require_triton_emulation(capabilities, "NVFP4 GPT-OSS experts")?;
+        require_triton_emulation(capabilities, "NVFP4 routed clamped SwiGLU")?;
         if inputs.expert_offset.is_none() {
             require_unsharded_experts(&inputs)?;
         }
@@ -299,7 +299,7 @@ fn lower_triton_experts<'context>(
     intermediate: i64,
     hidden_size: i64,
 ) -> Result<Value<'context>, Error> {
-    let dtype = kernel_dtype(inputs.hidden_shape.dtype(), "NVFP4 GPT-OSS experts")?;
+    let dtype = kernel_dtype(inputs.hidden_shape.dtype(), "NVFP4 routed clamped SwiGLU")?;
     let block_m = i64::try_from(inputs.block_size)
         .map_err(|_| Error::InvalidMoe("NVFP4 expert block size exceeds I64"))?;
     let block_n = 32_i64;
@@ -374,7 +374,7 @@ fn lower_triton_experts<'context>(
         block_m,
         block_n,
         block_k,
-        role: NvFp4GroupedRole::GptOssDown,
+        role: NvFp4GroupedRole::ClampedSwiGluDown,
     };
     let down_specification = KernelSpec::new(
         "nvfp4_grouped_down",
@@ -652,7 +652,7 @@ fn require_unsharded_experts(inputs: &ExpertInputs<'_>) -> Result<(), Error> {
     .any(|partition| matches!(partition, Partition::Sharded(_)))
     {
         return Err(Error::UnsupportedTarget {
-            operation: "NVFP4 GPT-OSS experts",
+            operation: "NVFP4 routed clamped SwiGLU",
             target: "sharded CUDA execution".to_owned(),
             requirement: "representation-aware local expert component geometry is not implemented",
         });

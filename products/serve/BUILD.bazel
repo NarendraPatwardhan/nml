@@ -11,37 +11,20 @@ load("@rules_img//img:test.bzl", "image_structure_test")
 nml_rust_library(
     name = "nml_serve",
     srcs = [
-        "src/engine.rs",
+        "src/gpt_oss.rs",
+        "src/gpt_oss/checkpoint.rs",
+        "src/gpt_oss/config.rs",
+        "src/gpt_oss/execution.rs",
+        "src/gpt_oss/graph.rs",
+        "src/gpt_oss/protocol.rs",
         "src/lib.rs",
-        "src/qwen3.rs",
-        "src/qwen3/config.rs",
-        "src/qwen3/model.rs",
     ],
     crate_root = "src/lib.rs",
     deps = [
         "//crates/nml:nml",
         "@rust_crates//serde",
         "@rust_crates//serde_json",
-    ],
-    visibility = [":__pkg__"],
-)
-
-# GPT-OSS remains a private product adapter rather than a model taxonomy in
-# NML's public facade. Its own target gives the selected artifact, parameter
-# schema, and graph one coherent contract while keeping changes independent of
-# the Qwen regression adapter and serving control plane.
-nml_rust_library(
-    name = "gpt_oss",
-    srcs = [
-        "src/gpt_oss.rs",
-        "src/gpt_oss/config.rs",
-        "src/gpt_oss/model.rs",
-    ],
-    crate_root = "src/gpt_oss.rs",
-    deps = [
-        "//crates/nml:nml",
-        "@rust_crates//serde",
-        "@rust_crates//serde_json",
+        "@rust_crates//sha2",
     ],
     visibility = [":__pkg__"],
 )
@@ -117,7 +100,7 @@ image_from_binary(
         "LD_LIBRARY_PATH": "/usr/local/lib/nml",
     },
     labels = {
-        "org.opencontainers.image.description": "NML Qwen inference over the CPU and CUDA acceleration substrate",
+        "org.opencontainers.image.description": "NML GPT-OSS 20B NVFP4 inference over the CPU and CUDA acceleration substrate",
         "org.opencontainers.image.source": "https://github.com/NarendraPatwardhan/nml",
         "org.opencontainers.image.title": "nml-serve",
     },
@@ -142,13 +125,14 @@ image_load(
     daemon = "docker",
     image = ":serve_image",
     strategy = "eager",
-    tag = "nml/serve:qwen",
+    tag = "nml/serve:gpt-oss-nvfp4",
     visibility = ["//visibility:public"],
 )
 
 # GHCR is the durable handoff between BuildBuddy and GPU venues. The first tag
 # says exactly which native manifest it names; a future multi-platform index
-# may claim the shorter `qwen` tag only after native AArch64 evidence exists.
+# may claim a shorter architecture-neutral tag only after native AArch64
+# evidence exists.
 # Eager publication consumes the authenticated Bazel output already present on
 # the trusted coordinator and authenticates to GHCR through Docker's private
 # credential store. Registry credentials never enter a Bazel action or source
@@ -160,7 +144,7 @@ image_push(
     repository = "narendrapatwardhan/nml",
     stamp = "disabled",
     strategy = "eager",
-    tag = "qwen-linux-amd64",
+    tag = "gpt-oss-nvfp4-linux-amd64",
 )
 
 # Structure validation reads OCI configuration and mtree metadata only. It is
@@ -181,54 +165,91 @@ nml_rust_test(
     name = "serve_contract_test",
     size = "small",
     srcs = [
-        "src/engine.rs",
+        "src/gpt_oss.rs",
+        "src/gpt_oss/checkpoint.rs",
+        "src/gpt_oss/config.rs",
+        "src/gpt_oss/execution.rs",
+        "src/gpt_oss/graph.rs",
+        "src/gpt_oss/protocol.rs",
         "src/lib.rs",
-        "src/qwen3.rs",
-        "src/qwen3/config.rs",
-        "src/qwen3/model.rs",
     ],
     crate_root = "src/lib.rs",
+    data = [
+        "//artifacts/gpt-oss-20b-nvfp4:manifest",
+        "@gpt_oss_harmony_tokenizer//file",
+    ],
     deps = [
         "//crates/nml:nml",
         "@rust_crates//serde",
         "@rust_crates//serde_json",
-    ],
-)
-
-nml_rust_test(
-    name = "gpt_oss_contract_test",
-    size = "small",
-    srcs = [
-        "src/gpt_oss.rs",
-        "src/gpt_oss/config.rs",
-        "src/gpt_oss/model.rs",
-    ],
-    crate_root = "src/gpt_oss.rs",
-    data = ["//artifacts/gpt-oss-20b-nvfp4:manifest"],
-    deps = [
-        "//crates/nml:nml",
-        "@rust_crates//serde",
-        "@rust_crates//serde_json",
-    ],
-)
-
-# The checkpoint is a deliberate ignored local input, so this exact numerical
-# and lifecycle contract is opt-in rather than a wildcard CI target. Run it
-# with --test_env=NML_QWEN3_MODEL=/absolute/path/to/Qwen3-0.6B.
-nml_rust_test(
-    name = "qwen3_bf16_cpu_contract_test",
-    size = "enormous",
-    srcs = ["tests/qwen3_bf16_cpu_contract.rs"],
-    crate_root = "tests/qwen3_bf16_cpu_contract.rs",
-    local = True,
-    tags = [
-        "exclusive",
-        "external",
-        "manual",
-    ],
-    deps = [
-        ":nml_serve",
-        "//crates/nml:nml",
         "@rust_crates//sha2",
     ],
+    env = {
+        "NML_GPT_OSS_TOKENIZER_RLOCATION": "$(rlocationpath @gpt_oss_harmony_tokenizer//file)",
+    },
+)
+
+# Both modes execute the complete immutable checkpoint and enforce the same
+# structural, memory, cache, event, and timing contracts. `generation` is the
+# permanent readable end-to-end execution gate. `acceptance` additionally
+# requires an independently produced token/event fixture; separate target
+# identities prevent an operator from accidentally weakening that oracle.
+_GPT_OSS_CUDA_CONTRACT_DEPS = [
+    ":nml_serve",
+    "//crates/nml:nml",
+    "@rust_crates//serde",
+    "@rust_crates//serde_json",
+    "@rust_crates//sha2",
+]
+
+_GPT_OSS_CUDA_CONTRACT_TAGS = [
+    "exclusive",
+    "external",
+    "manual",
+    "requires-gpu",
+]
+
+_GPT_OSS_CUDA_CONTRACT_VISIBILITY = [
+    "//:__pkg__",
+    "//products/serve/device-contracts:__pkg__",
+]
+
+nml_rust_test(
+    name = "gpt_oss_20b_nvfp4_cuda_generation_test",
+    size = "enormous",
+    srcs = ["tests/gpt_oss_20b_nvfp4_cuda_contract.rs"],
+    crate_root = "tests/gpt_oss_20b_nvfp4_cuda_contract.rs",
+    local = True,
+    tags = _GPT_OSS_CUDA_CONTRACT_TAGS,
+    data = ["//platforms/cuda:runtime_system_driver"],
+    env = {
+        "NML_CUDA_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime_system_driver)",
+    },
+    rustc_env = {"NML_GPT_OSS_CONTRACT_MODE": "generation"},
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": ["@platforms//os:linux"],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = _GPT_OSS_CUDA_CONTRACT_DEPS,
+    visibility = _GPT_OSS_CUDA_CONTRACT_VISIBILITY,
+)
+
+nml_rust_test(
+    name = "gpt_oss_20b_nvfp4_cuda_contract_test",
+    size = "enormous",
+    srcs = ["tests/gpt_oss_20b_nvfp4_cuda_contract.rs"],
+    crate_root = "tests/gpt_oss_20b_nvfp4_cuda_contract.rs",
+    local = True,
+    tags = _GPT_OSS_CUDA_CONTRACT_TAGS,
+    data = ["//platforms/cuda:runtime_system_driver"],
+    env = {
+        "NML_CUDA_RUNTIME_RLOCATION": "$(rlocationpath //platforms/cuda:runtime_system_driver)",
+    },
+    rustc_env = {"NML_GPT_OSS_CONTRACT_MODE": "acceptance"},
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": ["@platforms//os:linux"],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = _GPT_OSS_CUDA_CONTRACT_DEPS,
+    visibility = _GPT_OSS_CUDA_CONTRACT_VISIBILITY,
 )

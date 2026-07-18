@@ -1,0 +1,98 @@
+"""GPT-OSS full-checkpoint CUDA acceptance and OCI distribution."""
+
+load("//bazel:rust.bzl", "nml_rust_binary")
+load("//bazel:runfiles_layers.bzl", "oci_layered_binary")
+load("@rules_img//img:image.bzl", "image_from_binary")
+load("@rules_img//img:push.bzl", "image_push")
+load("@rules_img//img:test.bzl", "image_structure_test")
+
+# rules_img creates private intermediate targets. A dedicated package lets the
+# entire acceptance graph remain test-only without infecting the production
+# serving image or weakening Bazel's testonly dependency checks.
+package(default_testonly = True)
+
+_CONTRACTS = [
+    "//products/serve:gpt_oss_20b_nvfp4_cuda_contract_test",
+    "//products/serve:gpt_oss_20b_nvfp4_cuda_generation_test",
+]
+
+_RUNNER_ENV = {
+    "NML_CUDA_RUNTIME": "$(rlocationpath //platforms/cuda:runtime)",
+    "NML_GPT_OSS_20B_NVFP4_ACCEPTANCE_CONTRACT": "$(rlocationpath //products/serve:gpt_oss_20b_nvfp4_cuda_contract_test)",
+    "NML_GPT_OSS_20B_NVFP4_GENERATION_CONTRACT": "$(rlocationpath //products/serve:gpt_oss_20b_nvfp4_cuda_generation_test)",
+}
+
+# This tiny binary is the only layer that knows the GPT-OSS contract names and
+# mounted inputs. Lifecycle, authentication, deadlines, and child isolation
+# remain in the reusable model-agnostic runner.
+nml_rust_binary(
+    name = "runner",
+    srcs = ["main.rs"],
+    crate_root = "main.rs",
+    data = _CONTRACTS + ["//platforms/cuda:runtime"],
+    deps = [
+        "//tools/device-contracts:device_contract_runner",
+        "@rust_crates//tokio",
+    ],
+    rustc_env = _RUNNER_ENV,
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": ["@platforms//os:linux"],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    visibility = ["//visibility:public"],
+)
+
+oci_layered_binary(
+    name = "entrypoint",
+    application_runfiles = _CONTRACTS,
+    binary = ":runner",
+)
+
+image_from_binary(
+    name = "image",
+    base = "@distroless_cc_debian12",
+    binary = ":entrypoint",
+    cmd = [],
+    config_fragment = "image_config.json",
+    env = {
+        "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
+    },
+    labels = {
+        "org.opencontainers.image.description": "NML GPT-OSS 20B NVFP4 CUDA product acceptance",
+        "org.opencontainers.image.source": "https://github.com/NarendraPatwardhan/nml",
+        "org.opencontainers.image.title": "nml-gpt-oss-device-contracts",
+    },
+    path = "/usr/local/bin/nml-gpt-oss-device-contracts",
+    stamp = "disabled",
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    visibility = ["//visibility:public"],
+)
+
+image_push(
+    name = "publish",
+    image = ":image",
+    registry = "ghcr.io",
+    repository = "narendrapatwardhan/nml",
+    stamp = "disabled",
+    strategy = "eager",
+    tag = "gpt-oss-nvfp4-contracts-linux-amd64",
+    visibility = ["//visibility:public"],
+)
+
+image_structure_test(
+    name = "image_structure_test",
+    size = "small",
+    configs = select({
+        "//platforms:is_linux_x86_64": ["image_structure_linux_x86_64.yaml"],
+        "//platforms:is_linux_aarch64": ["image_structure_linux_aarch64.yaml"],
+        "//conditions:default": [],
+    }),
+    image = ":image",
+    target_compatible_with = select({
+        "//platforms:cuda.enabled": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)

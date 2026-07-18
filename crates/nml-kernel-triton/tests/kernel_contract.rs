@@ -165,7 +165,7 @@ fn nvfp4_grouped_experts_keep_routing_and_decode_inside_verified_kernels() {
             block_m: 16,
             block_n: 32,
             block_k: 32,
-            role: NvFp4GroupedRole::GptOssDown,
+            role: NvFp4GroupedRole::ClampedSwiGluDown,
         })
         .unwrap();
         assert!(down.contains("@nvfp4_grouped_down"), "{down}");
@@ -174,7 +174,7 @@ fn nvfp4_grouped_experts_keep_routing_and_decode_inside_verified_kernels() {
         assert_eq!(down.matches("tt.dot").count(), 1, "{down}");
         assert!(
             down.matches("arith.minnumf").count() >= 2,
-            "GPT-OSS gate/up clamps must remain in the down kernel: {down}"
+            "clamped SwiGLU activation must remain in the down kernel: {down}"
         );
     }
 }

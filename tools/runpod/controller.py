@@ -8,11 +8,16 @@ import signal
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from api import RunPodClient
+from api import (
+    NETWORK_VOLUME_MOUNT_PATH,
+    RunPodClient,
+    require_contract_inputs,
+    require_network_volume_id,
+)
 from lease import Lease, LeaseStore
 
 
@@ -47,6 +52,20 @@ class ContractRun:
     control_plane_timeout_seconds: int
     readiness_timeout_seconds: int
     template_id: str | None
+    network_volume_id: str | None = None
+    contract_inputs: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.network_volume_id is not None:
+            require_network_volume_id(self.network_volume_id)
+            if self.data_center is None:
+                raise ValueError("network-volume contract runs require a data center")
+        inputs = require_contract_inputs(self.contract_inputs)
+        if inputs and self.network_volume_id is None:
+            raise ValueError("contract inputs require an attached network volume")
+        object.__setattr__(self, "contract_inputs", inputs)
+        object.__setattr__(self, "gpu_types", list(self.gpu_types))
+        object.__setattr__(self, "contracts", list(self.contracts))
 
 
 def execute_contracts(
@@ -71,6 +90,14 @@ def execute_contracts(
         deadline_at=deadline,
         lease_token=token,
         template_id=request.template_id,
+        network_volume_id=request.network_volume_id,
+        network_volume_data_center=(
+            request.data_center if request.network_volume_id else None
+        ),
+        network_volume_mount_path=(
+            NETWORK_VOLUME_MOUNT_PATH if request.network_volume_id else None
+        ),
+        contract_inputs=request.contract_inputs,
     )
     store.save(lease)
     previous_handlers = install_signal_handlers()
@@ -88,6 +115,8 @@ def execute_contracts(
             source_dirty=request.source_dirty,
             data_center=request.data_center,
             template_id=request.template_id,
+            network_volume_id=request.network_volume_id,
+            contract_inputs=request.contract_inputs,
         )
         lease.pod_id = created.pod_id
         lease.machine_id = created.machine_id
@@ -120,6 +149,7 @@ def execute_contracts(
             timeout=request.total_timeout_seconds + 30,
         )
         validate_result_identity(lease, result)
+        record_network_volume_result(lease, result)
         lease.terminal_result = result
         success = result.get("status") == "succeeded"
         lease.record(
@@ -309,6 +339,13 @@ def validate_result_identity(lease: Lease, result: dict[str, Any]) -> None:
     validate_hardware_inventory(result)
     if result.get("status") not in {"succeeded", "failed", "timed_out", "interrupted"}:
         raise ControllerError("runner result has an unknown terminal status")
+
+
+def record_network_volume_result(lease: Lease, result: dict[str, Any]) -> None:
+    """Adds controller-owned persistent-storage provenance to a runner result."""
+    volume = lease.network_volume_identity()
+    if volume is not None:
+        result["network_volume"] = volume
 
 
 def validate_hardware_inventory(payload: dict[str, Any]) -> None:

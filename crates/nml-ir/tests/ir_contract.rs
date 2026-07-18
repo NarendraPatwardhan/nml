@@ -216,7 +216,7 @@ fn clamped_swiglu_moe_keeps_model_semantics_above_weight_representation() {
         let gate_bias = parameter("gate_bias", Shape::new(dtype, &[3, 10]).unwrap());
         let down_bias = parameter("down_bias", Shape::new(dtype, &[3, 4]).unwrap());
         let output = builder
-            .moe_clamped_swiglu(hidden, router, &gate, &gate_bias, &down, &down_bias, 2)
+            .routed_clamped_swiglu(hidden, router, &gate, &gate_bias, &down, &down_bias, 2)
             .unwrap();
         assert_eq!(output.shape().dimensions(), &[2, 4]);
         builder.finish(&[output]).unwrap()
@@ -236,7 +236,7 @@ fn clamped_swiglu_moe_keeps_model_semantics_above_weight_representation() {
     let compact_program = build(true);
     let compact = compact_program.stablehlo().unwrap();
     assert_eq!(
-        compact.matches("nml.nvfp4.gpt_oss_experts").count(),
+        compact.matches("nml.nvfp4.routed_swiglu").count(),
         1,
         "{compact}"
     );
@@ -266,7 +266,7 @@ fn clamped_swiglu_moe_keeps_model_semantics_above_weight_representation() {
         "{sm75}"
     );
     assert!(!sm75.contains("__gpu$xla.gpu.triton"), "{sm75}");
-    assert!(!sm75.contains("nml.nvfp4.gpt_oss_experts"), "{sm75}");
+    assert!(!sm75.contains("nml.nvfp4.routed_swiglu"), "{sm75}");
     assert!(sm75.contains("stablehlo.reduce"), "{sm75}");
 
     for (major, minor) in [(8, 0), (9, 0), (10, 0)] {
@@ -285,7 +285,7 @@ fn clamped_swiglu_moe_keeps_model_semantics_above_weight_representation() {
         assert_eq!(text.matches("__gpu$xla.gpu.triton").count(), 2, "{text}");
         assert!(text.contains("nvfp4_grouped_gate_up"), "{text}");
         assert!(text.contains("nvfp4_grouped_down"), "{text}");
-        assert!(!text.contains("nml.nvfp4.gpt_oss_experts"), "{text}");
+        assert!(!text.contains("nml.nvfp4.routed_swiglu"), "{text}");
         assert!(text.contains("stablehlo.reduce"), "{text}");
     }
 }
@@ -1949,7 +1949,7 @@ fn learned_sinks_preserve_each_optimized_paged_attention_dispatch() {
 }
 
 #[test]
-fn gpt_oss_identity_page_geometry_has_no_portable_cuda_branch() {
+fn learned_sink_identity_page_geometry_has_no_portable_cuda_branch() {
     use nml_sharding::Sharding;
 
     fn program(query_length: i64, capacity: i64) -> nml_ir::Program {
@@ -2004,9 +2004,9 @@ fn gpt_oss_identity_page_geometry_has_no_portable_cuda_branch() {
         module.text()
     }
 
-    // GPT-OSS uses 64 query heads, eight KV heads, 64-wide heads, learned
-    // sinks, and a 128-token local window on alternating layers. The finite
-    // product graph views its contiguous donated cache as one identity page.
+    // This representative learned-sink geometry uses grouped-query attention
+    // and a 128-token local window. A bounded caller may view contiguous
+    // donated cache storage as one identity page.
     let small = program(1, 8);
     for capability in [(8, 0), (9, 0), (10, 0)] {
         let text = lower(&small, capability);
@@ -2978,7 +2978,7 @@ fn expert_parallel_nvfp4_derives_local_components_inside_the_shared_manual_bound
             .unwrap(),
     );
     let output = builder
-        .moe_clamped_swiglu(hidden, router, &gate, &gate_bias, &down, &down_bias, 2)
+        .routed_clamped_swiglu(hidden, router, &gate, &gate_bias, &down, &down_bias, 2)
         .unwrap();
     let program = builder.finish(&[output]).unwrap();
     let mesh = Sharding::mesh(&[(data_axis, 2), (expert_axis, 2)]).unwrap();

@@ -1,4 +1,4 @@
-"""Run exact NML OCI artifacts on ephemeral RunPod GPUs."""
+"""Run exact NML OCI artifacts on ephemeral RunPod GPU Pods."""
 
 from __future__ import annotations
 
@@ -8,9 +8,16 @@ import os
 import re
 import sys
 
-from api import RunPodClient, TemplateSpec, require_string
+from api import (
+    NETWORK_VOLUME_MOUNT_PATH,
+    RunPodClient,
+    TemplateSpec,
+    require_contract_inputs,
+    require_network_volume_id,
+    require_string,
+)
 from controller import ContractRun, execute_contracts, recover_termination
-from lease import LeaseStore
+from lease import Lease, LeaseStore
 
 
 DEFAULT_GPU_TYPES = [
@@ -45,6 +52,23 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--gpu-count", type=positive_integer, default=1)
     run.add_argument("--cloud", choices=("SECURE", "COMMUNITY", "ALL"), default="SECURE")
     run.add_argument("--data-center")
+    run.add_argument(
+        "--network-volume-id",
+        help=(
+            "optional existing RunPod network volume; requires --data-center "
+            f"and is mounted at {NETWORK_VOLUME_MOUNT_PATH}"
+        ),
+    )
+    run.add_argument(
+        "--contract-input",
+        action="append",
+        dest="contract_inputs",
+        metavar="NAME=/workspace/PATH",
+        help=(
+            "opaque environment/path input declared by the selected contract; "
+            "repeat for multiple inputs"
+        ),
+    )
     run.add_argument("--container-disk-gb", type=positive_integer, default=20)
     run.add_argument(
         "--template-name",
@@ -82,6 +106,15 @@ def run_contracts(arguments: argparse.Namespace) -> int:
     match = require_digest_image(arguments.image)
     if COMMIT.fullmatch(arguments.source_commit) is None:
         raise ValueError("--source-commit must be a lowercase full Git commit")
+    data_center = arguments.data_center
+    network_volume_id = arguments.network_volume_id
+    contract_inputs = parse_contract_inputs(arguments.contract_inputs or [])
+    if network_volume_id is not None:
+        require_network_volume_id(network_volume_id)
+        if data_center is None:
+            raise ValueError("--network-volume-id requires --data-center")
+    if contract_inputs and network_volume_id is None:
+        raise ValueError("--contract-input requires --network-volume-id")
     client = client_from_environment()
     template_id = None
     if arguments.template_name:
@@ -104,7 +137,7 @@ def run_contracts(arguments: argparse.Namespace) -> int:
             gpu_types=arguments.gpus or DEFAULT_GPU_TYPES,
             gpu_count=arguments.gpu_count,
             cloud=arguments.cloud,
-            data_center=arguments.data_center,
+            data_center=data_center,
             container_disk_gb=arguments.container_disk_gb,
             contracts=arguments.contracts or DEFAULT_CONTRACTS,
             per_contract_timeout_seconds=arguments.per_contract_timeout,
@@ -112,6 +145,8 @@ def run_contracts(arguments: argparse.Namespace) -> int:
             control_plane_timeout_seconds=arguments.control_plane_timeout,
             readiness_timeout_seconds=arguments.readiness_timeout,
             template_id=template_id,
+            network_volume_id=network_volume_id,
+            contract_inputs=contract_inputs,
         ),
     )
     print(json.dumps(public_lease(lease), indent=2, sort_keys=True))
@@ -177,10 +212,20 @@ def client_from_environment() -> RunPodClient:
     return RunPodClient(key)
 
 
-def public_lease(lease: object) -> dict[str, object]:
-    result = dict(vars(lease))
-    result.pop("lease_token", None)
-    return result
+def public_lease(lease: Lease) -> dict[str, object]:
+    return lease.public_record()
+
+
+def parse_contract_inputs(values: list[str]) -> dict[str, str]:
+    inputs: dict[str, str] = {}
+    for value in values:
+        name, separator, path = value.partition("=")
+        if not separator:
+            raise ValueError("--contract-input must use NAME=/workspace/PATH")
+        if name in inputs:
+            raise ValueError(f"--contract-input repeats {name!r}")
+        inputs[name] = path
+    return require_contract_inputs(inputs)
 
 
 def positive_integer(value: str) -> int:

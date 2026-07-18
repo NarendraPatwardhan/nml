@@ -265,16 +265,8 @@ impl Config {
         self.sliding_window
     }
 
-    pub const fn swiglu_limit(&self) -> f64 {
-        self.swiglu_limit
-    }
-
-    pub const fn eos_token(&self) -> u32 {
-        self.eos_token_id
-    }
-
-    pub fn attention_kind(&self, layer: usize) -> Option<AttentionKind> {
-        self.layer_types.get(layer).copied()
+    pub(super) fn layer_types(&self) -> &[AttentionKind] {
+        &self.layer_types
     }
 }
 
@@ -340,11 +332,8 @@ mod tests {
         assert_eq!(config.experts_per_token(), 4);
         assert_eq!(config.vocabulary(), 201_088);
         assert_eq!(config.context_limit(), 131_072);
-        assert_eq!(
-            config.attention_kind(0),
-            Some(AttentionKind::SlidingAttention)
-        );
-        assert_eq!(config.attention_kind(1), Some(AttentionKind::FullAttention));
+        assert_eq!(config.layer_types()[0], AttentionKind::SlidingAttention);
+        assert_eq!(config.layer_types()[1], AttentionKind::FullAttention);
     }
 
     #[test]

@@ -129,6 +129,7 @@ bool nml_iree_tokenizer_lookup(const nml_iree_tokenizer_t* tokenizer,
 
 int32_t nml_iree_encoder_create(const nml_iree_tokenizer_t* tokenizer,
                                 size_t input_size,
+                                bool match_special_tokens,
                                 nml_iree_encoder_t** out_encoder) {
   if (!tokenizer || !out_encoder) {
     return nml_fail(IREE_STATUS_INVALID_ARGUMENT,
@@ -159,10 +160,13 @@ int32_t nml_iree_encoder_create(const nml_iree_tokenizer_t* tokenizer,
   iree_byte_span_t state_storage = {encoder->state_storage, state_size};
   iree_byte_span_t transform_buffer = {encoder->transform_buffer,
                                        transform_size};
+  iree_tokenizer_encode_flags_t flags = IREE_TOKENIZER_ENCODE_FLAG_AT_INPUT_START;
+  if (!match_special_tokens) {
+    flags |= IREE_TOKENIZER_ENCODE_FLAG_NO_SPECIAL_TOKEN_MATCHING;
+  }
   code = nml_consume_status(iree_tokenizer_encode_state_initialize(
       tokenizer->value, state_storage, transform_buffer,
-      iree_tokenizer_offset_run_list_empty(),
-      IREE_TOKENIZER_ENCODE_FLAG_AT_INPUT_START, &encoder->state));
+      iree_tokenizer_offset_run_list_empty(), flags, &encoder->state));
   if (code != IREE_STATUS_OK) {
     nml_iree_encoder_free(encoder);
     return code;

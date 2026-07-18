@@ -1241,7 +1241,7 @@ impl ProgramBuilder {
         )
     }
 
-    /// GPT-OSS clamped, interleaved residual SwiGLU experts.
+    /// Routed clamped, interleaved residual SwiGLU experts.
     ///
     /// Gate/up and down weights use input-major logical shapes
     /// `[experts, hidden, 2 * intermediate]` and
@@ -1250,7 +1250,7 @@ impl ProgramBuilder {
     /// activation contract; representation selects only the private
     /// contraction lowering.
     #[allow(clippy::too_many_arguments)]
-    pub fn moe_clamped_swiglu(
+    pub fn routed_clamped_swiglu(
         &mut self,
         hidden: Tensor,
         router_logits: Tensor,
@@ -1385,7 +1385,7 @@ impl ProgramBuilder {
                 let down_global = self.parameter_component_value(down_weights, down_global)?;
                 let down_bias = self.parameter_value(down_bias)?;
                 let result = self.push_value("clamped_swiglu_moe", hidden.shape);
-                self.operations.push(Operation::NvFp4GptOssExperts {
+                self.operations.push(Operation::NvFp4RoutedSwiGlu {
                     hidden: hidden.value,
                     expert_ids: expert_ids.value,
                     routing_weights: routing_weights.value,
@@ -5947,7 +5947,7 @@ impl Program {
         }
 
         for (operation_index, operation) in self.operations.iter().enumerate() {
-            if let Operation::NvFp4GptOssExperts {
+            if let Operation::NvFp4RoutedSwiGlu {
                 hidden,
                 expert_ids,
                 routing_weights,
@@ -6007,7 +6007,7 @@ impl Program {
                             2,
                             operation_index,
                             |local_block, local_inputs, local_shapes, local_result, offset| {
-                                nvfp4_backend::lower_gpt_oss_experts(
+                                nvfp4_backend::lower_routed_swiglu(
                                     context,
                                     local_block,
                                     nvfp4_expert_inputs(
@@ -6021,7 +6021,7 @@ impl Program {
                                 )
                             },
                         )?,
-                        _ => nvfp4_backend::lower_gpt_oss_experts(
+                        _ => nvfp4_backend::lower_routed_swiglu(
                             context,
                             &mut block,
                             nvfp4_expert_inputs(
@@ -6050,7 +6050,7 @@ impl Program {
                 // not become a second public routing API.
                 let _ = (sorted_assignments, block_experts);
                 let call = context.ffi_custom_call(
-                    "nml.nvfp4.gpt_oss_experts",
+                    "nml.nvfp4.routed_swiglu",
                     &[
                         mlir_value(&values, *hidden),
                         mlir_value(&values, *expert_ids),
@@ -7257,7 +7257,7 @@ impl Program {
                 }
                 Operation::NvFp4Linear { .. }
                 | Operation::NvFp4Embedding { .. }
-                | Operation::NvFp4GptOssExperts { .. } => {
+                | Operation::NvFp4RoutedSwiGlu { .. } => {
                     unreachable!("NVFP4 operation is lowered before scalar operations")
                 }
             };
@@ -7329,7 +7329,7 @@ struct Value {
 
 #[derive(Debug)]
 enum Operation {
-    NvFp4GptOssExperts {
+    NvFp4RoutedSwiGlu {
         hidden: usize,
         expert_ids: usize,
         routing_weights: usize,

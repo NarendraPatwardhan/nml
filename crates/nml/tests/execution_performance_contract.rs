@@ -261,15 +261,15 @@ fn measure_moe_workload(platform: &nml::Platform) {
     drop(first);
 }
 
-// These are GPT-OSS 20B dimensions, not toy multiples chosen to flatter a
-// kernel. The ordinary CPU performance target deliberately does not run this
-// CUDA acceptance family: its separately tracked CPU product work needs
+// These are production-scale dimensions, not toy multiples chosen to flatter
+// a kernel. The ordinary CPU performance target deliberately does not run this
+// CUDA acceptance family: its separately tracked CPU work needs
 // architecture-specific ceilings and must not inherit GPU-shaped claims.
-const GPT_OSS_HIDDEN: usize = 2_880;
-const GPT_OSS_INTERMEDIATE: usize = 2_880;
-const GPT_OSS_EXPERTS: usize = 32;
-const GPT_OSS_ROUTES: usize = 4;
-const GPT_OSS_VOCABULARY: usize = 201_088;
+const LARGE_HIDDEN: usize = 2_880;
+const LARGE_INTERMEDIATE: usize = 2_880;
+const ROUTED_EXPERTS: usize = 32;
+const ROUTES_PER_TOKEN: usize = 4;
+const LARGE_VOCABULARY: usize = 201_088;
 const NVFP4_SCALE: f32 = 1.0 / 1_024.0;
 
 fn measure_nvfp4_workloads(platform: &nml::Platform) {
@@ -287,7 +287,7 @@ fn measure_nvfp4_embedding(platform: &nml::Platform) {
         "model.embed_tokens.weight",
         Shape::new(
             DType::Bf16,
-            &[GPT_OSS_VOCABULARY as i64, GPT_OSS_HIDDEN as i64],
+            &[LARGE_VOCABULARY as i64, LARGE_HIDDEN as i64],
         )
         .unwrap(),
     )
@@ -303,7 +303,7 @@ fn measure_nvfp4_embedding(platform: &nml::Platform) {
     let executable = platform.compile(&program, nml::Sharding::single()).unwrap();
     let compile = compile_started.elapsed();
     let indices = (0..TOKENS)
-        .map(|index| ((index * 1_543) % GPT_OSS_VOCABULARY) as i32)
+        .map(|index| ((index * 1_543) % LARGE_VOCABULARY) as i32)
         .collect::<Vec<_>>();
     let index_host = nml::Slice::from_typed(index_shape, &indices).unwrap();
     let embedding_host = patterned_nvfp4(embedding);
@@ -347,11 +347,11 @@ fn measure_nvfp4_embedding(platform: &nml::Platform) {
 }
 
 fn measure_nvfp4_linear(platform: &nml::Platform, rows: usize, workload: &str) {
-    let input_shape = Shape::new(DType::Bf16, &[rows as i64, GPT_OSS_HIDDEN as i64]).unwrap();
+    let input_shape = Shape::new(DType::Bf16, &[rows as i64, LARGE_HIDDEN as i64]).unwrap();
     let weight = Parameter::nvfp4(
         "weight",
         "model.projection.weight",
-        Shape::new(DType::Bf16, &[GPT_OSS_HIDDEN as i64, GPT_OSS_HIDDEN as i64]).unwrap(),
+        Shape::new(DType::Bf16, &[LARGE_HIDDEN as i64, LARGE_HIDDEN as i64]).unwrap(),
     )
     .unwrap();
     let mut builder = ProgramBuilder::new();
@@ -364,7 +364,7 @@ fn measure_nvfp4_linear(platform: &nml::Platform, rows: usize, workload: &str) {
     let compile_started = Instant::now();
     let executable = platform.compile(&program, nml::Sharding::single()).unwrap();
     let compile = compile_started.elapsed();
-    let input_values = patterned_bf16(rows * GPT_OSS_HIDDEN);
+    let input_values = patterned_bf16(rows * LARGE_HIDDEN);
     let input_host = nml::Slice::from_typed(input_shape, &input_values).unwrap();
     let weight_host = patterned_nvfp4(weight);
     let upload_started = Instant::now();
@@ -408,17 +408,17 @@ fn measure_nvfp4_linear(platform: &nml::Platform, rows: usize, workload: &str) {
 
 fn measure_nvfp4_grouped_moe(platform: &nml::Platform) {
     const TOKENS: usize = 16;
-    let hidden_shape = Shape::new(DType::Bf16, &[TOKENS as i64, GPT_OSS_HIDDEN as i64]).unwrap();
-    let router_shape = Shape::new(DType::F32, &[TOKENS as i64, GPT_OSS_EXPERTS as i64]).unwrap();
+    let hidden_shape = Shape::new(DType::Bf16, &[TOKENS as i64, LARGE_HIDDEN as i64]).unwrap();
+    let router_shape = Shape::new(DType::F32, &[TOKENS as i64, ROUTED_EXPERTS as i64]).unwrap();
     let gate = Parameter::nvfp4(
         "gate_up",
         "model.experts.gate_up_proj",
         Shape::new(
             DType::Bf16,
             &[
-                GPT_OSS_EXPERTS as i64,
-                GPT_OSS_HIDDEN as i64,
-                (2 * GPT_OSS_INTERMEDIATE) as i64,
+                ROUTED_EXPERTS as i64,
+                LARGE_HIDDEN as i64,
+                (2 * LARGE_INTERMEDIATE) as i64,
             ],
         )
         .unwrap(),
@@ -430,9 +430,9 @@ fn measure_nvfp4_grouped_moe(platform: &nml::Platform) {
         Shape::new(
             DType::Bf16,
             &[
-                GPT_OSS_EXPERTS as i64,
-                GPT_OSS_INTERMEDIATE as i64,
-                GPT_OSS_HIDDEN as i64,
+                ROUTED_EXPERTS as i64,
+                LARGE_INTERMEDIATE as i64,
+                LARGE_HIDDEN as i64,
             ],
         )
         .unwrap(),
@@ -443,7 +443,7 @@ fn measure_nvfp4_grouped_moe(platform: &nml::Platform) {
         "model.experts.gate_up_proj_bias",
         Shape::new(
             DType::Bf16,
-            &[GPT_OSS_EXPERTS as i64, (2 * GPT_OSS_INTERMEDIATE) as i64],
+            &[ROUTED_EXPERTS as i64, (2 * LARGE_INTERMEDIATE) as i64],
         )
         .unwrap(),
     )
@@ -453,7 +453,7 @@ fn measure_nvfp4_grouped_moe(platform: &nml::Platform) {
         "model.experts.down_proj_bias",
         Shape::new(
             DType::Bf16,
-            &[GPT_OSS_EXPERTS as i64, GPT_OSS_HIDDEN as i64],
+            &[ROUTED_EXPERTS as i64, LARGE_HIDDEN as i64],
         )
         .unwrap(),
     )
@@ -462,14 +462,14 @@ fn measure_nvfp4_grouped_moe(platform: &nml::Platform) {
     let hidden = builder.input("hidden", hidden_shape);
     let router = builder.input("router", router_shape);
     let output = builder
-        .moe_clamped_swiglu(
+        .routed_clamped_swiglu(
             hidden,
             router,
             &gate,
             &gate_bias,
             &down,
             &down_bias,
-            GPT_OSS_ROUTES,
+            ROUTES_PER_TOKEN,
         )
         .unwrap();
     let program = builder
@@ -479,9 +479,9 @@ fn measure_nvfp4_grouped_moe(platform: &nml::Platform) {
     let compile_started = Instant::now();
     let executable = platform.compile(&program, nml::Sharding::single()).unwrap();
     let compile = compile_started.elapsed();
-    let hidden = patterned_bf16(TOKENS * GPT_OSS_HIDDEN);
+    let hidden = patterned_bf16(TOKENS * LARGE_HIDDEN);
     let hidden_host = nml::Slice::from_typed(hidden_shape, &hidden).unwrap();
-    let router = (0..TOKENS * GPT_OSS_EXPERTS)
+    let router = (0..TOKENS * ROUTED_EXPERTS)
         .map(|index| ((index * 17 % 101) as f32 - 50.0) / 16.0)
         .collect::<Vec<_>>();
     let router_host = nml::Slice::from_typed(router_shape, &router).unwrap();
@@ -553,7 +553,7 @@ fn patterned_nvfp4(parameter: Parameter) -> HostParameter {
         .map(|component| {
             let bytes = match component.role() {
                 // Both nibbles encode +0.5. A small global factor keeps the
-                // full GPT-OSS contractions finite without changing storage
+                // full production-scale contractions finite without changing storage
                 // density or the compact-kernel path under measurement.
                 ComponentRole::Payload => {
                     vec![0x11; component.storage().shape().element_count().unwrap()]

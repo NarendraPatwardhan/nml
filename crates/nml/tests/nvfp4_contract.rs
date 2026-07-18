@@ -210,7 +210,7 @@ fn execute_experts(platform: &nml::Platform, dtype: DType) {
     let hidden = builder.input("hidden", hidden_shape);
     let router = builder.input("router", router_shape);
     let output = builder
-        .moe_clamped_swiglu(hidden, router, &gate, &gate_bias, &down, &down_bias, ROUTES)
+        .routed_clamped_swiglu(hidden, router, &gate, &gate_bias, &down, &down_bias, ROUTES)
         .unwrap();
     let program = builder
         .finish_named(&[("output".to_owned(), output)])

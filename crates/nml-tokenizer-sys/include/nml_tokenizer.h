@@ -33,6 +33,7 @@ bool nml_iree_tokenizer_lookup(const nml_iree_tokenizer_t* tokenizer,
 // complete input.
 int32_t nml_iree_encoder_create(const nml_iree_tokenizer_t* tokenizer,
                                 size_t input_size,
+                                bool match_special_tokens,
                                 nml_iree_encoder_t** out_encoder);
 void nml_iree_encoder_free(nml_iree_encoder_t* encoder);
 int32_t nml_iree_encoder_feed(nml_iree_encoder_t* encoder,
