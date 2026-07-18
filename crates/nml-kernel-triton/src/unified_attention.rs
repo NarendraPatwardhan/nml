@@ -8,7 +8,7 @@
 //! reduction. Cache pages remain physical and are never materialized as a
 //! dense logical K/V tensor.
 
-use super::{ArgumentKind, Builder, Comparison, DType, Error, Reduction, Value};
+use super::{ArgumentKind, Builder, Comparison, DType, Error, Kernel, Reduction, Value};
 
 const LOG2_E: f64 = 1.442_695_040_888_963_4;
 
@@ -79,7 +79,7 @@ impl PagedAttention2dConfig {
     }
 }
 
-pub fn build_paged_attention_2d(config: PagedAttention2dConfig) -> Result<String, Error> {
+pub fn build_paged_attention_2d(config: PagedAttention2dConfig) -> Result<Kernel, Error> {
     let config = config.validate()?;
     let mut builder = Builder::new("paged_attention_2d")?;
     let query = pointer(&mut builder, "query", config.dtype)?;
@@ -186,7 +186,7 @@ pub struct PagedAttention3dConfig {
     pub segments: i64,
 }
 
-pub fn build_paged_attention_3d(config: PagedAttention3dConfig) -> Result<String, Error> {
+pub fn build_paged_attention_3d(config: PagedAttention3dConfig) -> Result<Kernel, Error> {
     let attention = config.attention.validate()?;
     if attention.learned_sinks
         || config.segments <= 0
@@ -752,7 +752,7 @@ impl SegmentReductionConfig {
     }
 }
 
-pub fn build_segment_reduction(config: SegmentReductionConfig) -> Result<String, Error> {
+pub fn build_segment_reduction(config: SegmentReductionConfig) -> Result<Kernel, Error> {
     let config = config.validate()?;
     let mut builder = Builder::new("paged_attention_segment_reduction")?;
     let segment_output = pointer(&mut builder, "segment_output", DType::F32)?;

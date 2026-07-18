@@ -1,6 +1,7 @@
 use nml_kernel_triton::{
     ArgumentKind, AttentionGeometry, AttentionLaunch, Builder, Comparison, DType, Error,
-    GatedActivation, GroupedProjectionConfig, KernelLaunch, KernelSpec, NvFp4EmbeddingConfig,
+    GatedActivation, GroupedProjectionConfig, Kernel, KernelLaunch, KernelSpec,
+    NvFp4EmbeddingConfig,
     NvFp4GroupedProjectionConfig, NvFp4GroupedRole, NvFp4LinearConfig, OutputAlias,
     PagedAttention2dConfig, PagedAttention3dConfig, Reduction, ScaleDotElement,
     SegmentReductionConfig, TensorSpec, build_grouped_projection, build_nvfp4_embedding,
@@ -11,7 +12,7 @@ use nml_mlir::{Block, Context, Region};
 
 #[test]
 fn named_typed_kernel_is_deterministic_and_verified() {
-    fn emit() -> String {
+    fn emit() -> Kernel {
         let mut builder = Builder::new("add_one").unwrap();
         let input = builder
             .argument(
@@ -46,12 +47,12 @@ fn named_typed_kernel_is_deterministic_and_verified() {
 
     let first = emit();
     assert_eq!(first, emit());
-    assert!(first.contains("tt.func public @add_one"), "{first}");
-    assert!(first.contains("tt.get_program_id x"), "{first}");
-    assert!(first.contains("tt.addptr"), "{first}");
-    assert!(first.contains("tt.load"), "{first}");
-    assert!(first.contains("arith.addf"), "{first}");
-    assert!(first.contains("tt.store"), "{first}");
+    assert!(first.text().contains("tt.func public @add_one"), "{first}");
+    assert!(first.text().contains("tt.get_program_id x"), "{first}");
+    assert!(first.text().contains("tt.addptr"), "{first}");
+    assert!(first.text().contains("tt.load"), "{first}");
+    assert!(first.text().contains("arith.addf"), "{first}");
+    assert!(first.text().contains("tt.store"), "{first}");
 }
 
 #[test]
@@ -68,6 +69,7 @@ fn nvfp4_linear_decodes_compact_tiles_inside_one_verified_kernel() {
     };
     assert_eq!(config.launch_grid().unwrap(), [4, 1, 1]);
     let ttir = build_nvfp4_linear(config).unwrap();
+    let ttir = ttir.text();
     for operation in [
         "@nvfp4_linear",
         "scf.for",
@@ -90,6 +92,7 @@ fn nvfp4_linear_decodes_compact_tiles_inside_one_verified_kernel() {
         ..config
     })
     .unwrap();
+    let bias_free = bias_free.text();
     let signature = ttir
         .lines()
         .find(|line| line.contains("tt.func public @nvfp4_linear"))
@@ -120,6 +123,7 @@ fn nvfp4_embedding_decodes_only_selected_compact_rows() {
         };
         assert_eq!(config.launch_grid().unwrap(), [1, 3, 1]);
         let ttir = build_nvfp4_embedding(config).unwrap();
+        let ttir = ttir.text();
         for operation in [
             "@nvfp4_embedding",
             "arith.shrui",
@@ -150,6 +154,7 @@ fn nvfp4_grouped_experts_keep_routing_and_decode_inside_verified_kernels() {
             role: NvFp4GroupedRole::GateUp,
         })
         .unwrap();
+        let gate_up = gate_up.text();
         assert!(gate_up.contains("@nvfp4_grouped_gate_up"), "{gate_up}");
         assert!(gate_up.contains("arith.shrui"), "{gate_up}");
         assert!(gate_up.contains("math.exp2"), "{gate_up}");
@@ -168,6 +173,7 @@ fn nvfp4_grouped_experts_keep_routing_and_decode_inside_verified_kernels() {
             role: NvFp4GroupedRole::ClampedSwiGluDown,
         })
         .unwrap();
+        let down = down.text();
         assert!(down.contains("@nvfp4_grouped_down"), "{down}");
         assert!(down.contains("arith.shrui"), "{down}");
         assert!(down.contains("math.exp2"), "{down}");
@@ -204,6 +210,7 @@ fn microscaling_dot_surface_is_typed_and_verified_by_the_pinned_dialect() {
     let _ = builder.add(&result, &zero).unwrap();
     builder.return_void().unwrap();
     let ttir = builder.finish().unwrap();
+    let ttir = ttir.text();
     assert!(ttir.contains("tt.dot_scaled"), "{ttir}");
     assert!(ttir.contains("lhs = e4m3 rhs = e2m1"), "{ttir}");
 }
@@ -225,6 +232,7 @@ fn grouped_expert_projections_are_verified_ttir() {
             multiply_routing_weight: false,
         })
         .unwrap();
+        let gate_up = gate_up.text();
         assert!(
             gate_up.contains("tt.func public @moe_grouped_gate_up"),
             "{gate_up}"
@@ -263,6 +271,7 @@ fn grouped_expert_projections_are_verified_ttir() {
                 multiply_routing_weight: true,
             })
             .unwrap();
+            let down = down.text();
             assert!(down.contains("tt.func public @moe_grouped_down"), "{down}");
             assert!(down.contains("arith.mulf"), "{down}");
             if activation == GatedActivation::Gelu {
@@ -349,7 +358,6 @@ fn typed_kernel_spec_lowers_the_verified_artifact() {
     builder.return_void().unwrap();
     let tensor = TensorSpec::new(DType::F32, &[4]).unwrap();
     let kernel = KernelSpec::new(
-        "copy",
         builder.finish().unwrap(),
         vec![tensor.clone()],
         vec![tensor],
@@ -366,7 +374,7 @@ fn typed_kernel_spec_lowers_the_verified_artifact() {
     let call = kernel
         .lower(
             &context,
-            &[input],
+            &[("input", input)],
             KernelLaunch {
                 grid: [4, 1, 1],
                 warps: 1,
@@ -391,24 +399,92 @@ fn typed_kernel_spec_lowers_the_verified_artifact() {
     assert!(text.contains("__gpu$xla.gpu.triton"), "{text}");
     assert!(text.contains("grid_x = 4 : i32"), "{text}");
 
+    // TTIR and StableHLO used to carry independently authored argument lists.
+    // Reject both count and type drift here so malformed custom calls cannot
+    // reach XLA's unchecked LLVM argument annotation.
     let tensor = TensorSpec::new(DType::F32, &[4]).unwrap();
+    let mut count_mismatch = Builder::new("count_mismatch").unwrap();
+    count_mismatch
+        .argument(
+            "input",
+            ArgumentKind::Pointer {
+                element: DType::F32,
+                address_space: 1,
+            },
+            None,
+        )
+        .unwrap();
+    count_mismatch
+        .argument(
+            "output",
+            ArgumentKind::Pointer {
+                element: DType::F32,
+                address_space: 1,
+            },
+            None,
+        )
+        .unwrap();
+    count_mismatch.return_void().unwrap();
     assert!(matches!(
         KernelSpec::new(
-            "copy",
-            String::from("@copy("),
+            count_mismatch.finish().unwrap(),
+            vec![tensor.clone(), tensor.clone()],
+            vec![tensor.clone()],
+            Vec::new(),
+        ),
+        Err(Error::InvalidKernelSpec(_))
+    ));
+
+    let mut type_mismatch = Builder::new("type_mismatch").unwrap();
+    type_mismatch
+        .argument(
+            "input",
+            ArgumentKind::Pointer {
+                element: DType::I32,
+                address_space: 1,
+            },
+            None,
+        )
+        .unwrap();
+    type_mismatch
+        .argument(
+            "output",
+            ArgumentKind::Pointer {
+                element: DType::F32,
+                address_space: 1,
+            },
+            None,
+        )
+        .unwrap();
+    type_mismatch.return_void().unwrap();
+    assert!(matches!(
+        KernelSpec::new(
+            type_mismatch.finish().unwrap(),
             vec![tensor.clone()],
             vec![tensor.clone()],
             Vec::new(),
         ),
-        Err(Error::Mlir(_))
+        Err(Error::InvalidKernelSpec(_))
     ));
 
-    let mut wrong_name = Builder::new("actual_name").unwrap();
-    wrong_name.return_void().unwrap();
+    let mut scalar_argument = Builder::new("scalar_argument").unwrap();
+    scalar_argument
+        .argument("input", ArgumentKind::Scalar(DType::F32), None)
+        .unwrap();
+    scalar_argument
+        .argument(
+            "output",
+            ArgumentKind::Pointer {
+                element: DType::F32,
+                address_space: 1,
+            },
+            None,
+        )
+        .unwrap();
+    scalar_argument.return_void().unwrap();
     assert!(matches!(
         KernelSpec::new(
-            "declared_name",
-            wrong_name.finish().unwrap(),
+            scalar_argument.finish().unwrap(),
             vec![tensor.clone()],
             vec![tensor.clone()],
             Vec::new(),
@@ -442,7 +518,6 @@ fn typed_kernel_spec_lowers_the_verified_artifact() {
     builder.return_void().unwrap();
     let tensor = TensorSpec::new(DType::F32, &[4]).unwrap();
     let bad_alias = KernelSpec::new(
-        "alias_contract",
         builder.finish().unwrap(),
         vec![tensor.clone()],
         vec![tensor.clone()],
@@ -484,7 +559,6 @@ fn typed_kernel_spec_lowers_the_verified_artifact() {
     builder.store(&output_pointer, &value).unwrap();
     builder.return_void().unwrap();
     let kernel = KernelSpec::new(
-        "launch_contract",
         builder.finish().unwrap(),
         vec![tensor.clone()],
         vec![tensor],
@@ -498,6 +572,10 @@ fn typed_kernel_spec_lowers_the_verified_artifact() {
     };
     assert!(matches!(
         kernel.lower(&context, &[], valid_launch),
+        Err(Error::InvalidKernelSpec(_))
+    ));
+    assert!(matches!(
+        kernel.lower(&context, &[("wrong_input", input)], valid_launch),
         Err(Error::InvalidKernelSpec(_))
     ));
     for invalid_launch in [
@@ -515,7 +593,7 @@ fn typed_kernel_spec_lowers_the_verified_artifact() {
         },
     ] {
         assert!(matches!(
-            kernel.lower(&context, &[input], invalid_launch),
+            kernel.lower(&context, &[("input", input)], invalid_launch),
             Err(Error::InvalidKernelSpec(_))
         ));
     }
@@ -625,6 +703,7 @@ fn tensor_pointer_and_shape_operations_verify_as_ttir() {
         .unwrap();
     builder.return_void().unwrap();
     let ttir = builder.finish().unwrap();
+    let ttir = ttir.text();
     assert!(ttir.contains("tt.make_range"), "{ttir}");
     assert!(ttir.contains("tt.expand_dims"), "{ttir}");
     assert!(ttir.contains("tt.broadcast"), "{ttir}");
@@ -762,6 +841,7 @@ fn non_power_of_two_gqa_uses_padded_masked_head_lanes() {
         learned_sinks: false,
     })
     .unwrap();
+    let ttir = ttir.text();
     assert!(ttir.contains("arith.constant 3 : i32"), "{ttir}");
     assert!(ttir.contains("arith.constant 4 : i32"), "{ttir}");
     assert!(ttir.contains("arith.andi"), "{ttir}");
@@ -824,6 +904,7 @@ fn retained_paged_attention_2d_is_complete_verified_ttir() {
         learned_sinks: false,
     })
     .unwrap();
+    let ttir = ttir.text();
     for operation in [
         "scf.while",
         "scf.if",
@@ -871,6 +952,8 @@ fn paged_attention_2d_initializes_online_softmax_from_learned_sinks() {
         ..config
     })
     .unwrap();
+    let ttir = ttir.text();
+    let without_sinks = without_sinks.text();
     assert_eq!(
         ttir.matches("!tt.ptr<bf16>").count(),
         without_sinks.matches("!tt.ptr<bf16>").count() + 5,
@@ -904,6 +987,7 @@ fn noncausal_sliding_window_has_both_position_bounds() {
         learned_sinks: false,
     })
     .unwrap();
+    let ttir = ttir.text();
     assert!(ttir.contains("arith.constant -17 : i32"), "{ttir}");
     assert!(ttir.contains("arith.cmpi sgt"), "{ttir}");
 }
@@ -921,6 +1005,7 @@ fn split_k_segment_reduction_is_complete_verified_ttir() {
         learned_sinks: false,
     })
     .unwrap();
+    let ttir = ttir.text();
     assert!(
         ttir.contains("@paged_attention_segment_reduction"),
         "{ttir}"
@@ -952,6 +1037,8 @@ fn split_k_reduction_adds_one_learned_sink_to_the_global_denominator() {
         ..config
     })
     .unwrap();
+    let ttir = ttir.text();
+    let without_sinks = without_sinks.text();
     assert_eq!(
         ttir.matches("!tt.ptr<bf16>").count(),
         without_sinks.matches("!tt.ptr<bf16>").count() + 3,
@@ -990,6 +1077,7 @@ fn retained_paged_attention_3d_writes_fp32_segment_state() {
         segments: 16,
     })
     .unwrap();
+    let ttir = ttir.text();
     assert!(ttir.contains("@paged_attention_3d"), "{ttir}");
     assert!(ttir.contains("tt.get_program_id z"), "{ttir}");
     assert!(ttir.contains("tensor<16x128xf32>"), "{ttir}");

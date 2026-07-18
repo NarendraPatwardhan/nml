@@ -530,6 +530,15 @@ backend API. NML owns a safe Rust builder over narrow TTIR bindings, typed named
 arguments, explicit output shapes and aliases, verified TTIR, launch grids,
 warps/stages, structured control flow, and deterministic errors.
 
+The builder's immutable result carries the canonical TTIR, public function
+name, and exact ordered argument kinds as one artifact. `KernelSpec` binds
+tensor shapes to that authored ABI and rejects differences in argument count,
+order, global-pointer address space, or element type before emitting
+StableHLO. Raw TTIR strings and separately reconstructed signatures never
+cross the custom-call boundary. Split-K paged attention keeps its producer
+sink-free and supplies learned sinks only to the global segment reduction,
+where their softmax correction is applied exactly once.
+
 The retained CUDA paths use Triton for unified paged attention and grouped
 expert projections on Ampere and newer GPUs. The pinned XLA Triton compiler
 rejects pre-Ampere devices, so SM75 uses portable XLA CUDA. Kernel source and
@@ -995,6 +1004,7 @@ table is a compact compatibility index, not a migration checklist.
 | D-055 | Framework crates expose model-independent mechanisms only; GPT-OSS artifact, architecture, protocol, scheduling, and lifecycle policy remain under `products/serve`. |
 | D-056 | GPT-OSS shape families compose bounded embedding, reusable layer-kind, and head executables through asynchronous PJRT dependencies; a full transformer is not one compiler module. |
 | D-057 | GPT-OSS compilation profiles are complete before parameter residency; request execution selects an existing bounded profile and never invokes XLA. |
+| D-058 | Every Triton custom call binds StableHLO tensors against the immutable builder-authored TTIR ABI; mismatched count, order, address space, or element type fails before XLA. |
 
 ## 16. Provenance and reference relationships
 

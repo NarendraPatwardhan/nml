@@ -1,4 +1,4 @@
-# GPT-OSS compilation and residency refactor
+# GPT-OSS compilation, residency, and Triton ABI refactor
 
 Status: implementation contract
 
@@ -23,10 +23,37 @@ compilation/autotuning occur while the complete model was already resident on
 the accelerator. Individual kernel contracts did not exercise that ordering.
 
 The failure was incorrectly attributed to the number of Triton kernels and to
-possible compiler parallelism. Every kernel path had already passed its
+possible compiler parallelism. Every isolated kernel path had passed its
 applicable standalone contract, and serializing XLA compilation reproduced the
-same failure. The compiler backtrace identified where XLA terminated; it did
-not establish a defective kernel ABI.
+same failure. The first compiler backtrace identified where XLA terminated but
+was insufficient by itself. Exact-binary disassembly plus the completed-call
+register state subsequently proved a defective custom-call ABI.
+
+### Split-K learned-sink root cause
+
+The split-K paged-attention producer intentionally excludes learned sinks: each
+producer computes independent KV segments, and the segment reduction applies
+the sink correction exactly once. Its TTIR function therefore had 18 input
+pointers and three output pointers. The StableHLO lowering accidentally reused
+a shared operand list containing the sink, describing 19 inputs and three
+outputs.
+
+XLA creates kernel argument metadata from the StableHLO operands and results.
+After Triton compilation it annotates the resulting LLVM function arguments
+without first checking that the function has the same visible arity. At
+zero-based argument 21, the malformed 22-buffer call indexed one past NML's
+21-argument TTIR function and `llvm::Value::setName` interpreted the LLVM
+function object as an argument. The asynchronous completion worker was merely
+where this deterministic mismatch became undefined behavior; compiler
+parallelism and LLVM-context lifetime were not the cause.
+
+ZML avoids this class of failure because its declared input/output record also
+drives TTIR argument declaration. Its split-K kernel retains a fixed sink slot
+and passes a dummy value while sink semantics are disabled. NML keeps its
+different, cleaner semantic split—the producer is genuinely sink-free and the
+reducer owns the sink—but now carries the builder-authored function ABI with
+the verified TTIR into `KernelSpec`. Count, order, pointer address space, and
+element type must match the StableHLO tensor ABI before a custom call exists.
 
 ## ZML reference
 
@@ -152,3 +179,11 @@ Permanent contracts must establish:
 - [x] Update `SYSTEM.md` and `TASKS.md` with the permanent lifecycle invariant.
 - [x] Pass the focused product contract and the applicable repository CPU/CUDA
   BuildBuddy gates.
+- [x] Remove the learned-sink operand from the split-K producer while retaining
+  it in the segment reduction.
+- [x] Replace raw TTIR strings at the call boundary with an immutable verified
+  kernel carrying its builder-authored name and argument ABI.
+- [x] Reject TTIR/custom-call count, order, pointer-address-space, and element-
+  type drift before StableHLO lowering.
+- [x] Cover split-K plus learned sinks in structural lowering and the unchanged
+  suitable-device numerical attention contract.

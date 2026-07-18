@@ -42,6 +42,9 @@ history—not a growing list of superseded tasks—is the implementation archive
 - [x] Real suitable-device substrate evidence: FA2/Triton paths passed on SM86;
   FA3/Triton paths passed on SM90. Both ran numerical attention and grouped-MoE
   contracts through ordinary dispatch. Multi-GPU CUDA remains unproven.
+- [x] Builder-authored Triton function ABIs are immutable inputs to typed
+  StableHLO calls. Structural contracts reject ABI drift before XLA, including
+  the split-K paged-attention plus learned-sink cross-product.
 
 ## Current milestone: componentized GPT-OSS 20B NVFP4 generation
 

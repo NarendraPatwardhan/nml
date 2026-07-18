@@ -108,7 +108,6 @@ pub(crate) fn lower_linear<'context>(
         argument_specs.push(tensor(plan.config.dtype, shape.dimensions())?);
     }
     let specification = KernelSpec::new(
-        "nvfp4_linear",
         build_nvfp4_linear(plan.config).map_err(kernel_error)?,
         argument_specs,
         vec![tensor(plan.config.dtype, &output_shape)?],
@@ -116,13 +115,13 @@ pub(crate) fn lower_linear<'context>(
     )
     .map_err(kernel_error)?;
     let mut arguments = vec![
-        inputs.activation,
-        inputs.payload,
-        inputs.block_scales,
-        inputs.global_scale,
+        ("input", inputs.activation),
+        ("payload", inputs.payload),
+        ("block_scales", inputs.block_scales),
+        ("global_scale", inputs.global_scale),
     ];
     if let Some(bias) = inputs.bias {
-        arguments.push(bias);
+        arguments.push(("bias", bias));
     }
     let call = specification
         .lower(
@@ -325,7 +324,6 @@ fn lower_triton_experts<'context>(
         role: NvFp4GroupedRole::GateUp,
     };
     let gate_specification = KernelSpec::new(
-        "nvfp4_grouped_gate_up",
         build_nvfp4_grouped_projection(gate_config).map_err(kernel_error)?,
         vec![
             tensor(dtype, inputs.hidden_shape.dimensions())?,
@@ -345,14 +343,14 @@ fn lower_triton_experts<'context>(
         .lower(
             context,
             &[
-                inputs.hidden,
-                inputs.sorted_assignments,
-                inputs.block_experts,
-                inputs.gate_payload,
-                inputs.gate_scales,
-                inputs.gate_global,
-                inputs.gate_bias,
-                expert_offset,
+                ("input", inputs.hidden),
+                ("sorted_assignments", inputs.sorted_assignments),
+                ("block_experts", inputs.block_experts),
+                ("payload", inputs.gate_payload),
+                ("block_scales", inputs.gate_scales),
+                ("global_scale", inputs.gate_global),
+                ("bias", inputs.gate_bias),
+                ("expert_offset", expert_offset),
             ],
             grouped_launch(
                 inputs.block_experts_shape.dimensions()[0],
@@ -377,7 +375,6 @@ fn lower_triton_experts<'context>(
         role: NvFp4GroupedRole::ClampedSwiGluDown,
     };
     let down_specification = KernelSpec::new(
-        "nvfp4_grouped_down",
         build_nvfp4_grouped_projection(down_config).map_err(kernel_error)?,
         vec![
             tensor(dtype, &[assignments, gate_output])?,
@@ -398,15 +395,15 @@ fn lower_triton_experts<'context>(
         .lower(
             context,
             &[
-                gate_output_value,
-                inputs.sorted_assignments,
-                inputs.block_experts,
-                inputs.down_payload,
-                inputs.down_scales,
-                inputs.down_global,
-                inputs.down_bias,
-                expert_offset,
-                inputs.routing_weights,
+                ("input", gate_output_value),
+                ("sorted_assignments", inputs.sorted_assignments),
+                ("block_experts", inputs.block_experts),
+                ("payload", inputs.down_payload),
+                ("block_scales", inputs.down_scales),
+                ("global_scale", inputs.down_global),
+                ("bias", inputs.down_bias),
+                ("expert_offset", expert_offset),
+                ("routing_weights", inputs.routing_weights),
             ],
             grouped_launch(
                 inputs.block_experts_shape.dimensions()[0],
@@ -458,7 +455,6 @@ pub(crate) fn lower_embedding<'context>(
         block_n: 64,
     };
     let specification = KernelSpec::new(
-        "nvfp4_embedding",
         build_nvfp4_embedding(config).map_err(kernel_error)?,
         vec![
             tensor(config.index_dtype, inputs.indices_shape.dimensions())?,
@@ -474,10 +470,10 @@ pub(crate) fn lower_embedding<'context>(
         .lower(
             context,
             &[
-                inputs.indices,
-                inputs.payload,
-                inputs.block_scales,
-                inputs.global_scale,
+                ("indices", inputs.indices),
+                ("payload", inputs.payload),
+                ("block_scales", inputs.block_scales),
+                ("global_scale", inputs.global_scale),
             ],
             KernelLaunch {
                 grid: config.launch_grid().map_err(kernel_error)?,

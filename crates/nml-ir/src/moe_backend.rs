@@ -74,7 +74,6 @@ pub(crate) fn lower<'context>(
         multiply_routing_weight: false,
     };
     let gate_up_spec = KernelSpec::new(
-        "moe_grouped_gate_up",
         build_grouped_projection(gate_up_config).map_err(kernel_error)?,
         vec![
             tensor(dtype, inputs.hidden_shape.dimensions())?,
@@ -96,11 +95,11 @@ pub(crate) fn lower<'context>(
         .lower(
             context,
             &[
-                inputs.hidden,
-                inputs.sorted_assignments,
-                inputs.block_experts,
-                inputs.gate_up_weights,
-                expert_offset,
+                ("input", inputs.hidden),
+                ("sorted_assignments", inputs.sorted_assignments),
+                ("block_experts", inputs.block_experts),
+                ("weights", inputs.gate_up_weights),
+                ("expert_offset", expert_offset),
             ],
             launch(block_count, gate_up_width, block_n)?,
         )
@@ -126,7 +125,6 @@ pub(crate) fn lower<'context>(
         multiply_routing_weight: true,
     };
     let down_spec = KernelSpec::new(
-        "moe_grouped_down",
         build_grouped_projection(down_config).map_err(kernel_error)?,
         vec![
             tensor(dtype, &[assignments, gate_up_width])?,
@@ -144,12 +142,12 @@ pub(crate) fn lower<'context>(
         .lower(
             context,
             &[
-                gate_up,
-                inputs.sorted_assignments,
-                inputs.block_experts,
-                inputs.down_weights,
-                expert_offset,
-                inputs.routing_weights,
+                ("input", gate_up),
+                ("sorted_assignments", inputs.sorted_assignments),
+                ("block_experts", inputs.block_experts),
+                ("weights", inputs.down_weights),
+                ("expert_offset", expert_offset),
+                ("routing_weights", inputs.routing_weights),
             ],
             launch(block_count, hidden_size, block_n)?,
         )

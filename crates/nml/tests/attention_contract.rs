@@ -323,6 +323,20 @@ fn accelerated_cuda_attention_matches_dense_reference(platform: &nml::Platform) 
             },
         );
     }
+    // Decode selects the split-K producer plus segment reducer. Learned sinks
+    // belong only to the reducer ABI; this exact cross-product previously let
+    // the StableHLO call carry one more buffer than the authored 3D TTIR.
+    execute_accelerated_paged_with_sinks(
+        platform,
+        DType::F32,
+        16,
+        1,
+        AttentionOptions {
+            causal: true,
+            sliding_window: Some(6),
+            scale: None,
+        },
+    );
 }
 
 fn execute_accelerated_dense(platform: &nml::Platform, dtype: DType, options: AttentionOptions) {
@@ -359,6 +373,7 @@ fn execute_accelerated_dense(platform: &nml::Platform, dtype: DType, options: At
         KV_HEADS,
         HEAD_DIMENSION,
         options,
+        None,
     );
 
     let mut builder = ProgramBuilder::new();
@@ -452,6 +467,35 @@ fn execute_accelerated_paged(
     query_length: usize,
     options: AttentionOptions,
 ) {
+    execute_accelerated_paged_case(platform, dtype, page_size, query_length, options, None);
+}
+
+fn execute_accelerated_paged_with_sinks(
+    platform: &nml::Platform,
+    dtype: DType,
+    page_size: usize,
+    query_length: usize,
+    options: AttentionOptions,
+) {
+    let sinks = round_values(dtype, &generated_values(6, 71));
+    execute_accelerated_paged_case(
+        platform,
+        dtype,
+        page_size,
+        query_length,
+        options,
+        Some(&sinks),
+    );
+}
+
+fn execute_accelerated_paged_case(
+    platform: &nml::Platform,
+    dtype: DType,
+    page_size: usize,
+    query_length: usize,
+    options: AttentionOptions,
+    sinks: Option<&[f32]>,
+) {
     const BATCHES: usize = 2;
     const QUERY_HEADS: usize = 6;
     const KV_HEADS: usize = 2;
@@ -502,6 +546,7 @@ fn execute_accelerated_paged(
         KV_HEADS,
         HEAD_DIMENSION,
         options,
+        sinks,
     );
 
     let token_width = KV_HEADS * HEAD_DIMENSION;
@@ -556,6 +601,12 @@ fn execute_accelerated_paged(
         "accelerated_query_positions",
         Shape::new(DType::I32, &[BATCHES as i64, query_length as i64]).unwrap(),
     );
+    let sink_tensor = sinks.map(|_| {
+        builder.input(
+            "accelerated_sinks",
+            Shape::new(dtype, &[QUERY_HEADS as i64]).unwrap(),
+        )
+    });
     let output = builder
         .paged_attention(
             query_tensor,
@@ -564,7 +615,7 @@ fn execute_accelerated_paged(
             table_tensor,
             length_tensor,
             position_tensor,
-            None,
+            sink_tensor,
             options,
         )
         .unwrap();
@@ -615,6 +666,15 @@ fn execute_accelerated_paged(
         &[BATCHES as i64, query_length as i64],
         &query_positions,
     );
+    if let Some(sinks) = sinks {
+        set_float(
+            platform,
+            &mut args,
+            "accelerated_sinks",
+            Shape::new(dtype, &[QUERY_HEADS as i64]).unwrap(),
+            sinks,
+        );
+    }
     for _ in 0..2 {
         let actual = decode(
             args.call()
@@ -642,6 +702,7 @@ fn reference_attention_geometry(
     key_value_heads: usize,
     head_dimension: usize,
     options: AttentionOptions,
+    sinks: Option<&[f32]>,
 ) -> Vec<f32> {
     let mut output = vec![0.0; batches * query_length * query_heads * head_dimension];
     let scale = options
@@ -679,7 +740,11 @@ fn reference_attention_geometry(
                         * scale;
                     scores.push(score);
                 }
-                let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let sink = sinks.map(|values| values[query_head]);
+                let maximum = sink
+                    .into_iter()
+                    .chain(scores.iter().copied())
+                    .fold(f32::NEG_INFINITY, f32::max);
                 if maximum == f32::NEG_INFINITY {
                     continue;
                 }
@@ -687,7 +752,8 @@ fn reference_attention_geometry(
                     .iter()
                     .map(|score| (*score - maximum).exp())
                     .collect::<Vec<_>>();
-                let denominator = weights.iter().sum::<f32>();
+                let denominator = weights.iter().sum::<f32>()
+                    + sink.map_or(0.0, |score| (score - maximum).exp());
                 let output_offset = ((batch * query_length + query_index) * query_heads
                     + query_head)
                     * head_dimension;

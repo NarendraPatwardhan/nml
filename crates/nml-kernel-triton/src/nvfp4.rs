@@ -4,7 +4,7 @@
 //! scales share the N row, while the K tile is decoded directly into the
 //! tensor-core operand. Only the current tile exists at activation precision.
 
-use super::{ArgumentKind, Builder, Comparison, DType, Error};
+use super::{ArgumentKind, Builder, Comparison, DType, Error, Kernel};
 
 const REPRESENTATION_BLOCK: i64 = 16;
 
@@ -142,7 +142,7 @@ impl NvFp4LinearConfig {
     }
 }
 
-pub fn build_nvfp4_linear(config: NvFp4LinearConfig) -> Result<String, Error> {
+pub fn build_nvfp4_linear(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
     config.validate()?;
     let block_m = i32::try_from(config.block_m)
         .map_err(|_| Error::InvalidKernelSpec("NVFP4 M tile exceeds I32"))?;
@@ -269,7 +269,7 @@ pub fn build_nvfp4_linear(config: NvFp4LinearConfig) -> Result<String, Error> {
     builder.finish()
 }
 
-pub fn build_nvfp4_embedding(config: NvFp4EmbeddingConfig) -> Result<String, Error> {
+pub fn build_nvfp4_embedding(config: NvFp4EmbeddingConfig) -> Result<Kernel, Error> {
     let config = config.validate()?;
     let block_m = i32::try_from(config.block_m)
         .map_err(|_| Error::InvalidKernelSpec("embedding M tile exceeds I32"))?;
@@ -365,7 +365,7 @@ pub fn build_nvfp4_embedding(config: NvFp4EmbeddingConfig) -> Result<String, Err
 /// adds the per-expert bias, and applies the route weight.
 pub fn build_nvfp4_grouped_projection(
     config: NvFp4GroupedProjectionConfig,
-) -> Result<String, Error> {
+) -> Result<Kernel, Error> {
     let config = config.validate()?;
     let name = match config.role {
         NvFp4GroupedRole::GateUp => "nvfp4_grouped_gate_up",

@@ -2,8 +2,9 @@
 //!
 //! A builder owns symbolic SSA values only while one kernel is authored.  Its
 //! finish boundary reparses and verifies the complete module in an isolated
-//! Triton MLIR context, then returns canonical text.  The StableHLO graph sees
-//! neither raw MLIR pointers nor partially constructed TTIR.
+//! Triton MLIR context, then returns canonical text together with the exact
+//! authored function ABI. The StableHLO graph sees neither raw MLIR pointers,
+//! partially constructed TTIR, nor an independently reconstructed ABI.
 
 #![forbid(unsafe_code)]
 
@@ -98,6 +99,45 @@ impl ArgumentKind {
             } => format!("!tt.ptr<{}, {address_space}>", element.spelling()),
             Self::Scalar(dtype) => dtype.spelling().to_owned(),
         }
+    }
+}
+
+/// One verified TTIR module and the public function ABI that authored it.
+///
+/// The fields are intentionally private. A `Kernel` can only come from
+/// [`Builder::finish`], so the canonical TTIR text and its typed argument list
+/// cannot drift before [`KernelSpec`](crate::KernelSpec) binds tensor shapes to
+/// the XLA custom call.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Kernel {
+    name: String,
+    ir: String,
+    arguments: Vec<KernelArgument>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KernelArgument {
+    name: String,
+    kind: ArgumentKind,
+}
+
+impl Kernel {
+    pub fn text(&self) -> &str {
+        &self.ir
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn arguments(&self) -> &[KernelArgument] {
+        &self.arguments
+    }
+}
+
+impl fmt::Display for Kernel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.ir)
     }
 }
 
@@ -269,6 +309,7 @@ impl ScaleDotElement {
 #[derive(Clone, Debug)]
 struct Argument {
     name: String,
+    kind: ArgumentKind,
     value: Value,
     divisibility: Option<i32>,
 }
@@ -424,6 +465,7 @@ impl Builder {
         };
         self.arguments.push(Argument {
             name: name.to_owned(),
+            kind,
             value: value.clone(),
             divisibility,
         });
@@ -1490,7 +1532,7 @@ impl Builder {
         Ok(())
     }
 
-    pub fn finish(self) -> Result<String, Error> {
+    pub fn finish(self) -> Result<Kernel, Error> {
         if !self.terminated {
             return Err(Error::MissingTerminator);
         }
@@ -1522,7 +1564,18 @@ impl Builder {
         let context = Context::new_ttir();
         let module = context.parse_module(&source)?;
         module.verify()?;
-        Ok(module.text())
+        Ok(Kernel {
+            name: self.name,
+            ir: module.text(),
+            arguments: self
+                .arguments
+                .into_iter()
+                .map(|argument| KernelArgument {
+                    name: argument.name,
+                    kind: argument.kind,
+                })
+                .collect(),
+        })
     }
 
     fn binary(

@@ -5,7 +5,7 @@
 //! tensor ABI, layouts, aliases, and launch validation used to create the one
 //! StableHLO operation.
 
-use super::{DType, Error, require_identifier};
+use super::{ArgumentKind, DType, Error, Kernel};
 use nml_mlir::{
     Context, Operation, OutputOperandAlias, TritonCustomCall, Type, Value as MlirValue,
 };
@@ -71,6 +71,7 @@ impl KernelLaunch {
 pub struct KernelSpec {
     name: String,
     ir: String,
+    input_names: Vec<String>,
     inputs: Vec<TensorSpec>,
     outputs: Vec<TensorSpec>,
     aliases: Vec<OutputAlias>,
@@ -78,29 +79,51 @@ pub struct KernelSpec {
 
 impl KernelSpec {
     pub fn new(
-        name: &str,
-        ir: String,
+        kernel: Kernel,
         inputs: Vec<TensorSpec>,
         outputs: Vec<TensorSpec>,
         aliases: Vec<OutputAlias>,
     ) -> Result<Self, Error> {
-        require_identifier(name)?;
         if inputs.is_empty() || outputs.is_empty() {
             return Err(Error::InvalidKernelSpec(
                 "kernel input and output ABIs must be nonempty",
             ));
         }
 
-        // Builder::finish already verifies authored kernels, but KernelSpec is
-        // the independent boundary that embeds TTIR in StableHLO. Reparse here
-        // so a malformed or name-mismatched string can never become an opaque
-        // backend_config whose failure is deferred to XLA.
+        if kernel.arguments().len() != inputs.len() + outputs.len() {
+            return Err(Error::InvalidKernelSpec(
+                "authored TTIR and custom-call tensor ABIs have different argument counts",
+            ));
+        }
+        if kernel
+            .arguments()
+            .iter()
+            .zip(inputs.iter().chain(&outputs))
+            .any(|(argument, tensor)| {
+                !matches!(
+                    argument.kind,
+                    ArgumentKind::Pointer {
+                        element,
+                        address_space: 1,
+                    } if element == tensor.dtype
+                )
+            })
+        {
+            return Err(Error::InvalidKernelSpec(
+                "authored TTIR arguments must be global pointers matching the custom-call tensor ABI",
+            ));
+        }
+
+        // Builder::finish already verifies authored kernels. KernelSpec
+        // independently reparses the immutable result at the StableHLO
+        // boundary so corruption can never become an opaque backend_config
+        // whose failure is deferred to XLA.
         let ttir_context = Context::new_ttir();
-        let module = ttir_context.parse_module(&ir)?;
+        let module = ttir_context.parse_module(kernel.text())?;
         module.verify()?;
         let ir = module.text();
         if ir.matches("tt.func public @").count() != 1
-            || !ir.contains(&format!("tt.func public @{name}("))
+            || !ir.contains(&format!("tt.func public @{}(", kernel.name()))
         {
             return Err(Error::InvalidKernelSpec(
                 "kernel IR must contain exactly one name-consistent public TTIR function",
@@ -119,9 +142,14 @@ impl KernelSpec {
                 ));
             }
         }
+        let input_names = kernel.arguments()[..inputs.len()]
+            .iter()
+            .map(|argument| argument.name.clone())
+            .collect();
         Ok(Self {
-            name: name.to_owned(),
+            name: kernel.name().to_owned(),
             ir,
+            input_names,
             inputs,
             outputs,
             aliases,
@@ -131,7 +159,7 @@ impl KernelSpec {
     pub fn lower<'context>(
         &self,
         context: &'context Context,
-        operands: &[MlirValue<'context>],
+        operands: &[(&str, MlirValue<'context>)],
         launch: KernelLaunch,
     ) -> Result<Operation<'context>, Error> {
         let launch = launch.validate()?;
@@ -140,7 +168,15 @@ impl KernelSpec {
                 "kernel operand count does not match its typed input ABI",
             ));
         }
-        for (operand, expected) in operands.iter().zip(&self.inputs) {
+        for ((name, operand), (expected_name, expected)) in operands
+            .iter()
+            .zip(self.input_names.iter().zip(&self.inputs))
+        {
+            if name != expected_name {
+                return Err(Error::InvalidKernelSpec(
+                    "kernel operand name or order does not match its authored TTIR ABI",
+                ));
+            }
             let expected = expected.mlir_type(context)?;
             if operand.type_().text() != expected.text() {
                 return Err(Error::InvalidKernelSpec(
@@ -180,9 +216,13 @@ impl KernelSpec {
                 operand_index: alias.input,
             })
             .collect::<Vec<_>>();
+        let operand_values = operands
+            .iter()
+            .map(|(_, operand)| *operand)
+            .collect::<Vec<_>>();
 
         Ok(context.triton_custom_call(
-            operands,
+            &operand_values,
             &result_types,
             TritonCustomCall {
                 name: &self.name,

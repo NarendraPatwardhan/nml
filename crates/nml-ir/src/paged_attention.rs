@@ -273,34 +273,32 @@ fn lower_triton_kernel<'context>(
     let positions_spec = tensor(KernelDType::I32, &[batch, query_len])?;
     let starts_spec = tensor(KernelDType::I32, &[batch + 1])?;
 
-    let mut base_operands = vec![inputs.query];
-    if let Some(sinks) = inputs.sinks {
-        base_operands.push(sinks);
-    }
-    base_operands.extend([
-        inputs.key_cache,
-        inputs.value_cache,
-        page_table,
-        sequence_lengths,
-        query_positions,
-        scale,
-        block_table_stride,
-        query_stride_0,
-        query_stride_1,
-    ]);
-    let cache_operands = [
-        key_stride_0,
-        key_stride_1,
-        key_stride_2,
-        value_stride_0,
-        value_stride_1,
-        value_stride_2,
+    // The split-K producer computes independent KV segments and therefore has
+    // no learned-sink input. The reduction owns that correction exactly once.
+    // Keep the producer ABI sink-free here; the 2D path adds its native sink
+    // argument below when that specialization consumes it directly.
+    let base_operands = vec![
+        ("query", inputs.query),
+        ("key_cache", inputs.key_cache),
+        ("value_cache", inputs.value_cache),
+        ("block_tables", page_table),
+        ("sequence_lengths", sequence_lengths),
+        ("query_positions", query_positions),
+        ("scale", scale),
+        ("block_table_stride", block_table_stride),
+        ("query_stride_0", query_stride_0),
+        ("query_stride_1", query_stride_1),
     ];
-    let mut base_specs = vec![query_spec.clone()];
-    if inputs.sinks.is_some() {
-        base_specs.push(tensor(kernel_dtype, &[query_heads])?);
-    }
-    base_specs.extend([
+    let cache_operands = [
+        ("key_stride_0", key_stride_0),
+        ("key_stride_1", key_stride_1),
+        ("key_stride_2", key_stride_2),
+        ("value_stride_0", value_stride_0),
+        ("value_stride_1", value_stride_1),
+        ("value_stride_2", value_stride_2),
+    ];
+    let base_specs = vec![
+        query_spec.clone(),
         cache_spec.clone(),
         cache_spec.clone(),
         page_table_spec,
@@ -310,7 +308,7 @@ fn lower_triton_kernel<'context>(
         scalar(KernelDType::I64)?,
         scalar(KernelDType::I64)?,
         scalar(KernelDType::I64)?,
-    ]);
+    ];
 
     match launch {
         AttentionLaunch::TwoDimensional {
@@ -325,10 +323,22 @@ fn lower_triton_kernel<'context>(
             let config = common_config(block_m, block_q, tile_size, inputs.sinks.is_some())?;
             let ir = build_paged_attention_2d(config).map_err(kernel_error)?;
             let mut operands = base_operands;
-            operands.extend([output_stride_0, output_stride_1]);
+            if let Some(sinks) = inputs.sinks {
+                operands.insert(1, ("sinks", sinks));
+            }
+            operands.extend([
+                ("output_stride_0", output_stride_0),
+                ("output_stride_1", output_stride_1),
+            ]);
             operands.extend(cache_operands);
-            operands.extend([query_starts, sequence_count]);
+            operands.extend([
+                ("query_starts", query_starts),
+                ("sequence_count", sequence_count),
+            ]);
             let mut specs = base_specs;
+            if inputs.sinks.is_some() {
+                specs.insert(1, tensor(kernel_dtype, &[query_heads])?);
+            }
             specs.extend([scalar(KernelDType::I64)?, scalar(KernelDType::I64)?]);
             specs.extend(
                 (0..6)
@@ -336,9 +346,8 @@ fn lower_triton_kernel<'context>(
                     .collect::<Result<Vec<_>, _>>()?,
             );
             specs.extend([starts_spec, scalar(KernelDType::I32)?]);
-            let specification =
-                KernelSpec::new("paged_attention_2d", ir, specs, vec![query_spec], vec![])
-                    .map_err(kernel_error)?;
+            let specification = KernelSpec::new(ir, specs, vec![query_spec], vec![])
+                .map_err(kernel_error)?;
             append_kernel(
                 context,
                 block,
@@ -368,7 +377,10 @@ fn lower_triton_kernel<'context>(
             .map_err(kernel_error)?;
             let mut operands = base_operands;
             operands.extend(cache_operands);
-            operands.extend([query_starts, sequence_count]);
+            operands.extend([
+                ("query_starts", query_starts),
+                ("sequence_count", sequence_count),
+            ]);
             let mut specs = base_specs;
             specs.extend(
                 (0..6)
@@ -384,7 +396,6 @@ fn lower_triton_kernel<'context>(
             let segment_statistics_spec =
                 tensor(KernelDType::F32, &[num_tokens, query_heads, segments_i64])?;
             let specification = KernelSpec::new(
-                "paged_attention_3d",
                 ir,
                 specs,
                 vec![
@@ -418,16 +429,20 @@ fn lower_triton_kernel<'context>(
                 learned_sinks: inputs.sinks.is_some(),
             })
             .map_err(kernel_error)?;
-            let mut reduction_operands = vec![segment_values, segment_maxima, segment_sums];
+            let mut reduction_operands = vec![
+                ("segment_output", segment_values),
+                ("segment_maximum", segment_maxima),
+                ("segment_sum", segment_sums),
+            ];
             if let Some(sinks) = inputs.sinks {
-                reduction_operands.push(sinks);
+                reduction_operands.push(("sinks", sinks));
             }
             reduction_operands.extend([
-                sequence_lengths,
-                sequence_count,
-                output_stride_0,
-                output_stride_1,
-                query_starts,
+                ("sequence_lengths", sequence_lengths),
+                ("sequence_count", sequence_count),
+                ("output_stride_0", output_stride_0),
+                ("output_stride_1", output_stride_1),
+                ("query_starts", query_starts),
             ]);
             let mut reduction_specs = vec![
                 segment_values_spec,
@@ -445,7 +460,6 @@ fn lower_triton_kernel<'context>(
                 starts_spec,
             ]);
             let reduction = KernelSpec::new(
-                "paged_attention_segment_reduction",
                 reduction_ir,
                 reduction_specs,
                 vec![query_spec],
@@ -467,7 +481,7 @@ fn append_kernel<'context>(
     context: &'context Context,
     block: &mut Block<'context>,
     specification: KernelSpec,
-    operands: &[Value<'context>],
+    operands: &[(&str, Value<'context>)],
     launch: KernelLaunch,
 ) -> Result<Value<'context>, Error> {
     let operation = specification

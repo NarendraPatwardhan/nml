@@ -5,7 +5,7 @@
 //! tiled expert matrix multiplications. Keeping the schedule outside TTIR
 //! avoids duplicating selection semantics in a backend-specific language.
 
-use super::{ArgumentKind, Builder, Comparison, DType, Error};
+use super::{ArgumentKind, Builder, Comparison, DType, Error, Kernel};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GatedActivation {
@@ -58,7 +58,7 @@ impl GroupedProjectionConfig {
 
 /// Builds either the gate/up or down expert projection. The function name is
 /// part of XLA's custom-call ABI and intentionally fixed by the semantic role.
-pub fn build_grouped_projection(config: GroupedProjectionConfig) -> Result<String, Error> {
+pub fn build_grouped_projection(config: GroupedProjectionConfig) -> Result<Kernel, Error> {
     let config = config.validate()?;
     let name = if config.multiply_routing_weight {
         "moe_grouped_down"
