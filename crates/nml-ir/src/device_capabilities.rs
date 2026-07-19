@@ -80,17 +80,10 @@ impl CudaCapabilities {
         self.supports_xla_triton() && self.supports_bf16_tensor_cores()
     }
 
-    /// Latency-sensitive compact decode is a dedicated typed CUDA custom call
-    /// on every explicitly supported pre-Blackwell family. Blackwell later
-    /// implements the same semantic operation through native NVFP4 lowering.
-    pub(crate) const fn supports_nvfp4_cuda_custom_call(self) -> bool {
-        (self.major == 7 && self.minor == 5) || self.major == 8 || self.major == 9
-    }
-
-    /// SM75 has no retained XLA/Triton implementation, so its custom-call
-    /// family also owns matrix-shaped execution. Newer devices reserve the
-    /// custom call for M=1 and use the distinct Triton matrix path for M>1.
-    pub(crate) const fn requires_nvfp4_cuda_matrix(self) -> bool {
+    /// Turing's retained NVFP4 path is a dedicated typed CUDA custom call.
+    /// Keeping this distinct from Triton support prevents an architecture
+    /// version test from leaking into every semantic lowering.
+    pub(crate) const fn supports_nvfp4_turing_custom_call(self) -> bool {
         self.major == 7 && self.minor == 5
     }
 

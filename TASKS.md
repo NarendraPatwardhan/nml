@@ -199,28 +199,30 @@ persistent dense weight expansion.
   `20260719T121922Z-aiuvl369ogh26v-69e805cd5128-diagnostic`; this is diagnostic
   evidence, not the final gate, because the published image records the
   equivalent pre-commit dirty source identity rather than the accepted commit.
-- [x] Implement the next bandwidth-oriented decode tranche: compiler-selected
-  four/eight-warp output-owner CUDA targets across SM75/SM8x/SM90, one-launch
-  compact Q/K/V, direct dense-router top-four, route-reducing expert down,
-  exact streaming LM-head top-64, six-layer decode segments, O(1) argument
-  completeness, and reusable token staging. The final focused gate passes in
-  `1c25610d-bb61-4c20-b274-b9b0575d4695`, the complete GPU-independent CUDA
-  suite in `a9853052-3b1c-464c-ba1b-e109b608282b`, the full CUDA binary closure
-  in `ebf5521e-5dd7-4d4e-80be-e788f40a3dcf`, and package/OCI structure
-  contracts in `e1ddc567-0b9a-4c7d-aedf-a60125c6382e`. This is compile and
-  structural evidence, not NVIDIA execution.
-- [ ] Publish this source as one immutable CUDA OCI digest and run the complete
-  compact-operation numerical contract followed by GPT-OSS generation under
-  the mandatory GDB/Nsight harness in both explicit-greedy and fixed-seed
-  stochastic modes. Retain token/Harmony output, image/model identities,
-  confirmed Pod cleanup, prefill behavior, and Q/K/V, ordinary O, router,
-  expert gate/up, expert down, and streaming-head Nsight Compute counters;
-  accept the tranche only at 149 tokens/s or better without prefill
-  regression.
-- [ ] Use those counters to choose the RMS-normalization boundary and finish
-  raw PJRT invocation preparation. Do not fuse normalization into each
-  output-owner block if repeated activation/norm-weight traffic is worse than
-  one materialized normalized vector.
+- [x] Reject and manually remove the composed-decode/direct-kernel experiment.
+  Immutable image `c10b80d8dd51...` completed a coherent 320-token A40 run
+  under the combined GDB/Nsight harness, but sustained only 5.601 steady
+  device tokens/s versus the accepted profiled baseline of 55.475. Direct
+  expert gate/up and down consumed 92.1% of GPU kernel time; adding streaming
+  head top-k raised the three rejected kernels to 97%. The durable report is
+  `references/runpod/reports/20260719T152709Z-lm4xqsqg7we5ym-c10b80d8dd51-diagnostic`.
+  Output-owner ordinary GEMV, direct top-four expert kernels, streaming head
+  top-k, six-layer decode segments, and their sole-purpose semantic APIs are
+  not retained as dormant paths. BuildBuddy publication and the combined
+  diagnostic harness remain independent accepted infrastructure. The restored
+  source passes the full remote CUDA suite in
+  `61f0b083-80e5-40a7-8d91-bb4dfd80c4a6`, package/image contracts in
+  `7287d013-ed87-44cc-a42c-9897fb1d1e1d`, and the CUDA binary plus serving-image
+  closure in `f2a46248-ea91-44c2-8866-3b3d833c0219`.
+- [ ] Publish the manually restored source as an immutable image and rerun the
+  whole GPT-OSS A40 baseline through the combined GDB/Nsight harness. Retain
+  the report locally and verify the measured steady rate against 59.611
+  tokens/s before deleting the Pod.
+- [ ] Design the next compact-projection change from the restored 59.611
+  tokens/s architecture and measured kernel evidence. Compile-only contracts
+  are necessary but cannot promote another performance design: publish and
+  measure the first meaningful kernel tranche on A40 before composing further
+  optimizations on top of it.
 
 ## Next milestone: continuous batching and shared paged state
 

@@ -1,8 +1,8 @@
 //! Bounded GPT-OSS component graphs.
 //!
-//! Prefill keeps one transformer layer per reusable executable. Decode groups
-//! one bounded repeating layer segment so XLA owns a useful command-buffer
-//! domain without making complete model depth part of one compiler unit.
+//! The compiler sees one natural fusion domain at a time: embedding, one full
+//! transformer layer, or final projection/sampling. Layer repetition remains an
+//! execution-plan concern and never duplicates kernel bodies in StableHLO.
 
 use super::checkpoint::{BoxError, Checkpoint, DecoderLayer, Result, message};
 use super::config::{AttentionKind, Config};
@@ -14,7 +14,6 @@ use nml::{DataType, Graph, Shape, Tensor};
 // a wider, spill-heavy attention specialization.
 pub(super) const CACHE_PAGE_SIZE: usize = 16;
 pub(super) const MAXIMUM_TOP_K: usize = 64;
-pub(super) const DECODE_SEGMENT_LAYERS: usize = 6;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum Phase {
@@ -103,6 +102,7 @@ pub(super) fn build_layer(
 ) -> Result<Vec<(String, Tensor)>> {
     let sequence = dimension(family.sequence())?;
     let hidden_size = dimension(config.hidden_size())?;
+    let query_heads = dimension(config.query_heads())?;
     let key_value_heads = dimension(config.key_value_heads())?;
     let head_dim = dimension(config.head_dim())?;
     let page_count = dimension(family.page_count())?;
@@ -126,75 +126,6 @@ pub(super) fn build_layer(
     let page_table = graph.input("page_table", shape(DataType::I32, &[1, page_count])?);
     let key_input = graph.input("cache.key", cache_shape);
     let value_input = graph.input("cache.value", cache_shape);
-    let outputs = build_layer_operation(
-        graph,
-        layer,
-        config,
-        family,
-        attention_kind,
-        LayerInputs {
-            hidden: hidden_input,
-            position,
-            sequence_lengths,
-            page_table,
-            key_cache: key_input,
-            value_cache: value_input,
-        },
-    )?;
-    let hidden = nml(graph.reuse_buffer(outputs.hidden, hidden_input))?;
-
-    Ok(vec![
-        ("hidden".to_owned(), hidden),
-        ("cache.key".to_owned(), outputs.key_cache),
-        ("cache.value".to_owned(), outputs.value_cache),
-    ])
-}
-
-#[derive(Clone, Copy)]
-struct LayerInputs {
-    hidden: Tensor,
-    position: Tensor,
-    sequence_lengths: Tensor,
-    page_table: Tensor,
-    key_cache: Tensor,
-    value_cache: Tensor,
-}
-
-#[derive(Clone, Copy)]
-struct LayerOutputs {
-    hidden: Tensor,
-    key_cache: Tensor,
-    value_cache: Tensor,
-}
-
-fn build_layer_operation(
-    graph: &mut Graph,
-    layer: &DecoderLayer,
-    config: &Config,
-    family: ShapeFamily,
-    attention_kind: AttentionKind,
-    inputs: LayerInputs,
-) -> Result<LayerOutputs> {
-    let sequence = dimension(family.sequence())?;
-    let hidden_size = dimension(config.hidden_size())?;
-    let query_heads = dimension(config.query_heads())?;
-    let key_value_heads = dimension(config.key_value_heads())?;
-    let head_dim = dimension(config.head_dim())?;
-    let page_count = dimension(family.page_count())?;
-    let page_size = dimension(CACHE_PAGE_SIZE)?;
-    let hidden_shape = shape(DataType::Bf16, &[1, sequence, hidden_size])?;
-    let cache_shape = shape(
-        DataType::Bf16,
-        &[page_count, page_size, key_value_heads, head_dim],
-    )?;
-    let LayerInputs {
-        hidden: hidden_input,
-        position,
-        sequence_lengths,
-        page_table,
-        key_cache: key_input,
-        value_cache: value_input,
-    } = inputs;
     let zero = nml(graph.scalar(0_i32))?;
 
     let token_shape = shape(DataType::I32, &[1, sequence])?;
@@ -210,25 +141,21 @@ fn build_layer_operation(
         2,
         config.rms_norm_epsilon(),
     ))?;
-    let [query, key, value] = nml(graph.parallel_linears(
+    let query = nml(graph.linear(
         hidden,
-        &[
-            (
-                &layer.self_attn.q_proj.weight,
-                Some(&layer.self_attn.q_proj.bias),
-            ),
-            (
-                &layer.self_attn.k_proj.weight,
-                Some(&layer.self_attn.k_proj.bias),
-            ),
-            (
-                &layer.self_attn.v_proj.weight,
-                Some(&layer.self_attn.v_proj.bias),
-            ),
-        ],
-    ))?
-    .try_into()
-    .map_err(|_| message("GPT-OSS attention requires exactly three projections"))?;
+        &layer.self_attn.q_proj.weight,
+        Some(&layer.self_attn.q_proj.bias),
+    ))?;
+    let key = nml(graph.linear(
+        hidden,
+        &layer.self_attn.k_proj.weight,
+        Some(&layer.self_attn.k_proj.bias),
+    ))?;
+    let value = nml(graph.linear(
+        hidden,
+        &layer.self_attn.v_proj.weight,
+        Some(&layer.self_attn.v_proj.bias),
+    ))?;
     let query = nml(graph.reshape(
         query,
         shape(DataType::Bf16, &[1, sequence, query_heads, head_dim])?,
@@ -334,10 +261,14 @@ fn build_layer_operation(
         hidden,
         shape(DataType::Bf16, &[sequence, hidden_size])?,
     ))?;
-    let routed = nml(graph.routed_clamped_swiglu_with_router(
+    let router_logits = nml(graph.linear(
         routed,
         &layer.mlp.router.weight,
-        &layer.mlp.router.bias,
+        Some(&layer.mlp.router.bias),
+    ))?;
+    let routed = nml(graph.routed_clamped_swiglu(
+        routed,
+        router_logits,
         &layer.mlp.experts.gate_up_proj,
         &layer.mlp.experts.gate_up_proj_bias,
         &layer.mlp.experts.down_proj,
@@ -346,74 +277,13 @@ fn build_layer_operation(
     ))?;
     let routed = nml(graph.reshape(routed, hidden_shape))?;
     hidden = nml(graph.add(residual, routed))?;
-    Ok(LayerOutputs {
-        hidden,
-        key_cache,
-        value_cache,
-    })
-}
-
-/// Builds one bounded, reusable decode command-buffer domain.
-///
-/// Six alternating layers divide the selected 24-layer model exactly. The
-/// graph is compiled once and rebound to four parameter/cache bundles; model
-/// depth remains an execution-plan property while XLA can capture all work
-/// inside one segment as one command buffer.
-pub(super) fn build_decode_segment(
-    graph: &mut Graph,
-    layers: &[(&DecoderLayer, AttentionKind)],
-    config: &Config,
-    family: ShapeFamily,
-) -> Result<Vec<(String, Tensor)>> {
-    if family.phase() != Phase::Decode || layers.len() != DECODE_SEGMENT_LAYERS {
-        return Err(message(
-            "GPT-OSS decode segment requires exactly six decode layers",
-        ));
-    }
-    let sequence = dimension(family.sequence())?;
-    let hidden_size = dimension(config.hidden_size())?;
-    let page_count = dimension(family.page_count())?;
-    let cache = cache_shape(config, family)?;
-    let hidden_input = graph.input(
-        "hidden",
-        shape(DataType::Bf16, &[1, sequence, hidden_size])?,
-    );
-    let position = graph.input("position", shape(DataType::I32, &[])?);
-    let one = nml(graph.scalar(1_i32))?;
-    let length = nml(graph.add(position, one))?;
-    let sequence_lengths = nml(graph.reshape(length, shape(DataType::I32, &[1])?))?;
-    let page_table = graph.input("page_table", shape(DataType::I32, &[1, page_count])?);
-    let mut hidden = hidden_input;
-    let mut cache_outputs = Vec::with_capacity(DECODE_SEGMENT_LAYERS * 2);
-    for (index, (layer, kind)) in layers.iter().copied().enumerate() {
-        let key_name = format!("cache.{index}.key");
-        let value_name = format!("cache.{index}.value");
-        let key_cache = graph.input(key_name.clone(), cache);
-        let value_cache = graph.input(value_name.clone(), cache);
-        let outputs = build_layer_operation(
-            graph,
-            layer,
-            config,
-            family,
-            kind,
-            LayerInputs {
-                hidden,
-                position,
-                sequence_lengths,
-                page_table,
-                key_cache,
-                value_cache,
-            },
-        )?;
-        hidden = outputs.hidden;
-        cache_outputs.push((key_name, outputs.key_cache));
-        cache_outputs.push((value_name, outputs.value_cache));
-    }
     let hidden = nml(graph.reuse_buffer(hidden, hidden_input))?;
-    let mut outputs = Vec::with_capacity(1 + cache_outputs.len());
-    outputs.push(("hidden".to_owned(), hidden));
-    outputs.extend(cache_outputs);
-    Ok(outputs)
+
+    Ok(vec![
+        ("hidden".to_owned(), hidden),
+        ("cache.key".to_owned(), key_cache),
+        ("cache.value".to_owned(), value_cache),
+    ])
 }
 
 pub(super) fn build_head(
@@ -451,21 +321,17 @@ pub(super) fn build_head(
         config.rms_norm_epsilon(),
     ))?;
     let last = nml(graph.reshape(last, shape(DataType::Bf16, &[1, hidden_size])?))?;
-    let (candidate_logits, candidate_indices) = nml(graph.linear_top_k(
-        last,
-        &checkpoint.lm_head.weight,
-        None,
-        MAXIMUM_TOP_K,
-    ))?;
+    let logits = nml(graph.linear(last, &checkpoint.lm_head.weight, None))?;
     let sampling_state = nml(graph.random_state(sampling_state_input))?;
-    let (sampling_state, token) = nml(graph.sample_top_k_candidates_dynamic(
-        candidate_logits,
-        candidate_indices,
+    let (sampling_state, token) = nml(graph.sample_tokens_dynamic(
+        logits,
         sampling_state,
+        1,
         top_k,
         temperature,
         top_p,
         min_p,
+        MAXIMUM_TOP_K,
     ))?;
     let sampling_state = nml(graph.reuse_buffer(
         sampling_state.into_tensor(),
@@ -630,45 +496,6 @@ mod tests {
         );
         assert!(!decode_layer.input_names().any(|name| name == "sequence_lengths"));
         assert_single_layer_identity!(decode_layer, 1);
-
-        let representatives = checkpoint
-            .model
-            .layers
-            .iter()
-            .zip(config.layer_types())
-            .take(DECODE_SEGMENT_LAYERS)
-            .map(|(layer, kind)| (layer, *kind))
-            .collect::<Vec<_>>();
-        let decode_segment =
-            finish!(|graph| build_decode_segment(graph, &representatives, &config, decode));
-        assert_eq!(
-            decode_segment
-                .inputs()
-                .filter(|(_, _, binding)| !binding.is_parameter_component())
-                .count(),
-            3 + 2 * DECODE_SEGMENT_LAYERS,
-        );
-        assert_eq!(
-            decode_segment
-                .inputs()
-                .filter(|(_, _, binding)| binding.is_parameter_component())
-                .count(),
-            29 * DECODE_SEGMENT_LAYERS,
-        );
-        assert_eq!(decode_segment.outputs().count(), 1 + 2 * DECODE_SEGMENT_LAYERS);
-        let aliases = decode_segment.output_aliases().collect::<Vec<_>>();
-        assert!(aliases.iter().all(Option::is_some));
-        let mut unique_aliases = aliases.iter().copied().flatten().collect::<Vec<_>>();
-        unique_aliases.sort_unstable();
-        unique_aliases.dedup();
-        assert_eq!(unique_aliases.len(), aliases.len());
-        assert!(!decode_segment
-            .input_names()
-            .any(|name| name == "sequence_lengths"));
-        for index in 0..DECODE_SEGMENT_LAYERS {
-            let prefix = format!("model.layers.{index}.");
-            assert!(decode_segment.input_names().any(|name| name.starts_with(&prefix)));
-        }
 
         let prefill_head = finish!(|graph| build_head(graph, &checkpoint, &config, prefill));
         assert_contract!(prefill_head, 7, 4, 2, &[None, Some(2)]);

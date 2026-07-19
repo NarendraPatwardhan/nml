@@ -45,12 +45,7 @@ fn nvfp4_linear_is_one_semantic_operation_with_three_physical_components() {
         .unwrap();
     sm75.verify().unwrap();
     let sm75 = sm75.text();
-    assert_eq!(
-        sm75.matches("nml.nvfp4.cuda.linear_matrix").count(),
-        1,
-        "{sm75}"
-    );
-    assert!(!sm75.contains("linear_m1"), "{sm75}");
+    assert_eq!(sm75.matches("nml.nvfp4.turing.linear").count(), 1, "{sm75}");
     assert!(!sm75.contains("__gpu$xla.gpu.triton"), "{sm75}");
     assert!(!sm75.contains("stablehlo.add"), "{sm75}");
     // Blackwell retains this explicitly named compact-weight emulation route
@@ -145,222 +140,6 @@ fn nvfp4_linear_validates_optional_bias_before_authoring_the_compact_operation()
 }
 
 #[test]
-fn nvfp4_decode_linear_uses_the_preblackwell_output_owner_path() {
-    let dtype = DType::Bf16;
-    let weight = Parameter::nvfp4(
-        "projection.weight",
-        "model.projection.weight",
-        Shape::new(dtype, &[512, 64]).unwrap(),
-    )
-    .unwrap();
-    let mut builder = ProgramBuilder::new();
-    let input = builder.input("hidden", Shape::new(dtype, &[1, 64]).unwrap());
-    let output = builder.linear(input, &weight, None).unwrap();
-    let program = builder.finish(&[output]).unwrap();
-
-    for (major, minor) in [(7, 5), (8, 0), (8, 6), (8, 9), (9, 0)] {
-        let context = Context::new();
-        let module = program
-            .module_with_sharding_cuda(
-                &context,
-                &nml_sharding::Sharding::single(),
-                108,
-                major,
-                minor,
-            )
-            .unwrap();
-        module.verify().unwrap();
-        let text = module.text();
-        assert_eq!(
-            text.matches("nml.nvfp4.cuda.linear_m1_w4").count(),
-            1,
-            "{text}"
-        );
-        assert!(!text.contains("__gpu$xla.gpu.triton"), "{text}");
-    }
-}
-
-#[test]
-fn nvfp4_decode_linear_selects_the_wide_output_owner_variant() {
-    let dtype = DType::Bf16;
-    let weight = Parameter::nvfp4(
-        "projection.weight",
-        "model.projection.weight",
-        Shape::new(dtype, &[4_096, 64]).unwrap(),
-    )
-    .unwrap();
-    let mut builder = ProgramBuilder::new();
-    let input = builder.input("hidden", Shape::new(dtype, &[1, 64]).unwrap());
-    let output = builder.linear(input, &weight, None).unwrap();
-    let program = builder.finish(&[output]).unwrap();
-    let text = program
-        .module_with_sharding_cuda(
-            &Context::new(),
-            &nml_sharding::Sharding::single(),
-            108,
-            8,
-            6,
-        )
-        .unwrap()
-        .text();
-
-    assert_eq!(
-        text.matches("nml.nvfp4.cuda.linear_m1_w8").count(),
-        1,
-        "{text}"
-    );
-    assert!(!text.contains("linear_m1_w4"), "{text}");
-}
-
-#[test]
-fn parallel_nvfp4_decode_linears_share_one_cuda_launch() {
-    let dtype = DType::Bf16;
-    let query = Parameter::nvfp4(
-        "query.weight",
-        "query.weight",
-        Shape::new(dtype, &[128, 64]).unwrap(),
-    )
-    .unwrap();
-    let key = Parameter::nvfp4(
-        "key.weight",
-        "key.weight",
-        Shape::new(dtype, &[64, 64]).unwrap(),
-    )
-    .unwrap();
-    let value = Parameter::nvfp4(
-        "value.weight",
-        "value.weight",
-        Shape::new(dtype, &[64, 64]).unwrap(),
-    )
-    .unwrap();
-    let query_bias = parameter("query.bias", Shape::new(dtype, &[128]).unwrap());
-    let key_bias = parameter("key.bias", Shape::new(dtype, &[64]).unwrap());
-    let value_bias = parameter("value.bias", Shape::new(dtype, &[64]).unwrap());
-    let mut builder = ProgramBuilder::new();
-    let input = builder.input("hidden", Shape::new(dtype, &[1, 64]).unwrap());
-    let results = builder
-        .parallel_linears(
-            input,
-            &[
-                (&query, Some(&query_bias)),
-                (&key, Some(&key_bias)),
-                (&value, Some(&value_bias)),
-            ],
-        )
-        .unwrap();
-    assert_eq!(results[0].shape().dimensions(), &[1, 128]);
-    assert_eq!(results[1].shape().dimensions(), &[1, 64]);
-    assert_eq!(results[2].shape().dimensions(), &[1, 64]);
-    let program = builder.finish(&results).unwrap();
-
-    let cpu = program.stablehlo().unwrap();
-    assert_eq!(cpu.matches("nml.nvfp4.linear").count(), 3, "{cpu}");
-    for (major, minor) in [(7, 5), (8, 0), (8, 6), (8, 9), (9, 0)] {
-        let context = Context::new();
-        let module = program
-            .module_with_sharding_cuda(
-                &context,
-                &nml_sharding::Sharding::single(),
-                108,
-                major,
-                minor,
-            )
-            .unwrap();
-        module.verify().unwrap();
-        let text = module.text();
-        assert_eq!(
-            text.matches("nml.nvfp4.cuda.linear_group3_m1").count(),
-            1,
-            "{text}"
-        );
-        assert!(!text.contains("__gpu$xla.gpu.triton"), "{text}");
-    }
-}
-
-#[test]
-fn parallel_nvfp4_prefill_preserves_the_matrix_lowering() {
-    let dtype = DType::Bf16;
-    let weights = ["query", "key", "value"].map(|name| {
-        Parameter::nvfp4(
-            format!("{name}.weight"),
-            format!("{name}.weight"),
-            Shape::new(dtype, &[64, 64]).unwrap(),
-        )
-        .unwrap()
-    });
-    let biases = ["query", "key", "value"].map(|name| {
-        parameter(
-            &format!("{name}.bias"),
-            Shape::new(dtype, &[64]).unwrap(),
-        )
-    });
-    let mut builder = ProgramBuilder::new();
-    let input = builder.input("hidden", Shape::new(dtype, &[8, 64]).unwrap());
-    let results = builder
-        .parallel_linears(
-            input,
-            &[
-                (&weights[0], Some(&biases[0])),
-                (&weights[1], Some(&biases[1])),
-                (&weights[2], Some(&biases[2])),
-            ],
-        )
-        .unwrap();
-    let program = builder.finish(&results).unwrap();
-    let context = Context::new();
-    let module = program
-        .module_with_sharding_cuda(&context, &nml_sharding::Sharding::single(), 108, 8, 0)
-        .unwrap();
-    module.verify().unwrap();
-    let text = module.text();
-    assert_eq!(text.matches("__gpu$xla.gpu.triton").count(), 3, "{text}");
-    assert!(!text.contains("nml.nvfp4.cuda.linear_group3_m1"), "{text}");
-}
-
-#[test]
-fn compact_decode_head_streams_exact_top64_candidates() {
-    let dtype = DType::Bf16;
-    let weight = Parameter::nvfp4(
-        "head.weight",
-        "head.weight",
-        Shape::new(dtype, &[256, 64]).unwrap(),
-    )
-    .unwrap();
-    let mut builder = ProgramBuilder::new();
-    let input = builder.input("hidden", Shape::new(dtype, &[1, 64]).unwrap());
-    let (values, indices) = builder.linear_top_k(input, &weight, None, 64).unwrap();
-    assert_eq!(values.shape().dtype(), DType::F32);
-    assert_eq!(values.shape().dimensions(), &[1, 64]);
-    assert_eq!(indices.shape().dtype(), DType::I32);
-    let program = builder.finish(&[values, indices]).unwrap();
-
-    let cpu = program.stablehlo().unwrap();
-    assert_eq!(cpu.matches("nml.nvfp4.linear").count(), 1, "{cpu}");
-    assert!(cpu.contains("stablehlo.sort"), "{cpu}");
-    for (major, minor) in [(7, 5), (8, 0), (8, 6), (8, 9), (9, 0)] {
-        let context = Context::new();
-        let module = program
-            .module_with_sharding_cuda(
-                &context,
-                &nml_sharding::Sharding::single(),
-                108,
-                major,
-                minor,
-            )
-            .unwrap();
-        module.verify().unwrap();
-        let text = module.text();
-        assert_eq!(
-            text.matches("nml.nvfp4.cuda.linear_top64_m1").count(),
-            1,
-            "{text}"
-        );
-        assert!(text.contains("tensor<2x64xf32>"), "{text}");
-        assert!(!text.contains("__gpu$xla.gpu.triton"), "{text}");
-    }
-}
-
-#[test]
 fn nvfp4_embedding_preserves_index_shape_and_decodes_only_selected_rows() {
     let weight = Parameter::nvfp4(
         "embedding.weight",
@@ -381,7 +160,7 @@ fn nvfp4_embedding_preserves_index_shape_and_decodes_only_selected_rows() {
     sm75.verify().unwrap();
     let sm75 = sm75.text();
     assert_eq!(
-        sm75.matches("nml.nvfp4.cuda.embedding").count(),
+        sm75.matches("nml.nvfp4.turing.embedding").count(),
         1,
         "{sm75}"
     );
@@ -477,12 +256,12 @@ fn clamped_swiglu_moe_keeps_model_semantics_above_weight_representation() {
     sm75.verify().unwrap();
     let sm75 = sm75.text();
     assert_eq!(
-        sm75.matches("nml.nvfp4.cuda.expert_gate_up").count(),
+        sm75.matches("nml.nvfp4.turing.expert_gate_up").count(),
         1,
         "{sm75}"
     );
     assert_eq!(
-        sm75.matches("nml.nvfp4.cuda.expert_down").count(),
+        sm75.matches("nml.nvfp4.turing.expert_down").count(),
         1,
         "{sm75}"
     );
@@ -512,7 +291,7 @@ fn clamped_swiglu_moe_keeps_model_semantics_above_weight_representation() {
 }
 
 #[test]
-fn decode_shaped_moe_consumes_direct_routes_and_reduces_inside_down() {
+fn decode_shaped_moe_launches_only_selected_expert_blocks() {
     let dtype = DType::Bf16;
     let mut builder = ProgramBuilder::new();
     let hidden = builder.input("hidden", Shape::new(dtype, &[1, 64]).unwrap());
@@ -546,83 +325,15 @@ fn decode_shaped_moe_consumes_direct_routes_and_reduces_inside_down() {
         .unwrap()
         .text();
 
+    assert!(text.contains("tensor<64xi32>"), "{text}");
+    assert!(text.contains("tensor<4xi32>"), "{text}");
     assert_eq!(
-        text.matches("nml.nvfp4.cuda.expert_gate_up_m1").count(),
-        1,
-        "decode must consume the direct route list: {text}"
+        text.matches("grid_x = 4 : i32").count(),
+        2,
+        "gate/up and down must launch exactly one block per selected route: {text}"
     );
-    assert_eq!(
-        text.matches("nml.nvfp4.cuda.expert_down_m1").count(),
-        1,
-        "decode must reduce routes inside the direct down boundary: {text}"
-    );
-    assert!(!text.contains("__gpu$xla.gpu.triton"), "{text}");
     assert!(text.contains("stablehlo.pad"), "{text}");
-}
-
-#[test]
-fn decode_shaped_moe_routes_top_four_inside_the_cuda_boundary() {
-    let dtype = DType::Bf16;
-    let mut builder = ProgramBuilder::new();
-    let hidden = builder.input("hidden", Shape::new(dtype, &[1, 64]).unwrap());
-    let router_weight = parameter("router.weight", Shape::new(dtype, &[32, 64]).unwrap());
-    let router_bias = parameter("router.bias", Shape::new(dtype, &[32]).unwrap());
-    let gate = Parameter::nvfp4(
-        "gate",
-        "model.gate",
-        Shape::new(dtype, &[32, 64, 128]).unwrap(),
-    )
-    .unwrap();
-    let gate_bias = parameter("gate_bias", Shape::new(dtype, &[32, 128]).unwrap());
-    let down = Parameter::nvfp4(
-        "down",
-        "model.down",
-        Shape::new(dtype, &[32, 64, 64]).unwrap(),
-    )
-    .unwrap();
-    let down_bias = parameter("down_bias", Shape::new(dtype, &[32, 64]).unwrap());
-    let output = builder
-        .routed_clamped_swiglu_with_router(
-            hidden,
-            &router_weight,
-            &router_bias,
-            &gate,
-            &gate_bias,
-            &down,
-            &down_bias,
-            4,
-        )
-        .unwrap();
-    let program = builder.finish(&[output]).unwrap();
-
-    for (major, minor) in [(7, 5), (8, 0), (8, 6), (8, 9), (9, 0)] {
-        let text = program
-            .module_with_sharding_cuda(
-                &Context::new(),
-                &nml_sharding::Sharding::single(),
-                108,
-                major,
-                minor,
-            )
-            .unwrap()
-            .text();
-        assert_eq!(
-            text.matches("nml.nvfp4.cuda.route_top4_m1").count(),
-            1,
-            "{text}"
-        );
-        assert_eq!(
-            text.matches("nml.nvfp4.cuda.expert_gate_up_m1").count(),
-            1,
-            "{text}"
-        );
-        assert_eq!(
-            text.matches("nml.nvfp4.cuda.expert_down_m1").count(),
-            1,
-            "{text}"
-        );
-        assert!(!text.contains("__gpu$xla.gpu.triton"), "{text}");
-    }
+    assert_eq!(text.matches("scf.if").count(), 2, "{text}");
 }
 
 #[test]
@@ -3330,86 +3041,4 @@ fn expert_parallel_nvfp4_derives_local_components_inside_the_shared_manual_bound
     assert_eq!(text.matches("stablehlo.all_reduce").count(), 1, "{text}");
     assert!(text.contains("tensor<2x32x32xui8>"), "{text}");
     assert!(text.contains("tensor<2x32x4xui8>"), "{text}");
-}
-
-#[test]
-fn expert_parallel_decode_keeps_global_routing_outside_the_manual_boundary() {
-    use nml_sharding::Sharding;
-
-    let expert_axis = AxisTag::new(223);
-    let expert_partition = [
-        Partition::Sharded(expert_axis),
-        Partition::Replicated,
-        Partition::Replicated,
-    ];
-    let dtype = DType::Bf16;
-    let mut builder = ProgramBuilder::new();
-    let hidden = builder.input("hidden", Shape::new(dtype, &[1, 32]).unwrap());
-    let router_weight = parameter("router.weight", Shape::new(dtype, &[4, 32]).unwrap());
-    let router_bias = parameter("router.bias", Shape::new(dtype, &[4]).unwrap());
-    let gate = Parameter::nvfp4(
-        "gate",
-        "model.gate",
-        Shape::new(dtype, &[4, 32, 64])
-            .unwrap()
-            .with_partitions(&expert_partition)
-            .unwrap(),
-    )
-    .unwrap();
-    let down = Parameter::nvfp4(
-        "down",
-        "model.down",
-        Shape::new(dtype, &[4, 32, 32])
-            .unwrap()
-            .with_partitions(&expert_partition)
-            .unwrap(),
-    )
-    .unwrap();
-    let gate_bias = parameter(
-        "gate_bias",
-        Shape::new(dtype, &[4, 64])
-            .unwrap()
-            .with_partitions(&expert_partition[..2])
-            .unwrap(),
-    );
-    let down_bias = parameter(
-        "down_bias",
-        Shape::new(dtype, &[4, 32])
-            .unwrap()
-            .with_partitions(&expert_partition[..2])
-            .unwrap(),
-    );
-    let output = builder
-        .routed_clamped_swiglu_with_router(
-            hidden,
-            &router_weight,
-            &router_bias,
-            &gate,
-            &gate_bias,
-            &down,
-            &down_bias,
-            4,
-        )
-        .unwrap();
-    let program = builder.finish(&[output]).unwrap();
-    let mesh = Sharding::mesh(&[(expert_axis, 2)]).unwrap();
-    let text = program
-        .module_with_sharding_cuda(&Context::new(), &mesh, 108, 8, 6)
-        .unwrap()
-        .text();
-
-    assert!(text.contains("sdy.manual_computation"), "{text}");
-    assert!(text.contains("stablehlo.sort"), "{text}");
-    assert!(!text.contains("nml.nvfp4.cuda.route_top4_m1"), "{text}");
-    assert_eq!(
-        text.matches("nml.nvfp4.cuda.expert_gate_up_m1").count(),
-        1,
-        "{text}"
-    );
-    assert_eq!(
-        text.matches("nml.nvfp4.cuda.expert_down_m1").count(),
-        1,
-        "{text}"
-    );
-    assert_eq!(text.matches("stablehlo.all_reduce").count(), 1, "{text}");
 }

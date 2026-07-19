@@ -591,8 +591,7 @@ is never reported as device execution.
 Portable MoE performs top-k routing, stable assignment construction, grouped
 expert execution, weighting, and combination in StableHLO. Shardy owns expert
 partitioning. Private Triton kernels specialize grouped expert projections on
-SM80 and newer for matrix-shaped work; CPU retains the portable contract and
-SM75 uses source-owned CUDA custom calls.
+SM80 and newer; CPU and SM75 use the portable graph.
 
 Static schedule capacity is not executable work. Sparse decode uses one expert
 block per selected route when `assignments * 4 <= experts`, matching ZML's
@@ -615,19 +614,6 @@ SM80+ lowering interchangeable at the graph boundary. Private compact CUDA
 lowering selects a dedicated F32-accumulating GEMV for `M = 1`; prefill retains
 the finite tensor-core matrix family. Weight/scale decode is register-local and
 exact, and one scale load is reused across its complete representation block.
-The compiler selects four- or eight-warp output-owner targets from logical
-geometry and SM count, making the variant part of executable identity. A
-semantic parallel-linear boundary combines compact Q/K/V decode without
-changing the three matrix contractions used by prefill. A retained-router
-boundary produces direct top-four routes, and compact head sampling streams an
-exact top-64 through XLA-owned workspaces rather than materializing full
-vocabulary logits. These are general backend semantics; no GPT-OSS layer name
-or NVIDIA product name enters framework dispatch.
-
-GPT-OSS decode composes exactly six consecutive alternating-attention layers
-per reusable segment executable. Embedding, four segments, and head bound the
-single-sequence decode path to six PJRT submissions per token while model
-topology and parameter binding remain product-owned.
 
 The operation substrate presently includes:
 
@@ -1107,9 +1093,6 @@ table is a compact compatibility index, not a migration checklist.
 | D-063 | Every grouped expert backend exposes gate/up plus one activation as `[assignments, intermediate]`; down never receives interleaved gate/up channels or recomputes their activation. |
 | D-064 | Compact CUDA decode uses dedicated `M = 1` GEMV with exact register-local E2M1/E4M3FN decoding and block-scale reuse; tensor-core matrix tiles remain the distinct prefill family. |
 | D-065 | Every paid RunPod product run is one combined Nsight-Systems-over-GDB execution; acceptance requires debugger, product, and profiler artifacts before Pod termination. |
-| D-066 | Compact CUDA `M = 1` variants are compiler-selected from geometry, SM count, and semantic epilogue; their four/eight-warp target identity is part of the executable cache key, while `M > 1` retains the matrix family. |
-| D-067 | Parallel Q/K/V, direct top-four routing, route-reducing expert down, and exact streaming linear top-k are framework semantic boundaries; products compose them without naming CUDA kernels. |
-| D-068 | GPT-OSS decode uses reusable six-layer segments and therefore submits embedding, four alternating-attention segments, and head per token; framework crates do not own the 24-layer topology. |
 
 ## 16. Provenance and reference relationships
 

@@ -117,40 +117,6 @@ pub(super) fn bind_tree<T: ParameterTree>(
     slots: &T,
     loaded: &Loaded<T>,
 ) -> Result<()> {
-    bind_tree_components(arguments, slots, loaded)?;
-    arguments
-        .bake()
-        .map_err(|error| Box::new(error) as BoxError)?;
-    Ok(())
-}
-
-/// Binds one reusable multi-layer executable without baking between layers.
-/// Parameter identity stays attached to each representative slot while tree
-/// paths prove that every rebound layer has the same structure.
-pub(super) fn bind_layer_group(
-    arguments: &mut Arguments<'_>,
-    slots: &[DecoderLayer],
-    loaded: &[LoadedDecoderLayer],
-) -> Result<()> {
-    if slots.len() != loaded.len() || slots.is_empty() {
-        return Err(message(
-            "reusable layer group has incompatible parameter depth",
-        ));
-    }
-    for (slot, parameters) in slots.iter().zip(loaded) {
-        bind_tree_components(arguments, slot, parameters)?;
-    }
-    arguments
-        .bake()
-        .map_err(|error| Box::new(error) as BoxError)?;
-    Ok(())
-}
-
-fn bind_tree_components<T: ParameterTree>(
-    arguments: &mut Arguments<'_>,
-    slots: &T,
-    loaded: &Loaded<T>,
-) -> Result<()> {
     let mut slot_parameters = Vec::<(String, Parameter)>::new();
     slots.visit_parameters("", &mut |path, parameter| {
         slot_parameters.push((path.to_owned(), parameter.clone()));
@@ -172,6 +138,9 @@ fn bind_tree_components<T: ParameterTree>(
             .set_parameter_slot(&slot, &parameter)
             .map_err(|error| Box::new(error) as BoxError)?;
     }
+    arguments
+        .bake()
+        .map_err(|error| Box::new(error) as BoxError)?;
     Ok(())
 }
 
