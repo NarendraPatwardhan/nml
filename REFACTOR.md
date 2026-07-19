@@ -1,7 +1,7 @@
 # NVFP4 decode performance refactor
 
-Status: accepted 59.611-token/s source architecture restored manually and
-accepted by the complete BuildBuddy CUDA gates; fresh A40 baseline pending
+Status: accepted architecture restored manually, accepted by the complete
+BuildBuddy CUDA gates, and reconfirmed by a fresh A40 baseline
 
 This document records the measured causes of GPT-OSS 20B decode performance
 on an NVIDIA A40 and the accepted corrective architecture. It replaces
@@ -57,8 +57,19 @@ The restored source passed the complete remote CUDA contract suite in
 BuildBuddy invocation `61f0b083-80e5-40a7-8d91-bb4dfd80c4a6`, package and
 image contracts in `7287d013-ed87-44cc-a42c-9897fb1d1e1d`, and the full CUDA
 binary plus serving-image closure in `f2a46248-ea91-44c2-8866-3b3d833c0219`.
-These results prove restoration and construction only. A fresh immutable A40
-run remains required before the historical 59.611-token/s baseline is trusted.
+These results prove restoration and construction only. The subsequently
+published image resolved to the accepted immutable digest
+`sha256:69e805cd5128e9b8d8c7dbe8caf9ae092f985ef6cc19966ebf5c2b345b6b85a0`.
+A fresh run of that digest from restored source commit
+`6f8dd0b222721a3ecd0a501e035192cd2b400ef4` then completed normally on A40
+under the combined GDB/Nsight harness. It generated 128 coherent tokens and
+sustained 57.248 steady device tokens/s, 56.398 overall device-decode tokens/s,
+and 54.504 decode-loop tokens/s. The complete validated report is
+`references/runpod/reports/20260719T155954Z-fdmcvpur8oks3p-69e805cd5128-diagnostic`.
+The paid Pod `fdmcvpur8oks3p` was terminated and deletion confirmed after the
+report was collected. This fresh result is consistent with the prior profiled
+55.475-token/s measurement and conclusively excludes the rejected
+5.601-token/s architecture from the restored tree.
 
 ## 0. Post-refactor A40 evidence
 

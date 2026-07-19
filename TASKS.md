@@ -214,10 +214,15 @@ persistent dense weight expansion.
   `61f0b083-80e5-40a7-8d91-bb4dfd80c4a6`, package/image contracts in
   `7287d013-ed87-44cc-a42c-9897fb1d1e1d`, and the CUDA binary plus serving-image
   closure in `f2a46248-ea91-44c2-8866-3b3d833c0219`.
-- [ ] Publish the manually restored source as an immutable image and rerun the
-  whole GPT-OSS A40 baseline through the combined GDB/Nsight harness. Retain
-  the report locally and verify the measured steady rate against 59.611
-  tokens/s before deleting the Pod.
+- [x] Publish the manually restored source and rerun the whole GPT-OSS A40
+  baseline through the combined GDB/Nsight harness. BuildBuddy publication
+  invocation `9d38ff9d-c361-425a-83e6-28ec433db6e4` resolved restored commit
+  `6f8dd0b222721a3ecd0a501e035192cd2b400ef4` to immutable digest
+  `69e805cd5128...`. The fresh 128-token run sustained 57.248 steady device
+  tokens/s, 56.398 device-decode tokens/s, and 54.504 decode-loop tokens/s,
+  generated coherent text, and exited normally. The validated report is
+  `references/runpod/reports/20260719T155954Z-fdmcvpur8oks3p-69e805cd5128-diagnostic`;
+  Pod `fdmcvpur8oks3p` was terminated and deletion confirmed.
 - [ ] Design the next compact-projection change from the restored 59.611
   tokens/s architecture and measured kernel evidence. Compile-only contracts
   are necessary but cannot promote another performance design: publish and
