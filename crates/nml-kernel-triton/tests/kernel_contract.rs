@@ -260,7 +260,7 @@ fn nvfp4_decode_experts_use_selected_expert_gemv_kernels() {
         .unwrap();
         let down = down.text();
         assert!(down.contains("@nvfp4_grouped_down_gemv"), "{down}");
-        assert_eq!(down.matches(" = \"tt.reduce\"").count(), 2, "{down}");
+        assert_eq!(down.matches(" = \"tt.reduce\"").count(), 1, "{down}");
         assert!(!down.contains("math.exp2"), "{down}");
         assert!(!down.contains("tt.dot"), "{down}");
     }

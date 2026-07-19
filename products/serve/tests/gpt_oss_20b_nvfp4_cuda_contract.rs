@@ -13,7 +13,7 @@ const MODEL_ENVIRONMENT: &str = "NML_GPT_OSS_MODEL";
 const GENERATION_FIXTURE_ENVIRONMENT: &str = "NML_GPT_OSS_GENERATION_FIXTURE";
 const ARTIFACT_MANIFEST: &str = "nml-artifact-manifest.json";
 const ARTIFACT_MANIFEST_SHA256: &str =
-    "ab4c8cbd4424c8fec95bf683c0efd04c9cd350ec2a26737408b5500e61003207";
+    "3c36a89cbc0f908b3e782550fe32f3b6890ef3f857232d11710bc8e0dbcea71d";
 const MODEL_IDENTITY: &str = "GPT-OSS 20B NVFP4";
 const PROMPT: &str = "What is the capital of France?";
 const MAX_NEW_TOKENS: usize = 32;
@@ -294,7 +294,11 @@ fn assert_runtime_timings(timings: &Timings, generated_tokens: usize) {
     ] {
         assert_nonzero_timing(name, duration);
     }
-    assert_submission("prefill", timings.prefill_submission);
+    assert_submission(
+        "prefill",
+        timings.prefill_submission,
+        LayerSubmission::Singles,
+    );
     if generated_tokens > 1 {
         assert_nonzero_timing(
             "decode state initialization",
@@ -302,7 +306,11 @@ fn assert_runtime_timings(timings: &Timings, generated_tokens: usize) {
         );
         assert_nonzero_timing("first decode execution", timings.first_decode_execution);
         assert_nonzero_timing("decode download", timings.decode_download);
-        assert_submission("first decode", timings.first_decode_submission);
+        assert_submission(
+            "first decode",
+            timings.first_decode_submission,
+            LayerSubmission::Pair,
+        );
     } else {
         assert_eq!(timings.decode_state_initialization, Duration::ZERO);
         assert_eq!(timings.first_decode_execution, Duration::ZERO);
@@ -310,20 +318,46 @@ fn assert_runtime_timings(timings: &Timings, generated_tokens: usize) {
     }
     if generated_tokens > 2 {
         assert_nonzero_timing("steady decode execution", timings.steady_decode_execution);
-        assert_submission("steady decode", timings.steady_decode_submission);
+        assert_submission(
+            "steady decode",
+            timings.steady_decode_submission,
+            LayerSubmission::Pair,
+        );
     } else {
         assert_eq!(timings.steady_decode_execution, Duration::ZERO);
     }
 }
 
-fn assert_submission(name: &str, timings: SubmissionTimings) {
-    for (component, duration) in [
-        ("embedding", timings.embedding),
-        ("sliding layers", timings.sliding_layers),
-        ("full layers", timings.full_layers),
-        ("head", timings.head),
-    ] {
+#[derive(Clone, Copy)]
+enum LayerSubmission {
+    Singles,
+    Pair,
+}
+
+fn assert_submission(name: &str, timings: SubmissionTimings, layers: LayerSubmission) {
+    for (component, duration) in [("embedding", timings.embedding), ("head", timings.head)] {
         assert_nonzero_timing(&format!("{name} {component} submission"), duration);
+    }
+    match layers {
+        LayerSubmission::Singles => {
+            assert_nonzero_timing(
+                &format!("{name} sliding layers submission"),
+                timings.sliding_layers,
+            );
+            assert_nonzero_timing(
+                &format!("{name} full layers submission"),
+                timings.full_layers,
+            );
+            assert_eq!(timings.layer_pairs, Duration::ZERO);
+        }
+        LayerSubmission::Pair => {
+            assert_eq!(timings.sliding_layers, Duration::ZERO);
+            assert_eq!(timings.full_layers, Duration::ZERO);
+            assert_nonzero_timing(
+                &format!("{name} layer pairs submission"),
+                timings.layer_pairs,
+            );
+        }
     }
 }
 

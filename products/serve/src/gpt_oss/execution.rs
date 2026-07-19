@@ -1,13 +1,13 @@
 //! Definition, compilation, residency, and request-local execution state.
 
 use super::checkpoint::{
-    BoxError, Checkpoint, LoadedCheckpoint, LoadedDecoderLayer, Result, bind_tree, message,
-    representative_layer,
+    BoxError, Checkpoint, LoadedCheckpoint, LoadedDecoderLayer, Result, bind_tree,
+    bind_tree_components, message, representative_layer,
 };
 use super::config::{AttentionKind, Config};
 use super::graph::{
-    CACHE_PAGE_SIZE, MAXIMUM_TOP_K, Phase, ShapeFamily, build_embedding, build_head, build_layer,
-    cache_shape, page_table_shape,
+    CACHE_PAGE_SIZE, MAXIMUM_TOP_K, Phase, ShapeFamily, build_decode_layer_pair, build_embedding,
+    build_head, build_layer, cache_shape, page_table_shape,
 };
 use crate::{CompilationProfile, SamplingOptions, SubmissionTimings};
 use nml::exe::{Arguments, Results};
@@ -403,7 +403,7 @@ impl ResidentModel<'_> {
 
         let mut decode_embedding = decode_executables.embedding.args();
         bind_embedding(&mut decode_embedding, checkpoint, parameters)?;
-        let mut decode_layers = bind_layers(
+        let mut decode_pairs = bind_decode_pairs(
             decode_executables,
             checkpoint,
             parameters,
@@ -569,21 +569,16 @@ impl ResidentModel<'_> {
                 .map_err(boxed)?;
             let mut hidden = one(decode_embedding.enqueue().map_err(boxed)?)?;
             decode_submission.embedding = submission_started.elapsed();
-            for ((arguments, cache), kind) in decode_layers
-                .iter_mut()
-                .zip(&mut caches)
-                .zip(config.layer_types())
-            {
-                let (next_hidden, elapsed) = execute_layer(
+            for (arguments, caches) in decode_pairs.iter_mut().zip(caches.chunks_exact_mut(2)) {
+                let (next_hidden, elapsed) = execute_layer_pair(
                     arguments,
                     hidden,
                     position.clone(),
-                    None,
                     page_table.clone(),
-                    cache,
+                    caches,
                 )?;
                 hidden = next_hidden;
-                record_layer_submission(&mut decode_submission, *kind, elapsed);
+                decode_submission.layer_pairs += elapsed;
             }
             let submission_started = Instant::now();
             decode_head.set("hidden", hidden).map_err(boxed)?;
@@ -651,9 +646,13 @@ impl ResidentModel<'_> {
 
 struct ComponentFamily {
     embedding: Exe,
-    sliding_layer: Exe,
-    full_layer: Exe,
+    layers: LayerExecutables,
     head: Exe,
+}
+
+enum LayerExecutables {
+    Prefill { sliding: Exe, full: Exe },
+    DecodePair(Exe),
 }
 
 impl ComponentFamily {
@@ -669,45 +668,61 @@ impl ComponentFamily {
         let embedding = compile(platform, placement, |graph| {
             build_embedding(graph, checkpoint, config, family)
         })?;
-        let sliding = representative_layer(
-            checkpoint,
-            config,
-            AttentionKind::SlidingAttention,
-        )?;
-        let sliding_layer = compile(platform, placement, |graph| {
-            build_layer(
-                graph,
-                sliding,
-                config,
-                family,
-                AttentionKind::SlidingAttention,
-            )
-        })?;
+        let sliding = representative_layer(checkpoint, config, AttentionKind::SlidingAttention)?;
         let full = representative_layer(checkpoint, config, AttentionKind::FullAttention)?;
-        let full_layer = compile(platform, placement, |graph| {
-            build_layer(
-                graph,
-                full,
-                config,
-                family,
-                AttentionKind::FullAttention,
-            )
-        })?;
+        let layers = match family.phase() {
+            Phase::Prefill => LayerExecutables::Prefill {
+                sliding: compile(platform, placement, |graph| {
+                    build_layer(
+                        graph,
+                        sliding,
+                        config,
+                        family,
+                        AttentionKind::SlidingAttention,
+                    )
+                })?,
+                full: compile(platform, placement, |graph| {
+                    build_layer(
+                        graph,
+                        full,
+                        config,
+                        family,
+                        AttentionKind::FullAttention,
+                    )
+                })?,
+            },
+            Phase::Decode => LayerExecutables::DecodePair(compile(
+                platform,
+                placement,
+                |graph| build_decode_layer_pair(graph, sliding, full, config, family),
+            )?),
+        };
         let head = compile(platform, placement, |graph| {
             build_head(graph, checkpoint, config, family)
         })?;
         Ok(Self {
             embedding,
-            sliding_layer,
-            full_layer,
+            layers,
             head,
         })
     }
 
-    fn layer(&self, kind: AttentionKind) -> &Exe {
-        match kind {
-            AttentionKind::SlidingAttention => &self.sliding_layer,
-            AttentionKind::FullAttention => &self.full_layer,
+    fn prefill_layer(&self, kind: AttentionKind) -> Result<&Exe> {
+        let LayerExecutables::Prefill { sliding, full } = &self.layers else {
+            return Err(message("decode family does not contain single-layer executables"));
+        };
+        Ok(match kind {
+            AttentionKind::SlidingAttention => sliding,
+            AttentionKind::FullAttention => full,
+        })
+    }
+
+    fn decode_pair(&self) -> Result<&Exe> {
+        match &self.layers {
+            LayerExecutables::DecodePair(executable) => Ok(executable),
+            LayerExecutables::Prefill { .. } => {
+                Err(message("prefill family does not contain a decode pair"))
+            }
         }
     }
 }
@@ -799,9 +814,43 @@ fn bind_layers<'family>(
         .zip(&parameters.model.layers)
         .zip(config.layer_types())
         .map(|((_, loaded), kind)| {
-            let executable = family.layer(*kind);
+            let executable = family.prefill_layer(*kind)?;
             let slots = representative_layer(checkpoint, config, *kind)?;
             bind_layer(executable, slots, loaded)
+        })
+        .collect()
+}
+
+fn bind_decode_pairs<'family>(
+    family: &'family ComponentFamily,
+    checkpoint: &Checkpoint,
+    parameters: &LoadedCheckpoint,
+    config: &Config,
+) -> Result<Vec<Arguments<'family>>> {
+    if checkpoint.model.layers.len() != parameters.model.layers.len()
+        || checkpoint.model.layers.len() != config.layer_types().len()
+        || !checkpoint.model.layers.len().is_multiple_of(2)
+    {
+        return Err(message(
+            "GPT-OSS decode pairing requires one complete alternating layer schedule",
+        ));
+    }
+    let slots = checkpoint.model.layers.get(0..2).ok_or_else(|| {
+        message("GPT-OSS decode pairing requires sliding and full representatives")
+    })?;
+    parameters
+        .model
+        .layers
+        .chunks_exact(2)
+        .enumerate()
+        .map(|(pair, loaded)| {
+            let first = pair * 2;
+            if config.layer_types()[first] != AttentionKind::SlidingAttention
+                || config.layer_types()[first + 1] != AttentionKind::FullAttention
+            {
+                return Err(message("GPT-OSS decode pair violates the alternating schedule"));
+            }
+            bind_layer_pair(family.decode_pair()?, slots, loaded)
         })
         .collect()
 }
@@ -813,6 +862,24 @@ fn bind_layer<'family>(
 ) -> Result<Arguments<'family>> {
     let mut arguments = executable.args();
     bind_tree(&mut arguments, slots, loaded)?;
+    Ok(arguments)
+}
+
+fn bind_layer_pair<'family>(
+    executable: &'family Exe,
+    slots: &[super::checkpoint::DecoderLayer],
+    loaded: &[LoadedDecoderLayer],
+) -> Result<Arguments<'family>> {
+    let [sliding_slot, full_slot] = slots else {
+        return Err(message("GPT-OSS decode pair slot count is not two"));
+    };
+    let [sliding_loaded, full_loaded] = loaded else {
+        return Err(message("GPT-OSS decode pair parameter count is not two"));
+    };
+    let mut arguments = executable.args();
+    bind_tree_components(&mut arguments, sliding_slot, sliding_loaded)?;
+    bind_tree_components(&mut arguments, full_slot, full_loaded)?;
+    arguments.bake().map_err(boxed)?;
     Ok(arguments)
 }
 
@@ -857,6 +924,60 @@ fn execute_layer(
     Ok((hidden, started.elapsed()))
 }
 
+fn execute_layer_pair(
+    arguments: &mut Arguments<'_>,
+    hidden: Buffer,
+    position: Buffer,
+    page_table: Buffer,
+    caches: &mut [LayerCache],
+) -> Result<(Buffer, Duration)> {
+    let [sliding, full] = caches else {
+        return Err(message("GPT-OSS decode execution requires exactly two caches"));
+    };
+    let started = Instant::now();
+    let (sliding_key, sliding_value) = sliding.take()?;
+    let (full_key, full_value) = full.take()?;
+    arguments.set("hidden", hidden).map_err(boxed)?;
+    arguments.set("position", position).map_err(boxed)?;
+    arguments.set("page_table", page_table).map_err(boxed)?;
+    arguments
+        .set("sliding.cache.key", sliding_key)
+        .map_err(boxed)?;
+    arguments
+        .set("sliding.cache.value", sliding_value)
+        .map_err(boxed)?;
+    arguments.set("full.cache.key", full_key).map_err(boxed)?;
+    arguments
+        .set("full.cache.value", full_value)
+        .map_err(boxed)?;
+    let mut outputs = arguments
+        .enqueue()
+        .map_err(boxed)?
+        .into_buffers()
+        .into_iter();
+    let hidden = outputs
+        .next()
+        .ok_or_else(|| message("GPT-OSS layer pair omitted hidden state"))?;
+    let sliding_key = outputs
+        .next()
+        .ok_or_else(|| message("GPT-OSS layer pair omitted sliding key cache"))?;
+    let sliding_value = outputs
+        .next()
+        .ok_or_else(|| message("GPT-OSS layer pair omitted sliding value cache"))?;
+    let full_key = outputs
+        .next()
+        .ok_or_else(|| message("GPT-OSS layer pair omitted full key cache"))?;
+    let full_value = outputs
+        .next()
+        .ok_or_else(|| message("GPT-OSS layer pair omitted full value cache"))?;
+    if outputs.next().is_some() {
+        return Err(message("GPT-OSS layer pair returned extra buffers"));
+    }
+    sliding.install(sliding_key, sliding_value)?;
+    full.install(full_key, full_value)?;
+    Ok((hidden, started.elapsed()))
+}
+
 fn record_layer_submission(
     timings: &mut SubmissionTimings,
     kind: AttentionKind,
@@ -872,6 +993,7 @@ fn add_submission(total: &mut SubmissionTimings, value: SubmissionTimings) {
     total.embedding += value.embedding;
     total.sliding_layers += value.sliding_layers;
     total.full_layers += value.full_layers;
+    total.layer_pairs += value.layer_pairs;
     total.head += value.head;
 }
 

@@ -1,8 +1,9 @@
 //! Bounded GPT-OSS component graphs.
 //!
-//! The compiler sees one natural fusion domain at a time: embedding, one full
-//! transformer layer, or final projection/sampling. Layer repetition remains an
-//! execution-plan concern and never duplicates kernel bodies in StableHLO.
+//! The compiler sees one bounded fusion domain at a time: embedding, one full
+//! prefill layer, one alternating decode-layer pair, or final projection and
+//! sampling. Model depth remains an execution-plan concern and never duplicates
+//! the reusable component bodies in StableHLO.
 
 use super::checkpoint::{BoxError, Checkpoint, DecoderLayer, Result, message};
 use super::config::{AttentionKind, Config};
@@ -100,6 +101,114 @@ pub(super) fn build_layer(
     family: ShapeFamily,
     attention_kind: AttentionKind,
 ) -> Result<Vec<(String, Tensor)>> {
+    let hidden_shape = hidden_shape(config, family)?;
+    let cache_shape = cache_shape(config, family)?;
+    let hidden_input = graph.input("hidden", hidden_shape);
+    let position = graph.input("position", shape(DataType::I32, &[])?);
+    let sequence_lengths = sequence_lengths(graph, family, position)?;
+    let page_table = graph.input("page_table", page_table_shape(family)?);
+    let key_input = graph.input("cache.key", cache_shape);
+    let value_input = graph.input("cache.value", cache_shape);
+    let (hidden, key_cache, value_cache) = apply_layer(
+        graph,
+        layer,
+        config,
+        family,
+        attention_kind,
+        hidden_input,
+        position,
+        sequence_lengths,
+        page_table,
+        key_input,
+        value_input,
+    )?;
+    let hidden = nml(graph.reuse_buffer(hidden, hidden_input))?;
+
+    Ok(vec![
+        ("hidden".to_owned(), hidden),
+        ("cache.key".to_owned(), key_cache),
+        ("cache.value".to_owned(), value_cache),
+    ])
+}
+
+/// Builds the one decode fusion domain justified by GPT-OSS's immutable
+/// alternating schedule: one sliding layer followed by one full layer.
+///
+/// This halves recurring PJRT graph submissions without making model depth a
+/// compiler constant. The pair shares position and page-table inputs, owns two
+/// independent donated cache pairs, and aliases the final hidden state back to
+/// the original input. Prefill deliberately retains single-layer components.
+pub(super) fn build_decode_layer_pair(
+    graph: &mut Graph,
+    sliding: &DecoderLayer,
+    full: &DecoderLayer,
+    config: &Config,
+    family: ShapeFamily,
+) -> Result<Vec<(String, Tensor)>> {
+    if family.phase() != Phase::Decode {
+        return Err(message("GPT-OSS layer pairs are decode-only"));
+    }
+    let hidden_shape = hidden_shape(config, family)?;
+    let cache_shape = cache_shape(config, family)?;
+    let hidden_input = graph.input("hidden", hidden_shape);
+    let position = graph.input("position", shape(DataType::I32, &[])?);
+    let sequence_lengths = sequence_lengths(graph, family, position)?;
+    let page_table = graph.input("page_table", page_table_shape(family)?);
+    let sliding_key_input = graph.input("sliding.cache.key", cache_shape);
+    let sliding_value_input = graph.input("sliding.cache.value", cache_shape);
+    let full_key_input = graph.input("full.cache.key", cache_shape);
+    let full_value_input = graph.input("full.cache.value", cache_shape);
+
+    let (hidden, sliding_key, sliding_value) = apply_layer(
+        graph,
+        sliding,
+        config,
+        family,
+        AttentionKind::SlidingAttention,
+        hidden_input,
+        position,
+        sequence_lengths,
+        page_table,
+        sliding_key_input,
+        sliding_value_input,
+    )?;
+    let (hidden, full_key, full_value) = apply_layer(
+        graph,
+        full,
+        config,
+        family,
+        AttentionKind::FullAttention,
+        hidden,
+        position,
+        sequence_lengths,
+        page_table,
+        full_key_input,
+        full_value_input,
+    )?;
+    let hidden = nml(graph.reuse_buffer(hidden, hidden_input))?;
+    Ok(vec![
+        ("hidden".to_owned(), hidden),
+        ("sliding.cache.key".to_owned(), sliding_key),
+        ("sliding.cache.value".to_owned(), sliding_value),
+        ("full.cache.key".to_owned(), full_key),
+        ("full.cache.value".to_owned(), full_value),
+    ])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_layer(
+    graph: &mut Graph,
+    layer: &DecoderLayer,
+    config: &Config,
+    family: ShapeFamily,
+    attention_kind: AttentionKind,
+    hidden_input: Tensor,
+    position: Tensor,
+    sequence_lengths: Tensor,
+    page_table: Tensor,
+    key_input: Tensor,
+    value_input: Tensor,
+) -> Result<(Tensor, Tensor, Tensor)> {
     let sequence = dimension(family.sequence())?;
     let hidden_size = dimension(config.hidden_size())?;
     let query_heads = dimension(config.query_heads())?;
@@ -107,25 +216,11 @@ pub(super) fn build_layer(
     let head_dim = dimension(config.head_dim())?;
     let page_count = dimension(family.page_count())?;
     let page_size = dimension(CACHE_PAGE_SIZE)?;
-    let hidden_shape = shape(DataType::Bf16, &[1, sequence, hidden_size])?;
+    let hidden_shape = hidden_shape(config, family)?;
     let cache_shape = shape(
         DataType::Bf16,
         &[page_count, page_size, key_value_heads, head_dim],
     )?;
-
-    let hidden_input = graph.input("hidden", hidden_shape);
-    let position = graph.input("position", shape(DataType::I32, &[])?);
-    let sequence_lengths = match family.phase() {
-        Phase::Prefill => graph.input("sequence_lengths", shape(DataType::I32, &[1])?),
-        Phase::Decode => {
-            let one = nml(graph.scalar(1_i32))?;
-            let length = nml(graph.add(position, one))?;
-            nml(graph.reshape(length, shape(DataType::I32, &[1])?))?
-        }
-    };
-    let page_table = graph.input("page_table", shape(DataType::I32, &[1, page_count])?);
-    let key_input = graph.input("cache.key", cache_shape);
-    let value_input = graph.input("cache.value", cache_shape);
     let zero = nml(graph.scalar(0_i32))?;
 
     let token_shape = shape(DataType::I32, &[1, sequence])?;
@@ -277,13 +372,7 @@ pub(super) fn build_layer(
     ))?;
     let routed = nml(graph.reshape(routed, hidden_shape))?;
     hidden = nml(graph.add(residual, routed))?;
-    let hidden = nml(graph.reuse_buffer(hidden, hidden_input))?;
-
-    Ok(vec![
-        ("hidden".to_owned(), hidden),
-        ("cache.key".to_owned(), key_cache),
-        ("cache.value".to_owned(), value_cache),
-    ])
+    Ok((hidden, key_cache, value_cache))
 }
 
 pub(super) fn build_head(
@@ -360,6 +449,32 @@ pub(super) fn cache_shape(config: &Config, family: ShapeFamily) -> Result<Shape>
             dimension(config.head_dim())?,
         ],
     )
+}
+
+fn hidden_shape(config: &Config, family: ShapeFamily) -> Result<Shape> {
+    shape(
+        DataType::Bf16,
+        &[
+            1,
+            dimension(family.sequence())?,
+            dimension(config.hidden_size())?,
+        ],
+    )
+}
+
+fn sequence_lengths(
+    graph: &mut Graph,
+    family: ShapeFamily,
+    position: Tensor,
+) -> Result<Tensor> {
+    match family.phase() {
+        Phase::Prefill => Ok(graph.input("sequence_lengths", shape(DataType::I32, &[1])?)),
+        Phase::Decode => {
+            let one = nml(graph.scalar(1_i32))?;
+            let length = nml(graph.add(position, one))?;
+            nml(graph.reshape(length, shape(DataType::I32, &[1])?))
+        }
+    }
 }
 
 pub(super) fn page_table_shape(family: ShapeFamily) -> Result<Shape> {
@@ -479,23 +594,27 @@ mod tests {
         let full = representative_layer(&checkpoint, &config, AttentionKind::FullAttention)
             .unwrap();
         let decode_layer = finish!(|graph| {
-            build_layer(
-                graph,
-                full,
-                &config,
-                decode,
-                AttentionKind::FullAttention,
-            )
+            build_decode_layer_pair(graph, sliding, full, &config, decode)
         });
         assert_contract!(
             decode_layer,
+            7,
+            58,
             5,
-            29,
-            3,
-            &[Some(0), Some(3), Some(4)],
+            &[Some(0), Some(3), Some(4), Some(5), Some(6)],
         );
         assert!(!decode_layer.input_names().any(|name| name == "sequence_lengths"));
-        assert_single_layer_identity!(decode_layer, 1);
+        let layer_names = decode_layer
+            .input_names()
+            .filter(|name| name.starts_with("model.layers."))
+            .collect::<Vec<_>>();
+        assert!(
+            layer_names
+                .iter()
+                .all(|name| name.starts_with("model.layers.0.") || name.starts_with("model.layers.1."))
+        );
+        assert!(layer_names.iter().any(|name| name.starts_with("model.layers.0.")));
+        assert!(layer_names.iter().any(|name| name.starts_with("model.layers.1.")));
 
         let prefill_head = finish!(|graph| build_head(graph, &checkpoint, &config, prefill));
         assert_contract!(prefill_head, 7, 4, 2, &[None, Some(2)]);

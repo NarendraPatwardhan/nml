@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
   "repository": "narendra747/gpt-oss-20b-nvfp4",
-  "revision": "729e9053f43c267636bfda3d6659c4141ff3ea1d",
+  "revision": "704c34282b2d84cc6a4e5ce7de14b6f6fc1286e9",
   "artifact_manifest_path": "nml-artifact-manifest.json",
-  "artifact_manifest_sha256": "ab4c8cbd4424c8fec95bf683c0efd04c9cd350ec2a26737408b5500e61003207",
+  "artifact_manifest_sha256": "3c36a89cbc0f908b3e782550fe32f3b6890ef3f857232d11710bc8e0dbcea71d",
   "artifact_file_count": 20,
-  "artifact_total_bytes": 11805933892,
-  "conversion_device": "NVIDIA RTX A5000",
-  "conversion_compute_capability": "8.6"
+  "artifact_total_bytes": 11805938322,
+  "conversion_device": "cpu",
+  "conversion_compute_capability": null
 }

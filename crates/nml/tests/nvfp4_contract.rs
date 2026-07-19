@@ -187,7 +187,7 @@ fn execute_experts(platform: &nml::Platform, dtype: DType, tokens: usize) {
         "model.gate",
         Shape::new(
             dtype,
-            &[EXPERTS as i64, HIDDEN as i64, (2 * INTERMEDIATE) as i64],
+            &[EXPERTS as i64, (2 * INTERMEDIATE) as i64, HIDDEN as i64],
         )
         .unwrap(),
     )
@@ -195,7 +195,7 @@ fn execute_experts(platform: &nml::Platform, dtype: DType, tokens: usize) {
     let down = Parameter::nvfp4(
         "down",
         "model.down",
-        Shape::new(dtype, &[EXPERTS as i64, INTERMEDIATE as i64, HIDDEN as i64]).unwrap(),
+        Shape::new(dtype, &[EXPERTS as i64, HIDDEN as i64, INTERMEDIATE as i64]).unwrap(),
     )
     .unwrap();
     let gate_bias = Parameter::dense(
@@ -236,8 +236,8 @@ fn execute_experts(platform: &nml::Platform, dtype: DType, tokens: usize) {
     let down_source = (0..EXPERTS * INTERMEDIATE * HIDDEN)
         .map(|index| (17.0 - index as f32) / 29.0)
         .collect::<Vec<_>>();
-    let gate_encoded = encode_parameter(&gate_source, 2 * INTERMEDIATE);
-    let down_encoded = encode_parameter(&down_source, HIDDEN);
+    let gate_encoded = encode_parameter(&gate_source, HIDDEN);
+    let down_encoded = encode_parameter(&down_source, INTERMEDIATE);
     let gate_bias_values = (0..EXPERTS * 2 * INTERMEDIATE)
         .map(|index| (index as f32 - 9.0) / 31.0)
         .collect::<Vec<_>>();
@@ -472,9 +472,9 @@ fn reference_experts(
             for output_index in 0..doubled {
                 let mut value = gate_bias[expert * doubled + output_index];
                 for input_index in 0..hidden_size {
-                    let row = expert * hidden_size + input_index;
+                    let row = expert * doubled + output_index;
                     value += hidden[token * hidden_size + input_index]
-                        * gate[row * doubled + output_index];
+                        * gate[row * hidden_size + input_index];
                 }
                 projected[output_index] = value;
             }
@@ -489,8 +489,8 @@ fn reference_experts(
             for output_index in 0..hidden_size {
                 let mut value = down_bias[expert * hidden_size + output_index];
                 for input_index in 0..intermediate {
-                    let row = expert * intermediate + input_index;
-                    value += activated[input_index] * down[row * hidden_size + output_index];
+                    let row = expert * hidden_size + output_index;
+                    value += activated[input_index] * down[row * intermediate + input_index];
                 }
                 output[token * hidden_size + output_index] += route_weight * value;
             }

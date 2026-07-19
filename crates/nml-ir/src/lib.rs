@@ -1244,9 +1244,11 @@ impl ProgramBuilder {
 
     /// Routed clamped, interleaved residual SwiGLU experts.
     ///
-    /// Gate/up and down weights use input-major logical shapes
-    /// `[experts, hidden, 2 * intermediate]` and
-    /// `[experts, intermediate, hidden]`. Biases remain ordinary dense
+    /// Gate/up and down weights use the framework-wide output-major logical
+    /// shapes `[experts, 2 * intermediate, hidden]` and
+    /// `[experts, hidden, intermediate]`. K is consequently the final,
+    /// quantized axis for both dense and compact expert contractions. Biases
+    /// remain ordinary dense
     /// parameters. Dense and NVFP4 weights share this exact routing and
     /// activation contract; representation selects only the private
     /// contraction lowering.
@@ -1277,21 +1279,21 @@ impl ProgramBuilder {
             || down_bias_shape.rank() != 2
         {
             return Err(Error::InvalidMoe(
-                "clamped SwiGLU expects hidden [tokens, hidden], router [tokens, experts], gate/up [experts, hidden, 2*intermediate], gate/up bias [experts, 2*intermediate], down [experts, intermediate, hidden], and down bias [experts, hidden]",
+                "clamped SwiGLU expects hidden [tokens, hidden], router [tokens, experts], gate/up [experts, 2*intermediate, hidden], gate/up bias [experts, 2*intermediate], down [experts, hidden, intermediate], and down bias [experts, hidden]",
             ));
         }
         let tokens = hidden.shape.dimensions()[0];
         let hidden_size = hidden.shape.dimensions()[1];
         let experts = router_logits.shape.dimensions()[1];
-        let doubled_intermediate = gate_shape.dimensions()[2];
+        let doubled_intermediate = gate_shape.dimensions()[1];
         if tokens != router_logits.shape.dimensions()[0]
             || experts != gate_shape.dimensions()[0]
             || experts != down_shape.dimensions()[0]
-            || gate_shape.dimensions()[1] != hidden_size
+            || gate_shape.dimensions()[2] != hidden_size
             || doubled_intermediate <= 0
             || doubled_intermediate % 2 != 0
-            || down_shape.dimensions()[1] != doubled_intermediate / 2
-            || down_shape.dimensions()[2] != hidden_size
+            || down_shape.dimensions()[1] != hidden_size
+            || down_shape.dimensions()[2] != doubled_intermediate / 2
             || gate_bias_shape.dimensions() != [experts, doubled_intermediate]
             || down_bias_shape.dimensions() != [experts, hidden_size]
         {
@@ -4811,7 +4813,7 @@ impl ProgramBuilder {
         let down_bias = self.parameter_value(down_bias)?;
         let tokens = hidden.shape.dimensions()[0];
         let experts = gate_up.shape.dimensions()[0];
-        let projected = self.dot_general(hidden, gate_up, &[], &[], &[1], &[1])?;
+        let projected = self.dot_general(hidden, gate_up, &[], &[], &[1], &[2])?;
         let gate_bias = self.broadcast_in_dim(gate_bias, projected.shape, &[1, 2])?;
         let projected = self.add(projected, gate_bias)?;
         let starts = vec![0; projected.shape.rank()];
@@ -4834,7 +4836,7 @@ impl ProgramBuilder {
         let up = self.add(up, one)?;
         let activated = self.multiply(up, swish)?;
 
-        let expert_outputs = self.dot_general(activated, down, &[1], &[0], &[2], &[1])?;
+        let expert_outputs = self.dot_general(activated, down, &[1], &[0], &[2], &[2])?;
         let expert_outputs = self.transpose(expert_outputs, &[1, 0, 2])?;
         let down_bias = self.broadcast_in_dim(down_bias, expert_outputs.shape, &[1, 2])?;
         let expert_outputs = self.add(expert_outputs, down_bias)?;

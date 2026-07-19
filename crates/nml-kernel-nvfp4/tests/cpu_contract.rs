@@ -78,7 +78,7 @@ fn oracle_project(
         .map(|output| {
             (0..inputs).fold(0.0, |sum, input_index| {
                 sum + f64::from(input[input_index])
-                    * oracle_value(encoded, outputs, expert * inputs + input_index, output)
+                    * oracle_value(encoded, inputs, expert * outputs + output, input_index)
             })
         })
         .collect()
@@ -133,8 +133,8 @@ fn grouped_projection_handles_uneven_and_empty_experts() {
     let values = (0..120)
         .map(|value| value as f32 / 17.0 - 3.0)
         .collect::<Vec<_>>();
-    let encoded = encode(&[4, 3, 10], &values);
-    let weight = weight(&[4, 3, 10], &encoded);
+    let encoded = encode(&[4, 10, 3], &values);
+    let weight = weight(&[4, 10, 3], &encoded);
     let input = [1.0, 2.0, -1.0, -0.5, 1.5, 3.0, 2.0, 0.0, 0.25];
     let experts = [2, 2, 0];
     let bias = (0..40)
@@ -149,9 +149,9 @@ fn grouped_projection_handles_uneven_and_empty_experts() {
             let expected = (0..3).fold(
                 f64::from(bias[expert * 10 + output_index]),
                 |sum, input_index| {
-                    let row = expert * 3 + input_index;
+                    let row = expert * 10 + output_index;
                     sum + f64::from(input[assignment * 3 + input_index])
-                        * oracle_value(&encoded, 10, row, output_index)
+                        * oracle_value(&encoded, 3, row, input_index)
                 },
             );
             assert!((f64::from(output[assignment * 10 + output_index]) - expected).abs() < 2.0e-5);
@@ -167,10 +167,10 @@ fn routed_experts_preserve_interleaved_clamped_residual_swiglu_semantics() {
     let down_values = (0..24)
         .map(|value| value as f32 / 7.0 - 1.5)
         .collect::<Vec<_>>();
-    let gate_encoded = encode(&[3, 2, 8], &gate_values);
-    let down_encoded = encode(&[3, 4, 2], &down_values);
-    let gate = weight(&[3, 2, 8], &gate_encoded);
-    let down = weight(&[3, 4, 2], &down_encoded);
+    let gate_encoded = encode(&[3, 8, 2], &gate_values);
+    let down_encoded = encode(&[3, 2, 4], &down_values);
+    let gate = weight(&[3, 8, 2], &gate_encoded);
+    let down = weight(&[3, 2, 4], &down_encoded);
     let hidden = [1.0, -0.5, 0.25, 2.0];
     let router_indices = [0, 2, 2, 0];
     let routing_weights = [0.75, 0.25, 0.4, 0.6];
@@ -208,7 +208,7 @@ fn routed_experts_preserve_interleaved_clamped_residual_swiglu_semantics() {
                 .map(|output| {
                     (0..4).fold(0.0, |sum, input_index| {
                         sum + activated[input_index]
-                            * oracle_value(&down_encoded, 2, expert * 4 + input_index, output)
+                            * oracle_value(&down_encoded, 4, expert * 2 + output, input_index)
                     })
                 })
                 .collect::<Vec<_>>();
@@ -240,19 +240,19 @@ fn routed_experts_match_the_independent_oracle_across_bounded_shapes() {
             2.0,
         );
         let gate_encoded = encode(
-            &[experts, hidden_size, intermediate * 2],
+            &[experts, intermediate * 2, hidden_size],
             &gate_values,
         );
         let down_encoded = encode(
-            &[experts, intermediate, hidden_size],
+            &[experts, hidden_size, intermediate],
             &down_values,
         );
         let gate = weight(
-            &[experts, hidden_size, intermediate * 2],
+            &[experts, intermediate * 2, hidden_size],
             &gate_encoded,
         );
         let down = weight(
-            &[experts, intermediate, hidden_size],
+            &[experts, hidden_size, intermediate],
             &down_encoded,
         );
         let hidden = generated_values(&mut state, tokens * hidden_size, 1.25);
@@ -318,9 +318,9 @@ fn routed_experts_match_the_independent_oracle_across_bounded_shapes() {
                                 sum + activated[input_index]
                                     * oracle_value(
                                         &down_encoded,
-                                        hidden_size,
-                                        expert * intermediate + input_index,
-                                        output_index,
+                                        intermediate,
+                                        expert * hidden_size + output_index,
+                                        input_index,
                                     )
                             },
                         )

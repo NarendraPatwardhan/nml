@@ -64,7 +64,7 @@ persistent dense weight expansion.
   makes the result read-only, and atomically issues an exact filesystem-identity
   receipt. Product startup hashes only the bounded manifest and hard-fails a
   missing or stale receipt; it never silently repeats the payload scan.
-- [x] Define NVFP4 recipe v1: packed E2M1 payload, E4M3FN block scales, F32
+- [x] Define NVFP4 recipe v2: output-major/K-contiguous packed E2M1 payload, E4M3FN block scales, F32
   global scale, block geometry, padding, logical shape, and component sharding.
 - [x] Replace dense-only weight handling with one closed `Parameter` /
   `LoadedParameter` abstraction. Dense is one component; NVFP4 is three
@@ -102,18 +102,20 @@ persistent dense weight expansion.
 
 ### Reusable component execution
 
-- [x] Replace monolithic full-transformer compilation with four bounded
-  executables per shape family: embedding, reusable sliding-attention layer,
-  reusable full-attention layer, and final head.
+- [x] Replace monolithic full-transformer compilation with bounded reusable
+  executables: embedding, sliding-attention layer, full-attention layer, and
+  final head for prefill; embedding, alternating sliding/full layer pair, and
+  final head for decode.
 - [x] Add representation-aware executable parameter slots. A loaded layer may
   bind to a representative compiled layer only when shape, representation,
   component roles/storage, platform, sharding, and executable contracts agree.
 - [x] Add asynchronous `enqueue` plus explicit `wait`; keep synchronous `call`
   as the convenience boundary. PJRT readiness dependencies chain component
   outputs without one host synchronization per layer.
-- [x] Compose prefill and decode through the 24 layer invocations while donating
-  hidden state and every K/V pair. Share one request-owned I32 identity page
-  table instead of copying model policy into the generic runtime cache owner.
+- [x] Compose prefill through 24 layer invocations and decode through 12 layer-
+  pair invocations while donating hidden state and every K/V pair. Share one
+  request-owned I32 identity page table instead of copying model policy into
+  the generic runtime cache owner.
 - [x] Use finite power-of-two prefill buckets and page-aligned power-of-two cache
   buckets. Validate, normalize, and deduplicate every configured profile;
   compile the complete plan while the checkpoint is metadata-only, then upload
@@ -223,11 +225,50 @@ persistent dense weight expansion.
   generated coherent text, and exited normally. The validated report is
   `references/runpod/reports/20260719T155954Z-fdmcvpur8oks3p-69e805cd5128-diagnostic`;
   Pod `fdmcvpur8oks3p` was terminated and deletion confirmed.
-- [ ] Design the next compact-projection change from the restored 59.611
-  tokens/s architecture and measured kernel evidence. Compile-only contracts
-  are necessary but cannot promote another performance design: publish and
-  measure the first meaningful kernel tranche on A40 before composing further
-  optimizations on top of it.
+- [x] Replace recipe v1 with one recipe-v2 output-major/K-contiguous layout for
+  ordinary, gate/up, and down contractions. Conversion transposes expert source
+  tensors before quantization; CPU, SM75, Triton matrix, and Triton decode
+  implementations consume the same packed components. No compatibility or
+  persistent prepared representation remains. Focused IR, Triton, and compact
+  CPU contracts pass remotely, including odd reduction widths, in BuildBuddy
+  invocations `4d31e920-c3cd-41f3-b9ee-7babad1d1842`,
+  `c04134f4-38ef-4e10-989b-8e79fe20c5a9`, and
+  `8dd33c22-6a36-43a4-bb76-ca89d0bb945c`.
+- [x] Replace decode-shaped Triton compact projections with finite rowwise GEMV
+  schedules that vector-load contiguous K blocks, decode one scale per 16
+  values, accumulate in F32, and retain the gate/up activation epilogue.
+  Matrix-shaped prefill retains its tensor-core schedule over the same recipe.
+- [x] Convert and publish the exact GPT-OSS artifact as recipe v2 and reject
+  every v1 identity. The public artifact is pinned at revision
+  `704c34282b2d84cc6a4e5ce7de14b6f6fc1286e9`; its converter-produced manifest
+  hashes to `3c36a89cbc0f908b3e782550fe32f3b6890ef3f857232d11710bc8e0dbcea71d`.
+  Conversion remained CPU-only even though a price-capped RunPod worker hosted
+  the process after BuildBuddy capacity failures; no GPU conversion semantics
+  or local model transformation were introduced. The complete common/CUDA
+  package contract suite passes in BuildBuddy invocation
+  `2436149e-5211-4036-9de2-451a61661407`, and the CUDA binary plus serving OCI
+  closure builds in invocation `ac508b59-a6f4-46d7-b61e-733b577e8192`.
+- [x] Reuse one baked argument owner per request/component across decode
+  iterations. Persistent parameter components remain bound while only donated
+  hidden/cache state and request-local scalar inputs are replaced; executable
+  output arity and names remain compile-time metadata.
+- [x] Compile bounded two-layer decode executables for the model's real
+  alternating attention schedule, reducing recurring PJRT graph submissions
+  from 24 layer calls to 12 without restoring the rejected six-layer/direct-
+  kernel experiment. Prefill retains single-layer components. The structural
+  product contract and complete CUDA product binaries pass in BuildBuddy
+  invocations `73b53056-cf33-4626-8f60-7e19206c3df5` and
+  `8587ad5e-ff8a-440c-8c2b-7e34c3edccc0`; runtime promotion still awaits the
+  recipe-v2 whole-model measurement.
+- [x] Keep sampling and top-k device-resident and reduce token readback to the
+  selected scalar plus readiness boundary; do not materialize vocabulary
+  logits on the host.
+- [ ] Publish the first complete recipe-v2 image and measure it on A40 through
+  the mandatory combined GDB/Nsight harness before composing any further
+  projection or orchestration experiment. Promotion requires correct text,
+  numerical contracts, durable trace evidence, and at least 143.12 steady
+  device tokens/s, a 2.5-fold improvement over the restored 57.248-token/s
+  baseline.
 
 ## Next milestone: continuous batching and shared paged state
 

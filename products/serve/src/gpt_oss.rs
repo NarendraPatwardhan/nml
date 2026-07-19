@@ -32,18 +32,24 @@ const ARTIFACT_MANIFEST: &str = "nml-artifact-manifest.json";
 const CHECKPOINT_INDEX: &str = "model.safetensors.index.json";
 const DIRECT_CHECKPOINT: &str = "model.safetensors";
 const ARTIFACT_MANIFEST_SHA256: &str =
-    "ab4c8cbd4424c8fec95bf683c0efd04c9cd350ec2a26737408b5500e61003207";
+    "3c36a89cbc0f908b3e782550fe32f3b6890ef3f857232d11710bc8e0dbcea71d";
 const ARTIFACT_FILE_COUNT: usize = 20;
-const ARTIFACT_TOTAL_BYTES: u64 = 11_805_933_892;
-const ARTIFACT_RECIPE: &str = "nml-nvfp4-weight-v1";
+const ARTIFACT_TOTAL_BYTES: u64 = 11_805_938_322;
+const ARTIFACT_RECIPE: &str = "nml-nvfp4-weight-v2";
 const ARTIFACT_RECIPE_SHA256: &str =
-    "ca5335749edbee2bf45b2220195b8e7f4551a4217cd8b99184cc772fb3d21014";
+    "68bad1480e9a68e4fa3d36c17315b8bcd5490e777cfd738f15c71101f6bb6603";
 const SOURCE_MANIFEST_SHA256: &str =
     "4f9fd730e12e0535cf6788a11a9b1604749f4520738a5c7ea643e27bf4b5ccb1";
 const TENSOR_MANIFEST_SHA256: &str =
     "fd7c6833d00eca158bc1145dc2577ad8d38d8f4ed977ef3e3dfc0c2a72ea5cae";
 const SOURCE_REPOSITORY: &str = "unsloth/gpt-oss-20b-BF16";
 const SOURCE_REVISION: &str = "cc89b3e7fd423253264883a80a4fa5abc619649f";
+const CONVERTER_NAME: &str = "nml-nvfp4-converter";
+const CONVERTER_VERSION: u32 = 2;
+const CONVERTER_SCRIPT_SHA256: &str =
+    "ca9a7a714798a8095d3eca1b873af8fed8637ba23b7ea984926c2c64de1c4079";
+const CONVERTER_REQUIREMENTS_SHA256: &str =
+    "f384757dfae59e89aa0dfad0ea75a651005a336437903981119636ed58de8c8e";
 
 /// Persistent product model. Its complete execution plan is compiled before
 /// its parameters become resident and is reused by every request.
@@ -255,7 +261,18 @@ fn validate_artifact(model_directory: &Path) -> std::result::Result<(), Artifact
 fn validate_manifest_identity(
     manifest: &ArtifactManifest,
 ) -> std::result::Result<(), ArtifactError> {
-    if manifest.schema_version != 1
+    let converter = &manifest.converter;
+    if converter.name != CONVERTER_NAME
+        || converter.version != CONVERTER_VERSION
+        || converter.device != "cpu"
+        || converter.python != "3.12.11"
+        || converter.torch != "2.8.0+cpu"
+        || converter.numpy != "2.2.6"
+        || converter.safetensors != "0.6.2"
+        || converter.huggingface_hub != "0.34.4"
+        || converter.script_sha256 != CONVERTER_SCRIPT_SHA256
+        || converter.requirements_sha256 != CONVERTER_REQUIREMENTS_SHA256
+        || manifest.schema_version != 1
         || manifest.recipe != ARTIFACT_RECIPE
         || manifest.recipe_sha256 != ARTIFACT_RECIPE_SHA256
         || manifest.source_manifest_sha256 != SOURCE_MANIFEST_SHA256
@@ -316,6 +333,7 @@ fn sha256(path: &Path) -> std::result::Result<String, ArtifactError> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ArtifactManifest {
+    converter: ConverterManifest,
     schema_version: u32,
     recipe: String,
     recipe_sha256: String,
@@ -324,6 +342,21 @@ struct ArtifactManifest {
     source_revision: String,
     tensor_manifest_sha256: String,
     files: Vec<ArtifactFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConverterManifest {
+    device: String,
+    huggingface_hub: String,
+    name: String,
+    numpy: String,
+    python: String,
+    requirements_sha256: String,
+    safetensors: String,
+    script_sha256: String,
+    torch: String,
+    version: u32,
 }
 
 #[derive(Deserialize)]

@@ -566,7 +566,7 @@ pub mod io {
                 .map_err(super::Error::Parameter)
         }
 
-        /// Resolves the three physical records of NML NVFP4 recipe v1.
+        /// Resolves the three physical records of NML NVFP4 recipe v2.
         ///
         /// A base `<name>` owns `<name>.payload`, `<name>.block_scales`, and
         /// `<name>.global_scale`. Partially present bases are rejected rather

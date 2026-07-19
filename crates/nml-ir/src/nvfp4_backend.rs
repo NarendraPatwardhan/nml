@@ -184,15 +184,26 @@ pub(crate) fn lower_routed_swiglu<'context>(
         .checked_mul(experts_per_token)
         .ok_or(Error::InvalidMoe("NVFP4 assignment count overflows"))?;
     let local_experts = inputs.gate_payload_shape.dimensions()[0];
-    let gate_input = inputs.gate_payload_shape.dimensions()[1];
     let gate_output = inputs.gate_bias_shape.dimensions()[1];
-    let intermediate = inputs.down_payload_shape.dimensions()[1];
     let down_output = inputs.down_bias_shape.dimensions()[1];
-    let expected_gate_output = intermediate.checked_mul(2).ok_or(Error::InvalidMoe(
-        "NVFP4 expert intermediate width overflows",
-    ))?;
-    if gate_input != hidden_size
-        || gate_output != expected_gate_output
+    if gate_output % 2 != 0 {
+        return Err(Error::InvalidMoe(
+            "NVFP4 gate/up output width must contain equal gate and up halves",
+        ));
+    }
+    let intermediate = gate_output / 2;
+    let packed_hidden = hidden_size
+        .checked_add(1)
+        .ok_or(Error::InvalidMoe("NVFP4 hidden width overflows"))?
+        / 2;
+    let packed_intermediate = intermediate
+        .checked_add(1)
+        .ok_or(Error::InvalidMoe("NVFP4 intermediate width overflows"))?
+        / 2;
+    if inputs.gate_payload_shape.dimensions()[2] != packed_hidden
+        || inputs.gate_payload_shape.dimensions()[1] != gate_output
+        || inputs.down_payload_shape.dimensions()[1] != down_output
+        || inputs.down_payload_shape.dimensions()[2] != packed_intermediate
         || down_output != hidden_size
     {
         return Err(Error::InvalidMoe(
@@ -585,11 +596,14 @@ impl LinearPlan {
             ));
         }
 
-        // Decode is latency-sensitive at small M. Hopper-and-newer devices
+        // Decode is a distinct bandwidth kernel. It uses narrow output rows,
+        // a wider contiguous K tile, and no artificial tensor-core rows.
         // retain a 64-row tile once enough rows exist for warp-group MMA;
         // Ampere/Ada use the smaller tile accepted by their ordinary tt.dot
         // lowering. This is private tuning, not an architecture-facing API.
-        let block_m = if rows <= 16 {
+        let block_m = if rows == 1 {
+            1
+        } else if rows <= 16 {
             16
         } else if capabilities.supports_warp_group_mma() {
             64
@@ -604,8 +618,20 @@ impl LinearPlan {
                 outputs,
                 inputs,
                 block_m,
-                block_n: if latency_sensitive { 64 } else { 128 },
-                block_k: if latency_sensitive { 128 } else { 64 },
+                block_n: if rows == 1 {
+                    if outputs >= 65_536 { 32 } else { 8 }
+                } else if latency_sensitive {
+                    64
+                } else {
+                    128
+                },
+                block_k: if rows == 1 {
+                    256
+                } else if latency_sensitive {
+                    128
+                } else {
+                    64
+                },
                 has_bias,
             },
             warps: if rows > 128 && capabilities.supports_warp_group_mma() {
@@ -613,7 +639,7 @@ impl LinearPlan {
             } else {
                 4
             },
-            stages: if latency_sensitive { 4 } else { 3 },
+            stages: if rows == 1 { 1 } else if latency_sensitive { 4 } else { 3 },
         })
     }
 }
@@ -626,7 +652,14 @@ impl GroupedPlan {
     /// retained Triton-capable NVIDIA generation. These boundaries deliberately
     /// match ZML's built-in grouped-MoE policy.
     const fn new(tokens: i64) -> Self {
-        if tokens <= 32 {
+        if tokens == 1 {
+            Self {
+                block_n: 8,
+                block_k: 256,
+                warps: 4,
+                stages: 1,
+            }
+        } else if tokens <= 32 {
             Self {
                 block_n: 64,
                 block_k: 128,

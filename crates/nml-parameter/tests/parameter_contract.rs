@@ -43,7 +43,7 @@ fn nvfp4_parameters_derive_exact_physical_components() {
         parameter.representation_id().kind(),
         RepresentationKind::NvFp4
     );
-    assert_eq!(parameter.representation_id().version(), 1);
+    assert_eq!(parameter.representation_id().version(), 2);
     let spec = parameter.nvfp4_spec().unwrap();
     assert_eq!(spec.quantized_axis(), 1);
     assert_eq!(spec.block_size(), 16);

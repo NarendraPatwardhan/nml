@@ -265,7 +265,7 @@ pub fn linear(
     Ok(())
 }
 
-/// Applies an input-major `[experts, K, N]` projection to routed assignments.
+/// Applies an output-major `[experts, N, K]` projection to routed assignments.
 ///
 /// `expert_indices` has one entry per input row. Empty experts require no
 /// special case; uneven routing changes work distribution but not semantics.
@@ -278,8 +278,8 @@ pub fn grouped_projection(
 ) -> Result<(), Error> {
     require_rank(weight, "grouped projection", 3)?;
     let experts = weight.dimensions[0];
-    let inputs = weight.dimensions[1];
-    let outputs = weight.dimensions[2];
+    let outputs = weight.dimensions[1];
+    let inputs = weight.dimensions[2];
     let expected_input = expert_indices
         .len()
         .checked_mul(inputs)
@@ -344,10 +344,10 @@ pub fn routed_clamped_swiglu(
     require_rank(gate_up, "clamped SwiGLU gate/up", 3)?;
     require_rank(down, "clamped SwiGLU down", 3)?;
     let experts = gate_up.dimensions[0];
-    let hidden_size = gate_up.dimensions[1];
-    let doubled_intermediate = gate_up.dimensions[2];
+    let doubled_intermediate = gate_up.dimensions[1];
+    let hidden_size = gate_up.dimensions[2];
     if doubled_intermediate % 2 != 0
-        || down.dimensions != [experts, doubled_intermediate / 2, hidden_size]
+        || down.dimensions != [experts, hidden_size, doubled_intermediate / 2]
     {
         return Err(Error::IncompatibleExpertWeights);
     }
@@ -455,15 +455,11 @@ fn project_expert(
     output: &mut [f32],
     implementation: CpuImplementation,
 ) {
-    let inputs = weight.dimensions[1];
-    if let Some(bias) = bias {
-        output.copy_from_slice(bias);
-    } else {
-        output.fill(0.0);
-    }
-    for (input_index, &activation) in input.iter().enumerate().take(inputs) {
-        let row = expert * inputs + input_index;
-        axpy_row(weight, row, activation, output, implementation);
+    let outputs = weight.dimensions[1];
+    for (output_index, destination) in output.iter_mut().enumerate() {
+        let row = expert * outputs + output_index;
+        *destination = bias.map_or(0.0, |values| values[output_index])
+            + dot_row(weight, row, input, implementation);
     }
 }
 
@@ -505,25 +501,6 @@ fn dot_row(
         .enumerate()
         .map(|(column, activation)| activation * weight.value(row, column))
         .sum()
-}
-
-fn axpy_row(
-    weight: &Weight<'_>,
-    row: usize,
-    activation: f32,
-    output: &mut [f32],
-    implementation: CpuImplementation,
-) {
-    #[cfg(target_arch = "x86_64")]
-    if matches!(implementation, CpuImplementation::Avx2) {
-        // SAFETY: runtime feature detection and grouped-projection validation
-        // satisfy the AVX2 kernel contract.
-        unsafe { x86::axpy_row(weight, row, activation, output) };
-        return;
-    }
-    for (column, destination) in output.iter_mut().enumerate() {
-        *destination += activation * weight.value(row, column);
-    }
 }
 
 fn nibble(payload: &[u8], row_offset: usize, column: usize) -> u8 {

@@ -276,7 +276,7 @@ unsafe fn execute_routed_swiglu(
     let tokens = to_usize(hidden_dimensions[0], "token count")?;
     let hidden_size = to_usize(hidden_dimensions[1], "hidden size")?;
     let experts = to_usize(gate_payload_dimensions[0], "expert count")?;
-    let gate_inputs = to_usize(gate_payload_dimensions[1], "gate/up input width")?;
+    let gate_inputs = hidden_size;
     let doubled_intermediate = to_usize(gate_bias_dimensions[1], "gate/up output width")?;
     if doubled_intermediate == 0 || doubled_intermediate % 2 != 0 {
         return Err(invalid(
@@ -287,23 +287,25 @@ unsafe fn execute_routed_swiglu(
     if tokens != to_usize(routing_dimensions[0], "routing token count")?
         || hidden_size != gate_inputs
         || experts == 0
+        || gate_payload_dimensions[1] != doubled_intermediate as i64
         || gate_payload_dimensions[2]
-            != i64::try_from(doubled_intermediate.div_ceil(2)).unwrap_or(i64::MAX)
+            != i64::try_from(hidden_size.div_ceil(2)).unwrap_or(i64::MAX)
         || gate_scale_dimensions
             != [
                 gate_payload_dimensions[0],
-                gate_payload_dimensions[1],
-                i64::try_from(doubled_intermediate.div_ceil(16)).unwrap_or(i64::MAX),
+                doubled_intermediate as i64,
+                i64::try_from(hidden_size.div_ceil(16)).unwrap_or(i64::MAX),
             ]
         || gate_bias_dimensions != [gate_payload_dimensions[0], doubled_intermediate as i64]
         || down_payload_dimensions[0] != gate_payload_dimensions[0]
-        || down_payload_dimensions[1] != intermediate as i64
-        || down_payload_dimensions[2] != i64::try_from(hidden_size.div_ceil(2)).unwrap_or(i64::MAX)
+        || down_payload_dimensions[1] != hidden_size as i64
+        || down_payload_dimensions[2]
+            != i64::try_from(intermediate.div_ceil(2)).unwrap_or(i64::MAX)
         || down_scale_dimensions
             != [
                 gate_payload_dimensions[0],
-                intermediate as i64,
-                i64::try_from(hidden_size.div_ceil(16)).unwrap_or(i64::MAX),
+                hidden_size as i64,
+                i64::try_from(intermediate.div_ceil(16)).unwrap_or(i64::MAX),
             ]
         || down_bias_dimensions != [gate_payload_dimensions[0], hidden_size as i64]
     {
@@ -348,23 +350,23 @@ unsafe fn execute_routed_swiglu(
         .checked_mul(hidden_size)
         .ok_or_else(|| invalid("NVFP4 routed SwiGLU hidden extent overflows"))?;
     let gate_payload_count = experts
-        .checked_mul(gate_inputs)
-        .and_then(|value| value.checked_mul(doubled_intermediate.div_ceil(2)))
+        .checked_mul(doubled_intermediate)
+        .and_then(|value| value.checked_mul(hidden_size.div_ceil(2)))
         .ok_or_else(|| invalid("NVFP4 routed SwiGLU gate/up payload extent overflows"))?;
     let gate_scale_count = experts
-        .checked_mul(gate_inputs)
-        .and_then(|value| value.checked_mul(doubled_intermediate.div_ceil(16)))
+        .checked_mul(doubled_intermediate)
+        .and_then(|value| value.checked_mul(hidden_size.div_ceil(16)))
         .ok_or_else(|| invalid("NVFP4 routed SwiGLU gate/up scale extent overflows"))?;
     let gate_bias_count = experts
         .checked_mul(doubled_intermediate)
         .ok_or_else(|| invalid("NVFP4 routed SwiGLU gate/up bias extent overflows"))?;
     let down_payload_count = experts
-        .checked_mul(intermediate)
-        .and_then(|value| value.checked_mul(hidden_size.div_ceil(2)))
+        .checked_mul(hidden_size)
+        .and_then(|value| value.checked_mul(intermediate.div_ceil(2)))
         .ok_or_else(|| invalid("NVFP4 routed SwiGLU down payload extent overflows"))?;
     let down_scale_count = experts
-        .checked_mul(intermediate)
-        .and_then(|value| value.checked_mul(hidden_size.div_ceil(16)))
+        .checked_mul(hidden_size)
+        .and_then(|value| value.checked_mul(intermediate.div_ceil(16)))
         .ok_or_else(|| invalid("NVFP4 routed SwiGLU down scale extent overflows"))?;
     let down_bias_count = experts
         .checked_mul(hidden_size)
@@ -379,14 +381,14 @@ unsafe fn execute_routed_swiglu(
         dtype,
         &[
             experts as i64,
-            gate_inputs as i64,
             doubled_intermediate as i64,
+            gate_inputs as i64,
         ],
     )
     .map_err(|error| invalid(&error.to_string()))?;
     let down_shape = Shape::new(
         dtype,
-        &[experts as i64, intermediate as i64, hidden_size as i64],
+        &[experts as i64, hidden_size as i64, intermediate as i64],
     )
     .map_err(|error| invalid(&error.to_string()))?;
     let gate = Weight::new(

@@ -422,12 +422,18 @@ unsafe fn launch_expert_gate_up(frame: &mut sys::XLA_FFI_CallFrame) -> Result<()
         || hidden_size <= 0
         || experts <= 0
         || intermediate <= 0
-        || payload_dims != [experts, hidden_size, intermediate]
+        || payload_dims
+            != [
+                experts,
+                doubled,
+                ceil_div_positive(hidden_size, 2)
+                    .ok_or_else(|| invalid("NVFP4 gate/up packed width overflows"))?,
+            ]
         || scale_dims
             != [
                 experts,
-                hidden_size,
-                ceil_div_positive(doubled, 16)
+                doubled,
+                ceil_div_positive(hidden_size, 16)
                     .ok_or_else(|| invalid("NVFP4 gate/up scale width overflows"))?,
             ]
         || bias_dims != [experts, doubled]
@@ -525,15 +531,15 @@ unsafe fn launch_expert_down(frame: &mut sys::XLA_FFI_CallFrame) -> Result<(), H
         || payload_dims
             != [
                 experts,
-                intermediate,
-                ceil_div_positive(hidden_size, 2)
+                hidden_size,
+                ceil_div_positive(intermediate, 2)
                     .ok_or_else(|| invalid("NVFP4 expert down packed width overflows"))?,
             ]
         || scale_dims
             != [
                 experts,
-                intermediate,
-                ceil_div_positive(hidden_size, 16)
+                hidden_size,
+                ceil_div_positive(intermediate, 16)
                     .ok_or_else(|| invalid("NVFP4 expert down scale width overflows"))?,
             ]
         || bias_dims != [experts, hidden_size]

@@ -156,7 +156,7 @@ def require_identity(published: dict[str, Any], artifact: dict[str, Any]) -> Non
     for name in required_strings:
         if not isinstance(published.get(name), str) or not published[name]:
             fail(f"published identity has invalid {name!r}")
-    if artifact.get("recipe") != "nml-nvfp4-weight-v1":
+    if artifact.get("recipe") != "nml-nvfp4-weight-v2":
         fail("published artifact does not use the admitted NVFP4 recipe")
 
 
@@ -164,13 +164,14 @@ def expected_components(sources: list[dict[str, Any]]) -> dict[str, dict[str, An
     result: dict[str, dict[str, Any]] = {}
     for source in sources:
         name = source["name"]
+        logical_shape, logical_mapping, transposed = logical_contract(source)
         common = {
             "logical_name": name,
-            "logical_shape": source["logical_shape"],
+            "logical_shape": logical_shape,
             "logical_dtype": source["source_dtype"],
             "logical_role": source["role"],
-            "logical_mapping": source["logical_mapping"],
-            "transpose": source["transpose"],
+            "logical_mapping": logical_mapping,
+            "transpose": transposed,
             "representation": source["target_representation"],
         }
         if source["target_representation"] == "dense":
@@ -182,7 +183,7 @@ def expected_components(sources: list[dict[str, Any]]) -> dict[str, dict[str, An
             continue
         if source["target_representation"] != "nvfp4":
             fail(f"unsupported representation for {name!r}")
-        shape = source["logical_shape"]
+        shape = logical_shape
         if not shape or shape[-1] <= 0:
             fail(f"invalid NVFP4 logical shape for {name!r}")
         add_expected(
@@ -216,6 +217,15 @@ def expected_components(sources: list[dict[str, Any]]) -> dict[str, dict[str, An
             },
         )
     return result
+
+
+def logical_contract(source: dict[str, Any]) -> tuple[list[int], str, bool]:
+    shape = source["logical_shape"]
+    if source["role"] in {"expert_gate_up_projection", "expert_down_projection"}:
+        if len(shape) != 3:
+            fail(f"expert source tensor {source['name']!r} must have rank three")
+        return [shape[0], shape[2], shape[1]], "transpose-0-2-1", True
+    return shape, source["logical_mapping"], source["transpose"]
 
 
 def add_expected(result: dict[str, dict[str, Any]], name: str, record: dict[str, Any]) -> None:

@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "recipe": "nml-nvfp4-weight-v1",
+  "recipe": "nml-nvfp4-weight-v2",
   "source_repository": "unsloth/gpt-oss-20b-BF16",
   "source_revision": "cc89b3e7fd423253264883a80a4fa5abc619649f",
   "destination_repository": "narendra747/gpt-oss-20b-nvfp4",
   "selection": "explicit-source-tensors-manifest",
-  "logical_mapping_version": 1,
+  "logical_mapping_version": 2,
   "prepared_layout_version": 0,
   "quantized_axis": "last",
   "scaling_geometry": "one-dimensional-rowwise",
@@ -38,7 +38,12 @@
     "partial_block": "zero-pad-for-quantization-and-omit-padding-from-logical-shape",
     "odd_payload_high_nibble": 0
   },
-  "source_layout": "logical-row-major-unswizzled",
+  "output_layout": "output-major-k-contiguous-unswizzled",
+  "role_mappings": {
+    "expert_gate_up_projection": "transpose-0-2-1-before-quantization",
+    "expert_down_projection": "transpose-0-2-1-before-quantization",
+    "default": "identity"
+  },
   "output_record_suffixes": {
     "payload": ".payload",
     "block_scales": ".block_scales",

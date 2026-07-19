@@ -1,2 +1,5 @@
 huggingface-hub==0.34.4
+numpy==2.2.6
 safetensors==0.6.2
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.8.0+cpu

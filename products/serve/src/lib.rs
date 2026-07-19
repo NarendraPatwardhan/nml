@@ -99,6 +99,7 @@ pub struct SubmissionTimings {
     pub embedding: Duration,
     pub sliding_layers: Duration,
     pub full_layers: Duration,
+    pub layer_pairs: Duration,
     pub head: Duration,
 }
 

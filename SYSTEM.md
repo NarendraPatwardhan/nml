@@ -190,6 +190,13 @@ dtype or an arbitrary tuple of tensors. The representation must remain packed
 through loading and device residency and lower through capability-selected CPU,
 pre-Blackwell emulation, or native Blackwell kernels.
 
+Its canonical recipe-v2 contraction layout is output-major and K-contiguous:
+`[N, K]` for ordinary projections, `[E, 2I, K]` for expert gate/up, and
+`[E, H, I]` for expert down. Source expert tensors are transposed before
+quantization. Every retained backend consumes this one physical mapping;
+runtime repacking, a second prepared copy, and recipe-v1 compatibility are not
+part of the architecture.
+
 W4A16 and W8A8 remain later independent product goals. Implementing NVFP4 does
 not select their signedness, calibration, grouping, scale, or checkpoint
 contracts. Section 14 defines the common acceptance boundary.
@@ -456,21 +463,23 @@ and receipt is outside the local receipt's threat model and requires an
 externally signed or filesystem-verified deployment boundary.
 
 The adapter declares 411 logical parameters over 703 compact physical
-components. Each finite prefill/decode shape family contains four bounded
-executables: embedding, one reusable sliding-attention layer, one reusable
-full-attention layer, and the final normalization/output head. Structural
-parameter-slot binding applies the appropriate loaded layer to either reusable
-layer executable after verifying logical shape, representation, component
-roles, physical storage, platform, and placement.
+components. Each finite prefill shape family contains four bounded executables:
+embedding, one reusable sliding-attention layer, one reusable full-attention
+layer, and the final normalization/output head. Each decode family instead
+contains three: embedding, one reusable alternating sliding/full layer pair,
+and the head. Structural parameter-slot binding applies the appropriate loaded
+layer or adjacent layer pair only after verifying logical shape,
+representation, component roles, physical storage, platform, and placement.
 
-Execution enqueues embedding, the 24 layer invocations, and the head through
-PJRT readiness dependencies, synchronizing the host only when the selected
-token is needed. Hidden state and every per-layer K/V pair use explicit output
-aliasing; one request-owned I32 page table describes all layer caches. Prefill
-and cache capacities use finite power-of-two/page buckets so compiled families
-are reusable across requests without making XLA compile a monolithic 24-layer
-module. This lifecycle does not claim continuous batching or cross-request
-cache sharing; those require the separate server-owned arena and scheduler.
+Execution enqueues embedding, the 24 prefill layer invocations or 12 decode
+pair invocations, and the head through PJRT readiness dependencies,
+synchronizing the host only when the selected token is needed. Hidden state and
+every per-layer K/V pair use explicit output aliasing; one request-owned I32
+page table describes all layer caches. Prefill and cache capacities use finite
+power-of-two/page buckets so compiled families are reusable across requests
+without making XLA compile a monolithic 24-layer module. This lifecycle does
+not claim continuous batching or cross-request cache sharing; those require the
+separate server-owned arena and scheduler.
 
 Loaded executables resolve immutable result arity once at compilation. A hot
 enqueue must not reacquire an executable metadata handle merely to rediscover
@@ -720,6 +729,15 @@ authenticates the small pinned manifest, and verifies that bounded receipt
 before loading it. It never rehashes checkpoint payloads during ordinary
 startup. Registry references used for execution are exact digests. Mutable
 tags may be human-facing aliases but never acceptance inputs.
+
+Checkpoint conversion is a CPU-only artifact-production job. It runs on a
+BuildBuddy remote runner with explicit CPU, disk, timeout, and redacted secret
+properties, then publishes directly to the selected artifact repository. It
+never rents a GPU, executes on the operator host, or sends model payloads back
+through the operator connection. CUDA venues begin only at immutable runtime
+evidence. [`tools/publish-nvfp4-artifact.sh`](./tools/publish-nvfp4-artifact.sh)
+is the canonical invocation; a disconnected terminal reconnects to its printed
+invocation with `bb view` and never starts a duplicate publisher speculatively.
 
 `rules_img` is NML's only OCI construction rule set. Its provider-oriented
 image graph, shallow base pulls, compact layer representation, Rust runfiles

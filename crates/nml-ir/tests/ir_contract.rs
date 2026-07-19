@@ -201,8 +201,8 @@ fn clamped_swiglu_moe_keeps_model_semantics_above_weight_representation() {
         let mut builder = ProgramBuilder::new();
         let hidden = builder.input("hidden", Shape::new(dtype, &[2, 4]).unwrap());
         let router = builder.input("router", Shape::new(DType::F32, &[2, 3]).unwrap());
-        let gate_shape = Shape::new(dtype, &[3, 4, 10]).unwrap();
-        let down_shape = Shape::new(dtype, &[3, 5, 4]).unwrap();
+        let gate_shape = Shape::new(dtype, &[3, 10, 4]).unwrap();
+        let down_shape = Shape::new(dtype, &[3, 4, 5]).unwrap();
         let gate = if nvfp4 {
             Parameter::nvfp4("gate", "model.gate", gate_shape).unwrap()
         } else {
@@ -241,8 +241,8 @@ fn clamped_swiglu_moe_keeps_model_semantics_above_weight_representation() {
         "{compact}"
     );
     assert!(compact.contains("stablehlo.sort"), "{compact}");
-    assert!(compact.contains("tensor<3x4x5xui8>"), "{compact}");
-    assert!(compact.contains("tensor<3x5x2xui8>"), "{compact}");
+    assert!(compact.contains("tensor<3x10x2xui8>"), "{compact}");
+    assert!(compact.contains("tensor<3x4x3xui8>"), "{compact}");
     Context::new()
         .parse_module(&compact)
         .unwrap()
@@ -299,7 +299,7 @@ fn decode_shaped_moe_launches_only_selected_expert_blocks() {
     let gate = Parameter::nvfp4(
         "gate",
         "model.gate",
-        Shape::new(dtype, &[32, 64, 128]).unwrap(),
+        Shape::new(dtype, &[32, 128, 64]).unwrap(),
     )
     .unwrap();
     let gate_bias = parameter("gate_bias", Shape::new(dtype, &[32, 128]).unwrap());
@@ -2999,7 +2999,7 @@ fn expert_parallel_nvfp4_derives_local_components_inside_the_shared_manual_bound
             .with_partitions(&[Partition::Sharded(data_axis), Partition::Replicated])
             .unwrap(),
     );
-    let gate_shape = Shape::new(DType::Bf16, &[4, 32, 64])
+    let gate_shape = Shape::new(DType::Bf16, &[4, 64, 32])
         .unwrap()
         .with_partitions(&expert_partition)
         .unwrap();
@@ -3039,6 +3039,6 @@ fn expert_parallel_nvfp4_derives_local_components_inside_the_shared_manual_bound
     assert!(text.contains("nvfp4_grouped_gate_up"), "{text}");
     assert!(text.contains("nvfp4_grouped_down"), "{text}");
     assert_eq!(text.matches("stablehlo.all_reduce").count(), 1, "{text}");
-    assert!(text.contains("tensor<2x32x32xui8>"), "{text}");
-    assert!(text.contains("tensor<2x32x4xui8>"), "{text}");
+    assert!(text.contains("tensor<2x64x16xui8>"), "{text}");
+    assert!(text.contains("tensor<2x64x2xui8>"), "{text}");
 }

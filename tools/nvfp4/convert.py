@@ -1,8 +1,8 @@
-"""Convert the pinned GPT-OSS 20B BF16 source into NML NVFP4 recipe v1.
+"""Convert the pinned GPT-OSS 20B BF16 source into NML NVFP4 recipe v2.
 
 This is a deterministic artifact-production tool, not an inference runtime.
 It validates the checked source manifest before interpreting weights, converts
-one tensor in bounded GPU row chunks, validates its own packed output, and
+one tensor in bounded CPU row chunks, validates its own packed output, and
 publishes all output files in one Hugging Face commit.
 """
 
@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
+import platform
 import shutil
 import sys
 from collections import defaultdict
@@ -59,21 +61,23 @@ def main() -> int:
     arguments.hf_token_file.unlink()
 
     # Imports happen after contract validation so a malformed invocation does
-    # not initialize CUDA or perform network I/O.
+    # not initialize the tensor runtime or perform network I/O.
     import torch
-    from huggingface_hub import HfApi, snapshot_download
+    from huggingface_hub import CommitOperationAdd, HfApi, snapshot_download
     from safetensors import safe_open
     from safetensors.torch import save_file
 
-    if not torch.cuda.is_available():
-        fail("CUDA is required for artifact conversion")
-    device = torch.device("cuda")
+    # Artifact production is a deterministic storage transformation, not an
+    # inference workload. Keeping it CPU-only prevents checkpoint identity from
+    # depending on accelerator availability or CUDA library state and lets the
+    # remote build runner own the large download without renting a GPU.
+    device = torch.device("cpu")
     print(
         json.dumps(
             {
                 "event": "device",
-                "name": torch.cuda.get_device_name(device),
-                "capability": torch.cuda.get_device_capability(device),
+                "kind": "cpu",
+                "threads": torch.get_num_threads(),
             },
             sort_keys=True,
         ),
@@ -87,22 +91,57 @@ def main() -> int:
         fail(f"output directory already exists: {output}")
     output.mkdir(parents=True, exist_ok=True)
 
-    expected_files = [entry["path"] for entry in source_manifest["files"]]
+    source_records = {entry["path"]: entry for entry in source_manifest["files"]}
+    expected_files = list(source_records)
+    by_shard = group_tensor_manifest(tensor_manifest)
+    metadata_files = [path for path in expected_files if path not in by_shard]
     print(json.dumps({"event": "download_started", "files": len(expected_files)}), flush=True)
     snapshot_download(
         repo_id=source_manifest["repository"],
         revision=source_manifest["revision"],
         local_dir=source,
-        allow_patterns=expected_files,
+        allow_patterns=metadata_files,
+        max_workers=4,
         token=token,
     )
-    validate_source_files(source, source_manifest)
-    by_shard = group_tensor_manifest(tensor_manifest)
-    validate_tensor_inventory(source, by_shard, safe_open)
+    verified = 0
+    for name in metadata_files:
+        verified += 1
+        validate_source_file(
+            source,
+            source_records[name],
+            verified,
+            len(expected_files),
+        )
 
     output_weight_map: dict[str, str] = {}
     output_files: list[dict[str, object]] = []
     for shard_index, shard_name in enumerate(sorted(by_shard), 1):
+        # A BF16 source shard is around 5 GiB while its NVFP4 output is around
+        # 1.4 GiB. Materialize, authenticate, and retire one source shard at a
+        # time so disk usage is bounded by the final artifact plus one shard;
+        # conversion must not require a 60+ GiB worker merely because the source
+        # checkpoint is sharded.
+        snapshot_download(
+            repo_id=source_manifest["repository"],
+            revision=source_manifest["revision"],
+            local_dir=source,
+            allow_patterns=[shard_name],
+            max_workers=1,
+            token=token,
+        )
+        verified += 1
+        validate_source_file(
+            source,
+            source_records[shard_name],
+            verified,
+            len(expected_files),
+        )
+        validate_tensor_inventory(
+            source,
+            {shard_name: by_shard[shard_name]},
+            safe_open,
+        )
         destination = output / shard_name
         if destination.exists() and arguments.resume:
             print(
@@ -143,6 +182,7 @@ def main() -> int:
             ),
             flush=True,
         )
+        (source / shard_name).unlink()
 
     for name in RUNTIME_FILES:
         shutil.copyfile(source / name, output / name)
@@ -181,6 +221,18 @@ def main() -> int:
         "source_manifest_sha256": sha256(arguments.source_manifest),
         "tensor_manifest_sha256": sha256(arguments.tensor_manifest),
         "recipe_sha256": sha256(arguments.recipe),
+        "converter": {
+            "name": "nml-nvfp4-converter",
+            "version": 2,
+            "device": "cpu",
+            "python": platform.python_version(),
+            "torch": torch.__version__,
+            "numpy": importlib.metadata.version("numpy"),
+            "safetensors": importlib.metadata.version("safetensors"),
+            "huggingface_hub": importlib.metadata.version("huggingface-hub"),
+            "script_sha256": sha256(Path(__file__)),
+            "requirements_sha256": sha256(Path(__file__).with_name("requirements.txt")),
+        },
         "files": sorted(output_files, key=lambda entry: str(entry["path"])),
     }
     write_json(output / "nml-artifact-manifest.json", artifact_manifest)
@@ -203,10 +255,22 @@ def main() -> int:
         ),
         flush=True,
     )
-    commit = api.upload_folder(
+    # `upload_folder` delegates to `create_commit` with the client's default of
+    # five concurrent file uploads. That is needlessly memory-hungry for this
+    # artifact: nine 1.3 GiB LFS shards can be in flight together while the
+    # converter's CPU allocator is still warm. Keep the publication atomic but
+    # bound it to one file at a time. The Hub still deduplicates already
+    # uploaded LFS objects when a remote runner has to retry this operation.
+    operations = [
+        CommitOperationAdd(path_in_repo=path.name, path_or_fileobj=path)
+        for path in sorted(output.iterdir())
+        if path.is_file()
+    ]
+    commit = api.create_commit(
         repo_id=arguments.destination_repository,
         repo_type="model",
-        folder_path=output,
+        operations=operations,
+        num_threads=1,
         commit_message=(
             "Publish deterministic NML NVFP4 conversion of "
             f"{source_manifest['repository']}@{source_manifest['revision']}"
@@ -243,7 +307,7 @@ def convert_shard(
     with safe_open(source, framework="pt", device="cpu") as handle:
         for tensor_index, record in enumerate(records, 1):
             name = record["name"]
-            tensor = handle.get_tensor(name).contiguous()
+            tensor = logical_tensor(handle.get_tensor(name), record)
             if record["target_representation"] == "dense":
                 converted[name] = tensor
             else:
@@ -268,12 +332,26 @@ def convert_shard(
                 flush=True,
             )
             del tensor
-            torch.cuda.empty_cache()
     save_file(
         converted,
         destination,
-        metadata={"format": "pt", "nml_recipe": "nml-nvfp4-weight-v1"},
+        metadata={"format": "pt", "nml_recipe": "nml-nvfp4-weight-v2"},
     )
+
+
+def logical_tensor(tensor: Any, record: dict[str, Any]) -> Any:
+    """Maps source storage into NML's one output-major contraction layout.
+
+    The source GPT-OSS expert tensors are input-major. Transposition happens
+    before quantization so the representation block remains the contraction K
+    axis; transposing packed v1 bytes would preserve the wrong scale geometry.
+    """
+    role = record["role"]
+    if role in {"expert_gate_up_projection", "expert_down_projection"}:
+        if tensor.ndim != 3:
+            fail(f"{role} source tensor must have rank three")
+        return tensor.permute(0, 2, 1).contiguous()
+    return tensor.contiguous()
 
 
 def quantize_tensor(tensor: Any, chunk_rows: int, device: Any, torch: Any) -> tuple[Any, Any, Any]:
@@ -378,8 +456,8 @@ def require_contract(
 ) -> None:
     if source.get("schema_version") != 1 or recipe.get("schema_version") != 1:
         fail("unsupported source or recipe schema")
-    if recipe.get("recipe") != "nml-nvfp4-weight-v1":
-        fail("converter only implements nml-nvfp4-weight-v1")
+    if recipe.get("recipe") != "nml-nvfp4-weight-v2":
+        fail("converter only implements nml-nvfp4-weight-v2")
     if recipe.get("source_repository") != source.get("repository") or recipe.get(
         "source_revision"
     ) != source.get("revision"):
@@ -390,21 +468,30 @@ def require_contract(
         fail("tensor manifest count differs from the source contract")
 
 
-def validate_source_files(root: Path, manifest: dict[str, Any]) -> None:
-    for index, record in enumerate(manifest["files"], 1):
-        path = root / record["path"]
-        if not path.is_file() or path.stat().st_size != record["size"]:
-            fail(f"source file size mismatch: {record['path']}")
-        actual = sha256(path)
-        if actual != record["sha256"]:
-            fail(f"source file hash mismatch: {record['path']}")
-        print(
-            json.dumps(
-                {"event": "source_verified", "index": index, "total": len(manifest["files"]), "path": record["path"]},
-                sort_keys=True,
-            ),
-            flush=True,
-        )
+def validate_source_file(
+    root: Path,
+    record: dict[str, Any],
+    index: int,
+    total: int,
+) -> None:
+    path = root / record["path"]
+    if not path.is_file() or path.stat().st_size != record["size"]:
+        fail(f"source file size mismatch: {record['path']}")
+    actual = sha256(path)
+    if actual != record["sha256"]:
+        fail(f"source file hash mismatch: {record['path']}")
+    print(
+        json.dumps(
+            {
+                "event": "source_verified",
+                "index": index,
+                "total": total,
+                "path": record["path"],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
 
 
 def group_tensor_manifest(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -487,13 +574,15 @@ def write_model_card(path: Path, source: dict[str, Any], recipe: dict[str, Any])
         "---\nlicense: apache-2.0\nlibrary_name: nml\nbase_model: openai/gpt-oss-20b\n"
         "tags:\n- gpt_oss\n- nvfp4\n- nml\n---\n\n"
         "# GPT-OSS 20B NVFP4\n\n"
-        "This is the deterministic NML NVFP4 recipe-v1 conversion of "
+        "This is the deterministic NML NVFP4 recipe-v2 conversion of "
         f"`{source['repository']}@{source['revision']}`. It uses last-axis "
         "one-dimensional blocks of 16 weights, low-nibble-first E2M1 payloads, "
         "positive E4M3FN block scales, and one F32 global factor per quantized "
         "parameter. Small and sensitivity-critical tensors remain BF16 exactly "
         "as declared by `nml-source-tensors.json`.\n\n"
-        "This artifact is intended for NML and is not mislabeled as the original "
+        "Conversion is CPU-only; exact converter and dependency provenance is "
+        "recorded in `nml-artifact-manifest.json`. This artifact is intended for "
+        "NML and is not mislabeled as the original "
         "GPT-OSS MXFP4 representation. Exact source hashes, tensor disposition, "
         f"and conversion semantics are included in the repository. Recipe: `{recipe['recipe']}`.\n",
         encoding="utf-8",

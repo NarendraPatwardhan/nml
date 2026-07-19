@@ -23,6 +23,48 @@ improvement over the original approximately 9-token/s baseline. BuildBuddy
 invocations and the durable A40 evidence are recorded in
 [`TASKS.md`](./TASKS.md) and below.
 
+## CURRENT: canonical compact projection and bounded orchestration
+
+The current implementation tranche replaces recipe v1 with a single
+output-major, K-contiguous recipe v2. Ordinary projections use `[N, K]`, expert
+gate/up uses `[E, 2I, K]`, and expert down uses `[E, H, I]`. GPT-OSS source
+expert tensors are transposed before quantization, not per request or on the
+device. CPU, SM75, Triton prefill, and Triton decode now consume the same packed
+components. This removes strided reduction-axis reads without introducing a
+second representation, runtime preparation, persistent BF16 expansion, or a
+legacy compatibility path.
+
+This does not reinstate the rejected direct-kernel experiment under a new
+name. That experiment kept recipe-v1 expert storage and generated K-leading
+two-dimensional program tensors whose adjacent lanes did not follow contiguous
+weight bytes; its grouped kernels paid the measured strided-memory penalty.
+Recipe v2 changes the artifact itself, and the rowwise programs keep K as the
+final TTIR dimension. The source layout and generated access geometry are both
+different, while the accepted expert activation boundary remains unchanged.
+
+The decode Triton family is a finite rowwise GEMV design: contiguous packed K
+loads, one decoded E4M3 scale per 16 values, exact E2M1 register decode, F32
+reduction, and direct BF16 result storage. Gate/up still owns the clamped
+SwiGLU epilogue; down consumes only activated intermediates. Matrix-shaped
+prefill keeps its tensor-core schedule over the same recipe. Focused IR,
+portable compact, and generated-TTIR contracts are green remotely. The next
+truthful evidence boundary is a newly converted immutable recipe-v2 artifact
+and a whole-model A40 GDB/Nsight run; compile-only success cannot promote its
+performance.
+
+The same tranche reuses baked argument owners across decode iterations and
+compiles two-layer decode executables matching the actual alternating attention
+schedule. This reduces the recurring layer submissions from 24 to 12 without
+reviving the rejected six-layer composition. Sampling remains device-resident
+and the host receives only the chosen token. These orchestration changes are
+structurally complete, but their performance is deliberately not inferred from
+compile contracts. Recipe v2, its kernels, and layer-pair execution are promoted
+together only after the immutable whole-model A40 measurement. The current
+promotion gate is at least 143.12 steady device tokens/s: a 2.5-fold improvement
+over the restored 57.248-token/s profiled baseline. The earlier 100-token/s gate
+below is retained as historical context, not the acceptance threshold for this
+tranche.
+
 ## Failed composed-decode/direct-kernel experiment
 
 The follow-on output-owner/direct-kernel approach is rejected. Immutable image
@@ -317,12 +359,12 @@ The existing tensor-core family remains available for prefill shapes where M
 is large enough to reuse decoded weights. Decode and prefill must not be forced
 through one geometry merely to reduce the number of internal kernel types.
 
-If the source artifact layout prevents aligned/coalesced decode loads, the
-loader may create one immutable, versioned, device-prepared layout after
-upload. Preparation must be representation-aware, included in identity and
-accounting, verified against the scalar oracle, and release the obsolete
-source device buffers. Per-token repacking and persistent BF16 expansion are
-forbidden.
+Recipe v2 resolves the source-layout defect before quantization: expert tensors
+are transposed into output-major/K-contiguous logical form, and every retained
+backend consumes those components directly. No prepared device copy exists.
+A future recipe with stronger native tile constraints would require its own
+explicit representation decision, accounting, and oracle; it may not quietly
+reintroduce runtime repacking or persistent BF16 expansion.
 
 ## 6. Product orchestration is real but secondary
 

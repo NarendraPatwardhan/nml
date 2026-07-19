@@ -117,6 +117,21 @@ pub(super) fn bind_tree<T: ParameterTree>(
     slots: &T,
     loaded: &Loaded<T>,
 ) -> Result<()> {
+    bind_tree_components(arguments, slots, loaded)?;
+    arguments
+        .bake()
+        .map_err(|error| Box::new(error) as BoxError)?;
+    Ok(())
+}
+
+/// Binds one tree without sealing the complete executable. Composite bounded
+/// executables use this for each structural subtree, then call `bake` exactly
+/// once after every parameter component has been installed.
+pub(super) fn bind_tree_components<T: ParameterTree>(
+    arguments: &mut Arguments<'_>,
+    slots: &T,
+    loaded: &Loaded<T>,
+) -> Result<()> {
     let mut slot_parameters = Vec::<(String, Parameter)>::new();
     slots.visit_parameters("", &mut |path, parameter| {
         slot_parameters.push((path.to_owned(), parameter.clone()));
@@ -138,9 +153,6 @@ pub(super) fn bind_tree<T: ParameterTree>(
             .set_parameter_slot(&slot, &parameter)
             .map_err(|error| Box::new(error) as BoxError)?;
     }
-    arguments
-        .bake()
-        .map_err(|error| Box::new(error) as BoxError)?;
     Ok(())
 }
 
@@ -207,7 +219,7 @@ pub(super) fn declare_with(
                 experts: Experts {
                     gate_up_proj: nvfp4(
                         &format!("{expert_prefix}.gate_up_proj"),
-                        shape(&[experts, hidden, doubled_intermediate])?,
+                        shape(&[experts, doubled_intermediate, hidden])?,
                     )?,
                     gate_up_proj_bias: dense(
                         &format!("{expert_prefix}.gate_up_proj_bias"),
@@ -215,7 +227,7 @@ pub(super) fn declare_with(
                     )?,
                     down_proj: nvfp4(
                         &format!("{expert_prefix}.down_proj"),
-                        shape(&[experts, intermediate, hidden])?,
+                        shape(&[experts, hidden, intermediate])?,
                     )?,
                     down_proj_bias: dense(
                         &format!("{expert_prefix}.down_proj_bias"),

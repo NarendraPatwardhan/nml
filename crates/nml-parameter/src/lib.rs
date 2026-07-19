@@ -13,7 +13,7 @@ use std::fmt;
 use std::sync::Arc;
 
 /// Version of NML's selected rowwise weight-only NVFP4 recipe.
-pub const NVFP4_RECIPE_VERSION: u16 = 1;
+pub const NVFP4_RECIPE_VERSION: u16 = 2;
 pub const NVFP4_BLOCK_SIZE: i64 = 16;
 pub const NVFP4_VALUES_PER_PAYLOAD_BYTE: i64 = 2;
 
@@ -46,7 +46,7 @@ pub struct DenseSpec {
     component: ComponentSpec,
 }
 
-/// NML recipe v1: last-axis, one-dimensional NVFP4 weight scaling.
+/// NML recipe v2: output-major, last-axis NVFP4 weight scaling.
 ///
 /// Every consecutive group of sixteen logical values owns one positive
 /// E4M3FN block scale. Two E2M1 codes are packed low-nibble first, and one F32
@@ -386,7 +386,7 @@ impl StorageSpec {
     }
 }
 
-/// Exact scalar and row codec for NML NVFP4 recipe v1.
+/// Exact scalar and row codec shared by NML NVFP4 recipe v2 components.
 ///
 /// This is permanent product/reference code shared by checkpoint inspection
 /// and the CPU implementation. It deliberately exposes no graph dtype.
