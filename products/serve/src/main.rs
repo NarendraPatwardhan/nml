@@ -115,10 +115,11 @@ fn print_timings(timings: &Timings) {
 
 fn print_submission(name: &str, timings: SubmissionTimings) {
     eprintln!(
-        "serve: {name:>24}: embedding={:.3} ms sliding={:.3} ms full={:.3} ms head={:.3} ms",
+        "serve: {name:>24}: embedding={:.3} ms sliding={:.3} ms full={:.3} ms segments={:.3} ms head={:.3} ms",
         timings.embedding.as_secs_f64() * 1e3,
         timings.sliding_layers.as_secs_f64() * 1e3,
         timings.full_layers.as_secs_f64() * 1e3,
+        timings.decode_segments.as_secs_f64() * 1e3,
         timings.head.as_secs_f64() * 1e3,
     );
 }

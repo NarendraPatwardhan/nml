@@ -190,13 +190,37 @@ persistent dense weight expansion.
   `259a3cb4-8d7b-4c50-a769-8c43ac8e97ba`. The corrected CUDA serve OCI image
   constructs in `64b7b6b6-9ced-4360-93be-9d8d6ac11436`. None is presented as
   NVIDIA runtime evidence.
-- [ ] Publish the corrected OCI digest and rerun both explicit-greedy throughput
-  and fixed-seed stochastic generation on A40. Retain token/Harmony output,
-  component submission timings, compiler spill diagnostics, useful compact
-  bandwidth, prefill non-regression, steady token rate, image/model identities,
-  and confirmed Pod cleanup. Run the complete deterministic compact-operation
-  corpus first in the same Pod/image; a reduced local SM75 benchmark is not
-  evidence for the SM86 Triton implementation.
+- [x] Capture post-refactor A40 hardware evidence for image digest
+  `69e805cd5128...` with one mandatory Nsight-Systems-over-GDB stochastic
+  128-token run. GDB observed a normal inferior exit, Nsight exported its full
+  node trace and four CUDA summaries, and the product sustained 55.475 steady
+  device tokens/s under profiling versus 59.611 without profiling. The report
+  directory under `references/runpod/reports` is
+  `20260719T121922Z-aiuvl369ogh26v-69e805cd5128-diagnostic`; this is diagnostic
+  evidence, not the final gate, because the published image records the
+  equivalent pre-commit dirty source identity rather than the accepted commit.
+- [x] Implement the next bandwidth-oriented decode tranche: compiler-selected
+  four/eight-warp output-owner CUDA targets across SM75/SM8x/SM90, one-launch
+  compact Q/K/V, direct dense-router top-four, route-reducing expert down,
+  exact streaming LM-head top-64, six-layer decode segments, O(1) argument
+  completeness, and reusable token staging. The final focused gate passes in
+  `1c25610d-bb61-4c20-b274-b9b0575d4695`, the complete GPU-independent CUDA
+  suite in `a9853052-3b1c-464c-ba1b-e109b608282b`, the full CUDA binary closure
+  in `ebf5521e-5dd7-4d4e-80be-e788f40a3dcf`, and package/OCI structure
+  contracts in `e1ddc567-0b9a-4c7d-aedf-a60125c6382e`. This is compile and
+  structural evidence, not NVIDIA execution.
+- [ ] Publish this source as one immutable CUDA OCI digest and run the complete
+  compact-operation numerical contract followed by GPT-OSS generation under
+  the mandatory GDB/Nsight harness in both explicit-greedy and fixed-seed
+  stochastic modes. Retain token/Harmony output, image/model identities,
+  confirmed Pod cleanup, prefill behavior, and Q/K/V, ordinary O, router,
+  expert gate/up, expert down, and streaming-head Nsight Compute counters;
+  accept the tranche only at 149 tokens/s or better without prefill
+  regression.
+- [ ] Use those counters to choose the RMS-normalization boundary and finish
+  raw PJRT invocation preparation. Do not fuse normalization into each
+  output-owner block if repeated activation/norm-weight traffic is worse than
+  one materialized normalized vector.
 
 ## Next milestone: continuous batching and shared paged state
 

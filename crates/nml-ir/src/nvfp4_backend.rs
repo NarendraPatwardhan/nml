@@ -1,9 +1,11 @@
 //! Private CUDA lowering for semantic NVFP4 operations.
 //!
 //! Model code sees an ordinary linear operation over a logical parameter.
-//! This module is the only place where that operation becomes a compact-weight
-//! W4A16 Triton kernel. The source payload and scale tensors are passed through
-//! unchanged; decoding is tile-local inside the contraction kernel.
+//! This module is the only place where that operation selects a compact CUDA
+//! execution family: source-owned output-owner kernels for single-row decode,
+//! or matrix-oriented CUDA/Triton lowering for larger row counts. The source
+//! payload and scale tensors pass through unchanged and decode only inside the
+//! selected contraction.
 
 use crate::{Error, device_capabilities::CudaCapabilities};
 use nml_kernel_triton::{
@@ -31,6 +33,7 @@ pub(crate) struct LinearInputs<'context> {
 
 pub(crate) struct ExpertInputs<'context> {
     pub hidden: Value<'context>,
+    pub expert_ids: Value<'context>,
     pub routing_weights: Value<'context>,
     pub gate_payload: Value<'context>,
     pub gate_scales: Value<'context>,
@@ -44,7 +47,9 @@ pub(crate) struct ExpertInputs<'context> {
     pub block_experts: Value<'context>,
     pub active_blocks: Value<'context>,
     pub expert_offset: Option<Value<'context>>,
+    pub router: Option<RouterInputs<'context>>,
     pub hidden_shape: Shape,
+    pub expert_ids_shape: Shape,
     pub routing_shape: Shape,
     pub gate_payload_shape: Shape,
     pub gate_scales_shape: Shape,
@@ -58,6 +63,14 @@ pub(crate) struct ExpertInputs<'context> {
     pub block_experts_shape: Shape,
     pub result_type: Type<'context>,
     pub block_size: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RouterInputs<'context> {
+    pub weight: Value<'context>,
+    pub bias: Value<'context>,
+    pub weight_shape: Shape,
+    pub bias_shape: Shape,
 }
 
 pub(crate) struct EmbeddingInputs<'context> {
@@ -88,6 +101,11 @@ struct GroupedPlan {
     stages: i32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DecodePlan {
+    target: &'static str,
+}
+
 pub(crate) fn lower_linear<'context>(
     context: &'context Context,
     block: &mut Block<'context>,
@@ -95,8 +113,11 @@ pub(crate) fn lower_linear<'context>(
     capabilities: CudaCapabilities,
 ) -> Result<Value<'context>, Error> {
     require_unsharded(&inputs)?;
-    if capabilities.supports_nvfp4_turing_custom_call() {
-        return lower_turing_linear(context, block, inputs);
+    let rows = input_rows(inputs.activation_shape)?;
+    if capabilities.supports_nvfp4_cuda_custom_call()
+        && (rows == 1 || capabilities.requires_nvfp4_cuda_matrix())
+    {
+        return lower_cuda_linear(context, block, inputs, capabilities);
     }
     let plan = LinearPlan::new(
         inputs.activation_shape,
@@ -155,29 +176,163 @@ pub(crate) fn lower_linear<'context>(
     Ok(result)
 }
 
+/// Lowers a semantic set of independent projections over one activation.
+///
+/// The grouped CUDA call is deliberately a decode specialization. Prefill and
+/// unsupported representation details reuse the ordinary compact linear
+/// lowering, so grouping never changes graph semantics or removes a more
+/// capable matrix path.
+pub(crate) fn lower_linear_group<'context>(
+    context: &'context Context,
+    block: &mut Block<'context>,
+    inputs: Vec<LinearInputs<'context>>,
+    capabilities: CudaCapabilities,
+) -> Result<Vec<Value<'context>>, Error> {
+    if inputs.len() != 3 {
+        return Err(Error::InvalidLinearAlgebra(
+            "the compact CUDA linear group requires exactly three projections",
+        ));
+    }
+    let activation_shape = inputs[0].activation_shape;
+    let rows = input_rows(activation_shape)?;
+    let can_share_decode = rows == 1
+        && capabilities.supports_nvfp4_cuda_custom_call()
+        && inputs.iter().all(|input| {
+            input.activation_shape == activation_shape
+                && input.bias.is_some()
+                && input.bias_shape.is_some()
+        });
+    if can_share_decode {
+        for input in &inputs {
+            require_unsharded(input)?;
+        }
+        let mut operands = vec![inputs[0].activation];
+        let mut result_types = Vec::with_capacity(inputs.len());
+        for input in &inputs {
+            let bias = input.bias.ok_or(Error::InvalidLinearAlgebra(
+                "grouped compact decode requires one bias per projection",
+            ))?;
+            operands.extend([
+                input.payload,
+                input.block_scales,
+                input.global_scale,
+                bias,
+            ]);
+            result_types.push(input.result_type);
+        }
+        let mut total_outputs = 0_i64;
+        for input in &inputs {
+            let outputs = input.result_shape.dimensions().last().copied().ok_or(
+                Error::InvalidLinearAlgebra(
+                    "grouped compact decode result must have an output axis",
+                ),
+            )?;
+            total_outputs = total_outputs.checked_add(outputs).ok_or(
+                Error::InvalidLinearAlgebra(
+                    "grouped compact decode output extent overflows",
+                ),
+            )?;
+        }
+        let plan = DecodePlan::new(total_outputs, capabilities, true);
+        let call = context.ffi_custom_call(plan.target, &operands, &result_types)?;
+        let results = (0..inputs.len())
+            .map(|index| call.result(index))
+            .collect::<Result<Vec<_>, _>>()?;
+        block.append_operation(call)?;
+        return Ok(results);
+    }
+
+    let mut results = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        results.push(lower_linear(context, block, input, capabilities)?);
+    }
+    Ok(results)
+}
+
+pub(crate) fn lower_linear_top64<'context>(
+    context: &'context Context,
+    block: &mut Block<'context>,
+    inputs: LinearInputs<'context>,
+    values_type: Type<'context>,
+    indices_type: Type<'context>,
+) -> Result<(Value<'context>, Value<'context>), Error> {
+    require_unsharded(&inputs)?;
+    if input_rows(inputs.activation_shape)? != 1 || inputs.bias.is_some() {
+        return Err(Error::UnsupportedTarget {
+            operation: "compact linear top-64",
+            target: "pre-Blackwell CUDA decode".to_owned(),
+            requirement: "one activation row and a bias-free compact projection",
+        });
+    }
+    let outputs = *inputs
+        .result_shape
+        .dimensions()
+        .last()
+        .ok_or(Error::InvalidLinearAlgebra(
+            "compact linear top-64 result must have an output axis",
+        ))?;
+    if outputs < 64 {
+        return Err(Error::InvalidSort(
+            "compact linear top-64 requires at least 64 outputs",
+        ));
+    }
+    let groups = outputs
+        .checked_add(127)
+        .map(|extent| extent / 128)
+        .ok_or(Error::InvalidSort(
+            "compact linear top-64 workspace extent overflows",
+        ))?;
+    let workspace_values = context.ranked_tensor_type(DType::F32, &[groups, 64])?;
+    let workspace_indices = context.ranked_tensor_type(DType::I32, &[groups, 64])?;
+    let call = context.ffi_custom_call(
+        "nml.nvfp4.cuda.linear_top64_m1",
+        &[
+            inputs.activation,
+            inputs.payload,
+            inputs.block_scales,
+            inputs.global_scale,
+        ],
+        &[
+            workspace_values,
+            workspace_indices,
+            workspace_values,
+            workspace_indices,
+            values_type,
+            indices_type,
+        ],
+    )?;
+    let values = call.result(4)?;
+    let indices = call.result(5)?;
+    block.append_operation(call)?;
+    Ok((values, indices))
+}
+
 pub(crate) fn lower_routed_swiglu<'context>(
     context: &'context Context,
     block: &mut Block<'context>,
     inputs: ExpertInputs<'context>,
     capabilities: CudaCapabilities,
 ) -> Result<Value<'context>, Error> {
-    let use_turing_adapter = capabilities.supports_nvfp4_turing_custom_call();
-    if use_turing_adapter {
+    let tokens = inputs.hidden_shape.dimensions()[0];
+    let direct_decode = tokens == 1 && capabilities.supports_nvfp4_cuda_custom_call();
+    let use_cuda_matrix = capabilities.requires_nvfp4_cuda_matrix();
+    if use_cuda_matrix && !direct_decode {
         if inputs.expert_offset.is_some() {
             return Err(Error::UnsupportedTarget {
                 operation: "NVFP4 routed clamped SwiGLU",
                 target: "sharded CUDA SM75 execution".to_owned(),
-                requirement: "the Turing grouped adapter currently owns one complete local expert set",
+                requirement: "the SM75 matrix adapter currently owns one complete local expert set",
             });
         }
         require_unsharded_experts(&inputs)?;
-    } else {
+    } else if !direct_decode {
         require_triton_emulation(capabilities, "NVFP4 routed clamped SwiGLU")?;
         if inputs.expert_offset.is_none() {
             require_unsharded_experts(&inputs)?;
         }
+    } else if inputs.expert_offset.is_none() {
+        require_unsharded_experts(&inputs)?;
     }
-    let tokens = inputs.hidden_shape.dimensions()[0];
     let hidden_size = inputs.hidden_shape.dimensions()[1];
     let experts_per_token = inputs.routing_shape.dimensions()[1];
     let assignments = tokens
@@ -200,8 +355,18 @@ pub(crate) fn lower_routed_swiglu<'context>(
         ));
     }
 
-    let down = if use_turing_adapter {
-        lower_turing_experts(
+    if direct_decode {
+        return lower_cuda_direct_experts(
+            context,
+            block,
+            &inputs,
+            assignments,
+            intermediate,
+        );
+    }
+
+    let down = if use_cuda_matrix {
+        lower_cuda_experts(
             context,
             block,
             &inputs,
@@ -247,7 +412,107 @@ pub(crate) fn lower_routed_swiglu<'context>(
     .map_err(Into::into)
 }
 
-fn lower_turing_experts<'context>(
+#[allow(clippy::too_many_arguments)]
+fn lower_cuda_direct_experts<'context>(
+    context: &'context Context,
+    block: &mut Block<'context>,
+    inputs: &ExpertInputs<'context>,
+    routes: i64,
+    intermediate: i64,
+) -> Result<Value<'context>, Error> {
+    if inputs.expert_ids_shape.dimensions() != [1, routes] {
+        return Err(Error::InvalidMoe(
+            "direct NVFP4 decode requires one row of route IDs",
+        ));
+    }
+    let (expert_ids, routing_weights) = match inputs.router {
+        Some(router) => {
+            let [experts, router_inputs] = router.weight_shape.dimensions() else {
+                return Err(Error::InvalidMoe(
+                    "direct router weight must have shape [experts, hidden]",
+                ));
+            };
+            if routes != 4
+                || *experts < 4
+                || *experts > 32
+                || *router_inputs != inputs.hidden_shape.dimensions()[1]
+                || router.bias_shape.dimensions() != [*experts]
+                || router.weight_shape.dtype() != inputs.hidden_shape.dtype()
+                || router.bias_shape.dtype() != inputs.hidden_shape.dtype()
+                || router
+                    .weight_shape
+                    .partitions()
+                    .iter()
+                    .chain(router.bias_shape.partitions())
+                    .any(|partition| matches!(partition, Partition::Sharded(_)))
+            {
+                return Err(Error::UnsupportedTarget {
+                    operation: "direct NVFP4 MoE router",
+                    target: "pre-Blackwell CUDA decode".to_owned(),
+                    requirement:
+                        "one dense replicated F16/BF16 router with 4 selected from at most 32 experts",
+                });
+            }
+            let ids_type = context.ranked_tensor_type(DType::I32, &[1, routes])?;
+            let weights_type =
+                context.ranked_tensor_type(inputs.hidden_shape.dtype(), &[1, routes])?;
+            let route_call = context.ffi_custom_call(
+                "nml.nvfp4.cuda.route_top4_m1",
+                &[inputs.hidden, router.weight, router.bias],
+                &[ids_type, weights_type],
+            )?;
+            let ids = route_call.result(0)?;
+            let weights = route_call.result(1)?;
+            block.append_operation(route_call)?;
+            (ids, weights)
+        }
+        None => (inputs.expert_ids, inputs.routing_weights),
+    };
+    let expert_offset = match inputs.expert_offset {
+        Some(value) => value,
+        None => {
+            let scalar_i32 = context.ranked_tensor_type(DType::I32, &[])?;
+            constant(context, block, scalar_i32, "0")?
+        }
+    };
+    let activated_type =
+        context.ranked_tensor_type(inputs.hidden_shape.dtype(), &[routes, intermediate])?;
+    let gate_call = context.ffi_custom_call(
+        "nml.nvfp4.cuda.expert_gate_up_m1",
+        &[
+            inputs.hidden,
+            expert_ids,
+            inputs.gate_payload,
+            inputs.gate_scales,
+            inputs.gate_global,
+            inputs.gate_bias,
+            expert_offset,
+        ],
+        &[activated_type],
+    )?;
+    let activated = gate_call.result(0)?;
+    block.append_operation(gate_call)?;
+
+    let down_call = context.ffi_custom_call(
+        "nml.nvfp4.cuda.expert_down_m1",
+        &[
+            activated,
+            expert_ids,
+            inputs.down_payload,
+            inputs.down_scales,
+            inputs.down_global,
+            inputs.down_bias,
+            routing_weights,
+            expert_offset,
+        ],
+        &[inputs.result_type],
+    )?;
+    let result = down_call.result(0)?;
+    block.append_operation(down_call)?;
+    Ok(result)
+}
+
+fn lower_cuda_experts<'context>(
     context: &'context Context,
     block: &mut Block<'context>,
     inputs: &ExpertInputs<'context>,
@@ -258,7 +523,7 @@ fn lower_turing_experts<'context>(
     let activated_type =
         context.ranked_tensor_type(inputs.hidden_shape.dtype(), &[assignments, intermediate])?;
     let gate_call = context.ffi_custom_call(
-        "nml.nvfp4.turing.expert_gate_up",
+        "nml.nvfp4.cuda.expert_gate_up",
         &[
             inputs.hidden,
             inputs.sorted_assignments,
@@ -276,7 +541,7 @@ fn lower_turing_experts<'context>(
     let weighted_type =
         context.ranked_tensor_type(inputs.hidden_shape.dtype(), &[assignments, hidden_size])?;
     let down_call = context.ffi_custom_call(
-        "nml.nvfp4.turing.expert_down",
+        "nml.nvfp4.cuda.expert_down",
         &[
             activated,
             inputs.sorted_assignments,
@@ -443,8 +708,8 @@ pub(crate) fn lower_embedding<'context>(
     capabilities: CudaCapabilities,
 ) -> Result<Value<'context>, Error> {
     require_unsharded_embedding(&inputs)?;
-    if capabilities.supports_nvfp4_turing_custom_call() {
-        return lower_turing_embedding(context, block, inputs);
+    if capabilities.requires_nvfp4_cuda_matrix() {
+        return lower_cuda_embedding(context, block, inputs);
     }
     require_triton_emulation(capabilities, "NVFP4 embedding")?;
     let rows = inputs
@@ -511,10 +776,11 @@ pub(crate) fn lower_embedding<'context>(
     Ok(result)
 }
 
-fn lower_turing_linear<'context>(
+fn lower_cuda_linear<'context>(
     context: &'context Context,
     block: &mut Block<'context>,
     inputs: LinearInputs<'context>,
+    capabilities: CudaCapabilities,
 ) -> Result<Value<'context>, Error> {
     let mut operands = vec![
         inputs.activation,
@@ -525,20 +791,52 @@ fn lower_turing_linear<'context>(
     if let Some(bias) = inputs.bias {
         operands.push(bias);
     }
-    let call =
-        context.ffi_custom_call("nml.nvfp4.turing.linear", &operands, &[inputs.result_type])?;
+    let outputs = *inputs.result_shape.dimensions().last().ok_or(
+        Error::InvalidLinearAlgebra("NVFP4 CUDA linear result must have an output axis"),
+    )?;
+    let target = if input_rows(inputs.activation_shape)? == 1 {
+        DecodePlan::new(outputs, capabilities, false).target
+    } else {
+        // SM75 cannot use the Triton matrix path, so it retains the dedicated
+        // CUDA matrix adapter. Keep its target identity distinct from the
+        // latency-oriented M=1 family: executable cache keys and traces must
+        // describe the execution regime truthfully.
+        "nml.nvfp4.cuda.linear_matrix"
+    };
+    let call = context.ffi_custom_call(target, &operands, &[inputs.result_type])?;
     let result = call.result(0)?;
     block.append_operation(call)?;
     Ok(result)
 }
 
-fn lower_turing_embedding<'context>(
+impl DecodePlan {
+    fn new(outputs: i64, capabilities: CudaCapabilities, grouped: bool) -> Self {
+        // Eight output owners amortize activation staging when they still
+        // provide at least three resident blocks per SM. Narrow projections
+        // retain four owners to expose enough independently schedulable work.
+        // Core count and target name make the finite choice part of the
+        // compiler/cache identity rather than an execution-time device query.
+        let blocks_with_eight = outputs.saturating_add(7) / 8;
+        let occupancy_floor = i64::try_from(capabilities.core_count().saturating_mul(3))
+            .unwrap_or(i64::MAX);
+        let eight_warps = blocks_with_eight >= occupancy_floor;
+        let target = match (grouped, eight_warps) {
+            (false, false) => "nml.nvfp4.cuda.linear_m1_w4",
+            (false, true) => "nml.nvfp4.cuda.linear_m1_w8",
+            (true, false) => "nml.nvfp4.cuda.linear_group3_m1_w4",
+            (true, true) => "nml.nvfp4.cuda.linear_group3_m1_w8",
+        };
+        Self { target }
+    }
+}
+
+fn lower_cuda_embedding<'context>(
     context: &'context Context,
     block: &mut Block<'context>,
     inputs: EmbeddingInputs<'context>,
 ) -> Result<Value<'context>, Error> {
     let call = context.ffi_custom_call(
-        "nml.nvfp4.turing.embedding",
+        "nml.nvfp4.cuda.embedding",
         &[
             inputs.indices,
             inputs.payload,
@@ -658,6 +956,21 @@ impl GroupedPlan {
     }
 }
 
+fn input_rows(shape: Shape) -> Result<i64, Error> {
+    if shape.rank() == 0 {
+        return Err(Error::InvalidLinearAlgebra(
+            "NVFP4 linear activation must have rank",
+        ));
+    }
+    shape.dimensions()[..shape.rank() - 1]
+        .iter()
+        .try_fold(1_i64, |product, dimension| product.checked_mul(*dimension))
+        .filter(|rows| *rows > 0)
+        .ok_or(Error::InvalidLinearAlgebra(
+            "NVFP4 linear row extent must be positive and fit I64",
+        ))
+}
+
 fn require_unsharded(inputs: &LinearInputs<'_>) -> Result<(), Error> {
     if [
         inputs.activation_shape,
@@ -694,6 +1007,7 @@ fn require_unsharded(inputs: &LinearInputs<'_>) -> Result<(), Error> {
 fn require_unsharded_experts(inputs: &ExpertInputs<'_>) -> Result<(), Error> {
     if [
         inputs.hidden_shape,
+        inputs.expert_ids_shape,
         inputs.routing_shape,
         inputs.gate_payload_shape,
         inputs.gate_scales_shape,

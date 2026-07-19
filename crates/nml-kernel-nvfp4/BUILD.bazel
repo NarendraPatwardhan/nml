@@ -1,14 +1,23 @@
-"""Portable CPU semantics for NML's closed NVFP4 representation."""
+"""CPU and CUDA execution for NML's closed NVFP4 representation."""
 
 load("//bazel:rust.bzl", "nml_rust_library", "nml_rust_test")
 load("@rules_cuda//cuda:defs.bzl", "cuda_library")
 
 cuda_library(
-    name = "turing_adapter",
-    srcs = ["src/turing_adapter.cu"],
+    name = "cuda_adapter",
+    srcs = ["src/cuda_adapter.cu"],
     hdrs = ["include/nml_nvfp4.h"],
     alwayslink = True,
-    archs = ["compute_75:sm_75"],
+    # One semantic compact representation has explicit pre-Blackwell device
+    # implementations.  These are capabilities, not product-specific tuning;
+    # the runtime rejects architectures outside this closed set.
+    archs = [
+        "compute_75:sm_75",
+        "compute_80:sm_80",
+        "compute_86:sm_86",
+        "compute_89:sm_89",
+        "compute_90:sm_90",
+    ],
     copts = [
         "-O3",
         "-allow-unsupported-compiler",
@@ -46,7 +55,7 @@ nml_rust_library(
         "//crates/nml-types:nml_types",
     ],
     link_deps = select({
-        "//platforms:cuda.enabled": [":turing_adapter"],
+        "//platforms:cuda.enabled": [":cuda_adapter"],
         "//conditions:default": [],
     }),
     visibility = ["//crates:__subpackages__"],

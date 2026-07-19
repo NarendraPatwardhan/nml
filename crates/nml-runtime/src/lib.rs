@@ -967,11 +967,24 @@ impl Buffer {
 
     pub fn to_slice(&self) -> Result<Slice<'static>, Error> {
         let mut result = Slice::alloc(self.shape)?;
+        self.copy_to_slice(&mut result)?;
+        Ok(result)
+    }
+
+    /// Copies into caller-owned host storage so steady-state scalar and small
+    /// metadata transfers do not allocate on every execution.
+    pub fn copy_to_slice(&self, result: &mut Slice<'_>) -> Result<(), Error> {
+        if result.shape() != self.shape {
+            return Err(Error::Tensor(nml_tensor::Error::ShapeMismatch {
+                expected: self.shape,
+                actual: result.shape(),
+            }));
+        }
         if self.sharding.is_replicated() {
             self.storage.shards[0]
-                .to_slice(&mut result)
+                .to_slice(result)
                 .map_err(Error::Pjrt)?;
-            return Ok(result);
+            return Ok(());
         }
         for (index, shard) in self.storage.shards.iter().enumerate() {
             let source = shard.to_slice_alloc().map_err(Error::Pjrt)?;
@@ -979,7 +992,7 @@ impl Buffer {
             let mut destination = result.region_view_mut(&ranges)?;
             destination.copy_from(&source)?;
         }
-        Ok(result)
+        Ok(())
     }
 
     pub fn delete(self) -> Result<(), Error> {
@@ -1148,6 +1161,7 @@ impl Exe {
             executable: self,
             slots: vec![None; self.inputs.len()],
             baked: vec![false; self.inputs.len()],
+            missing: self.inputs.len(),
         }
     }
 
@@ -1177,6 +1191,7 @@ pub mod exe {
         pub(super) executable: &'exe Exe,
         pub(super) slots: Vec<Option<Buffer>>,
         pub(super) baked: Vec<bool>,
+        pub(super) missing: usize,
     }
 
     impl Arguments<'_> {
@@ -1188,8 +1203,15 @@ pub mod exe {
                 .copied()
                 .ok_or_else(|| Error::UnknownArgument(name.to_owned()))?;
             self.validate(index, &buffer)?;
-            self.slots[index] = Some(buffer);
+            self.install(index, buffer);
             Ok(self)
+        }
+
+        fn install(&mut self, index: usize, buffer: Buffer) {
+            if self.slots[index].is_none() {
+                self.missing -= 1;
+            }
+            self.slots[index] = Some(buffer);
         }
 
         fn validate(&self, index: usize, buffer: &Buffer) -> Result<(), Error> {
@@ -1209,6 +1231,14 @@ pub mod exe {
             }
             if buffer.sharding != self.executable.sharding {
                 return Err(Error::ArgumentSharding(binding.name.clone()));
+            }
+            let actual = buffer.raw_shards().len();
+            if actual != self.executable.device_count {
+                return Err(Error::ArgumentShardCount {
+                    name: binding.name.clone(),
+                    expected: self.executable.device_count,
+                    actual,
+                });
             }
             if self.baked[index] {
                 return Err(Error::BakedArgument(binding.name.clone()));
@@ -1299,7 +1329,7 @@ pub mod exe {
             // multi-component parameter must never leave a partially rebound
             // executable behind.
             for (index, buffer) in assignments {
-                self.slots[index] = Some(buffer);
+                self.install(index, buffer);
             }
             Ok(self)
         }
@@ -1320,20 +1350,15 @@ pub mod exe {
         /// without synchronizing the host. Returned buffers can be supplied to
         /// another enqueue immediately; PJRT preserves readiness dependencies.
         pub fn enqueue(&mut self) -> Result<Results, Error> {
-            for (index, binding) in self.executable.inputs.iter().enumerate() {
-                if self.slots[index].is_none() {
-                    return Err(Error::MissingArgument(binding.name.clone()));
-                }
-            }
-            for (slot, binding) in self.slots.iter().zip(&self.executable.inputs) {
-                let actual = slot.as_ref().expect("checked above").raw_shards().len();
-                if actual != self.executable.device_count {
-                    return Err(Error::ArgumentShardCount {
-                        name: binding.name.clone(),
-                        expected: self.executable.device_count,
-                        actual,
-                    });
-                }
+            if self.missing != 0 {
+                let missing = self
+                    .slots
+                    .iter()
+                    .position(Option::is_none)
+                    .expect("the missing count and slots must agree");
+                return Err(Error::MissingArgument(
+                    self.executable.inputs[missing].name.clone(),
+                ));
             }
             for output in &self.executable.outputs {
                 if let Some(input) = output.alias_input {
@@ -1427,6 +1452,7 @@ pub mod exe {
             for output in &self.executable.outputs {
                 if let Some(input) = output.alias_input {
                     self.slots[input] = None;
+                    self.missing += 1;
                 }
             }
             self.executable.results(buffers, completion)

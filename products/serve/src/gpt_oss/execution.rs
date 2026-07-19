@@ -1,13 +1,14 @@
 //! Definition, compilation, residency, and request-local execution state.
 
 use super::checkpoint::{
-    BoxError, Checkpoint, LoadedCheckpoint, LoadedDecoderLayer, Result, bind_tree, message,
-    representative_layer,
+    BoxError, Checkpoint, LoadedCheckpoint, LoadedDecoderLayer, Result, bind_layer_group,
+    bind_tree, message, representative_layer,
 };
 use super::config::{AttentionKind, Config};
 use super::graph::{
-    CACHE_PAGE_SIZE, MAXIMUM_TOP_K, Phase, ShapeFamily, build_embedding, build_head, build_layer,
-    cache_shape, page_table_shape,
+    CACHE_PAGE_SIZE, DECODE_SEGMENT_LAYERS, MAXIMUM_TOP_K, Phase, ShapeFamily,
+    build_decode_segment, build_embedding, build_head, build_layer, cache_shape,
+    page_table_shape,
 };
 use crate::{CompilationProfile, SamplingOptions, SubmissionTimings};
 use nml::exe::{Arguments, Results};
@@ -392,7 +393,7 @@ impl ResidentModel<'_> {
 
         let mut prefill_embedding = prefill_executables.embedding.args();
         bind_embedding(&mut prefill_embedding, checkpoint, parameters)?;
-        let mut prefill_layers = bind_layers(
+        let mut prefill_layers = bind_prefill_layers(
             prefill_executables,
             checkpoint,
             parameters,
@@ -403,7 +404,7 @@ impl ResidentModel<'_> {
 
         let mut decode_embedding = decode_executables.embedding.args();
         bind_embedding(&mut decode_embedding, checkpoint, parameters)?;
-        let mut decode_layers = bind_layers(
+        let mut decode_segments = bind_decode_segments(
             decode_executables,
             checkpoint,
             parameters,
@@ -473,6 +474,10 @@ impl ResidentModel<'_> {
         let temperature = upload_f32_scalar(platform, request.sampling.temperature, placement)?;
         let top_p = upload_f32_scalar(platform, request.sampling.top_p, placement)?;
         let min_p = upload_f32_scalar(platform, request.sampling.min_p, placement)?;
+        let mut token_staging = Slice::alloc(
+            Shape::new(nml::DataType::I32, &[1, 1]).map_err(boxed)?,
+        )
+        .map_err(boxed)?;
         for head in [&mut prefill_head, &mut decode_head] {
             head.set("top_k", top_k.clone()).map_err(boxed)?;
             head.set("temperature", temperature.clone()).map_err(boxed)?;
@@ -529,7 +534,7 @@ impl ResidentModel<'_> {
         token_buffer.wait().map_err(boxed)?;
         let prefill_execution = prefill_started.elapsed();
         let download_started = Instant::now();
-        let mut next_token = download_token(&token_buffer)?;
+        let mut next_token = download_token(&token_buffer, &mut token_staging)?;
         let prefill_download = download_started.elapsed();
 
         let decode_state_started = Instant::now();
@@ -569,21 +574,16 @@ impl ResidentModel<'_> {
                 .map_err(boxed)?;
             let mut hidden = one(decode_embedding.enqueue().map_err(boxed)?)?;
             decode_submission.embedding = submission_started.elapsed();
-            for ((arguments, cache), kind) in decode_layers
-                .iter_mut()
-                .zip(&mut caches)
-                .zip(config.layer_types())
-            {
-                let (next_hidden, elapsed) = execute_layer(
-                    arguments,
+            for segment in &mut decode_segments {
+                let (next_hidden, elapsed) = execute_decode_segment(
+                    segment,
                     hidden,
                     position.clone(),
-                    None,
                     page_table.clone(),
-                    cache,
+                    &mut caches,
                 )?;
                 hidden = next_hidden;
-                record_layer_submission(&mut decode_submission, *kind, elapsed);
+                decode_submission.decode_segments += elapsed;
             }
             let submission_started = Instant::now();
             decode_head.set("hidden", hidden).map_err(boxed)?;
@@ -622,7 +622,7 @@ impl ResidentModel<'_> {
                 add_submission(&mut steady_decode_submission, decode_submission);
             }
             let download_started = Instant::now();
-            next_token = download_token(&token_buffer)?;
+            next_token = download_token(&token_buffer, &mut token_staging)?;
             decode_download += download_started.elapsed();
         }
 
@@ -651,9 +651,13 @@ impl ResidentModel<'_> {
 
 struct ComponentFamily {
     embedding: Exe,
-    sliding_layer: Exe,
-    full_layer: Exe,
+    layers: LayerExecutables,
     head: Exe,
+}
+
+enum LayerExecutables {
+    Prefill { sliding: Exe, full: Exe },
+    Decode { segment: Exe },
 }
 
 impl ComponentFamily {
@@ -669,45 +673,81 @@ impl ComponentFamily {
         let embedding = compile(platform, placement, |graph| {
             build_embedding(graph, checkpoint, config, family)
         })?;
-        let sliding = representative_layer(
-            checkpoint,
-            config,
-            AttentionKind::SlidingAttention,
-        )?;
-        let sliding_layer = compile(platform, placement, |graph| {
-            build_layer(
-                graph,
-                sliding,
-                config,
-                family,
-                AttentionKind::SlidingAttention,
-            )
-        })?;
-        let full = representative_layer(checkpoint, config, AttentionKind::FullAttention)?;
-        let full_layer = compile(platform, placement, |graph| {
-            build_layer(
-                graph,
-                full,
-                config,
-                family,
-                AttentionKind::FullAttention,
-            )
-        })?;
+        let layers = match family.phase() {
+            Phase::Prefill => {
+                let sliding = representative_layer(
+                    checkpoint,
+                    config,
+                    AttentionKind::SlidingAttention,
+                )?;
+                let sliding = compile(platform, placement, |graph| {
+                    build_layer(
+                        graph,
+                        sliding,
+                        config,
+                        family,
+                        AttentionKind::SlidingAttention,
+                    )
+                })?;
+                let full =
+                    representative_layer(checkpoint, config, AttentionKind::FullAttention)?;
+                let full = compile(platform, placement, |graph| {
+                    build_layer(
+                        graph,
+                        full,
+                        config,
+                        family,
+                        AttentionKind::FullAttention,
+                    )
+                })?;
+                LayerExecutables::Prefill { sliding, full }
+            }
+            Phase::Decode => {
+                let representatives = checkpoint
+                    .model
+                    .layers
+                    .iter()
+                    .zip(config.layer_types())
+                    .take(DECODE_SEGMENT_LAYERS)
+                    .map(|(layer, kind)| (layer, *kind))
+                    .collect::<Vec<_>>();
+                if representatives.len() != DECODE_SEGMENT_LAYERS {
+                    return Err(message(
+                        "GPT-OSS checkpoint cannot supply a complete decode segment",
+                    ));
+                }
+                let segment = compile(platform, placement, |graph| {
+                    build_decode_segment(graph, &representatives, config, family)
+                })?;
+                LayerExecutables::Decode { segment }
+            }
+        };
         let head = compile(platform, placement, |graph| {
             build_head(graph, checkpoint, config, family)
         })?;
         Ok(Self {
             embedding,
-            sliding_layer,
-            full_layer,
+            layers,
             head,
         })
     }
 
-    fn layer(&self, kind: AttentionKind) -> &Exe {
-        match kind {
-            AttentionKind::SlidingAttention => &self.sliding_layer,
-            AttentionKind::FullAttention => &self.full_layer,
+    fn prefill_layer(&self, kind: AttentionKind) -> Result<&Exe> {
+        let LayerExecutables::Prefill { sliding, full } = &self.layers else {
+            return Err(message("decode executable family has no prefill layer"));
+        };
+        Ok(match kind {
+            AttentionKind::SlidingAttention => sliding,
+            AttentionKind::FullAttention => full,
+        })
+    }
+
+    fn decode_segment(&self) -> Result<&Exe> {
+        match &self.layers {
+            LayerExecutables::Decode { segment } => Ok(segment),
+            LayerExecutables::Prefill { .. } => {
+                Err(message("prefill executable family has no decode segment"))
+            }
         }
     }
 }
@@ -781,7 +821,7 @@ fn bind_head(
     Ok(())
 }
 
-fn bind_layers<'family>(
+fn bind_prefill_layers<'family>(
     family: &'family ComponentFamily,
     checkpoint: &Checkpoint,
     parameters: &LoadedCheckpoint,
@@ -799,9 +839,59 @@ fn bind_layers<'family>(
         .zip(&parameters.model.layers)
         .zip(config.layer_types())
         .map(|((_, loaded), kind)| {
-            let executable = family.layer(*kind);
+            let executable = family.prefill_layer(*kind)?;
             let slots = representative_layer(checkpoint, config, *kind)?;
             bind_layer(executable, slots, loaded)
+        })
+        .collect()
+}
+
+struct BoundDecodeSegment<'family> {
+    arguments: Arguments<'family>,
+    first_layer: usize,
+}
+
+fn bind_decode_segments<'family>(
+    family: &'family ComponentFamily,
+    checkpoint: &Checkpoint,
+    parameters: &LoadedCheckpoint,
+    config: &Config,
+) -> Result<Vec<BoundDecodeSegment<'family>>> {
+    let layer_count = checkpoint.model.layers.len();
+    if layer_count != parameters.model.layers.len()
+        || layer_count != config.layer_types().len()
+        || !layer_count.is_multiple_of(DECODE_SEGMENT_LAYERS)
+    {
+        return Err(message(
+            "GPT-OSS decode segment schedule and checkpoint disagree",
+        ));
+    }
+    let executable = family.decode_segment()?;
+    // The executable was compiled from the first segment's parameter slots.
+    // Every later segment must bind its loaded storage through those same
+    // compiled slot identities. Passing the later checkpoint declarations as
+    // slots would look structurally similar but fail the executable manifest:
+    // their binding names were never compiled into this reusable executable.
+    let representative_slots = &checkpoint.model.layers[..DECODE_SEGMENT_LAYERS];
+    let representative_pattern = &config.layer_types()[..DECODE_SEGMENT_LAYERS];
+    parameters
+        .model
+        .layers
+        .chunks_exact(DECODE_SEGMENT_LAYERS)
+        .zip(config.layer_types().chunks_exact(DECODE_SEGMENT_LAYERS))
+        .enumerate()
+        .map(|(index, (loaded, pattern))| {
+            if pattern != representative_pattern {
+                return Err(message(
+                    "GPT-OSS decode segments do not share one reusable layer pattern",
+                ));
+            }
+            let mut arguments = executable.args();
+            bind_layer_group(&mut arguments, representative_slots, loaded)?;
+            Ok(BoundDecodeSegment {
+                arguments,
+                first_layer: index * DECODE_SEGMENT_LAYERS,
+            })
         })
         .collect()
 }
@@ -857,6 +947,65 @@ fn execute_layer(
     Ok((hidden, started.elapsed()))
 }
 
+fn execute_decode_segment(
+    segment: &mut BoundDecodeSegment<'_>,
+    hidden: Buffer,
+    position: Buffer,
+    page_table: Buffer,
+    caches: &mut [LayerCache],
+) -> Result<(Buffer, Duration)> {
+    let started = Instant::now();
+    let end = segment
+        .first_layer
+        .checked_add(DECODE_SEGMENT_LAYERS)
+        .ok_or_else(|| message("GPT-OSS decode segment range overflows usize"))?;
+    let segment_caches = caches
+        .get_mut(segment.first_layer..end)
+        .ok_or_else(|| message("GPT-OSS decode segment cache range is absent"))?;
+    segment.arguments.set("hidden", hidden).map_err(boxed)?;
+    segment
+        .arguments
+        .set("position", position)
+        .map_err(boxed)?;
+    segment
+        .arguments
+        .set("page_table", page_table)
+        .map_err(boxed)?;
+    for (index, cache) in segment_caches.iter_mut().enumerate() {
+        let (key, value) = cache.take()?;
+        segment
+            .arguments
+            .set(&format!("cache.{index}.key"), key)
+            .map_err(boxed)?;
+        segment
+            .arguments
+            .set(&format!("cache.{index}.value"), value)
+            .map_err(boxed)?;
+    }
+    let mut outputs = segment
+        .arguments
+        .enqueue()
+        .map_err(boxed)?
+        .into_buffers()
+        .into_iter();
+    let hidden = outputs
+        .next()
+        .ok_or_else(|| message("GPT-OSS decode segment omitted hidden state"))?;
+    for cache in segment_caches {
+        let key = outputs
+            .next()
+            .ok_or_else(|| message("GPT-OSS decode segment omitted key cache"))?;
+        let value = outputs
+            .next()
+            .ok_or_else(|| message("GPT-OSS decode segment omitted value cache"))?;
+        cache.install(key, value)?;
+    }
+    if outputs.next().is_some() {
+        return Err(message("GPT-OSS decode segment returned extra buffers"));
+    }
+    Ok((hidden, started.elapsed()))
+}
+
 fn record_layer_submission(
     timings: &mut SubmissionTimings,
     kind: AttentionKind,
@@ -872,6 +1021,7 @@ fn add_submission(total: &mut SubmissionTimings, value: SubmissionTimings) {
     total.embedding += value.embedding;
     total.sliding_layers += value.sliding_layers;
     total.full_layers += value.full_layers;
+    total.decode_segments += value.decode_segments;
     total.head += value.head;
 }
 
@@ -945,9 +1095,9 @@ fn upload_f32_scalar(
         .map_err(boxed)
 }
 
-fn download_token(buffer: &Buffer) -> Result<u32> {
-    let slice = buffer.to_slice().map_err(boxed)?;
-    let values = slice.items::<i32>().map_err(boxed)?;
+fn download_token(buffer: &Buffer, staging: &mut Slice<'_>) -> Result<u32> {
+    buffer.copy_to_slice(staging).map_err(boxed)?;
+    let values = staging.items::<i32>().map_err(boxed)?;
     let [token] = values else {
         return Err(message("GPT-OSS token output is not scalar-shaped"));
     };

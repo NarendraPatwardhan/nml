@@ -591,7 +591,8 @@ is never reported as device execution.
 Portable MoE performs top-k routing, stable assignment construction, grouped
 expert execution, weighting, and combination in StableHLO. Shardy owns expert
 partitioning. Private Triton kernels specialize grouped expert projections on
-SM80 and newer; CPU and SM75 use the portable graph.
+SM80 and newer for matrix-shaped work; CPU retains the portable contract and
+SM75 uses source-owned CUDA custom calls.
 
 Static schedule capacity is not executable work. Sparse decode uses one expert
 block per selected route when `assignments * 4 <= experts`, matching ZML's
@@ -614,6 +615,19 @@ SM80+ lowering interchangeable at the graph boundary. Private compact CUDA
 lowering selects a dedicated F32-accumulating GEMV for `M = 1`; prefill retains
 the finite tensor-core matrix family. Weight/scale decode is register-local and
 exact, and one scale load is reused across its complete representation block.
+The compiler selects four- or eight-warp output-owner targets from logical
+geometry and SM count, making the variant part of executable identity. A
+semantic parallel-linear boundary combines compact Q/K/V decode without
+changing the three matrix contractions used by prefill. A retained-router
+boundary produces direct top-four routes, and compact head sampling streams an
+exact top-64 through XLA-owned workspaces rather than materializing full
+vocabulary logits. These are general backend semantics; no GPT-OSS layer name
+or NVIDIA product name enters framework dispatch.
+
+GPT-OSS decode composes exactly six consecutive alternating-attention layers
+per reusable segment executable. Embedding, four segments, and head bound the
+single-sequence decode path to six PJRT submissions per token while model
+topology and parameter binding remain product-owned.
 
 The operation substrate presently includes:
 
@@ -746,10 +760,10 @@ material. A runner-local, owner-only registry-auth file or credential
 helper bridges those values into `rules_img` and is removed when publication
 ends; it is never a Bazel input or remotely executed action environment. The
 publish operation disables automatic remote-run retries.
-Local `bb run` publication through Docker's credential store is retained only
-as an operator recovery path because it transfers the completed layers through
-the laptop twice. Registry inspection by exact digest is the authority after
-either path, not a missing terminal event or mutable tag.
+Local publication is unsupported because it transfers the completed layers
+through the laptop twice and makes operator connectivity part of release
+correctness. Registry inspection by exact digest is the authority after the
+remote push, not a missing terminal event or mutable tag.
 
 CUDA product images expose `/usr/local/lib/nml` as the one dynamic-loader
 boundary. A platform-selected symlink there resolves rules_cuda's hermetic
@@ -770,8 +784,9 @@ mutation through its Packages REST surface, so changing the first published
 package from its private default to public is a one-time web control-plane
 action. A classic PAT with only the required package scopes is stored as the
 encrypted BuildBuddy organization secret `GHCR_TOKEN`; its matching public
-username is fixed by the repository owner. The recovery-only local publisher may use Docker's
-credential store. Neither credential enters Bazel inputs, source files,
+username is fixed by the repository owner. An explicitly selected token file
+may instead be injected into one remote run through BuildBuddy's redacted
+short-lived secret channel. Neither form enters Bazel inputs, source files,
 ordinary environment properties, logs, OCI layers, or RunPod.
 
 ### 12.2 RunPod control-plane boundary
@@ -890,13 +905,22 @@ is deliberately non-retrying because pushing a tag is an external mutation;
 completion is established by independently resolving the public tag to its
 immutable registry digest.
 
-Local publication through `bb run` and the Docker credential store is a
-recovery path, not the normal data path, because it requires downloading the
-large remotely built OCI layers. Local and RunPod GPU executors pull the same
-digest and run the same in-image contract selection; neither recompiles NML,
-runs Bazel, nor carries a source checkout. Provisioning a paid external Pod is
-an explicit `bb run` or equivalent operator action, never a hermetic or
-cacheable `bb test`.
+Local publication through `bb run` or a host Docker credential store is not a
+supported path. Local and RunPod GPU executors pull the same digest and run the
+same in-image contract selection; neither recompiles NML, runs Bazel, nor
+carries a source checkout. Provisioning a paid external Pod is an explicit
+remote-runner action, never a hermetic or cacheable `bb test`.
+
+The one-hop procedure is repository-owned rather than reconstructed by an
+operator: `bash tools/publish-serve-image.sh`. It requires a clean, pushed
+commit; reads the package token from `../github.packages.key` by default (or
+`GHCR_TOKEN_FILE` when deliberately overridden); injects it through
+BuildBuddy's redacted short-lived secret header; and creates and removes the
+owner-only Docker credential store on the remote runner. The runner invokes
+the canonical CUDA publication target beside BuildBuddy's cache, so no OCI
+layer traverses the operator machine. This is the only supported token-file
+publication flow; ad hoc `docker login`, local `bb run` publication,
+token-bearing command lines, and locally constructed images are not.
 
 Every OCI GPU result records the NML commit, image digest, contract selection,
 GPU model and UUID when available, compute capability, driver, execution
@@ -913,6 +937,17 @@ compiler or transfer time into a misleading single number.
 Product reports additionally separate asynchronous host submission by
 component class. GPU kernel attribution comes from a device profiler or
 compiler diagnostics; host timers must not be relabeled as device time.
+
+Every paid RunPod product execution uses one inseparable diagnostic harness:
+Nsight Systems launches GDB, and GDB launches the exact OCI product entrypoint
+as its inferior. There is no debugger-only or profiler-only acceptance path.
+Success requires a normal inferior exit, the product's numerical completion
+contract, a complete `.nsys-rep`, and the exported CUDA kernel, API, launch,
+and memory summaries in one attempt directory. The Pod is not terminated until
+that entire directory has been copied to the operator machine and validated.
+This cost is intentional during pre-alpha development: a successful result
+without crash evidence or attribution data is incomplete evidence and must not
+consume a paid execution slot.
 
 ## 14. Capability boundary and forward work
 
@@ -1071,6 +1106,10 @@ table is a compact compatibility index, not a migration checklist.
 | D-062 | GPT-OSS generation uses explicit-state runtime top-k/temperature/top-p/min-p sampling by default; greedy decoding is an explicit `top_k = 1` request, not product policy. |
 | D-063 | Every grouped expert backend exposes gate/up plus one activation as `[assignments, intermediate]`; down never receives interleaved gate/up channels or recomputes their activation. |
 | D-064 | Compact CUDA decode uses dedicated `M = 1` GEMV with exact register-local E2M1/E4M3FN decoding and block-scale reuse; tensor-core matrix tiles remain the distinct prefill family. |
+| D-065 | Every paid RunPod product run is one combined Nsight-Systems-over-GDB execution; acceptance requires debugger, product, and profiler artifacts before Pod termination. |
+| D-066 | Compact CUDA `M = 1` variants are compiler-selected from geometry, SM count, and semantic epilogue; their four/eight-warp target identity is part of the executable cache key, while `M > 1` retains the matrix family. |
+| D-067 | Parallel Q/K/V, direct top-four routing, route-reducing expert down, and exact streaming linear top-k are framework semantic boundaries; products compose them without naming CUDA kernels. |
+| D-068 | GPT-OSS decode uses reusable six-layer segments and therefore submits embedding, four alternating-attention segments, and head per token; framework crates do not own the 24-layer topology. |
 
 ## 16. Provenance and reference relationships
 

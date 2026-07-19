@@ -1261,6 +1261,74 @@ impl ProgramBuilder {
         down_bias: &Parameter,
         experts_per_token: usize,
     ) -> Result<Tensor, Error> {
+        self.routed_clamped_swiglu_inner(
+            hidden,
+            router_logits,
+            None,
+            gate_up_weights,
+            gate_up_bias,
+            down_weights,
+            down_bias,
+            experts_per_token,
+        )
+    }
+
+    /// Routes and executes clamped SwiGLU experts from a dense router.
+    ///
+    /// The semantic result is identical to authoring [`Self::linear`] followed
+    /// by [`Self::routed_clamped_swiglu`]. Retaining the router boundary lets a
+    /// decode backend select and normalize the winning experts without
+    /// materializing full logits or a general sort. Matrix-shaped execution
+    /// keeps the ordinary graph path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn routed_clamped_swiglu_with_router(
+        &mut self,
+        hidden: Tensor,
+        router_weight: &Parameter,
+        router_bias: &Parameter,
+        gate_up_weights: &Parameter,
+        gate_up_bias: &Parameter,
+        down_weights: &Parameter,
+        down_bias: &Parameter,
+        experts_per_token: usize,
+    ) -> Result<Tensor, Error> {
+        if !matches!(router_weight.representation(), RepresentationSpec::Dense(_))
+            || !matches!(router_bias.representation(), RepresentationSpec::Dense(_))
+        {
+            return Err(Error::InvalidMoe(
+                "the fused MoE router currently requires dense weight and bias storage",
+            ));
+        }
+        let router_logits = self.linear(hidden, router_weight, Some(router_bias))?;
+        let router_weight = self.parameter_value(router_weight)?;
+        let router_bias = self.parameter_value(router_bias)?;
+        self.routed_clamped_swiglu_inner(
+            hidden,
+            router_logits,
+            Some(NvFp4RouterProjection {
+                weight: router_weight.value,
+                bias: router_bias.value,
+            }),
+            gate_up_weights,
+            gate_up_bias,
+            down_weights,
+            down_bias,
+            experts_per_token,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn routed_clamped_swiglu_inner(
+        &mut self,
+        hidden: Tensor,
+        router_logits: Tensor,
+        router: Option<NvFp4RouterProjection>,
+        gate_up_weights: &Parameter,
+        gate_up_bias: &Parameter,
+        down_weights: &Parameter,
+        down_bias: &Parameter,
+        experts_per_token: usize,
+    ) -> Result<Tensor, Error> {
         self.require_local(hidden)?;
         self.require_local(router_logits)?;
         self.require_float(hidden, "clamped_swiglu_moe")?;
@@ -1388,6 +1456,8 @@ impl ProgramBuilder {
                 let result = self.push_value("clamped_swiglu_moe", hidden.shape);
                 self.operations.push(Operation::NvFp4RoutedSwiGlu {
                     hidden: hidden.value,
+                    router_weight: router.map(|router| router.weight),
+                    router_bias: router.map(|router| router.bias),
                     expert_ids: expert_ids.value,
                     routing_weights: routing_weights.value,
                     gate_payload: gate_payload.value,
@@ -3689,6 +3759,68 @@ impl ProgramBuilder {
         } else {
             values
         };
+        self.sample_top_k_candidates_dynamic(
+            values,
+            original_indices,
+            state,
+            top_k,
+            temperature,
+            top_p,
+            min_p,
+        )
+    }
+
+    /// Samples from an already sorted, descending top-k candidate set.
+    ///
+    /// `original_indices` maps each candidate back to the source vocabulary.
+    /// This boundary lets a projection backend stream exact candidates without
+    /// materializing the full logits tensor while retaining the same dynamic
+    /// temperature, top-k, top-p, min-p, and random-state semantics.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_top_k_candidates_dynamic(
+        &mut self,
+        values: Tensor,
+        original_indices: Tensor,
+        state: RandomState,
+        top_k: Tensor,
+        temperature: Tensor,
+        top_p: Tensor,
+        min_p: Tensor,
+    ) -> Result<(RandomState, Tensor), Error> {
+        self.require_local(values)?;
+        self.require_local(original_indices)?;
+        self.require_float(values, "sample_top_k_candidates_dynamic")?;
+        if values.shape.rank() == 0
+            || original_indices.shape != values.shape.with_dtype(DType::I32)
+        {
+            return Err(Error::InvalidSampling(
+                "top-k candidate values and I32 source indices must have one identical non-scalar shape",
+            ));
+        }
+        self.require_sampling_scalar(top_k, DType::I32, "top_k")?;
+        for (value, name) in [
+            (temperature, "temperature"),
+            (top_p, "top_p"),
+            (min_p, "min_p"),
+        ] {
+            self.require_local(value)?;
+            if value.shape.rank() != 0 || value.shape.dtype().class() != DTypeClass::Float {
+                return Err(Error::InvalidSampling(match name {
+                    "temperature" => "temperature must be a floating-point scalar",
+                    "top_p" => "top-p must be a floating-point scalar",
+                    _ => "min-p must be a floating-point scalar",
+                }));
+            }
+        }
+        let candidate_axis = values.shape.rank() - 1;
+        let maximum_top_k = usize::try_from(values.shape.dimensions()[candidate_axis])
+            .map_err(|_| Error::InvalidSampling("candidate bound does not fit usize"))?;
+        if maximum_top_k == 0 || maximum_top_k > i32::MAX as usize {
+            return Err(Error::InvalidSampling(
+                "candidate bound must be positive and fit I32",
+            ));
+        }
+
         let one_i32 = self.scalar(1i32)?;
         let maximum_i32 = self.scalar(maximum_top_k as i32)?;
         let top_k = self.maximum(top_k, one_i32)?;
@@ -4335,12 +4467,133 @@ impl ProgramBuilder {
         self.add(product, bias)
     }
 
+    /// Authors independent linear projections of one activation.
+    ///
+    /// This is a semantic grouping boundary, not a CUDA or model-specific
+    /// operation. Backends may share activation traffic and launch overhead
+    /// when the representations and contraction geometry permit it; otherwise
+    /// the projections retain exactly the behavior of repeated [`Self::linear`]
+    /// calls. Keeping the boundary in the graph prevents product code from
+    /// naming a kernel family or a device architecture.
+    pub fn parallel_linears(
+        &mut self,
+        input: Tensor,
+        projections: &[(&Parameter, Option<&Parameter>)],
+    ) -> Result<Vec<Tensor>, Error> {
+        self.require_local(input)?;
+        if input.shape.rank() == 0 {
+            return Err(Error::InvalidLinearAlgebra(
+                "parallel linear input requires at least one dimension",
+            ));
+        }
+        if projections.is_empty() {
+            return Err(Error::InvalidLinearAlgebra(
+                "parallel linear requires at least one projection",
+            ));
+        }
+
+        // Three projections are a useful representation-independent semantic
+        // group (for example Q/K/V), while the private CUDA lowering currently
+        // has a compact M=1 specialization for precisely this arity. Validate
+        // every projection before adding any of their physical components.
+        if projections.len() == 3
+            && projections
+                .iter()
+                .all(|(weight, _)| matches!(weight.representation(), RepresentationSpec::NvFp4(_)))
+        {
+            let plans = projections
+                .iter()
+                .map(|(weight, bias)| self.validate_nvfp4_linear(input, weight, *bias))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut results = Vec::with_capacity(plans.len());
+            let mut authored = Vec::with_capacity(plans.len());
+            for plan in plans {
+                let (result, projection) = self.author_nvfp4_linear(plan)?;
+                results.push(result);
+                authored.push(projection);
+            }
+            self.operations.push(Operation::NvFp4LinearGroup {
+                input: input.value,
+                projections: authored,
+            });
+            return Ok(results);
+        }
+
+        projections
+            .iter()
+            .map(|(weight, bias)| self.linear(input, weight, *bias))
+            .collect()
+    }
+
+    /// Returns the exact top `k` candidates of one linear projection.
+    ///
+    /// Candidate logits are F32 and indices are I32. The portable definition
+    /// remains linear followed by stable top-k; compact single-row CUDA may
+    /// stream candidates through bounded workspaces instead of materializing
+    /// the full output axis.
+    pub fn linear_top_k(
+        &mut self,
+        input: Tensor,
+        weight: &Parameter,
+        bias: Option<&Parameter>,
+        k: usize,
+    ) -> Result<(Tensor, Tensor), Error> {
+        let logits = self.linear(input, weight, bias)?;
+        let axis = logits.shape.rank() - 1;
+        let (fallback_values, fallback_indices) = self.top_k(logits, axis, k, true)?;
+        let fallback_values = self.convert(fallback_values, DType::F32)?;
+        if !matches!(weight.representation(), RepresentationSpec::NvFp4(_)) {
+            return Ok((fallback_values, fallback_indices));
+        }
+
+        let [payload, block_scales, global_scale] = require_nvfp4_components(weight)?;
+        let payload = self.parameter_component_value(weight, payload)?;
+        let block_scales = self.parameter_component_value(weight, block_scales)?;
+        let global_scale = self.parameter_component_value(weight, global_scale)?;
+        let bias = bias.map(|bias| self.parameter_value(bias)).transpose()?;
+        let values_result = self.push_value("linear_top_k_values", fallback_values.shape);
+        let indices_result = self.push_value("linear_top_k_indices", fallback_indices.shape);
+        self.operations.push(Operation::NvFp4LinearTopK {
+            input: input.value,
+            payload: payload.value,
+            block_scales: block_scales.value,
+            global_scale: global_scale.value,
+            bias: bias.map(|bias| bias.value),
+            linear_result: logits.value,
+            fallback_values: fallback_values.value,
+            fallback_indices: fallback_indices.value,
+            values_result: values_result.value,
+            indices_result: indices_result.value,
+            k,
+        });
+        Ok((values_result, indices_result))
+    }
+
     fn nvfp4_linear(
         &mut self,
         input: Tensor,
         weight: &Parameter,
         bias: Option<&Parameter>,
     ) -> Result<Tensor, Error> {
+        let plan = self.validate_nvfp4_linear(input, weight, bias)?;
+        let (result, projection) = self.author_nvfp4_linear(plan)?;
+        self.operations.push(Operation::NvFp4Linear {
+            input: input.value,
+            payload: projection.payload,
+            block_scales: projection.block_scales,
+            global_scale: projection.global_scale,
+            bias: projection.bias,
+            result: projection.result,
+        });
+        Ok(result)
+    }
+
+    fn validate_nvfp4_linear<'parameter>(
+        &self,
+        input: Tensor,
+        weight: &'parameter Parameter,
+        bias: Option<&'parameter Parameter>,
+    ) -> Result<NvFp4LinearPlan<'parameter>, Error> {
         let logical = weight.shape();
         if logical.rank() != 2 {
             return Err(Error::InvalidParameter(format!(
@@ -4364,9 +4617,6 @@ impl ProgramBuilder {
             });
         }
         let [payload, scales, global] = require_nvfp4_components(weight)?;
-        let payload = self.parameter_component_value(weight, payload)?;
-        let scales = self.parameter_component_value(weight, scales)?;
-        let global = self.parameter_component_value(weight, global)?;
         let mut dimensions = input.shape.dimensions().to_vec();
         dimensions[input_axis] = logical.dimensions()[0];
         let mut axis_tags = input.shape.axis_tags().to_vec();
@@ -4377,11 +4627,9 @@ impl ProgramBuilder {
             .with_axis_tags(&axis_tags)?
             .with_partitions(&partitions)?;
 
-        // Bias belongs to the compact contraction epilogue. Validate its
-        // complete semantic contract before authoring the NVFP4 operation so a
-        // failed call cannot leave a partially formed compact projection in the
-        // program. Dense linear intentionally retains its ordinary broadcast +
-        // add lowering above.
+        // Bias belongs to the compact contraction epilogue. Validate its full
+        // representation and semantic contract before the caller authors any
+        // component of this projection.
         let bias = match bias {
             Some(bias) => {
                 let bias_shape = bias.shape();
@@ -4406,20 +4654,57 @@ impl ProgramBuilder {
                         right: shape.dimensions()[input_axis],
                     });
                 }
-                Some(self.parameter_value(bias)?)
+                let component = bias.dense_component().ok_or_else(|| {
+                    Error::InvalidParameter(format!(
+                        "linear bias {:?} requires dense storage",
+                        bias.name()
+                    ))
+                })?;
+                let storage = component.storage();
+                if storage.encoding() != StorageEncoding::Dense(bias_shape.dtype())
+                    || storage.shape() != bias_shape
+                {
+                    return Err(Error::InvalidParameter(format!(
+                        "linear bias {:?} has inconsistent logical and physical storage",
+                        bias.name()
+                    )));
+                }
+                Some((bias, component))
             }
             None => None,
         };
-        let result = self.push_value("nvfp4_linear", shape);
-        self.operations.push(Operation::NvFp4Linear {
-            input: input.value,
-            payload: payload.value,
-            block_scales: scales.value,
-            global_scale: global.value,
-            bias: bias.map(|bias| bias.value),
-            result: result.value,
-        });
-        Ok(result)
+        Ok(NvFp4LinearPlan {
+            weight,
+            payload,
+            block_scales: scales,
+            global_scale: global,
+            bias,
+            result_shape: shape,
+        })
+    }
+
+    fn author_nvfp4_linear(
+        &mut self,
+        plan: NvFp4LinearPlan<'_>,
+    ) -> Result<(Tensor, NvFp4LinearProjection), Error> {
+        let payload = self.parameter_component_value(plan.weight, plan.payload)?;
+        let scales = self.parameter_component_value(plan.weight, plan.block_scales)?;
+        let global = self.parameter_component_value(plan.weight, plan.global_scale)?;
+        let bias = plan
+            .bias
+            .map(|(parameter, component)| self.parameter_component_value(parameter, component))
+            .transpose()?;
+        let result = self.push_value("nvfp4_linear", plan.result_shape);
+        Ok((
+            result,
+            NvFp4LinearProjection {
+                payload: payload.value,
+                block_scales: scales.value,
+                global_scale: global.value,
+                bias: bias.map(|bias| bias.value),
+                result: result.value,
+            },
+        ))
     }
 
     pub fn dot_general(
@@ -5993,6 +6278,8 @@ impl Program {
         for (operation_index, operation) in self.operations.iter().enumerate() {
             if let Operation::NvFp4RoutedSwiGlu {
                 hidden,
+                router_weight,
+                router_bias,
                 expert_ids,
                 routing_weights,
                 gate_payload,
@@ -6011,8 +6298,17 @@ impl Program {
             } = operation
             {
                 if let Some(cuda) = capabilities.cuda_capabilities() {
+                    let router = (*router_weight).zip(*router_bias).map(|(weight, bias)| {
+                        nvfp4_backend::RouterInputs {
+                            weight: mlir_value(&values, weight),
+                            bias: mlir_value(&values, bias),
+                            weight_shape: self.values[weight].shape,
+                            bias_shape: self.values[bias].shape,
+                        }
+                    });
                     let operands = [
                         mlir_value(&values, *hidden),
+                        mlir_value(&values, *expert_ids),
                         mlir_value(&values, *routing_weights),
                         mlir_value(&values, *gate_payload),
                         mlir_value(&values, *gate_scales),
@@ -6028,6 +6324,7 @@ impl Program {
                     ];
                     let shapes = [
                         self.values[*hidden].shape,
+                        self.values[*expert_ids].shape,
                         self.values[*routing_weights].shape,
                         self.values[*gate_payload].shape,
                         self.values[*gate_scales].shape,
@@ -6041,7 +6338,7 @@ impl Program {
                         self.values[*block_experts].shape,
                         self.values[*active_blocks].shape,
                     ];
-                    let lowered = match shapes[2].partitions()[0] {
+                    let lowered = match shapes[3].partitions()[0] {
                         Partition::Sharded(expert_axis) => lower_expert_parallel(
                             context,
                             &mut block,
@@ -6051,35 +6348,46 @@ impl Program {
                             types[*result],
                             self.values[*result].shape,
                             expert_axis,
-                            2,
+                            3,
                             operation_index,
                             |local_block, local_inputs, local_shapes, local_result, offset| {
+                                let expert_inputs = nvfp4_expert_inputs(
+                                    local_inputs,
+                                    local_shapes,
+                                    local_result,
+                                    *block_size,
+                                    Some(offset),
+                                );
+                                // Router logits and top-k stay replicated and
+                                // are already explicit inputs to the manual
+                                // expert boundary. Do not capture the outer
+                                // dense router values inside Shardy's isolated
+                                // region; direct local experts still consume
+                                // the precomputed global route list.
                                 nvfp4_backend::lower_routed_swiglu(
                                     context,
                                     local_block,
-                                    nvfp4_expert_inputs(
-                                        local_inputs,
-                                        local_shapes,
-                                        local_result,
-                                        *block_size,
-                                        Some(offset),
-                                    ),
+                                    expert_inputs,
                                     cuda,
                                 )
                             },
                         )?,
-                        _ => nvfp4_backend::lower_routed_swiglu(
-                            context,
-                            &mut block,
-                            nvfp4_expert_inputs(
+                        _ => {
+                            let mut expert_inputs = nvfp4_expert_inputs(
                                 &operands,
                                 &shapes,
                                 types[*result],
                                 *block_size,
                                 None,
-                            ),
-                            cuda,
-                        )?,
+                            );
+                            expert_inputs.router = router;
+                            nvfp4_backend::lower_routed_swiglu(
+                                context,
+                                &mut block,
+                                expert_inputs,
+                                cuda,
+                            )?
+                        }
                     };
                     values[*result] = Some(constrain_compound_result(
                         context,
@@ -6219,6 +6527,116 @@ impl Program {
                     context.ffi_custom_call("nml.nvfp4.linear", &operands, &[types[*result]])?;
                 values[*result] = Some(call.result(0)?);
                 block.append_operation(call)?;
+                continue;
+            }
+            if let Operation::NvFp4LinearGroup { input, projections } = operation {
+                if let Some(cuda) = capabilities.cuda_capabilities() {
+                    let lowered = nvfp4_backend::lower_linear_group(
+                        context,
+                        &mut block,
+                        projections
+                            .iter()
+                            .map(|projection| nvfp4_backend::LinearInputs {
+                                activation: mlir_value(&values, *input),
+                                payload: mlir_value(&values, projection.payload),
+                                block_scales: mlir_value(&values, projection.block_scales),
+                                global_scale: mlir_value(&values, projection.global_scale),
+                                bias: projection.bias.map(|bias| mlir_value(&values, bias)),
+                                activation_shape: self.values[*input].shape,
+                                payload_shape: self.values[projection.payload].shape,
+                                block_scales_shape: self.values[projection.block_scales].shape,
+                                global_scale_shape: self.values[projection.global_scale].shape,
+                                bias_shape: projection.bias.map(|bias| self.values[bias].shape),
+                                result_shape: self.values[projection.result].shape,
+                                result_type: types[projection.result],
+                            })
+                            .collect(),
+                        cuda,
+                    )?;
+                    for (projection, result) in projections.iter().zip(lowered) {
+                        values[projection.result] = Some(constrain_compound_result(
+                            context,
+                            &mut block,
+                            result,
+                            types[projection.result],
+                            sharding,
+                            self.values[projection.result].shape,
+                        )?);
+                    }
+                    continue;
+                }
+
+                for projection in projections {
+                    let mut operands = vec![
+                        mlir_value(&values, *input),
+                        mlir_value(&values, projection.payload),
+                        mlir_value(&values, projection.block_scales),
+                        mlir_value(&values, projection.global_scale),
+                    ];
+                    if let Some(bias) = projection.bias {
+                        operands.push(mlir_value(&values, bias));
+                    }
+                    let call = context.ffi_custom_call(
+                        "nml.nvfp4.linear",
+                        &operands,
+                        &[types[projection.result]],
+                    )?;
+                    values[projection.result] = Some(call.result(0)?);
+                    block.append_operation(call)?;
+                }
+                continue;
+            }
+            if let Operation::NvFp4LinearTopK {
+                input,
+                payload,
+                block_scales,
+                global_scale,
+                bias,
+                linear_result,
+                fallback_values,
+                fallback_indices,
+                values_result,
+                indices_result,
+                k,
+            } = operation
+            {
+                let rows = self.values[*input].shape.dimensions()
+                    [..self.values[*input].shape.rank() - 1]
+                    .iter()
+                    .try_fold(1_i64, |count, dimension| count.checked_mul(*dimension));
+                let custom_decode = capabilities.cuda_capabilities().is_some_and(|cuda| {
+                    cuda.supports_nvfp4_cuda_custom_call()
+                        && rows == Some(1)
+                        && *k == 64
+                        && bias.is_none()
+                });
+                if custom_decode {
+                    let (top_values, top_indices) = nvfp4_backend::lower_linear_top64(
+                        context,
+                        &mut block,
+                        nvfp4_backend::LinearInputs {
+                            activation: mlir_value(&values, *input),
+                            payload: mlir_value(&values, *payload),
+                            block_scales: mlir_value(&values, *block_scales),
+                            global_scale: mlir_value(&values, *global_scale),
+                            bias: None,
+                            activation_shape: self.values[*input].shape,
+                            payload_shape: self.values[*payload].shape,
+                            block_scales_shape: self.values[*block_scales].shape,
+                            global_scale_shape: self.values[*global_scale].shape,
+                            bias_shape: None,
+                            result_shape: self.values[*linear_result].shape,
+                            result_type: types[*linear_result],
+                        },
+                        types[*values_result],
+                        types[*indices_result],
+                    )?;
+                    values[*values_result] = Some(top_values);
+                    values[*indices_result] = Some(top_indices);
+                } else {
+                    values[*values_result] = Some(mlir_value(&values, *fallback_values));
+                    values[*indices_result] = Some(mlir_value(&values, *fallback_indices));
+                }
                 continue;
             }
             if let Operation::MoeDispatch {
@@ -7307,6 +7725,8 @@ impl Program {
                     )
                 }
                 Operation::NvFp4Linear { .. }
+                | Operation::NvFp4LinearGroup { .. }
+                | Operation::NvFp4LinearTopK { .. }
                 | Operation::NvFp4Embedding { .. }
                 | Operation::NvFp4RoutedSwiGlu { .. } => {
                     unreachable!("NVFP4 operation is lowered before scalar operations")
@@ -7382,6 +7802,8 @@ struct Value {
 enum Operation {
     NvFp4RoutedSwiGlu {
         hidden: usize,
+        router_weight: Option<usize>,
+        router_bias: Option<usize>,
         expert_ids: usize,
         routing_weights: usize,
         gate_payload: usize,
@@ -7412,6 +7834,23 @@ enum Operation {
         global_scale: usize,
         bias: Option<usize>,
         result: usize,
+    },
+    NvFp4LinearGroup {
+        input: usize,
+        projections: Vec<NvFp4LinearProjection>,
+    },
+    NvFp4LinearTopK {
+        input: usize,
+        payload: usize,
+        block_scales: usize,
+        global_scale: usize,
+        bias: Option<usize>,
+        linear_result: usize,
+        fallback_values: usize,
+        fallback_indices: usize,
+        values_result: usize,
+        indices_result: usize,
+        k: usize,
     },
     Cholesky {
         input: usize,
@@ -7700,6 +8139,30 @@ enum Operation {
         input: usize,
         result: usize,
     },
+}
+
+#[derive(Debug)]
+struct NvFp4LinearProjection {
+    payload: usize,
+    block_scales: usize,
+    global_scale: usize,
+    bias: Option<usize>,
+    result: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NvFp4RouterProjection {
+    weight: usize,
+    bias: usize,
+}
+
+struct NvFp4LinearPlan<'parameter> {
+    weight: &'parameter Parameter,
+    payload: &'parameter ComponentSpec,
+    block_scales: &'parameter ComponentSpec,
+    global_scale: &'parameter ComponentSpec,
+    bias: Option<(&'parameter Parameter, &'parameter ComponentSpec)>,
+    result_shape: Shape,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -9226,35 +9689,38 @@ fn nvfp4_expert_inputs<'context>(
     block_size: usize,
     expert_offset: Option<MlirValue<'context>>,
 ) -> nvfp4_backend::ExpertInputs<'context> {
-    debug_assert_eq!(operands.len(), 13);
-    debug_assert_eq!(shapes.len(), 13);
+    debug_assert_eq!(operands.len(), 14);
+    debug_assert_eq!(shapes.len(), 14);
     nvfp4_backend::ExpertInputs {
         hidden: operands[0],
-        routing_weights: operands[1],
-        gate_payload: operands[2],
-        gate_scales: operands[3],
-        gate_global: operands[4],
-        gate_bias: operands[5],
-        down_payload: operands[6],
-        down_scales: operands[7],
-        down_global: operands[8],
-        down_bias: operands[9],
-        sorted_assignments: operands[10],
-        block_experts: operands[11],
-        active_blocks: operands[12],
+        expert_ids: operands[1],
+        routing_weights: operands[2],
+        gate_payload: operands[3],
+        gate_scales: operands[4],
+        gate_global: operands[5],
+        gate_bias: operands[6],
+        down_payload: operands[7],
+        down_scales: operands[8],
+        down_global: operands[9],
+        down_bias: operands[10],
+        sorted_assignments: operands[11],
+        block_experts: operands[12],
+        active_blocks: operands[13],
         expert_offset,
+        router: None,
         hidden_shape: shapes[0],
-        routing_shape: shapes[1],
-        gate_payload_shape: shapes[2],
-        gate_scales_shape: shapes[3],
-        gate_global_shape: shapes[4],
-        gate_bias_shape: shapes[5],
-        down_payload_shape: shapes[6],
-        down_scales_shape: shapes[7],
-        down_global_shape: shapes[8],
-        down_bias_shape: shapes[9],
-        schedule_shape: shapes[10],
-        block_experts_shape: shapes[11],
+        expert_ids_shape: shapes[1],
+        routing_shape: shapes[2],
+        gate_payload_shape: shapes[3],
+        gate_scales_shape: shapes[4],
+        gate_global_shape: shapes[5],
+        gate_bias_shape: shapes[6],
+        down_payload_shape: shapes[7],
+        down_scales_shape: shapes[8],
+        down_global_shape: shapes[9],
+        down_bias_shape: shapes[10],
+        schedule_shape: shapes[11],
+        block_experts_shape: shapes[12],
         result_type,
         block_size,
     }
