@@ -291,6 +291,52 @@ fn clamped_swiglu_moe_keeps_model_semantics_above_weight_representation() {
 }
 
 #[test]
+fn decode_shaped_moe_launches_only_selected_expert_blocks() {
+    let dtype = DType::Bf16;
+    let mut builder = ProgramBuilder::new();
+    let hidden = builder.input("hidden", Shape::new(dtype, &[1, 64]).unwrap());
+    let router = builder.input("router", Shape::new(DType::F32, &[1, 32]).unwrap());
+    let gate = Parameter::nvfp4(
+        "gate",
+        "model.gate",
+        Shape::new(dtype, &[32, 64, 128]).unwrap(),
+    )
+    .unwrap();
+    let gate_bias = parameter("gate_bias", Shape::new(dtype, &[32, 128]).unwrap());
+    let down = Parameter::nvfp4(
+        "down",
+        "model.down",
+        Shape::new(dtype, &[32, 64, 64]).unwrap(),
+    )
+    .unwrap();
+    let down_bias = parameter("down_bias", Shape::new(dtype, &[32, 64]).unwrap());
+    let output = builder
+        .routed_clamped_swiglu(hidden, router, &gate, &gate_bias, &down, &down_bias, 4)
+        .unwrap();
+    let program = builder.finish(&[output]).unwrap();
+    let text = program
+        .module_with_sharding_cuda(
+            &Context::new(),
+            &nml_sharding::Sharding::single(),
+            108,
+            8,
+            6,
+        )
+        .unwrap()
+        .text();
+
+    assert!(text.contains("tensor<64xi32>"), "{text}");
+    assert!(text.contains("tensor<4xi32>"), "{text}");
+    assert_eq!(
+        text.matches("grid_x = 4 : i32").count(),
+        2,
+        "gate/up and down must launch exactly one block per selected route: {text}"
+    );
+    assert!(text.contains("stablehlo.pad"), "{text}");
+    assert_eq!(text.matches("scf.if").count(), 2, "{text}");
+}
+
+#[test]
 fn matmul_is_typed_deterministic_and_verified() {
     fn build() -> String {
         let mut builder = ProgramBuilder::new();

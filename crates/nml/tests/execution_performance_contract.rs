@@ -276,7 +276,16 @@ fn measure_nvfp4_workloads(platform: &nml::Platform) {
     measure_nvfp4_embedding(platform);
     measure_nvfp4_linear(platform, 1, "nvfp4_linear_decode_m1_k2880_n2880");
     measure_nvfp4_linear(platform, 128, "nvfp4_linear_prefill_m128_k2880_n2880");
-    measure_nvfp4_grouped_moe(platform);
+    measure_nvfp4_grouped_moe(
+        platform,
+        1,
+        "nvfp4_grouped_moe_decode_m1_experts32_top4_hidden2880_intermediate2880",
+    );
+    measure_nvfp4_grouped_moe(
+        platform,
+        16,
+        "nvfp4_grouped_moe_tokens16_experts32_top4_hidden2880_intermediate2880",
+    );
 }
 
 fn measure_nvfp4_embedding(platform: &nml::Platform) {
@@ -406,10 +415,13 @@ fn measure_nvfp4_linear(platform: &nml::Platform, rows: usize, workload: &str) {
     drop(first);
 }
 
-fn measure_nvfp4_grouped_moe(platform: &nml::Platform) {
-    const TOKENS: usize = 16;
-    let hidden_shape = Shape::new(DType::Bf16, &[TOKENS as i64, LARGE_HIDDEN as i64]).unwrap();
-    let router_shape = Shape::new(DType::F32, &[TOKENS as i64, ROUTED_EXPERTS as i64]).unwrap();
+fn measure_nvfp4_grouped_moe(
+    platform: &nml::Platform,
+    tokens: usize,
+    workload: &str,
+) {
+    let hidden_shape = Shape::new(DType::Bf16, &[tokens as i64, LARGE_HIDDEN as i64]).unwrap();
+    let router_shape = Shape::new(DType::F32, &[tokens as i64, ROUTED_EXPERTS as i64]).unwrap();
     let gate = Parameter::nvfp4(
         "gate_up",
         "model.experts.gate_up_proj",
@@ -479,9 +491,9 @@ fn measure_nvfp4_grouped_moe(platform: &nml::Platform) {
     let compile_started = Instant::now();
     let executable = platform.compile(&program, nml::Sharding::single()).unwrap();
     let compile = compile_started.elapsed();
-    let hidden = patterned_bf16(TOKENS * LARGE_HIDDEN);
+    let hidden = patterned_bf16(tokens * LARGE_HIDDEN);
     let hidden_host = nml::Slice::from_typed(hidden_shape, &hidden).unwrap();
-    let router = (0..TOKENS * ROUTED_EXPERTS)
+    let router = (0..tokens * ROUTED_EXPERTS)
         .map(|index| ((index * 17 % 101) as f32 - 50.0) / 16.0)
         .collect::<Vec<_>>();
     let router_host = nml::Slice::from_typed(router_shape, &router).unwrap();
@@ -524,7 +536,7 @@ fn measure_nvfp4_grouped_moe(platform: &nml::Platform) {
     let download = download_started.elapsed();
     report_phases(
         platform,
-        "nvfp4_grouped_moe_tokens16_experts32_top4_hidden2880_intermediate2880",
+        workload,
         compile,
         upload,
         first_execution,

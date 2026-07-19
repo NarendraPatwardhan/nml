@@ -20,6 +20,7 @@ pub(crate) struct Inputs<'context> {
     pub down_weights: Value<'context>,
     pub sorted_assignments: Value<'context>,
     pub block_experts: Value<'context>,
+    pub active_blocks: Value<'context>,
     pub expert_offset: Option<Value<'context>>,
     pub hidden_shape: Shape,
     pub gate_up_shape: Shape,
@@ -54,6 +55,14 @@ pub(crate) fn lower<'context>(
     let gate_up_width = intermediate
         .checked_mul(2)
         .ok_or(Error::InvalidMoe("gate/up width overflows"))?;
+    if inputs.gate_up_shape.dimensions()[1] != gate_up_width
+        || inputs.gate_up_shape.dimensions()[2] != hidden_size
+        || inputs.down_shape.dimensions()[1] != hidden_size
+    {
+        return Err(Error::InvalidMoe(
+            "grouped expert logical dimensions are inconsistent",
+        ));
+    }
     let block_m = i64::try_from(inputs.block_size)
         .map_err(|_| Error::InvalidMoe("expert block size exceeds I64"))?;
     let block_n = 32_i64;
@@ -64,13 +73,17 @@ pub(crate) fn lower<'context>(
         dtype,
         assignments,
         input_size: hidden_size,
-        output_size: gate_up_width,
+        output_size: intermediate,
         local_experts,
         source_row_divisor: experts_per_token,
         block_m,
         block_n,
         block_k,
-        gated_activation: None,
+        gated_activation: Some(match inputs.activation {
+            MoeActivation::Silu => GatedActivation::Silu,
+            MoeActivation::Gelu => GatedActivation::Gelu,
+            MoeActivation::Relu => GatedActivation::Relu,
+        }),
         multiply_routing_weight: false,
     };
     let gate_up_spec = KernelSpec::new(
@@ -79,10 +92,11 @@ pub(crate) fn lower<'context>(
             tensor(dtype, inputs.hidden_shape.dimensions())?,
             tensor(KernelDType::I32, inputs.schedule_shape.dimensions())?,
             tensor(KernelDType::I32, inputs.block_experts_shape.dimensions())?,
+            tensor(KernelDType::I32, &[])?,
             tensor(dtype, inputs.gate_up_shape.dimensions())?,
             tensor(KernelDType::I32, &[])?,
         ],
-        vec![tensor(dtype, &[assignments, gate_up_width])?],
+        vec![tensor(dtype, &[assignments, intermediate])?],
         vec![],
     )
     .map_err(kernel_error)?;
@@ -98,10 +112,11 @@ pub(crate) fn lower<'context>(
                 ("input", inputs.hidden),
                 ("sorted_assignments", inputs.sorted_assignments),
                 ("block_experts", inputs.block_experts),
+                ("active_blocks", inputs.active_blocks),
                 ("weights", inputs.gate_up_weights),
                 ("expert_offset", expert_offset),
             ],
-            launch(block_count, gate_up_width, block_n)?,
+            launch(block_count, intermediate, block_n)?,
         )
         .map_err(kernel_error)?;
     let gate_up = gate_up_call.result(0)?;
@@ -117,19 +132,16 @@ pub(crate) fn lower<'context>(
         block_m,
         block_n,
         block_k,
-        gated_activation: Some(match inputs.activation {
-            MoeActivation::Silu => GatedActivation::Silu,
-            MoeActivation::Gelu => GatedActivation::Gelu,
-            MoeActivation::Relu => GatedActivation::Relu,
-        }),
+        gated_activation: None,
         multiply_routing_weight: true,
     };
     let down_spec = KernelSpec::new(
         build_grouped_projection(down_config).map_err(kernel_error)?,
         vec![
-            tensor(dtype, &[assignments, gate_up_width])?,
+            tensor(dtype, &[assignments, intermediate])?,
             tensor(KernelDType::I32, inputs.schedule_shape.dimensions())?,
             tensor(KernelDType::I32, inputs.block_experts_shape.dimensions())?,
+            tensor(KernelDType::I32, &[])?,
             tensor(dtype, inputs.down_shape.dimensions())?,
             tensor(KernelDType::I32, &[])?,
             tensor(dtype, &[tokens, experts_per_token])?,
@@ -145,6 +157,7 @@ pub(crate) fn lower<'context>(
                 ("input", gate_up),
                 ("sorted_assignments", inputs.sorted_assignments),
                 ("block_experts", inputs.block_experts),
+                ("active_blocks", inputs.active_blocks),
                 ("weights", inputs.down_weights),
                 ("expert_offset", expert_offset),
                 ("routing_weights", inputs.routing_weights),

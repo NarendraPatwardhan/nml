@@ -68,6 +68,7 @@ _COMMON_CONTRACTS = [
     "//crates/nml-compiler:compiler_contract_test",
     "//crates/nml-ir:ir_contract_test",
     "//crates/nml-kernel-triton:triton_kernel_contract_test",
+    "//crates/nml-kernel-nvfp4:nvfp4_cpu_contract_test",
     "//crates/nml-mlir:mlir_contract_test",
     "//crates/nml-parameter:parameter_contract_test",
     "//crates/nml-pjrt-cpu:cpu_runtime_contract_test",
@@ -81,10 +82,12 @@ _COMMON_CONTRACTS = [
     "//crates/nml:linear_cpu_contract_test",
     "//crates/nml:attention_cpu_contract_test",
     "//crates/nml:neural_ops_cpu_contract_test",
+    "//crates/nml:nvfp4_cpu_contract_test",
     "//crates/nml:execution_performance_cpu_contract_test",
     "//crates/nml:structural_contract_test",
     "//products/serve:serve_contract_test",
     "//tools/device-contracts:device_contract_runner_contract_test",
+    "//tools/artifact:materialization_contract_test",
     "//tools/runpod:runpod_contract_test",
 ]
 

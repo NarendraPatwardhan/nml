@@ -75,13 +75,15 @@ fn nvfp4_linear_decodes_compact_tiles_inside_one_verified_kernel() {
         "scf.for",
         "arith.shrui",
         "arith.andi",
-        "math.exp2",
+        "tt.bitcast",
+        "tt.reshape",
         "tt.dot",
         "tt.store",
     ] {
         assert!(ttir.contains(operation), "missing {operation}:\n{ttir}");
     }
     assert_eq!(ttir.matches("tt.dot").count(), 1, "{ttir}");
+    assert!(!ttir.contains("math.exp2"), "{ttir}");
     assert!(
         ttir.rfind("arith.addf").unwrap() > ttir.find("tt.dot").unwrap(),
         "bias must be added after the contraction: {ttir}"
@@ -110,6 +112,29 @@ fn nvfp4_linear_decodes_compact_tiles_inside_one_verified_kernel() {
 }
 
 #[test]
+fn nvfp4_decode_linear_uses_compact_gemv_without_dead_matrix_rows() {
+    let config = NvFp4LinearConfig {
+        dtype: DType::Bf16,
+        rows: 1,
+        outputs: 201_088,
+        inputs: 2_880,
+        block_m: 16,
+        block_n: 64,
+        block_k: 128,
+        has_bias: false,
+    };
+    assert_eq!(config.launch_grid().unwrap(), [3_142, 1, 1]);
+    let ttir = build_nvfp4_linear(config).unwrap();
+    let ttir = ttir.text();
+    assert!(ttir.contains("@nvfp4_linear_gemv"), "{ttir}");
+    assert!(ttir.contains("tt.reduce"), "{ttir}");
+    assert!(ttir.contains("tt.bitcast"), "{ttir}");
+    assert!(ttir.contains("tt.reshape"), "{ttir}");
+    assert!(!ttir.contains("tt.dot"), "{ttir}");
+    assert!(!ttir.contains("math.exp2"), "{ttir}");
+}
+
+#[test]
 fn nvfp4_embedding_decodes_only_selected_compact_rows() {
     for index_dtype in [DType::I32, DType::I64] {
         let config = NvFp4EmbeddingConfig {
@@ -128,13 +153,15 @@ fn nvfp4_embedding_decodes_only_selected_compact_rows() {
             "@nvfp4_embedding",
             "arith.shrui",
             "arith.andi",
-            "math.exp2",
+            "tt.bitcast",
+            "tt.reshape",
             "tt.load",
             "tt.store",
         ] {
             assert!(ttir.contains(operation), "missing {operation}:\n{ttir}");
         }
         assert!(!ttir.contains("tt.dot"), "{ttir}");
+        assert!(!ttir.contains("math.exp2"), "{ttir}");
     }
 }
 
@@ -143,25 +170,33 @@ fn nvfp4_grouped_experts_keep_routing_and_decode_inside_verified_kernels() {
     for dtype in [DType::F16, DType::Bf16] {
         let gate_up = build_nvfp4_grouped_projection(NvFp4GroupedProjectionConfig {
             dtype,
+            tokens: 16,
             assignments: 32,
             input_size: 64,
-            output_size: 128,
+            output_size: 64,
             local_experts: 4,
             source_row_divisor: 2,
             block_m: 16,
             block_n: 32,
             block_k: 32,
-            role: NvFp4GroupedRole::GateUp,
+            role: NvFp4GroupedRole::GateUpActivated,
         })
         .unwrap();
         let gate_up = gate_up.text();
         assert!(gate_up.contains("@nvfp4_grouped_gate_up"), "{gate_up}");
         assert!(gate_up.contains("arith.shrui"), "{gate_up}");
         assert!(gate_up.contains("math.exp2"), "{gate_up}");
-        assert_eq!(gate_up.matches("tt.dot").count(), 1, "{gate_up}");
+        assert!(gate_up.contains("scf.if"), "{gate_up}");
+        assert_eq!(gate_up.matches("tt.dot").count(), 2, "{gate_up}");
+        assert_eq!(gate_up.matches("math.exp2").count(), 1, "{gate_up}");
+        assert!(
+            gate_up.matches("arith.minnumf").count() >= 2,
+            "clamped SwiGLU must be applied in the gate/up epilogue: {gate_up}"
+        );
 
         let down = build_nvfp4_grouped_projection(NvFp4GroupedProjectionConfig {
             dtype,
+            tokens: 16,
             assignments: 32,
             input_size: 64,
             output_size: 64,
@@ -170,18 +205,64 @@ fn nvfp4_grouped_experts_keep_routing_and_decode_inside_verified_kernels() {
             block_m: 16,
             block_n: 32,
             block_k: 32,
-            role: NvFp4GroupedRole::ClampedSwiGluDown,
+            role: NvFp4GroupedRole::Down,
         })
         .unwrap();
         let down = down.text();
         assert!(down.contains("@nvfp4_grouped_down"), "{down}");
         assert!(down.contains("arith.shrui"), "{down}");
-        assert!(down.contains("math.exp2"), "{down}");
+        assert!(!down.contains("math.exp2"), "{down}");
+        assert!(down.contains("scf.if"), "{down}");
         assert_eq!(down.matches("tt.dot").count(), 1, "{down}");
         assert!(
-            down.matches("arith.minnumf").count() >= 2,
-            "clamped SwiGLU activation must remain in the down kernel: {down}"
+            down.matches("arith.minnumf").count() < 2,
+            "down must consume the already-activated intermediate: {down}"
         );
+    }
+}
+
+#[test]
+fn nvfp4_decode_experts_use_selected_expert_gemv_kernels() {
+    for dtype in [DType::F16, DType::Bf16] {
+        let gate_up = build_nvfp4_grouped_projection(NvFp4GroupedProjectionConfig {
+            dtype,
+            tokens: 1,
+            assignments: 4,
+            input_size: 64,
+            output_size: 64,
+            local_experts: 4,
+            source_row_divisor: 4,
+            block_m: 16,
+            block_n: 32,
+            block_k: 32,
+            role: NvFp4GroupedRole::GateUpActivated,
+        })
+        .unwrap();
+        let gate_up = gate_up.text();
+        assert!(gate_up.contains("@nvfp4_grouped_gate_up_gemv"), "{gate_up}");
+        assert_eq!(gate_up.matches(" = \"tt.reduce\"").count(), 2, "{gate_up}");
+        assert_eq!(gate_up.matches("math.exp2").count(), 1, "{gate_up}");
+        assert!(!gate_up.contains("tt.dot"), "{gate_up}");
+
+        let down = build_nvfp4_grouped_projection(NvFp4GroupedProjectionConfig {
+            dtype,
+            tokens: 1,
+            assignments: 4,
+            input_size: 64,
+            output_size: 64,
+            local_experts: 4,
+            source_row_divisor: 1,
+            block_m: 16,
+            block_n: 32,
+            block_k: 32,
+            role: NvFp4GroupedRole::Down,
+        })
+        .unwrap();
+        let down = down.text();
+        assert!(down.contains("@nvfp4_grouped_down_gemv"), "{down}");
+        assert_eq!(down.matches(" = \"tt.reduce\"").count(), 2, "{down}");
+        assert!(!down.contains("math.exp2"), "{down}");
+        assert!(!down.contains("tt.dot"), "{down}");
     }
 }
 
@@ -218,70 +299,67 @@ fn microscaling_dot_surface_is_typed_and_verified_by_the_pinned_dialect() {
 #[test]
 fn grouped_expert_projections_are_verified_ttir() {
     for dtype in [DType::F16, DType::Bf16, DType::F32] {
-        let gate_up = build_grouped_projection(GroupedProjectionConfig {
-            dtype,
-            assignments: 32,
-            input_size: 64,
-            output_size: 128,
-            local_experts: 4,
-            source_row_divisor: 2,
-            block_m: 16,
-            block_n: 32,
-            block_k: 32,
-            gated_activation: None,
-            multiply_routing_weight: false,
-        })
-        .unwrap();
-        let gate_up = gate_up.text();
-        assert!(
-            gate_up.contains("tt.func public @moe_grouped_gate_up"),
-            "{gate_up}"
-        );
-        assert!(gate_up.contains("tt.dot"), "{gate_up}");
-        assert!(gate_up.contains("scf.for"), "{gate_up}");
-        assert_eq!(
-            gate_up.matches("tt.dot").count(),
-            1,
-            "the K dimension must not be statically unrolled: {gate_up}"
-        );
-        assert!(gate_up.contains("tt.load"), "{gate_up}");
-        assert!(gate_up.contains("tt.store"), "{gate_up}");
-        assert!(gate_up.contains("arith.maxsi"), "{gate_up}");
-        assert!(
-            gate_up.matches("arith.minsi").count() >= 2,
-            "assignment and expert addresses must both be clamped: {gate_up}"
-        );
-
         for activation in [
             GatedActivation::Silu,
             GatedActivation::Gelu,
             GatedActivation::Relu,
         ] {
-            let down = build_grouped_projection(GroupedProjectionConfig {
+            let gate_up = build_grouped_projection(GroupedProjectionConfig {
                 dtype,
                 assignments: 32,
                 input_size: 64,
                 output_size: 64,
                 local_experts: 4,
-                source_row_divisor: 1,
+                source_row_divisor: 2,
                 block_m: 16,
                 block_n: 32,
                 block_k: 32,
                 gated_activation: Some(activation),
-                multiply_routing_weight: true,
+                multiply_routing_weight: false,
             })
             .unwrap();
-            let down = down.text();
-            assert!(down.contains("tt.func public @moe_grouped_down"), "{down}");
-            assert!(down.contains("arith.mulf"), "{down}");
+            let gate_up = gate_up.text();
+            assert!(
+                gate_up.contains("tt.func public @moe_grouped_gate_up"),
+                "{gate_up}"
+            );
+            assert!(gate_up.contains("scf.for"), "{gate_up}");
+            assert!(gate_up.contains("scf.if"), "{gate_up}");
+            assert_eq!(gate_up.matches("tt.dot").count(), 2, "{gate_up}");
+            assert!(gate_up.contains("tt.load"), "{gate_up}");
+            assert!(gate_up.contains("tt.store"), "{gate_up}");
+            assert!(
+                gate_up.find("scf.if") < gate_up.find("scf.for"),
+                "inactive and non-local blocks must branch before contraction: {gate_up}"
+            );
             if activation == GatedActivation::Gelu {
-                assert!(down.contains("math.exp2"), "{down}");
+                assert!(gate_up.contains("math.exp2"), "{gate_up}");
                 assert!(
-                    !down.contains("math.tanh"),
-                    "XLA's retained Triton pipeline cannot legalize math.tanh: {down}"
+                    !gate_up.contains("math.tanh"),
+                    "XLA's retained Triton pipeline cannot legalize math.tanh: {gate_up}"
                 );
             }
         }
+
+        let down = build_grouped_projection(GroupedProjectionConfig {
+            dtype,
+            assignments: 32,
+            input_size: 64,
+            output_size: 64,
+            local_experts: 4,
+            source_row_divisor: 1,
+            block_m: 16,
+            block_n: 32,
+            block_k: 32,
+            gated_activation: None,
+            multiply_routing_weight: true,
+        })
+        .unwrap();
+        let down = down.text();
+        assert!(down.contains("tt.func public @moe_grouped_down"), "{down}");
+        assert_eq!(down.matches("tt.dot").count(), 1, "{down}");
+        assert!(!down.contains("math.exp2"), "{down}");
+        assert!(down.contains("arith.mulf"), "{down}");
     }
 
     assert!(
@@ -327,6 +405,18 @@ fn invalid_kernel_contracts_fail_before_mlir() {
     assert!(matches!(
         second.add(&local, &foreign),
         Err(Error::ForeignValue)
+    ));
+
+    let integer_tensor = second.full_integer(&[16], 0, DType::I32).unwrap();
+    assert!(matches!(
+        second.bitcast(&integer_tensor, DType::F16),
+        Err(Error::TypeMismatch { operation: "bitcast" })
+    ));
+    assert!(matches!(
+        second.reshape(&integer_tensor, &[2, 4]),
+        Err(Error::TypeMismatch {
+            operation: "reshape"
+        })
     ));
 }
 
@@ -625,6 +715,9 @@ fn tensor_pointer_and_shape_operations_verify_as_ttir() {
     let offsets = builder.range(0, 16).unwrap();
     let columns = builder.expand_dimension(&offsets, 1).unwrap();
     let _tile = builder.broadcast(&columns, &[16, 16]).unwrap();
+    let integer_bits = builder.full_integer(&[16], 0, DType::I32).unwrap();
+    let reinterpreted = builder.bitcast(&integer_bits, DType::F32).unwrap();
+    let _regrouped = builder.reshape(&reinterpreted, &[4, 4]).unwrap();
     let input_addresses = builder.add_pointer(&input, &offsets).unwrap();
     let output_addresses = builder.add_pointer(&output, &offsets).unwrap();
     let values = builder.load(&input_addresses).unwrap();
@@ -707,6 +800,8 @@ fn tensor_pointer_and_shape_operations_verify_as_ttir() {
     assert!(ttir.contains("tt.make_range"), "{ttir}");
     assert!(ttir.contains("tt.expand_dims"), "{ttir}");
     assert!(ttir.contains("tt.broadcast"), "{ttir}");
+    assert!(ttir.contains("tt.reshape"), "{ttir}");
+    assert!(ttir.contains("tt.bitcast"), "{ttir}");
     assert!(ttir.contains("arith.cmpf"), "{ttir}");
     assert!(ttir.contains("math.exp2"), "{ttir}");
     assert!(ttir.contains("math.log2"), "{ttir}");
@@ -801,6 +896,13 @@ fn cuda_attention_launch_policy_is_geometry_only() {
     assert!(matches!(
         select_attention_launch(non_power_of_two_page).unwrap(),
         AttentionLaunch::SplitK { tile_size: 32, .. }
+    ));
+
+    let mut wide_page = geometry(true, 4);
+    wide_page.page_size = 256;
+    assert!(matches!(
+        select_attention_launch(wide_page).unwrap(),
+        AttentionLaunch::SplitK { tile_size: 64, .. }
     ));
 }
 

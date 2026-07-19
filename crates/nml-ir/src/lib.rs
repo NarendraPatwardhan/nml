@@ -63,6 +63,7 @@ pub struct RandomState {
 struct MoeAssignmentPlan {
     sorted_assignments: Tensor,
     block_experts: Tensor,
+    active_blocks: Tensor,
     block_size: usize,
 }
 
@@ -1399,6 +1400,7 @@ impl ProgramBuilder {
                     down_bias: down_bias.value,
                     sorted_assignments: assignment_plan.sorted_assignments.value,
                     block_experts: assignment_plan.block_experts.value,
+                    active_blocks: assignment_plan.active_blocks.value,
                     block_size: assignment_plan.block_size,
                     result: result.value,
                 });
@@ -5016,6 +5018,7 @@ impl ProgramBuilder {
             down_weights: down_weights.value,
             sorted_assignments: assignment_plan.sorted_assignments.value,
             block_experts: assignment_plan.block_experts.value,
+            active_blocks: assignment_plan.active_blocks.value,
             portable_output: portable_output.value,
             result: result.value,
             activation,
@@ -5044,10 +5047,19 @@ impl ProgramBuilder {
             .ok()
             .filter(|value| *value > 0)
             .ok_or(Error::InvalidMoe("expert block size must be positive"))?;
-        let max_blocks = assignments
+        // If `a` assignments reach `e` non-empty experts, block alignment can
+        // add at most `e * (block_size - 1)` positions. Bound capacity by the
+        // number of experts that can actually be non-empty rather than by the
+        // complete expert set. Capacity is storage, not executable work; the
+        // runtime `active_blocks` scalar below carries the latter.
+        let maximum_nonempty_experts = assignments.min(expert_count);
+        let maximum_padded_positions = maximum_nonempty_experts
+            .checked_mul(block_size_i64 - 1)
+            .and_then(|padding| assignments.checked_add(padding))
+            .ok_or(Error::InvalidMoe("padded assignment schedule is too large"))?;
+        let max_blocks = maximum_padded_positions
             .checked_add(block_size_i64 - 1)
             .and_then(|value| value.checked_div(block_size_i64))
-            .and_then(|value| value.checked_add(expert_count))
             .ok_or(Error::InvalidMoe("padded assignment schedule is too large"))?;
         let max_positions = max_blocks
             .checked_mul(block_size_i64)
@@ -5063,10 +5075,39 @@ impl ProgramBuilder {
 
         let flat_ids = self.reshape(expert_ids, Shape::new(DType::I32, &[assignments])?)?;
         let assignment_ids = self.iota(Shape::new(DType::I32, &[assignments])?, 0)?;
-        let block_slots = self.iota(Shape::new(DType::I32, &[max_blocks])?, 0)?;
         let sentinel = self.scalar(i32::try_from(assignments).map_err(|_| {
             Error::InvalidMoe("assignment count must fit the I32 routing contract")
         })?)?;
+
+        // Decode and other very sparse shapes do not need global expert
+        // alignment. Give every route one block directly: the first lane is
+        // the assignment and all remaining lanes are sentinels. This preserves
+        // top-k order and makes launch capacity exactly proportional to the
+        // selected routes. The factor is the same conservative crossover used
+        // by the referenced ZML schedule.
+        if assignments
+            .checked_mul(4)
+            .is_some_and(|scaled| scaled <= expert_count)
+        {
+            let sorted_assignments = self.pad(
+                assignment_ids,
+                sentinel,
+                &[0],
+                &[block_size_i64 - 1],
+                &[block_size_i64 - 1],
+            )?;
+            let active_blocks = self.scalar(i32::try_from(assignments).map_err(|_| {
+                Error::InvalidMoe("active expert block count must fit I32")
+            })?)?;
+            return Ok(MoeAssignmentPlan {
+                sorted_assignments,
+                block_experts: flat_ids,
+                active_blocks,
+                block_size,
+            });
+        }
+
+        let block_slots = self.iota(Shape::new(DType::I32, &[max_blocks])?, 0)?;
         let mut sorted_assignments =
             self.broadcast_in_dim(sentinel, Shape::new(DType::I32, &[max_positions])?, &[])?;
         let invalid_expert = self.scalar(-1_i32)?;
@@ -5114,9 +5155,12 @@ impl ProgramBuilder {
             padded_prefix = self.add(padded_prefix, padded)?;
         }
 
+        let active_blocks = self.divide(padded_prefix, block)?;
+
         Ok(MoeAssignmentPlan {
             sorted_assignments,
             block_experts,
+            active_blocks,
             block_size,
         })
     }
@@ -5961,6 +6005,7 @@ impl Program {
                 down_bias,
                 sorted_assignments,
                 block_experts,
+                active_blocks,
                 block_size,
                 result,
             } = operation
@@ -5979,6 +6024,7 @@ impl Program {
                         mlir_value(&values, *down_bias),
                         mlir_value(&values, *sorted_assignments),
                         mlir_value(&values, *block_experts),
+                        mlir_value(&values, *active_blocks),
                     ];
                     let shapes = [
                         self.values[*hidden].shape,
@@ -5993,6 +6039,7 @@ impl Program {
                         self.values[*down_bias].shape,
                         self.values[*sorted_assignments].shape,
                         self.values[*block_experts].shape,
+                        self.values[*active_blocks].shape,
                     ];
                     let lowered = match shapes[2].partitions()[0] {
                         Partition::Sharded(expert_axis) => lower_expert_parallel(
@@ -6048,7 +6095,7 @@ impl Program {
                 // deterministic padded schedule is retained in the semantic
                 // operation for CUDA grouped lowering and deliberately does
                 // not become a second public routing API.
-                let _ = (sorted_assignments, block_experts);
+                let _ = (sorted_assignments, block_experts, active_blocks);
                 let call = context.ffi_custom_call(
                     "nml.nvfp4.routed_swiglu",
                     &[
@@ -6181,6 +6228,7 @@ impl Program {
                 down_weights,
                 sorted_assignments,
                 block_experts,
+                active_blocks,
                 portable_output,
                 result,
                 activation,
@@ -6208,6 +6256,7 @@ impl Program {
                                     mlir_value(&values, *down_weights),
                                     mlir_value(&values, *sorted_assignments),
                                     mlir_value(&values, *block_experts),
+                                    mlir_value(&values, *active_blocks),
                                 ],
                                 [
                                     self.values[*hidden].shape,
@@ -6216,6 +6265,7 @@ impl Program {
                                     self.values[*down_weights].shape,
                                     self.values[*sorted_assignments].shape,
                                     self.values[*block_experts].shape,
+                                    self.values[*active_blocks].shape,
                                 ],
                                 types[*result],
                                 self.values[*result].shape,
@@ -6235,6 +6285,7 @@ impl Program {
                                     down_weights: mlir_value(&values, *down_weights),
                                     sorted_assignments: mlir_value(&values, *sorted_assignments),
                                     block_experts: mlir_value(&values, *block_experts),
+                                    active_blocks: mlir_value(&values, *active_blocks),
                                     expert_offset: None,
                                     hidden_shape: self.values[*hidden].shape,
                                     gate_up_shape: self.values[*gate_up_weights].shape,
@@ -7343,6 +7394,7 @@ enum Operation {
         down_bias: usize,
         sorted_assignments: usize,
         block_experts: usize,
+        active_blocks: usize,
         block_size: usize,
         result: usize,
     },
@@ -7576,6 +7628,7 @@ enum Operation {
         down_weights: usize,
         sorted_assignments: usize,
         block_experts: usize,
+        active_blocks: usize,
         portable_output: usize,
         result: usize,
         activation: MoeActivation,
@@ -8689,8 +8742,8 @@ fn lower_expert_parallel_moe<'context>(
     context: &'context Context,
     block: &mut Block<'context>,
     sharding: &Sharding,
-    inputs: [MlirValue<'context>; 6],
-    shapes: [Shape; 6],
+    inputs: [MlirValue<'context>; 7],
+    shapes: [Shape; 7],
     result_type: MlirType<'context>,
     result_shape: Shape,
     expert_axis: AxisTag,
@@ -8721,6 +8774,7 @@ fn lower_expert_parallel_moe<'context>(
                     down_weights: local_inputs[3],
                     sorted_assignments: local_inputs[4],
                     block_experts: local_inputs[5],
+                    active_blocks: local_inputs[6],
                     expert_offset: Some(expert_offset),
                     hidden_shape: local_shapes[0],
                     gate_up_shape: local_shapes[2],
@@ -9172,8 +9226,8 @@ fn nvfp4_expert_inputs<'context>(
     block_size: usize,
     expert_offset: Option<MlirValue<'context>>,
 ) -> nvfp4_backend::ExpertInputs<'context> {
-    debug_assert_eq!(operands.len(), 12);
-    debug_assert_eq!(shapes.len(), 12);
+    debug_assert_eq!(operands.len(), 13);
+    debug_assert_eq!(shapes.len(), 13);
     nvfp4_backend::ExpertInputs {
         hidden: operands[0],
         routing_weights: operands[1],
@@ -9187,6 +9241,7 @@ fn nvfp4_expert_inputs<'context>(
         down_bias: operands[9],
         sorted_assignments: operands[10],
         block_experts: operands[11],
+        active_blocks: operands[12],
         expert_offset,
         hidden_shape: shapes[0],
         routing_shape: shapes[1],

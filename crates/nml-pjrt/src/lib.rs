@@ -1567,10 +1567,13 @@ impl Client {
         self.state.plugin.into_result(error)?;
         let inner = NonNull::new(args.executable)
             .ok_or(Error::NullResult("PJRT_Client_Compile executable"))?;
-        Ok(LoadedExecutable {
+        let mut loaded = LoadedExecutable {
             client: self.clone(),
             inner,
-        })
+            output_count: 0,
+        };
+        loaded.output_count = loaded.executable()?.output_count()?;
+        Ok(loaded)
     }
 
     fn require_own_device(&self, device: &Device) -> Result<(), Error> {
@@ -2327,6 +2330,10 @@ impl Drop for Executable {
 pub struct LoadedExecutable {
     client: Client,
     inner: NonNull<sys::PJRT_LoadedExecutable>,
+    // Output arity is immutable for a compiled executable. Resolve it once at
+    // construction instead of acquiring and destroying a PJRT_Executable
+    // metadata handle on every latency-sensitive enqueue.
+    output_count: usize,
 }
 
 impl LoadedExecutable {
@@ -2441,7 +2448,7 @@ impl LoadedExecutable {
                 return Err(Error::ForeignClientObject("buffer"));
             }
         }
-        let output_count = self.executable()?.output_count()?;
+        let output_count = self.output_count;
         let argument_pointers = inputs
             .iter()
             .map(|arguments| {

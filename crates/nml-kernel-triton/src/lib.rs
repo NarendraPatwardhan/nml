@@ -610,6 +610,50 @@ impl Builder {
         )
     }
 
+    /// Changes only a tensor's static dimension grouping.
+    ///
+    /// Compact kernels use this to load one physical scale per representation
+    /// block and broadcast that value across its sixteen logical lanes. The
+    /// element count is checked here; callers cannot use reshape as an
+    /// indexing or storage-layout escape hatch.
+    pub fn reshape(&mut self, value: &Value, shape: &[i64]) -> Result<Value, Error> {
+        self.require_values(&[value])?;
+        validate_shape(shape)?;
+        let ValueType::Tensor {
+            shape: source,
+            element,
+            pointer_address_space: None,
+        } = &value.value_type
+        else {
+            return Err(Error::ExpectedTensor);
+        };
+        let source_elements = element_count(source).ok_or(Error::TypeMismatch {
+            operation: "reshape",
+        })?;
+        let result_elements = element_count(shape).ok_or(Error::TypeMismatch {
+            operation: "reshape",
+        })?;
+        if source_elements != result_elements {
+            return Err(Error::TypeMismatch {
+                operation: "reshape",
+            });
+        }
+        let result = ValueType::Tensor {
+            shape: shape.to_vec(),
+            element: *element,
+            pointer_address_space: None,
+        };
+        self.emit_value(
+            result.clone(),
+            format!(
+                "\"tt.reshape\"({}) : ({}) -> {}",
+                value.id,
+                value.value_type.spelling(),
+                result.spelling()
+            ),
+        )
+    }
+
     pub fn integer(&mut self, value: i64, dtype: DType) -> Result<Value, Error> {
         if dtype.is_float() {
             return Err(Error::TypeMismatch {
@@ -745,6 +789,44 @@ impl Builder {
             result.clone(),
             format!(
                 "arith.{operation} {} : {} to {}",
+                value.id,
+                value.value_type.spelling(),
+                result.spelling()
+            ),
+        )
+    }
+
+    /// Reinterprets equal-width scalar or tensor elements without conversion.
+    ///
+    /// This is deliberately narrower than `cast`: pointers are never admitted
+    /// and the source and destination widths must match. NVFP4 scale decoding
+    /// uses it to construct exact IEEE F32 values from integer exponent and
+    /// mantissa fields without transcendental arithmetic.
+    pub fn bitcast(&mut self, value: &Value, dtype: DType) -> Result<Value, Error> {
+        self.require_values(&[value])?;
+        let source = value.value_type.element();
+        if source == dtype {
+            return Ok(value.clone());
+        }
+        if source.bit_width() != dtype.bit_width()
+            || matches!(value.value_type, ValueType::Pointer { .. })
+            || matches!(
+                value.value_type,
+                ValueType::Tensor {
+                    pointer_address_space: Some(_),
+                    ..
+                }
+            )
+        {
+            return Err(Error::TypeMismatch {
+                operation: "bitcast",
+            });
+        }
+        let result = value.value_type.with_element(dtype)?;
+        self.emit_value(
+            result.clone(),
+            format!(
+                "\"tt.bitcast\"({}) : ({}) -> {}",
                 value.id,
                 value.value_type.spelling(),
                 result.spelling()
@@ -1795,6 +1877,12 @@ fn validate_shape(shape: &[i64]) -> Result<(), Error> {
     } else {
         Ok(())
     }
+}
+
+fn element_count(shape: &[i64]) -> Option<i64> {
+    shape
+        .iter()
+        .try_fold(1_i64, |product, dimension| product.checked_mul(*dimension))
 }
 
 fn same_types(left: &[Value], right: &[Value]) -> bool {

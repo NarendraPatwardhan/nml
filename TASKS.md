@@ -59,6 +59,11 @@ persistent dense weight expansion.
 - [x] Select and hash one exact GPT-OSS 20B artifact with conversion provenance,
   configuration, tokenizer, tensor inventory, physical component inventory,
   and recipe identity.
+- [x] Move the full 11.8 GB content hash to canonical artifact ingestion. The
+  materializer authenticates the pinned manifest, hashes every declared file,
+  makes the result read-only, and atomically issues an exact filesystem-identity
+  receipt. Product startup hashes only the bounded manifest and hard-fails a
+  missing or stale receipt; it never silently repeats the payload scan.
 - [x] Define NVFP4 recipe v1: packed E2M1 payload, E4M3FN block scales, F32
   global scale, block geometry, padding, logical shape, and component sharding.
 - [x] Replace dense-only weight handling with one closed `Parameter` /
@@ -123,16 +128,75 @@ persistent dense weight expansion.
   CPU execution.
 - [x] Build the complete CUDA product binaries and GPU-independent CUDA
   contracts from the final source tree through BuildBuddy.
-- [ ] Run the full immutable checkpoint on a suitable non-Blackwell CUDA device.
-  Record artifact bytes, host peak, compact resident bytes, cache/workspace,
-  compilation per component family, first execution, prefill, steady decode,
-  selected kernels, generated token IDs, Harmony events, and confirmed Pod
-  cleanup.
+- [x] Run the full immutable checkpoint on a suitable non-Blackwell CUDA
+  device. The initial A40 baseline generated 320 tokens through all 24 layers
+  and reported 7.7 steady decode tokens/s; that run exposed the sparse-MoE and
+  attention-page performance defects below rather than closing performance.
 - [ ] Pin an independent generation fixture and require it in the distinct
   acceptance target. The readable-generation target may not masquerade as
   independent acceptance.
 - [ ] Publish and run one immutable product/device-contract OCI digest carrying
   the accepted source revision and exact runtime closure.
+
+### Full-model performance correction
+
+- [x] Move clamped residual SwiGLU to the gate/up epilogue for both dense and
+  NVFP4 expert lowering. Gate/up now writes only
+  `[assignments, intermediate]`; down consumes that activated tensor and owns
+  no activation transcendental. Non-local partitions write zero only for live
+  assignments, while inactive capacity blocks perform no stores or weight
+  work.
+- [x] Replace dynamic E2M1/E4M3FN exponentiation with exact integer/bitcast
+  decoding. Load each block scale once for its complete 16-value
+  representation block and structurally reject quant-decode `math.exp2`.
+- [x] Add dedicated compact `M = 1` GEMV families for ordinary linears,
+  paired gate/up plus activation, and routed down on SM75 and SM80+. Decode
+  kernels use F32 reductions and no dead-row `tt.dot`; prefill retains the
+  tensor-core matrix family.
+- [x] Extend the independent CPU oracle across deterministic randomized expert
+  shapes, odd widths, empty experts, uneven routes, bias/route order, and
+  one-token decode. Generated-TTIR and IR contracts pin the same boundary.
+
+- [x] Make MoE schedule capacity proportional to the number of experts that can
+  actually be non-empty, and use ZML's direct sparse assignment crossover for
+  decode-shaped route sets.
+- [x] Carry an explicit active-block scalar through dense/NVFP4 and
+  expert-parallel grouped lowering. Inactive and non-local Triton programs now
+  branch before every weight address, scale decode, and contraction; SM75
+  custom calls return before fragment or weight work.
+- [x] Select the finite decode/small/large grouped-NVFP4 tile families from
+  token geometry and named CUDA capabilities instead of retaining the generic
+  32x32 contraction tile for GPT-OSS decode.
+- [x] Replace the product's 256-token cache pages with 16-token pages and
+  independently cap framework decode attention tiles at 64 tokens. This
+  removes the geometry that produced roughly 12 KiB of register spills in each
+  A40 split-K attention producer.
+- [x] Resolve PJRT loaded-executable output arity once at compilation, retain
+  executable input indices and output names, and stop repeating immutable
+  metadata work at every component enqueue.
+- [x] Replace the product's implicit greedy head with request-owned,
+  explicit-state top-k/temperature/top-p/min-p sampling. Greedy remains the
+  explicit `top_k = 1` mode.
+- [x] Report non-synchronizing host submission time separately for embedding,
+  sliding layers, full layers, and the head in prefill, first decode, and
+  steady decode phases.
+- [x] Pass the complete BuildBuddy CPU and CUDA build/test envelopes for the
+  final corrected source tree. Focused artifact, CPU-NVFP4, TTIR, IR, and
+  product contracts pass in invocation
+  `4ed47218-5dcf-43d3-b86d-b433d23f3166`; the complete CPU suite passes in
+  `55b69599-5499-49f9-8ac0-c894bc2d835a`, the GPU-independent CUDA suite in
+  `613a8006-71a4-4f58-8bcf-55fc7f7d6f53`, the complete CUDA binary closure in
+  `b5552060-f990-4070-9af6-4da37d7bcba9`, and CUDA packaging in
+  `259a3cb4-8d7b-4c50-a769-8c43ac8e97ba`. The corrected CUDA serve OCI image
+  constructs in `64b7b6b6-9ced-4360-93be-9d8d6ac11436`. None is presented as
+  NVIDIA runtime evidence.
+- [ ] Publish the corrected OCI digest and rerun both explicit-greedy throughput
+  and fixed-seed stochastic generation on A40. Retain token/Harmony output,
+  component submission timings, compiler spill diagnostics, useful compact
+  bandwidth, prefill non-regression, steady token rate, image/model identities,
+  and confirmed Pod cleanup. Run the complete deterministic compact-operation
+  corpus first in the same Pod/image; a reduced local SM75 benchmark is not
+  evidence for the SM86 Triton implementation.
 
 ## Next milestone: continuous batching and shared paged state
 
@@ -213,7 +277,8 @@ non-streaming GPT-OSS requests with deterministic lifecycle behavior.
   SM80+ operation paths.
 - [x] GPT-OSS configuration, complete checkpoint declaration, Harmony, and
   reusable component graph/execution architecture.
-- [ ] Full-checkpoint GPT-OSS text generation accepted on real CUDA hardware.
+- [x] Full-checkpoint GPT-OSS text generation executes on real CUDA hardware;
+  the distinct independent-fixture acceptance gate remains open above.
 - [ ] Continuous batching, shared page arena, and prefix caching.
 - [ ] Real multi-GPU CUDA Shardy execution and collectives.
 - [ ] Bounded network serving lifecycle.

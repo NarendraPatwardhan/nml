@@ -1,4 +1,6 @@
-use nml_serve::{CompilationProfile, Event, GenerationOptions, Timings};
+use nml_serve::{
+    CompilationProfile, Event, GenerationOptions, SamplingOptions, SubmissionTimings, Timings,
+};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -37,6 +39,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             prompt: cli.prompt,
             max_new_tokens: cli.max_new_tokens,
             cache_capacity: Some(cli.cache_capacity),
+            sampling: cli.sampling,
         },
         |event| -> std::io::Result<()> {
             match event {
@@ -105,6 +108,19 @@ fn print_timings(timings: &Timings) {
     ] {
         eprintln!("serve: {name:>24}: {:9.3} ms", duration.as_secs_f64() * 1e3);
     }
+    print_submission("prefill submission", timings.prefill_submission);
+    print_submission("first decode submission", timings.first_decode_submission);
+    print_submission("steady decode submission", timings.steady_decode_submission);
+}
+
+fn print_submission(name: &str, timings: SubmissionTimings) {
+    eprintln!(
+        "serve: {name:>24}: embedding={:.3} ms sliding={:.3} ms full={:.3} ms head={:.3} ms",
+        timings.embedding.as_secs_f64() * 1e3,
+        timings.sliding_layers.as_secs_f64() * 1e3,
+        timings.full_layers.as_secs_f64() * 1e3,
+        timings.head.as_secs_f64() * 1e3,
+    );
 }
 
 struct Cli {
@@ -113,6 +129,7 @@ struct Cli {
     max_new_tokens: usize,
     prefill_capacity: usize,
     cache_capacity: usize,
+    sampling: SamplingOptions,
     backend: Backend,
 }
 
@@ -134,6 +151,7 @@ impl Cli {
         let mut max_new_tokens = 32usize;
         let mut prefill_capacity = None;
         let mut cache_capacity = None;
+        let mut sampling = SamplingOptions::default();
         let mut backend = Backend::Cpu;
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
@@ -157,6 +175,24 @@ impl Cli {
                         "--cache-capacity",
                     )?);
                 }
+                "--seed" => {
+                    let seed = parse_u64(&value(&mut arguments, "--seed")?, "--seed")?;
+                    sampling.seed = [seed, seed ^ 0x9e37_79b9_7f4a_7c15];
+                }
+                "--temperature" => {
+                    sampling.temperature =
+                        parse_f32(&value(&mut arguments, "--temperature")?, "--temperature")?;
+                }
+                "--top-k" => {
+                    sampling.top_k =
+                        parse_usize(&value(&mut arguments, "--top-k")?, "--top-k")?;
+                }
+                "--top-p" => {
+                    sampling.top_p = parse_f32(&value(&mut arguments, "--top-p")?, "--top-p")?;
+                }
+                "--min-p" => {
+                    sampling.min_p = parse_f32(&value(&mut arguments, "--min-p")?, "--min-p")?;
+                }
                 "--backend" => {
                     backend = match value(&mut arguments, "--backend")?.as_str() {
                         "cpu" => Backend::Cpu,
@@ -176,6 +212,7 @@ impl Cli {
                 .ok_or_else(|| format!("--prefill-capacity is required\n{}", usage()))?,
             cache_capacity: cache_capacity
                 .ok_or_else(|| format!("--cache-capacity is required\n{}", usage()))?,
+            sampling,
             backend,
         }))
     }
@@ -193,6 +230,18 @@ fn parse_usize(value: &str, option: &str) -> Result<usize, String> {
         .map_err(|_| format!("{option} requires a nonnegative integer, received {value:?}"))
 }
 
+fn parse_u64(value: &str, option: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("{option} requires an unsigned integer, received {value:?}"))
+}
+
+fn parse_f32(value: &str, option: &str) -> Result<f32, String> {
+    value
+        .parse::<f32>()
+        .map_err(|_| format!("{option} requires a floating-point value, received {value:?}"))
+}
+
 fn usage() -> &'static str {
-    "usage: serve --model PATH --prompt TEXT --prefill-capacity N --cache-capacity N [--max-new-tokens N] [--backend cpu|cuda]"
+    "usage: serve --model PATH --prompt TEXT --prefill-capacity N --cache-capacity N [--max-new-tokens N] [--seed N] [--temperature F] [--top-k N] [--top-p F] [--min-p F] [--backend cpu|cuda]"
 }

@@ -1,0 +1,26 @@
+"""Hermetic artifact materialization and receipt tooling."""
+
+load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
+
+py_library(
+    name = "materialization_lib",
+    srcs = ["materialize.py"],
+    imports = ["."],
+    visibility = [":__pkg__"],
+)
+
+py_binary(
+    name = "materialize",
+    srcs = ["materialize.py"],
+    main = "materialize.py",
+    python_version = "3.12",
+    visibility = ["//visibility:public"],
+)
+
+py_test(
+    name = "materialization_contract_test",
+    srcs = ["materialize_test.py"],
+    main = "materialize_test.py",
+    deps = [":materialization_lib"],
+    python_version = "3.12",
+)

@@ -16,6 +16,34 @@ pub struct GenerationOptions {
     pub prompt: String,
     pub max_new_tokens: usize,
     pub cache_capacity: Option<usize>,
+    pub sampling: SamplingOptions,
+}
+
+/// Runtime sampling controls for one generation request.
+///
+/// The candidate capacity remains a bounded compiled product contract; these
+/// values select a deterministic distribution within it without compiling a
+/// new executable. `top_k = 1` is the explicit greedy mode rather than an
+/// implicit serving default.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SamplingOptions {
+    pub seed: [u64; 2],
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    pub min_p: f32,
+}
+
+impl Default for SamplingOptions {
+    fn default() -> Self {
+        Self {
+            seed: [0x4e4d_4c2d_4750_544f, 0x5353_2d32_3042_0001],
+            temperature: 1.0,
+            top_k: 50,
+            top_p: 1.0,
+            min_p: 0.0,
+        }
+    }
 }
 
 /// One bounded execution profile compiled before the model becomes resident.
@@ -52,6 +80,26 @@ pub struct Timings {
     pub first_decode_execution: Duration,
     pub steady_decode_execution: Duration,
     pub decode_download: Duration,
+    /// Host time spent binding and submitting component executables during
+    /// prefill. No device synchronization is introduced by these counters.
+    pub prefill_submission: SubmissionTimings,
+    /// Host submission time for the first decode step.
+    pub first_decode_submission: SubmissionTimings,
+    /// Aggregate host submission time for all later decode steps.
+    pub steady_decode_submission: SubmissionTimings,
+}
+
+/// Host-side cost of crossing the reusable executable boundaries.
+///
+/// Layer values are accumulated across model depth. They are intentionally not
+/// presented as GPU kernel timings because PJRT execution remains asynchronous
+/// until the generated-token buffer is awaited.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SubmissionTimings {
+    pub embedding: Duration,
+    pub sliding_layers: Duration,
+    pub full_layers: Duration,
+    pub head: Duration,
 }
 
 pub struct GenerationReport {
@@ -103,6 +151,7 @@ impl<'platform> Generator<'platform> {
             options.prompt,
             options.max_new_tokens,
             options.cache_capacity,
+            options.sampling,
             |event| {
                 if let Some(event) = map_harmony_event(event) {
                     emit(event).map_err(|error| Box::new(error) as Error)?;
@@ -168,6 +217,9 @@ fn timings(value: gpt_oss::ProductTimings) -> Timings {
         first_decode_execution: value.first_decode_execution,
         steady_decode_execution: value.steady_decode_execution,
         decode_download: value.decode_download,
+        prefill_submission: value.prefill_submission,
+        first_decode_submission: value.first_decode_submission,
+        steady_decode_submission: value.steady_decode_submission,
     }
 }
 

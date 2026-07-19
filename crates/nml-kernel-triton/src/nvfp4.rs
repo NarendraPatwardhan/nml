@@ -4,7 +4,7 @@
 //! scales share the N row, while the K tile is decoded directly into the
 //! tensor-core operand. Only the current tile exists at activation precision.
 
-use super::{ArgumentKind, Builder, Comparison, DType, Error, Kernel};
+use super::{ArgumentKind, Builder, Comparison, DType, Error, Kernel, Reduction, Value};
 
 const REPRESENTATION_BLOCK: i64 = 16;
 
@@ -22,13 +22,14 @@ pub struct NvFp4LinearConfig {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NvFp4GroupedRole {
-    GateUp,
-    ClampedSwiGluDown,
+    GateUpActivated,
+    Down,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NvFp4GroupedProjectionConfig {
     pub dtype: DType,
+    pub tokens: i64,
     pub assignments: i64,
     pub input_size: i64,
     pub output_size: i64,
@@ -74,6 +75,7 @@ impl NvFp4EmbeddingConfig {
             || !tiled(self.block_n)
             || self.block_m > 128
             || self.block_n > 128
+            || self.block_n % REPRESENTATION_BLOCK != 0
         {
             return Err(Error::InvalidKernelSpec(
                 "invalid compact embedding specialization",
@@ -88,6 +90,7 @@ impl NvFp4GroupedProjectionConfig {
         let tiled = |value: i64| value > 0 && (value as u64).is_power_of_two();
         let fits_i32 = |value: i64| value > 0 && i32::try_from(value).is_ok();
         if !matches!(self.dtype, DType::F16 | DType::Bf16)
+            || !fits_i32(self.tokens)
             || !fits_i32(self.assignments)
             || !fits_i32(self.input_size)
             || !fits_i32(self.output_size)
@@ -100,6 +103,19 @@ impl NvFp4GroupedProjectionConfig {
             || self.block_n > 128
             || self.block_k > 128
             || self.block_k % REPRESENTATION_BLOCK != 0
+            || match self.role {
+                NvFp4GroupedRole::GateUpActivated => {
+                    self.block_n % 8 != 0
+                        || self
+                            .tokens
+                            .checked_mul(self.source_row_divisor)
+                            != Some(self.assignments)
+                }
+                NvFp4GroupedRole::Down => {
+                    self.block_n % REPRESENTATION_BLOCK != 0
+                        || self.source_row_divisor != 1
+                }
+            }
             || self.input_size.checked_mul(self.output_size).is_none()
         {
             return Err(Error::InvalidKernelSpec(
@@ -144,6 +160,13 @@ impl NvFp4LinearConfig {
 
 pub fn build_nvfp4_linear(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
     config.validate()?;
+    if config.rows == 1 {
+        return build_nvfp4_linear_gemv(config);
+    }
+    build_nvfp4_linear_matrix(config)
+}
+
+fn build_nvfp4_linear_matrix(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
     let block_m = i32::try_from(config.block_m)
         .map_err(|_| Error::InvalidKernelSpec("NVFP4 M tile exceeds I32"))?;
     let block_n = i32::try_from(config.block_n)
@@ -185,6 +208,9 @@ pub fn build_nvfp4_linear(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
     let lower = builder.integer(0, DType::I32)?;
     let upper = builder.integer(config.inputs, DType::I32)?;
     let step = builder.integer(config.block_k, DType::I32)?;
+    // The representation carries one tensor-wide scale. Load it once per
+    // program rather than once per reduction tile.
+    let global = builder.load(&global_scale)?;
     let accumulator = builder.full_float(&[config.block_m, config.block_n], 0.0, DType::F32)?;
     let result = builder.for_loop(
         &lower,
@@ -226,17 +252,35 @@ pub fn build_nvfp4_linear(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
             let code = builder.bit_and(&code, &nibble_mask)?;
             let values = decode_e2m1(builder, &code)?;
 
-            let representation_block = builder.integer(REPRESENTATION_BLOCK, DType::I32)?;
-            let scale_columns = builder.divide(&columns, &representation_block)?;
+            let scale_tile = config.block_k / REPRESENTATION_BLOCK;
+            let scale_range = builder.range(0, i32::try_from(scale_tile).map_err(|_| {
+                Error::InvalidKernelSpec("NVFP4 scale tile exceeds I32")
+            })?)?;
+            let representation_block =
+                builder.integer(REPRESENTATION_BLOCK, DType::I32)?;
+            let scale_start = builder.divide(&start, &representation_block)?;
+            let scale_columns = builder.add(&scale_start, &scale_range)?;
+            let scale_limit = builder.integer(scale_width, DType::I32)?;
+            let valid_scale_columns =
+                builder.compare(Comparison::Less, &scale_columns, &scale_limit)?;
             let scale_width = builder.integer(scale_width, DType::I32)?;
             let scale_rows = builder.multiply(&outputs, &scale_width)?;
             let scale_offsets = matrix_offsets(builder, &scale_columns, &scale_rows)?;
             let scale_pointer = builder.add_pointer(&block_scales, &scale_offsets)?;
-            let scale_zero =
-                builder.full_integer(&[config.block_k, config.block_n], 0, DType::U8)?;
-            let scales = builder.load_masked(&scale_pointer, &weight_mask, &scale_zero)?;
+            let scale_mask = builder.mask_2d(&valid_scale_columns, &valid_outputs)?;
+            let scale_zero = builder.full_integer(
+                &[scale_tile, config.block_n],
+                0,
+                DType::U8,
+            )?;
+            let scales = builder.load_masked(&scale_pointer, &scale_mask, &scale_zero)?;
             let scales = decode_e4m3fn(builder, &scales)?;
-            let global = builder.load(&global_scale)?;
+            let scales = builder.reshape(&scales, &[scale_tile, 1, config.block_n])?;
+            let scales = builder.broadcast(
+                &scales,
+                &[scale_tile, REPRESENTATION_BLOCK, config.block_n],
+            )?;
+            let scales = builder.reshape(&scales, &[config.block_k, config.block_n])?;
             let scaled = builder.multiply(&values, &scales)?;
             let scaled = builder.multiply(&scaled, &global)?;
             let scaled = builder.cast(&scaled, config.dtype)?;
@@ -265,6 +309,141 @@ pub fn build_nvfp4_linear(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
     let output_pointer = builder.add_pointer(&output, &output_offsets)?;
     let output_mask = builder.mask_2d(&valid_rows, &valid_outputs)?;
     builder.store_masked(&output_pointer, &result, &output_mask)?;
+    builder.return_void()?;
+    builder.finish()
+}
+
+/// Builds the autoregressive `M = 1` compact projection.
+///
+/// Tensor-core matrix tiles are intentionally not used here: promoting one
+/// row to a sixteen-row dot wastes fifteen rows of arithmetic and register
+/// state. One program owns an output tile, walks packed K pairs, reuses each
+/// decoded block scale for all eight packed bytes that it governs, and reduces
+/// directly into F32 output accumulators.
+fn build_nvfp4_linear_gemv(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
+    let block_n = i32::try_from(config.block_n)
+        .map_err(|_| Error::InvalidKernelSpec("NVFP4 N tile exceeds I32"))?;
+    let packed_k = config.block_k / 2;
+    let packed_k_i32 = i32::try_from(packed_k)
+        .map_err(|_| Error::InvalidKernelSpec("NVFP4 packed K tile exceeds I32"))?;
+    let scale_k = config.block_k / REPRESENTATION_BLOCK;
+    let scale_k_i32 = i32::try_from(scale_k)
+        .map_err(|_| Error::InvalidKernelSpec("NVFP4 scale K tile exceeds I32"))?;
+    let packed_width = ceil_div(config.inputs, 2);
+    let scale_width = ceil_div(config.inputs, REPRESENTATION_BLOCK);
+
+    let mut builder = Builder::new("nvfp4_linear_gemv")?;
+    let input = pointer(&mut builder, "input", config.dtype)?;
+    let payload = pointer(&mut builder, "payload", DType::U8)?;
+    let block_scales = pointer(&mut builder, "block_scales", DType::U8)?;
+    let global_scale = pointer(&mut builder, "global_scale", DType::F32)?;
+    let bias = config
+        .has_bias
+        .then(|| pointer(&mut builder, "bias", config.dtype))
+        .transpose()?;
+    let output = pointer(&mut builder, "output", config.dtype)?;
+
+    let output_program = builder.program_id(0)?;
+    let block_n_value = builder.integer(config.block_n, DType::I32)?;
+    let output_base = builder.multiply(&output_program, &block_n_value)?;
+    let output_lanes = builder.range(0, block_n)?;
+    let outputs = builder.add(&output_base, &output_lanes)?;
+    let output_limit = builder.integer(config.outputs, DType::I32)?;
+    let valid_outputs = builder.compare(Comparison::Less, &outputs, &output_limit)?;
+
+    let lower = builder.integer(0, DType::I32)?;
+    let upper = builder.integer(config.inputs, DType::I32)?;
+    let step = builder.integer(config.block_k, DType::I32)?;
+    let global = builder.load(&global_scale)?;
+    let accumulator = builder.full_float(&[config.block_n], 0.0, DType::F32)?;
+    let result = builder.for_loop(
+        &lower,
+        &upper,
+        &step,
+        &[accumulator],
+        |body, start, carried| {
+            let pair_lanes = body.range(0, packed_k_i32)?;
+            let two_i32 = body.integer(2, DType::I32)?;
+            let pair_offsets = body.multiply(&pair_lanes, &two_i32)?;
+            let even_k = body.add(&start, &pair_offsets)?;
+            let one_i32 = body.integer(1, DType::I32)?;
+            let odd_k = body.add(&even_k, &one_i32)?;
+            let input_limit = body.integer(config.inputs, DType::I32)?;
+            let valid_even = body.compare(Comparison::Less, &even_k, &input_limit)?;
+            let valid_odd = body.compare(Comparison::Less, &odd_k, &input_limit)?;
+
+            let input_zero = body.full_float(&[packed_k], 0.0, config.dtype)?;
+            let even_addresses = body.add_pointer(&input, &even_k)?;
+            let odd_addresses = body.add_pointer(&input, &odd_k)?;
+            let even = body.load_masked(&even_addresses, &valid_even, &input_zero)?;
+            let odd = body.load_masked(&odd_addresses, &valid_odd, &input_zero)?;
+            let even = body.cast(&even, DType::F32)?;
+            let odd = body.cast(&odd, DType::F32)?;
+            let even = body.expand_dimension(&even, 1)?;
+            let odd = body.expand_dimension(&odd, 1)?;
+
+            let packed_start = body.divide(&start, &two_i32)?;
+            let packed_columns = body.add(&packed_start, &pair_lanes)?;
+            let packed_width_value = body.integer(packed_width, DType::I32)?;
+            let payload_rows = body.multiply(&outputs, &packed_width_value)?;
+            let payload_offsets = matrix_offsets(body, &packed_columns, &payload_rows)?;
+            let payload_addresses = body.add_pointer(&payload, &payload_offsets)?;
+            let payload_mask = body.mask_2d(&valid_even, &valid_outputs)?;
+            let payload_zero =
+                body.full_integer(&[packed_k, config.block_n], 0, DType::U8)?;
+            let packed =
+                body.load_masked(&payload_addresses, &payload_mask, &payload_zero)?;
+            let nibble_mask =
+                body.full_integer(&[packed_k, config.block_n], 0x0f, DType::U8)?;
+            let low_code = body.bit_and(&packed, &nibble_mask)?;
+            let four = body.full_integer(&[packed_k, config.block_n], 4, DType::U8)?;
+            let high_code = body.shift_right_logical(&packed, &four)?;
+            let low = decode_e2m1(body, &low_code)?;
+            let high = decode_e2m1(body, &high_code)?;
+
+            let scale_lanes = body.range(0, scale_k_i32)?;
+            let representation_block = body.integer(REPRESENTATION_BLOCK, DType::I32)?;
+            let scale_start = body.divide(&start, &representation_block)?;
+            let scale_columns = body.add(&scale_start, &scale_lanes)?;
+            let scale_limit = body.integer(scale_width, DType::I32)?;
+            let valid_scales = body.compare(Comparison::Less, &scale_columns, &scale_limit)?;
+            let scale_width_value = body.integer(scale_width, DType::I32)?;
+            let scale_rows = body.multiply(&outputs, &scale_width_value)?;
+            let scale_offsets = matrix_offsets(body, &scale_columns, &scale_rows)?;
+            let scale_addresses = body.add_pointer(&block_scales, &scale_offsets)?;
+            let scale_mask = body.mask_2d(&valid_scales, &valid_outputs)?;
+            let scale_zero =
+                body.full_integer(&[scale_k, config.block_n], 0, DType::U8)?;
+            let scales = body.load_masked(&scale_addresses, &scale_mask, &scale_zero)?;
+            let scales = decode_e4m3fn(body, &scales)?;
+            let scales = body.reshape(&scales, &[scale_k, 1, config.block_n])?;
+            let scales = body.broadcast(&scales, &[scale_k, 8, config.block_n])?;
+            let scales = body.reshape(&scales, &[packed_k, config.block_n])?;
+            let low = body.multiply(&low, &scales)?;
+            let high = body.multiply(&high, &scales)?;
+            let low = body.multiply(&low, &global)?;
+            let high = body.multiply(&high, &global)?;
+            let low = body.multiply(&low, &even)?;
+            let high = body.multiply(&high, &odd)?;
+            let products = body.add(&low, &high)?;
+            let partial = body.reduce(Reduction::Sum, &products, 0)?;
+            Ok(vec![body.add(&carried[0], &partial)?])
+        },
+    )?[0]
+        .clone();
+
+    let result = if let Some(bias) = bias {
+        let bias_addresses = builder.add_pointer(&bias, &outputs)?;
+        let bias_zero = builder.full_float(&[config.block_n], 0.0, config.dtype)?;
+        let bias = builder.load_masked(&bias_addresses, &valid_outputs, &bias_zero)?;
+        let bias = builder.cast(&bias, DType::F32)?;
+        builder.add(&result, &bias)?
+    } else {
+        result
+    };
+    let result = builder.cast(&result, config.dtype)?;
+    let output_addresses = builder.add_pointer(&output, &outputs)?;
+    builder.store_masked(&output_addresses, &result, &valid_outputs)?;
     builder.return_void()?;
     builder.finish()
 }
@@ -336,13 +515,32 @@ pub fn build_nvfp4_embedding(config: NvFp4EmbeddingConfig) -> Result<Kernel, Err
     let scale_width_value = builder.integer(scale_width, DType::I64)?;
     let scale_rows = builder.multiply(&token, &scale_width_value)?;
     let representation_block = builder.integer(REPRESENTATION_BLOCK, DType::I32)?;
-    let scale_columns = builder.divide(&columns, &representation_block)?;
+    let scale_tile = config.block_n / REPRESENTATION_BLOCK;
+    let scale_lanes = builder.range(
+        0,
+        i32::try_from(scale_tile)
+            .map_err(|_| Error::InvalidKernelSpec("embedding scale tile exceeds I32"))?,
+    )?;
+    let scale_base = builder.divide(&column_base, &representation_block)?;
+    let scale_columns = builder.add(&scale_base, &scale_lanes)?;
+    let scale_limit = builder.integer(scale_width, DType::I32)?;
+    let valid_scale_columns =
+        builder.compare(Comparison::Less, &scale_columns, &scale_limit)?;
     let scale_columns = builder.cast(&scale_columns, DType::I64)?;
     let scale_columns = builder.expand_dimension(&scale_columns, 0)?;
     let scale_offsets = builder.add(&scale_rows, &scale_columns)?;
     let scale_addresses = builder.add_pointer(&block_scales, &scale_offsets)?;
-    let scales = builder.load_masked(&scale_addresses, &mask, &payload_zero)?;
+    let scale_mask = builder.mask_2d(&valid_rows, &valid_scale_columns)?;
+    let scale_zero =
+        builder.full_integer(&[config.block_m, scale_tile], 0, DType::U8)?;
+    let scales = builder.load_masked(&scale_addresses, &scale_mask, &scale_zero)?;
     let scales = decode_e4m3fn(&mut builder, &scales)?;
+    let scales = builder.reshape(&scales, &[config.block_m, scale_tile, 1])?;
+    let scales = builder.broadcast(
+        &scales,
+        &[config.block_m, scale_tile, REPRESENTATION_BLOCK],
+    )?;
+    let scales = builder.reshape(&scales, &[config.block_m, config.block_n])?;
     let global = builder.load(&global_scale)?;
     let result = builder.multiply(&values, &scales)?;
     let result = builder.multiply(&result, &global)?;
@@ -359,227 +557,1023 @@ pub fn build_nvfp4_embedding(config: NvFp4EmbeddingConfig) -> Result<Kernel, Err
 
 /// Builds one compact, input-major routed expert projection.
 ///
-/// Routing is represented by the deterministic padded assignment schedule
-/// authored in StableHLO. Gate/up writes interleaved biased channels. Down
-/// consumes those channels, applies the selected clamped residual SwiGLU,
-/// adds the per-expert bias, and applies the route weight.
+/// Both prefill and decode observe the same expert boundary: gate/up performs
+/// its paired contractions, adds paired biases, applies clamped residual
+/// SwiGLU exactly once, and writes `[assignments, intermediate]`. Down consumes
+/// that activated tensor and applies only its bias and routing epilogue.
 pub fn build_nvfp4_grouped_projection(
     config: NvFp4GroupedProjectionConfig,
 ) -> Result<Kernel, Error> {
     let config = config.validate()?;
-    let name = match config.role {
-        NvFp4GroupedRole::GateUp => "nvfp4_grouped_gate_up",
-        NvFp4GroupedRole::ClampedSwiGluDown => "nvfp4_grouped_down",
-    };
-    let mut builder = Builder::new(name)?;
+    match (config.tokens == 1, config.role) {
+        (true, NvFp4GroupedRole::GateUpActivated) => build_grouped_gate_up_gemv(config),
+        (true, NvFp4GroupedRole::Down) => build_grouped_down_gemv(config),
+        (false, NvFp4GroupedRole::GateUpActivated) => build_grouped_gate_up_matrix(config),
+        (false, NvFp4GroupedRole::Down) => build_grouped_down_matrix(config),
+    }
+}
+
+struct GroupedMatrixSchedule {
+    address_assignment: Value,
+    address_expert: Value,
+    execute_block: Value,
+    store_rows: Value,
+    compute_rows: Value,
+    column_start: Value,
+    columns: Value,
+    valid_columns: Value,
+    source_bases: Value,
+}
+
+fn grouped_matrix_schedule(
+    builder: &mut Builder,
+    config: NvFp4GroupedProjectionConfig,
+    sorted_assignments: &Value,
+    block_experts: &Value,
+    active_blocks_pointer: &Value,
+    expert_offset_pointer: &Value,
+) -> Result<GroupedMatrixSchedule, Error> {
+    let block_index = builder.program_id(0)?;
+    let output_block = builder.program_id(1)?;
+    let active_blocks = builder.load(active_blocks_pointer)?;
+    let active_block = builder.compare(Comparison::Less, &block_index, &active_blocks)?;
+
+    let row_lanes = builder.range(0, config.block_m as i32)?;
+    let block_m = builder.integer(config.block_m, DType::I32)?;
+    let row_start = builder.multiply(&block_index, &block_m)?;
+    let schedule_positions = builder.add(&row_start, &row_lanes)?;
+    let assignment_addresses = builder.add_pointer(sorted_assignments, &schedule_positions)?;
+    let assignments = builder.load(&assignment_addresses)?;
+    let zero_rows = builder.full_integer(&[config.block_m], 0, DType::I32)?;
+    let assignment_limit =
+        builder.full_integer(&[config.block_m], config.assignments, DType::I32)?;
+    let nonnegative = builder.compare(Comparison::GreaterEqual, &assignments, &zero_rows)?;
+    let below_limit = builder.compare(Comparison::Less, &assignments, &assignment_limit)?;
+    let valid_assignment = builder.bit_and(&nonnegative, &below_limit)?;
+    let last_assignment =
+        builder.full_integer(&[config.block_m], config.assignments - 1, DType::I32)?;
+    let address_assignment = builder.maximum(&assignments, &zero_rows)?;
+    let address_assignment = builder.minimum(&address_assignment, &last_assignment)?;
+
+    let expert_address = builder.add_pointer(block_experts, &block_index)?;
+    let global_expert = builder.load(&expert_address)?;
+    let expert_offset = builder.load(expert_offset_pointer)?;
+    let expert = builder.subtract(&global_expert, &expert_offset)?;
+    let zero = builder.integer(0, DType::I32)?;
+    let local_experts = builder.integer(config.local_experts, DType::I32)?;
+    let after_first = builder.compare(Comparison::GreaterEqual, &expert, &zero)?;
+    let before_last = builder.compare(Comparison::Less, &expert, &local_experts)?;
+    let valid_expert = builder.bit_and(&after_first, &before_last)?;
+    let execute_block = builder.bit_and(&active_block, &valid_expert)?;
+    let store_rows = builder.bit_and(&valid_assignment, &active_block)?;
+    let compute_rows = builder.bit_and(&store_rows, &valid_expert)?;
+    let last_expert = builder.integer(config.local_experts - 1, DType::I32)?;
+    let address_expert = builder.maximum(&expert, &zero)?;
+    let address_expert = builder.minimum(&address_expert, &last_expert)?;
+
+    let block_n = builder.integer(config.block_n, DType::I32)?;
+    let column_start = builder.multiply(&output_block, &block_n)?;
+    let column_lanes = builder.range(0, config.block_n as i32)?;
+    let columns = builder.add(&column_start, &column_lanes)?;
+    let output_size = builder.integer(config.output_size, DType::I32)?;
+    let valid_columns = builder.compare(Comparison::Less, &columns, &output_size)?;
+
+    let divisor = builder.integer(config.source_row_divisor, DType::I32)?;
+    let source_rows = builder.divide(&address_assignment, &divisor)?;
+    let source_rows = builder.cast(&source_rows, DType::I64)?;
+    let input_stride = builder.integer(config.input_size, DType::I64)?;
+    let source_bases = builder.multiply(&source_rows, &input_stride)?;
+    let source_bases = builder.expand_dimension(&source_bases, 1)?;
+
+    Ok(GroupedMatrixSchedule {
+        address_assignment,
+        address_expert,
+        execute_block,
+        store_rows,
+        compute_rows,
+        column_start,
+        columns,
+        valid_columns,
+        source_bases,
+    })
+}
+
+struct GroupedDecodeSchedule {
+    address_assignment: Value,
+    address_expert: Value,
+    execute: Value,
+    store: Value,
+    source_base: Value,
+    output_block: Value,
+}
+
+fn grouped_decode_schedule(
+    builder: &mut Builder,
+    config: NvFp4GroupedProjectionConfig,
+    sorted_assignments: &Value,
+    block_experts: &Value,
+    active_blocks_pointer: &Value,
+    expert_offset_pointer: &Value,
+) -> Result<GroupedDecodeSchedule, Error> {
+    let block_index = builder.program_id(0)?;
+    let output_block = builder.program_id(1)?;
+    let active_blocks = builder.load(active_blocks_pointer)?;
+    let active_block = builder.compare(Comparison::Less, &block_index, &active_blocks)?;
+
+    // With one token, top-k routing produces at most one assignment for each
+    // selected expert. StableHLO still authors padded block-sized schedules;
+    // the compact GEMV consumes only the first live slot of each active block.
+    let block_m = builder.integer(config.block_m, DType::I32)?;
+    let schedule_position = builder.multiply(&block_index, &block_m)?;
+    let assignment_address = builder.add_pointer(sorted_assignments, &schedule_position)?;
+    let assignment = builder.load(&assignment_address)?;
+    let zero = builder.integer(0, DType::I32)?;
+    let assignment_limit = builder.integer(config.assignments, DType::I32)?;
+    let nonnegative = builder.compare(Comparison::GreaterEqual, &assignment, &zero)?;
+    let below_limit = builder.compare(Comparison::Less, &assignment, &assignment_limit)?;
+    let valid_assignment = builder.bit_and(&nonnegative, &below_limit)?;
+    let last_assignment = builder.integer(config.assignments - 1, DType::I32)?;
+    let address_assignment = builder.maximum(&assignment, &zero)?;
+    let address_assignment = builder.minimum(&address_assignment, &last_assignment)?;
+
+    let expert_address = builder.add_pointer(block_experts, &block_index)?;
+    let global_expert = builder.load(&expert_address)?;
+    let expert_offset = builder.load(expert_offset_pointer)?;
+    let expert = builder.subtract(&global_expert, &expert_offset)?;
+    let local_experts = builder.integer(config.local_experts, DType::I32)?;
+    let after_first = builder.compare(Comparison::GreaterEqual, &expert, &zero)?;
+    let before_last = builder.compare(Comparison::Less, &expert, &local_experts)?;
+    let valid_expert = builder.bit_and(&after_first, &before_last)?;
+    let store = builder.bit_and(&active_block, &valid_assignment)?;
+    let execute = builder.bit_and(&store, &valid_expert)?;
+    let last_expert = builder.integer(config.local_experts - 1, DType::I32)?;
+    let address_expert = builder.maximum(&expert, &zero)?;
+    let address_expert = builder.minimum(&address_expert, &last_expert)?;
+
+    let source_divisor = builder.integer(config.source_row_divisor, DType::I32)?;
+    let source_row = builder.divide(&address_assignment, &source_divisor)?;
+    let source_row = builder.cast(&source_row, DType::I64)?;
+    let input_stride = builder.integer(config.input_size, DType::I64)?;
+    let source_base = builder.multiply(&source_row, &input_stride)?;
+
+    Ok(GroupedDecodeSchedule {
+        address_assignment,
+        address_expert,
+        execute,
+        store,
+        source_base,
+        output_block,
+    })
+}
+
+fn build_grouped_gate_up_matrix(
+    config: NvFp4GroupedProjectionConfig,
+) -> Result<Kernel, Error> {
+    let mut builder = Builder::new("nvfp4_grouped_gate_up")?;
     let input = pointer(&mut builder, "input", config.dtype)?;
     let sorted_assignments = pointer(&mut builder, "sorted_assignments", DType::I32)?;
     let block_experts = pointer(&mut builder, "block_experts", DType::I32)?;
+    let active_blocks = pointer(&mut builder, "active_blocks", DType::I32)?;
     let payload = pointer(&mut builder, "payload", DType::U8)?;
     let block_scales = pointer(&mut builder, "block_scales", DType::U8)?;
     let global_scale = pointer(&mut builder, "global_scale", DType::F32)?;
     let bias = pointer(&mut builder, "bias", config.dtype)?;
-    let expert_offset_pointer = pointer(&mut builder, "expert_offset", DType::I32)?;
-    let routing_weights = matches!(config.role, NvFp4GroupedRole::ClampedSwiGluDown)
-        .then(|| pointer(&mut builder, "routing_weights", config.dtype))
-        .transpose()?;
+    let expert_offset = pointer(&mut builder, "expert_offset", DType::I32)?;
     let output = pointer(&mut builder, "output", config.dtype)?;
+    let schedule = grouped_matrix_schedule(
+        &mut builder,
+        config,
+        &sorted_assignments,
+        &block_experts,
+        &active_blocks,
+        &expert_offset,
+    )?;
 
-    let block_index = builder.program_id(0)?;
-    let output_block = builder.program_id(1)?;
-    let row_lanes = builder.range(0, config.block_m as i32)?;
-    let column_lanes = builder.range(0, config.block_n as i32)?;
-    let block_m = builder.integer(config.block_m, DType::I32)?;
-    let block_n = builder.integer(config.block_n, DType::I32)?;
-    let row_start = builder.multiply(&block_index, &block_m)?;
-    let column_start = builder.multiply(&output_block, &block_n)?;
-    let schedule_positions = builder.add(&row_start, &row_lanes)?;
-    let assignment_addresses = builder.add_pointer(&sorted_assignments, &schedule_positions)?;
-    let assignment_sentinel =
-        builder.full_integer(&[config.block_m], config.assignments, DType::I32)?;
-    let assignments = builder.load(&assignment_addresses)?;
-    let valid_assignment = builder.compare(Comparison::Less, &assignments, &assignment_sentinel)?;
-    let last_assignment = builder.integer(config.assignments - 1, DType::I32)?;
-    let address_assignment = builder.minimum(&assignments, &last_assignment)?;
+    // Gate and up are adjacent logical channels and therefore share one
+    // physical payload byte. Their scale representation has one E4M3FN value
+    // per eight gate/up pairs (sixteen logical values).
+    let logical_width = config
+        .output_size
+        .checked_mul(2)
+        .ok_or(Error::InvalidKernelSpec("gate/up logical width overflows"))?;
+    let packed_width = config.output_size;
+    let scale_width = ceil_div(logical_width, REPRESENTATION_BLOCK);
+    let scale_n = config.block_n / 8;
+    let payload_stride = config
+        .input_size
+        .checked_mul(packed_width)
+        .ok_or(Error::InvalidKernelSpec("gate/up payload stride overflows"))?;
+    let scale_stride = config
+        .input_size
+        .checked_mul(scale_width)
+        .ok_or(Error::InvalidKernelSpec("gate/up scale stride overflows"))?;
+    let expert_i64 = builder.cast(&schedule.address_expert, DType::I64)?;
+    let payload_stride_value = builder.integer(payload_stride, DType::I64)?;
+    let scale_stride_value = builder.integer(scale_stride, DType::I64)?;
+    let payload_expert_base = builder.multiply(&expert_i64, &payload_stride_value)?;
+    let scale_expert_base = builder.multiply(&expert_i64, &scale_stride_value)?;
 
-    let expert_address = builder.add_pointer(&block_experts, &block_index)?;
-    let global_expert = builder.load(&expert_address)?;
-    let expert_offset = builder.load(&expert_offset_pointer)?;
-    let expert = builder.subtract(&global_expert, &expert_offset)?;
-    let zero_i32 = builder.integer(0, DType::I32)?;
-    let after_first_expert = builder.compare(Comparison::GreaterEqual, &expert, &zero_i32)?;
-    let local_experts = builder.integer(config.local_experts, DType::I32)?;
-    let before_last_expert = builder.compare(Comparison::Less, &expert, &local_experts)?;
-    let valid_expert = builder.bit_and(&after_first_expert, &before_last_expert)?;
-    let compute_rows = builder.bit_and(&valid_assignment, &valid_expert)?;
-    let last_local_expert = builder.integer(config.local_experts - 1, DType::I32)?;
-    let address_expert = builder.maximum(&expert, &zero_i32)?;
-    let address_expert = builder.minimum(&address_expert, &last_local_expert)?;
+    let accumulators = builder.if_then_else(
+        &schedule.execute_block,
+        |body| {
+            let global = body.load(&global_scale)?;
+            let gate_accumulator =
+                body.full_float(&[config.block_m, config.block_n], 0.0, DType::F32)?;
+            let up_accumulator =
+                body.full_float(&[config.block_m, config.block_n], 0.0, DType::F32)?;
+            let lower = body.integer(0, DType::I32)?;
+            let upper = body.integer(config.input_size, DType::I32)?;
+            let step = body.integer(config.block_k, DType::I32)?;
+            let k_lanes = body.range(0, config.block_k as i32)?;
+            body.for_loop(
+                &lower,
+                &upper,
+                &step,
+                &[gate_accumulator, up_accumulator],
+                |loop_body, start, carried| {
+                    let k = loop_body.add(&start, &k_lanes)?;
+                    let input_limit = loop_body.integer(config.input_size, DType::I32)?;
+                    let valid_k = loop_body.compare(Comparison::Less, &k, &input_limit)?;
+                    let input_mask = loop_body.mask_2d(&schedule.compute_rows, &valid_k)?;
+                    let input_zero = loop_body.full_float(
+                        &[config.block_m, config.block_k],
+                        0.0,
+                        config.dtype,
+                    )?;
+                    let k_i64 = loop_body.cast(&k, DType::I64)?;
+                    let input_columns = loop_body.expand_dimension(&k_i64, 0)?;
+                    let input_offsets = loop_body.add(&schedule.source_bases, &input_columns)?;
+                    let input_addresses = loop_body.add_pointer(&input, &input_offsets)?;
+                    let input_tile =
+                        loop_body.load_masked(&input_addresses, &input_mask, &input_zero)?;
 
-    let columns = builder.add(&column_start, &column_lanes)?;
-    let output_size = builder.integer(config.output_size, DType::I32)?;
-    let valid_columns = builder.compare(Comparison::Less, &columns, &output_size)?;
-    let divisor = builder.integer(config.source_row_divisor, DType::I32)?;
-    let source_rows = builder.divide(&address_assignment, &divisor)?;
-    let source_rows = builder.cast(&source_rows, DType::I64)?;
-    let input_stride_value = match config.role {
-        NvFp4GroupedRole::GateUp => config.input_size,
-        NvFp4GroupedRole::ClampedSwiGluDown => {
-            config
-                .input_size
-                .checked_mul(2)
-                .ok_or(Error::InvalidKernelSpec(
-                    "clamped SwiGLU activation stride overflows",
-                ))?
-        }
-    };
-    let input_stride = builder.integer(input_stride_value, DType::I64)?;
-    let source_bases = builder.multiply(&source_rows, &input_stride)?;
-    let source_bases = builder.expand_dimension(&source_bases, 1)?;
+                    let k_rows = loop_body.expand_dimension(&k_i64, 1)?;
+                    let packed_width_value = loop_body.integer(packed_width, DType::I64)?;
+                    let payload_rows = loop_body.multiply(&k_rows, &packed_width_value)?;
+                    let payload_rows = loop_body.add(&payload_rows, &payload_expert_base)?;
+                    let columns_i64 = loop_body.cast(&schedule.columns, DType::I64)?;
+                    let payload_columns = loop_body.expand_dimension(&columns_i64, 0)?;
+                    let payload_offsets = loop_body.add(&payload_rows, &payload_columns)?;
+                    let payload_addresses = loop_body.add_pointer(&payload, &payload_offsets)?;
+                    let payload_mask =
+                        loop_body.mask_2d(&valid_k, &schedule.valid_columns)?;
+                    let payload_zero = loop_body.full_integer(
+                        &[config.block_k, config.block_n],
+                        0,
+                        DType::U8,
+                    )?;
+                    let packed = loop_body.load_masked(
+                        &payload_addresses,
+                        &payload_mask,
+                        &payload_zero,
+                    )?;
+                    let nibble = loop_body.full_integer(
+                        &[config.block_k, config.block_n],
+                        0x0f,
+                        DType::U8,
+                    )?;
+                    let gate_code = loop_body.bit_and(&packed, &nibble)?;
+                    let four = loop_body.full_integer(
+                        &[config.block_k, config.block_n],
+                        4,
+                        DType::U8,
+                    )?;
+                    let up_code = loop_body.shift_right_logical(&packed, &four)?;
+                    let gate = decode_e2m1(loop_body, &gate_code)?;
+                    let up = decode_e2m1(loop_body, &up_code)?;
+
+                    let scale_lanes = loop_body.range(0, scale_n as i32)?;
+                    let eight = loop_body.integer(8, DType::I32)?;
+                    let scale_column_start = loop_body.divide(&schedule.column_start, &eight)?;
+                    let scale_columns = loop_body.add(&scale_column_start, &scale_lanes)?;
+                    let scale_limit = loop_body.integer(scale_width, DType::I32)?;
+                    let valid_scale_columns =
+                        loop_body.compare(Comparison::Less, &scale_columns, &scale_limit)?;
+                    let scale_width_value = loop_body.integer(scale_width, DType::I64)?;
+                    let scale_rows = loop_body.multiply(&k_rows, &scale_width_value)?;
+                    let scale_rows = loop_body.add(&scale_rows, &scale_expert_base)?;
+                    let scale_columns_i64 = loop_body.cast(&scale_columns, DType::I64)?;
+                    let scale_columns_i64 =
+                        loop_body.expand_dimension(&scale_columns_i64, 0)?;
+                    let scale_offsets = loop_body.add(&scale_rows, &scale_columns_i64)?;
+                    let scale_addresses =
+                        loop_body.add_pointer(&block_scales, &scale_offsets)?;
+                    let scale_mask =
+                        loop_body.mask_2d(&valid_k, &valid_scale_columns)?;
+                    let scale_zero = loop_body.full_integer(
+                        &[config.block_k, scale_n],
+                        0,
+                        DType::U8,
+                    )?;
+                    let scales = loop_body.load_masked(
+                        &scale_addresses,
+                        &scale_mask,
+                        &scale_zero,
+                    )?;
+                    let scales = decode_e4m3fn(loop_body, &scales)?;
+                    let scales =
+                        loop_body.reshape(&scales, &[config.block_k, scale_n, 1])?;
+                    let scales = loop_body.broadcast(
+                        &scales,
+                        &[config.block_k, scale_n, 8],
+                    )?;
+                    let scales =
+                        loop_body.reshape(&scales, &[config.block_k, config.block_n])?;
+                    let gate = loop_body.multiply(&gate, &scales)?;
+                    let up = loop_body.multiply(&up, &scales)?;
+                    let gate = loop_body.multiply(&gate, &global)?;
+                    let up = loop_body.multiply(&up, &global)?;
+                    let gate = loop_body.cast(&gate, config.dtype)?;
+                    let up = loop_body.cast(&up, config.dtype)?;
+                    Ok(vec![
+                        loop_body.dot(&input_tile, &gate, &carried[0])?,
+                        loop_body.dot(&input_tile, &up, &carried[1])?,
+                    ])
+                },
+            )
+        },
+        |body| {
+            Ok(vec![
+                body.full_float(&[config.block_m, config.block_n], 0.0, DType::F32)?,
+                body.full_float(&[config.block_m, config.block_n], 0.0, DType::F32)?,
+            ])
+        },
+    )?;
+    let mut gate = accumulators[0].clone();
+    let mut up = accumulators[1].clone();
+
+    let expert_i64 = builder.cast(&schedule.address_expert, DType::I64)?;
+    let logical_width_value = builder.integer(logical_width, DType::I64)?;
+    let bias_base = builder.multiply(&expert_i64, &logical_width_value)?;
+    let columns_i64 = builder.cast(&schedule.columns, DType::I64)?;
+    let two = builder.integer(2, DType::I64)?;
+    let gate_columns = builder.multiply(&columns_i64, &two)?;
+    let gate_offsets = builder.add(&bias_base, &gate_columns)?;
+    let one = builder.integer(1, DType::I64)?;
+    let up_offsets = builder.add(&gate_offsets, &one)?;
+    let gate_addresses = builder.add_pointer(&bias, &gate_offsets)?;
+    let up_addresses = builder.add_pointer(&bias, &up_offsets)?;
+    let bias_mask = builder.bit_and(&schedule.valid_columns, &schedule.execute_block)?;
+    let bias_zero = builder.full_float(&[config.block_n], 0.0, config.dtype)?;
+    let gate_bias = builder.load_masked(&gate_addresses, &bias_mask, &bias_zero)?;
+    let up_bias = builder.load_masked(&up_addresses, &bias_mask, &bias_zero)?;
+    let gate_bias = builder.cast(&gate_bias, DType::F32)?;
+    let gate_bias = builder.expand_dimension(&gate_bias, 0)?;
+    let up_bias = builder.cast(&up_bias, DType::F32)?;
+    let up_bias = builder.expand_dimension(&up_bias, 0)?;
+    gate = builder.add(&gate, &gate_bias)?;
+    up = builder.add(&up, &up_bias)?;
+    let activated = clamped_residual_swiglu(&mut builder, gate, up)?;
+
+    let assignments_i64 = builder.cast(&schedule.address_assignment, DType::I64)?;
+    let output_width = builder.integer(config.output_size, DType::I64)?;
+    let output_rows = builder.multiply(&assignments_i64, &output_width)?;
+    let output_offsets = matrix_offsets(&mut builder, &output_rows, &columns_i64)?;
+    let output_addresses = builder.add_pointer(&output, &output_offsets)?;
+    let output_mask = builder.mask_2d(&schedule.store_rows, &schedule.valid_columns)?;
+    let activated = builder.cast(&activated, config.dtype)?;
+    builder.store_masked(&output_addresses, &activated, &output_mask)?;
+    builder.return_void()?;
+    builder.finish()
+}
+
+fn build_grouped_down_matrix(
+    config: NvFp4GroupedProjectionConfig,
+) -> Result<Kernel, Error> {
+    let mut builder = Builder::new("nvfp4_grouped_down")?;
+    let input = pointer(&mut builder, "input", config.dtype)?;
+    let sorted_assignments = pointer(&mut builder, "sorted_assignments", DType::I32)?;
+    let block_experts = pointer(&mut builder, "block_experts", DType::I32)?;
+    let active_blocks = pointer(&mut builder, "active_blocks", DType::I32)?;
+    let payload = pointer(&mut builder, "payload", DType::U8)?;
+    let block_scales = pointer(&mut builder, "block_scales", DType::U8)?;
+    let global_scale = pointer(&mut builder, "global_scale", DType::F32)?;
+    let bias = pointer(&mut builder, "bias", config.dtype)?;
+    let expert_offset = pointer(&mut builder, "expert_offset", DType::I32)?;
+    let routing_weights = pointer(&mut builder, "routing_weights", config.dtype)?;
+    let output = pointer(&mut builder, "output", config.dtype)?;
+    let schedule = grouped_matrix_schedule(
+        &mut builder,
+        config,
+        &sorted_assignments,
+        &block_experts,
+        &active_blocks,
+        &expert_offset,
+    )?;
 
     let packed_width = ceil_div(config.output_size, 2);
     let scale_width = ceil_div(config.output_size, REPRESENTATION_BLOCK);
-    let expert = builder.cast(&address_expert, DType::I64)?;
-    let payload_expert_stride =
-        config
-            .input_size
-            .checked_mul(packed_width)
-            .ok_or(Error::InvalidKernelSpec(
-                "compact expert payload stride overflows",
-            ))?;
-    let scale_expert_stride =
-        config
-            .input_size
-            .checked_mul(scale_width)
-            .ok_or(Error::InvalidKernelSpec(
-                "compact expert scale stride overflows",
-            ))?;
-    let payload_expert_stride = builder.integer(payload_expert_stride, DType::I64)?;
-    let scale_expert_stride = builder.integer(scale_expert_stride, DType::I64)?;
-    let payload_expert_base = builder.multiply(&expert, &payload_expert_stride)?;
-    let scale_expert_base = builder.multiply(&expert, &scale_expert_stride)?;
+    let scale_n = config.block_n / REPRESENTATION_BLOCK;
+    let payload_stride = config
+        .input_size
+        .checked_mul(packed_width)
+        .ok_or(Error::InvalidKernelSpec("down payload stride overflows"))?;
+    let scale_stride = config
+        .input_size
+        .checked_mul(scale_width)
+        .ok_or(Error::InvalidKernelSpec("down scale stride overflows"))?;
+    let expert_i64 = builder.cast(&schedule.address_expert, DType::I64)?;
+    let payload_stride_value = builder.integer(payload_stride, DType::I64)?;
+    let scale_stride_value = builder.integer(scale_stride, DType::I64)?;
+    let payload_expert_base = builder.multiply(&expert_i64, &payload_stride_value)?;
+    let scale_expert_base = builder.multiply(&expert_i64, &scale_stride_value)?;
 
-    let input_zero = builder.full_float(&[config.block_m, config.block_k], 0.0, config.dtype)?;
-    let payload_zero = builder.full_integer(&[config.block_k, config.block_n], 0, DType::U8)?;
-    let accumulator = builder.full_float(&[config.block_m, config.block_n], 0.0, DType::F32)?;
-    let k_lanes = builder.range(0, config.block_k as i32)?;
-    let input_size = builder.integer(config.input_size, DType::I32)?;
-    let k_lower = builder.integer(0, DType::I32)?;
-    let k_step = builder.integer(config.block_k, DType::I32)?;
-    let accumulated = builder.for_loop(
-        &k_lower,
-        &input_size,
-        &k_step,
-        std::slice::from_ref(&accumulator),
-        |body, k_start, carried| {
-            let k = body.add(&k_start, &k_lanes)?;
-            let valid_k = body.compare(Comparison::Less, &k, &input_size)?;
-            let input_mask = body.mask_2d(&compute_rows, &valid_k)?;
-            let weight_mask = body.mask_2d(&valid_k, &valid_columns)?;
-            let k_i64 = body.cast(&k, DType::I64)?;
+    let mut accumulator = builder
+        .if_then_else(
+            &schedule.execute_block,
+            |body| {
+                let global = body.load(&global_scale)?;
+                let accumulator =
+                    body.full_float(&[config.block_m, config.block_n], 0.0, DType::F32)?;
+                let lower = body.integer(0, DType::I32)?;
+                let upper = body.integer(config.input_size, DType::I32)?;
+                let step = body.integer(config.block_k, DType::I32)?;
+                let k_lanes = body.range(0, config.block_k as i32)?;
+                let accumulated = body.for_loop(
+                    &lower,
+                    &upper,
+                    &step,
+                    &[accumulator],
+                    |loop_body, start, carried| {
+                        let k = loop_body.add(&start, &k_lanes)?;
+                        let input_limit = loop_body.integer(config.input_size, DType::I32)?;
+                        let valid_k =
+                            loop_body.compare(Comparison::Less, &k, &input_limit)?;
+                        let input_mask =
+                            loop_body.mask_2d(&schedule.compute_rows, &valid_k)?;
+                        let input_zero = loop_body.full_float(
+                            &[config.block_m, config.block_k],
+                            0.0,
+                            config.dtype,
+                        )?;
+                        let k_i64 = loop_body.cast(&k, DType::I64)?;
+                        let input_columns = loop_body.expand_dimension(&k_i64, 0)?;
+                        let input_offsets =
+                            loop_body.add(&schedule.source_bases, &input_columns)?;
+                        let input_addresses = loop_body.add_pointer(&input, &input_offsets)?;
+                        let input_tile = loop_body.load_masked(
+                            &input_addresses,
+                            &input_mask,
+                            &input_zero,
+                        )?;
 
-            let input_columns = match config.role {
-                NvFp4GroupedRole::GateUp => body.expand_dimension(&k_i64, 0)?,
-                NvFp4GroupedRole::ClampedSwiGluDown => {
-                    let two = body.integer(2, DType::I64)?;
-                    let interleaved = body.multiply(&k_i64, &two)?;
-                    body.expand_dimension(&interleaved, 0)?
-                }
-            };
-            let input_offsets = body.add(&source_bases, &input_columns)?;
-            let input_addresses = body.add_pointer(&input, &input_offsets)?;
-            let mut input_tile = body.load_masked(&input_addresses, &input_mask, &input_zero)?;
-            if matches!(config.role, NvFp4GroupedRole::ClampedSwiGluDown) {
-                let one = body.integer(1, DType::I64)?;
-                let up_offsets = body.add(&input_offsets, &one)?;
-                let up_addresses = body.add_pointer(&input, &up_offsets)?;
-                let up = body.load_masked(&up_addresses, &input_mask, &input_zero)?;
-                input_tile = clamped_residual_swiglu(body, input_tile, up, config.dtype)?;
-            }
+                        let k_rows = loop_body.expand_dimension(&k_i64, 1)?;
+                        let packed_width_value = loop_body.integer(packed_width, DType::I64)?;
+                        let payload_rows = loop_body.multiply(&k_rows, &packed_width_value)?;
+                        let payload_rows = loop_body.add(&payload_rows, &payload_expert_base)?;
+                        let two = loop_body.integer(2, DType::I32)?;
+                        let packed_columns = loop_body.divide(&schedule.columns, &two)?;
+                        let packed_columns = loop_body.cast(&packed_columns, DType::I64)?;
+                        let packed_columns = loop_body.expand_dimension(&packed_columns, 0)?;
+                        let payload_offsets = loop_body.add(&payload_rows, &packed_columns)?;
+                        let payload_addresses = loop_body.add_pointer(&payload, &payload_offsets)?;
+                        let payload_mask =
+                            loop_body.mask_2d(&valid_k, &schedule.valid_columns)?;
+                        let payload_zero = loop_body.full_integer(
+                            &[config.block_k, config.block_n],
+                            0,
+                            DType::U8,
+                        )?;
+                        let packed = loop_body.load_masked(
+                            &payload_addresses,
+                            &payload_mask,
+                            &payload_zero,
+                        )?;
+                        let parity = loop_body.remainder(&schedule.columns, &two)?;
+                        let four = loop_body.integer(4, DType::I32)?;
+                        let shift = loop_body.multiply(&parity, &four)?;
+                        let shift = loop_body.cast(&shift, DType::U8)?;
+                        let shift = loop_body.expand_dimension(&shift, 0)?;
+                        let code = loop_body.shift_right_logical(&packed, &shift)?;
+                        let nibble = loop_body.full_integer(
+                            &[config.block_k, config.block_n],
+                            0x0f,
+                            DType::U8,
+                        )?;
+                        let code = loop_body.bit_and(&code, &nibble)?;
+                        let values = decode_e2m1(loop_body, &code)?;
 
-            let k_i64 = body.expand_dimension(&k_i64, 1)?;
-            let packed_width_value = body.integer(packed_width, DType::I64)?;
-            let payload_rows = body.multiply(&k_i64, &packed_width_value)?;
-            let payload_rows = body.add(&payload_rows, &payload_expert_base)?;
-            let two = body.integer(2, DType::I32)?;
-            let packed_columns = body.divide(&columns, &two)?;
-            let packed_columns = body.cast(&packed_columns, DType::I64)?;
-            let packed_columns = body.expand_dimension(&packed_columns, 0)?;
-            let payload_offsets = body.add(&payload_rows, &packed_columns)?;
-            let payload_addresses = body.add_pointer(&payload, &payload_offsets)?;
-            let packed = body.load_masked(&payload_addresses, &weight_mask, &payload_zero)?;
-            let parity = body.remainder(&columns, &two)?;
-            let four = body.integer(4, DType::I32)?;
-            let shift = body.multiply(&parity, &four)?;
-            let shift = body.cast(&shift, DType::U8)?;
-            let shift = body.expand_dimension(&shift, 0)?;
-            let code = body.shift_right_logical(&packed, &shift)?;
-            let nibble_mask =
-                body.full_integer(&[config.block_k, config.block_n], 0x0f, DType::U8)?;
-            let code = body.bit_and(&code, &nibble_mask)?;
-            let values = decode_e2m1(body, &code)?;
+                        let scale_lanes = loop_body.range(0, scale_n as i32)?;
+                        let representation_block =
+                            loop_body.integer(REPRESENTATION_BLOCK, DType::I32)?;
+                        let scale_column_start =
+                            loop_body.divide(&schedule.column_start, &representation_block)?;
+                        let scale_columns =
+                            loop_body.add(&scale_column_start, &scale_lanes)?;
+                        let scale_limit = loop_body.integer(scale_width, DType::I32)?;
+                        let valid_scale_columns = loop_body.compare(
+                            Comparison::Less,
+                            &scale_columns,
+                            &scale_limit,
+                        )?;
+                        let scale_width_value = loop_body.integer(scale_width, DType::I64)?;
+                        let scale_rows = loop_body.multiply(&k_rows, &scale_width_value)?;
+                        let scale_rows = loop_body.add(&scale_rows, &scale_expert_base)?;
+                        let scale_columns_i64 =
+                            loop_body.cast(&scale_columns, DType::I64)?;
+                        let scale_columns_i64 =
+                            loop_body.expand_dimension(&scale_columns_i64, 0)?;
+                        let scale_offsets = loop_body.add(&scale_rows, &scale_columns_i64)?;
+                        let scale_addresses =
+                            loop_body.add_pointer(&block_scales, &scale_offsets)?;
+                        let scale_mask =
+                            loop_body.mask_2d(&valid_k, &valid_scale_columns)?;
+                        let scale_zero = loop_body.full_integer(
+                            &[config.block_k, scale_n],
+                            0,
+                            DType::U8,
+                        )?;
+                        let scales = loop_body.load_masked(
+                            &scale_addresses,
+                            &scale_mask,
+                            &scale_zero,
+                        )?;
+                        let scales = decode_e4m3fn(loop_body, &scales)?;
+                        let scales =
+                            loop_body.reshape(&scales, &[config.block_k, scale_n, 1])?;
+                        let scales = loop_body.broadcast(
+                            &scales,
+                            &[config.block_k, scale_n, REPRESENTATION_BLOCK],
+                        )?;
+                        let scales =
+                            loop_body.reshape(&scales, &[config.block_k, config.block_n])?;
+                        let weights = loop_body.multiply(&values, &scales)?;
+                        let weights = loop_body.multiply(&weights, &global)?;
+                        let weights = loop_body.cast(&weights, config.dtype)?;
+                        Ok(vec![loop_body.dot(&input_tile, &weights, &carried[0])?])
+                    },
+                )?;
+                Ok(vec![accumulated[0].clone()])
+            },
+            |body| {
+                Ok(vec![body.full_float(
+                    &[config.block_m, config.block_n],
+                    0.0,
+                    DType::F32,
+                )?])
+            },
+        )?
+        .remove(0);
 
-            let scale_width_value = body.integer(scale_width, DType::I64)?;
-            let scale_rows = body.multiply(&k_i64, &scale_width_value)?;
-            let scale_rows = body.add(&scale_rows, &scale_expert_base)?;
-            let representation_block = body.integer(REPRESENTATION_BLOCK, DType::I32)?;
-            let scale_columns = body.divide(&columns, &representation_block)?;
-            let scale_columns = body.cast(&scale_columns, DType::I64)?;
-            let scale_columns = body.expand_dimension(&scale_columns, 0)?;
-            let scale_offsets = body.add(&scale_rows, &scale_columns)?;
-            let scale_addresses = body.add_pointer(&block_scales, &scale_offsets)?;
-            let scales = body.load_masked(&scale_addresses, &weight_mask, &payload_zero)?;
-            let scales = decode_e4m3fn(body, &scales)?;
-            let global = body.load(&global_scale)?;
-            let weights = body.multiply(&values, &scales)?;
-            let weights = body.multiply(&weights, &global)?;
-            let weights = body.cast(&weights, config.dtype)?;
-            Ok(vec![body.dot(&input_tile, &weights, &carried[0])?])
-        },
-    )?;
-    let mut accumulator = accumulated[0].clone();
-
-    let expert_i64 = builder.cast(&address_expert, DType::I64)?;
-    let output_size_i64 = builder.integer(config.output_size, DType::I64)?;
-    let bias_base = builder.multiply(&expert_i64, &output_size_i64)?;
-    let columns_i64 = builder.cast(&columns, DType::I64)?;
+    let expert_i64 = builder.cast(&schedule.address_expert, DType::I64)?;
+    let output_width = builder.integer(config.output_size, DType::I64)?;
+    let bias_base = builder.multiply(&expert_i64, &output_width)?;
+    let columns_i64 = builder.cast(&schedule.columns, DType::I64)?;
     let bias_offsets = builder.add(&bias_base, &columns_i64)?;
     let bias_addresses = builder.add_pointer(&bias, &bias_offsets)?;
-    let bias_mask = builder.bit_and(&valid_columns, &valid_expert)?;
+    let bias_mask = builder.bit_and(&schedule.valid_columns, &schedule.execute_block)?;
     let bias_zero = builder.full_float(&[config.block_n], 0.0, config.dtype)?;
     let bias_values = builder.load_masked(&bias_addresses, &bias_mask, &bias_zero)?;
     let bias_values = builder.cast(&bias_values, DType::F32)?;
     let bias_values = builder.expand_dimension(&bias_values, 0)?;
     accumulator = builder.add(&accumulator, &bias_values)?;
 
-    if let Some(routing_weights) = routing_weights {
-        let routing_addresses = builder.add_pointer(&routing_weights, &address_assignment)?;
-        let routing_zero = builder.full_float(&[config.block_m], 0.0, config.dtype)?;
-        let routing = builder.load_masked(&routing_addresses, &compute_rows, &routing_zero)?;
-        let routing = builder.cast(&routing, DType::F32)?;
-        let routing = builder.expand_dimension(&routing, 1)?;
-        accumulator = builder.multiply(&accumulator, &routing)?;
-    }
+    let routing_addresses =
+        builder.add_pointer(&routing_weights, &schedule.address_assignment)?;
+    let routing_zero = builder.full_float(&[config.block_m], 0.0, config.dtype)?;
+    let routing = builder.load_masked(
+        &routing_addresses,
+        &schedule.compute_rows,
+        &routing_zero,
+    )?;
+    let routing = builder.cast(&routing, DType::F32)?;
+    let routing = builder.expand_dimension(&routing, 1)?;
+    accumulator = builder.multiply(&accumulator, &routing)?;
 
-    let assignments_i64 = builder.cast(&address_assignment, DType::I64)?;
-    let output_rows = builder.multiply(&assignments_i64, &output_size_i64)?;
-    let output_rows = builder.expand_dimension(&output_rows, 1)?;
-    let columns_i64 = builder.expand_dimension(&columns_i64, 0)?;
-    let output_offsets = builder.add(&output_rows, &columns_i64)?;
+    let assignments_i64 = builder.cast(&schedule.address_assignment, DType::I64)?;
+    let output_rows = builder.multiply(&assignments_i64, &output_width)?;
+    let output_offsets = matrix_offsets(&mut builder, &output_rows, &columns_i64)?;
     let output_addresses = builder.add_pointer(&output, &output_offsets)?;
-    let output_mask = builder.mask_2d(&valid_assignment, &valid_columns)?;
+    let output_mask = builder.mask_2d(&schedule.store_rows, &schedule.valid_columns)?;
     let output_values = builder.cast(&accumulator, config.dtype)?;
     builder.store_masked(&output_addresses, &output_values, &output_mask)?;
     builder.return_void()?;
     builder.finish()
 }
 
+fn build_grouped_gate_up_gemv(
+    config: NvFp4GroupedProjectionConfig,
+) -> Result<Kernel, Error> {
+    let mut builder = Builder::new("nvfp4_grouped_gate_up_gemv")?;
+    let input = pointer(&mut builder, "input", config.dtype)?;
+    let sorted_assignments = pointer(&mut builder, "sorted_assignments", DType::I32)?;
+    let block_experts = pointer(&mut builder, "block_experts", DType::I32)?;
+    let active_blocks = pointer(&mut builder, "active_blocks", DType::I32)?;
+    let payload = pointer(&mut builder, "payload", DType::U8)?;
+    let block_scales = pointer(&mut builder, "block_scales", DType::U8)?;
+    let global_scale = pointer(&mut builder, "global_scale", DType::F32)?;
+    let bias = pointer(&mut builder, "bias", config.dtype)?;
+    let expert_offset = pointer(&mut builder, "expert_offset", DType::I32)?;
+    let output = pointer(&mut builder, "output", config.dtype)?;
+    let schedule = grouped_decode_schedule(
+        &mut builder,
+        config,
+        &sorted_assignments,
+        &block_experts,
+        &active_blocks,
+        &expert_offset,
+    )?;
+
+    let block_n = builder.integer(config.block_n, DType::I32)?;
+    let column_start = builder.multiply(&schedule.output_block, &block_n)?;
+    let column_lanes = builder.range(0, config.block_n as i32)?;
+    let columns = builder.add(&column_start, &column_lanes)?;
+    let output_limit = builder.integer(config.output_size, DType::I32)?;
+    let valid_columns = builder.compare(Comparison::Less, &columns, &output_limit)?;
+
+    let logical_width = config
+        .output_size
+        .checked_mul(2)
+        .ok_or(Error::InvalidKernelSpec("gate/up logical width overflows"))?;
+    let packed_width = config.output_size;
+    let scale_width = ceil_div(logical_width, REPRESENTATION_BLOCK);
+    let scale_n = config.block_n / 8;
+    let payload_stride = config
+        .input_size
+        .checked_mul(packed_width)
+        .ok_or(Error::InvalidKernelSpec("gate/up payload stride overflows"))?;
+    let scale_stride = config
+        .input_size
+        .checked_mul(scale_width)
+        .ok_or(Error::InvalidKernelSpec("gate/up scale stride overflows"))?;
+    let expert_i64 = builder.cast(&schedule.address_expert, DType::I64)?;
+    let payload_stride_value = builder.integer(payload_stride, DType::I64)?;
+    let scale_stride_value = builder.integer(scale_stride, DType::I64)?;
+    let payload_expert_base = builder.multiply(&expert_i64, &payload_stride_value)?;
+    let scale_expert_base = builder.multiply(&expert_i64, &scale_stride_value)?;
+
+    let accumulators = builder.if_then_else(
+        &schedule.execute,
+        |body| {
+            let global = body.load(&global_scale)?;
+            let gate_accumulator = body.full_float(&[config.block_n], 0.0, DType::F32)?;
+            let up_accumulator = body.full_float(&[config.block_n], 0.0, DType::F32)?;
+            let lower = body.integer(0, DType::I32)?;
+            let upper = body.integer(config.input_size, DType::I32)?;
+            let step = body.integer(config.block_k, DType::I32)?;
+            let k_lanes = body.range(0, config.block_k as i32)?;
+            body.for_loop(
+                &lower,
+                &upper,
+                &step,
+                &[gate_accumulator, up_accumulator],
+                |loop_body, start, carried| {
+                    let k = loop_body.add(&start, &k_lanes)?;
+                    let input_limit = loop_body.integer(config.input_size, DType::I32)?;
+                    let valid_k = loop_body.compare(Comparison::Less, &k, &input_limit)?;
+                    let k_i64 = loop_body.cast(&k, DType::I64)?;
+                    let input_offsets = loop_body.add(&schedule.source_base, &k_i64)?;
+                    let input_addresses = loop_body.add_pointer(&input, &input_offsets)?;
+                    let input_zero =
+                        loop_body.full_float(&[config.block_k], 0.0, config.dtype)?;
+                    let activation =
+                        loop_body.load_masked(&input_addresses, &valid_k, &input_zero)?;
+                    let activation = loop_body.cast(&activation, DType::F32)?;
+                    let activation = loop_body.expand_dimension(&activation, 1)?;
+
+                    let k_rows = loop_body.expand_dimension(&k_i64, 1)?;
+                    let packed_width_value = loop_body.integer(packed_width, DType::I64)?;
+                    let payload_rows = loop_body.multiply(&k_rows, &packed_width_value)?;
+                    let payload_rows = loop_body.add(&payload_rows, &payload_expert_base)?;
+                    let columns_i64 = loop_body.cast(&columns, DType::I64)?;
+                    let payload_columns = loop_body.expand_dimension(&columns_i64, 0)?;
+                    let payload_offsets = loop_body.add(&payload_rows, &payload_columns)?;
+                    let payload_addresses = loop_body.add_pointer(&payload, &payload_offsets)?;
+                    let payload_mask = loop_body.mask_2d(&valid_k, &valid_columns)?;
+                    let payload_zero = loop_body.full_integer(
+                        &[config.block_k, config.block_n],
+                        0,
+                        DType::U8,
+                    )?;
+                    let packed = loop_body.load_masked(
+                        &payload_addresses,
+                        &payload_mask,
+                        &payload_zero,
+                    )?;
+                    let nibble = loop_body.full_integer(
+                        &[config.block_k, config.block_n],
+                        0x0f,
+                        DType::U8,
+                    )?;
+                    let gate_code = loop_body.bit_and(&packed, &nibble)?;
+                    let four = loop_body.full_integer(
+                        &[config.block_k, config.block_n],
+                        4,
+                        DType::U8,
+                    )?;
+                    let up_code = loop_body.shift_right_logical(&packed, &four)?;
+                    let gate = decode_e2m1(loop_body, &gate_code)?;
+                    let up = decode_e2m1(loop_body, &up_code)?;
+
+                    let scale_lanes = loop_body.range(0, scale_n as i32)?;
+                    let eight = loop_body.integer(8, DType::I32)?;
+                    let scale_column_start = loop_body.divide(&column_start, &eight)?;
+                    let scale_columns = loop_body.add(&scale_column_start, &scale_lanes)?;
+                    let scale_limit = loop_body.integer(scale_width, DType::I32)?;
+                    let valid_scale_columns =
+                        loop_body.compare(Comparison::Less, &scale_columns, &scale_limit)?;
+                    let scale_width_value = loop_body.integer(scale_width, DType::I64)?;
+                    let scale_rows = loop_body.multiply(&k_rows, &scale_width_value)?;
+                    let scale_rows = loop_body.add(&scale_rows, &scale_expert_base)?;
+                    let scale_columns_i64 = loop_body.cast(&scale_columns, DType::I64)?;
+                    let scale_columns_i64 =
+                        loop_body.expand_dimension(&scale_columns_i64, 0)?;
+                    let scale_offsets = loop_body.add(&scale_rows, &scale_columns_i64)?;
+                    let scale_addresses =
+                        loop_body.add_pointer(&block_scales, &scale_offsets)?;
+                    let scale_mask = loop_body.mask_2d(&valid_k, &valid_scale_columns)?;
+                    let scale_zero = loop_body.full_integer(
+                        &[config.block_k, scale_n],
+                        0,
+                        DType::U8,
+                    )?;
+                    let scales = loop_body.load_masked(
+                        &scale_addresses,
+                        &scale_mask,
+                        &scale_zero,
+                    )?;
+                    let scales = decode_e4m3fn(loop_body, &scales)?;
+                    let scales =
+                        loop_body.reshape(&scales, &[config.block_k, scale_n, 1])?;
+                    let scales =
+                        loop_body.broadcast(&scales, &[config.block_k, scale_n, 8])?;
+                    let scales =
+                        loop_body.reshape(&scales, &[config.block_k, config.block_n])?;
+                    let gate = loop_body.multiply(&gate, &scales)?;
+                    let up = loop_body.multiply(&up, &scales)?;
+                    let gate = loop_body.multiply(&gate, &global)?;
+                    let up = loop_body.multiply(&up, &global)?;
+                    let gate = loop_body.multiply(&gate, &activation)?;
+                    let up = loop_body.multiply(&up, &activation)?;
+                    let gate = loop_body.reduce(Reduction::Sum, &gate, 0)?;
+                    let up = loop_body.reduce(Reduction::Sum, &up, 0)?;
+                    Ok(vec![
+                        loop_body.add(&carried[0], &gate)?,
+                        loop_body.add(&carried[1], &up)?,
+                    ])
+                },
+            )
+        },
+        |body| {
+            Ok(vec![
+                body.full_float(&[config.block_n], 0.0, DType::F32)?,
+                body.full_float(&[config.block_n], 0.0, DType::F32)?,
+            ])
+        },
+    )?;
+    let mut gate = accumulators[0].clone();
+    let mut up = accumulators[1].clone();
+
+    let expert_i64 = builder.cast(&schedule.address_expert, DType::I64)?;
+    let logical_width_value = builder.integer(logical_width, DType::I64)?;
+    let bias_base = builder.multiply(&expert_i64, &logical_width_value)?;
+    let columns_i64 = builder.cast(&columns, DType::I64)?;
+    let two = builder.integer(2, DType::I64)?;
+    let gate_columns = builder.multiply(&columns_i64, &two)?;
+    let gate_offsets = builder.add(&bias_base, &gate_columns)?;
+    let one = builder.integer(1, DType::I64)?;
+    let up_offsets = builder.add(&gate_offsets, &one)?;
+    let gate_addresses = builder.add_pointer(&bias, &gate_offsets)?;
+    let up_addresses = builder.add_pointer(&bias, &up_offsets)?;
+    let bias_mask = builder.bit_and(&valid_columns, &schedule.execute)?;
+    let bias_zero = builder.full_float(&[config.block_n], 0.0, config.dtype)?;
+    let gate_bias = builder.load_masked(&gate_addresses, &bias_mask, &bias_zero)?;
+    let up_bias = builder.load_masked(&up_addresses, &bias_mask, &bias_zero)?;
+    let gate_bias = builder.cast(&gate_bias, DType::F32)?;
+    let up_bias = builder.cast(&up_bias, DType::F32)?;
+    gate = builder.add(&gate, &gate_bias)?;
+    up = builder.add(&up, &up_bias)?;
+    let activated = clamped_residual_swiglu(&mut builder, gate, up)?;
+
+    let assignment_i64 = builder.cast(&schedule.address_assignment, DType::I64)?;
+    let output_width = builder.integer(config.output_size, DType::I64)?;
+    let output_base = builder.multiply(&assignment_i64, &output_width)?;
+    let output_offsets = builder.add(&output_base, &columns_i64)?;
+    let output_addresses = builder.add_pointer(&output, &output_offsets)?;
+    let output_mask = builder.bit_and(&valid_columns, &schedule.store)?;
+    let activated = builder.cast(&activated, config.dtype)?;
+    builder.store_masked(&output_addresses, &activated, &output_mask)?;
+    builder.return_void()?;
+    builder.finish()
+}
+
+fn build_grouped_down_gemv(
+    config: NvFp4GroupedProjectionConfig,
+) -> Result<Kernel, Error> {
+    let mut builder = Builder::new("nvfp4_grouped_down_gemv")?;
+    let input = pointer(&mut builder, "input", config.dtype)?;
+    let sorted_assignments = pointer(&mut builder, "sorted_assignments", DType::I32)?;
+    let block_experts = pointer(&mut builder, "block_experts", DType::I32)?;
+    let active_blocks = pointer(&mut builder, "active_blocks", DType::I32)?;
+    let payload = pointer(&mut builder, "payload", DType::U8)?;
+    let block_scales = pointer(&mut builder, "block_scales", DType::U8)?;
+    let global_scale = pointer(&mut builder, "global_scale", DType::F32)?;
+    let bias = pointer(&mut builder, "bias", config.dtype)?;
+    let expert_offset = pointer(&mut builder, "expert_offset", DType::I32)?;
+    let routing_weights = pointer(&mut builder, "routing_weights", config.dtype)?;
+    let output = pointer(&mut builder, "output", config.dtype)?;
+    let schedule = grouped_decode_schedule(
+        &mut builder,
+        config,
+        &sorted_assignments,
+        &block_experts,
+        &active_blocks,
+        &expert_offset,
+    )?;
+
+    let pair_n = config.block_n / 2;
+    let pair_n_i32 = i32::try_from(pair_n)
+        .map_err(|_| Error::InvalidKernelSpec("down packed N tile exceeds I32"))?;
+    let pair_n_value = builder.integer(pair_n, DType::I32)?;
+    let pair_start = builder.multiply(&schedule.output_block, &pair_n_value)?;
+    let pair_lanes = builder.range(0, pair_n_i32)?;
+    let pairs = builder.add(&pair_start, &pair_lanes)?;
+    let two = builder.integer(2, DType::I32)?;
+    let even_columns = builder.multiply(&pairs, &two)?;
+    let one = builder.integer(1, DType::I32)?;
+    let odd_columns = builder.add(&even_columns, &one)?;
+    let output_limit = builder.integer(config.output_size, DType::I32)?;
+    let valid_even = builder.compare(Comparison::Less, &even_columns, &output_limit)?;
+    let valid_odd = builder.compare(Comparison::Less, &odd_columns, &output_limit)?;
+
+    let packed_width = ceil_div(config.output_size, 2);
+    let scale_width = ceil_div(config.output_size, REPRESENTATION_BLOCK);
+    let scale_n = config.block_n / REPRESENTATION_BLOCK;
+    let payload_stride = config
+        .input_size
+        .checked_mul(packed_width)
+        .ok_or(Error::InvalidKernelSpec("down payload stride overflows"))?;
+    let scale_stride = config
+        .input_size
+        .checked_mul(scale_width)
+        .ok_or(Error::InvalidKernelSpec("down scale stride overflows"))?;
+    let expert_i64 = builder.cast(&schedule.address_expert, DType::I64)?;
+    let payload_stride_value = builder.integer(payload_stride, DType::I64)?;
+    let scale_stride_value = builder.integer(scale_stride, DType::I64)?;
+    let payload_expert_base = builder.multiply(&expert_i64, &payload_stride_value)?;
+    let scale_expert_base = builder.multiply(&expert_i64, &scale_stride_value)?;
+
+    let accumulators = builder.if_then_else(
+        &schedule.execute,
+        |body| {
+            let global = body.load(&global_scale)?;
+            let even_accumulator = body.full_float(&[pair_n], 0.0, DType::F32)?;
+            let odd_accumulator = body.full_float(&[pair_n], 0.0, DType::F32)?;
+            let lower = body.integer(0, DType::I32)?;
+            let upper = body.integer(config.input_size, DType::I32)?;
+            let step = body.integer(config.block_k, DType::I32)?;
+            let k_lanes = body.range(0, config.block_k as i32)?;
+            body.for_loop(
+                &lower,
+                &upper,
+                &step,
+                &[even_accumulator, odd_accumulator],
+                |loop_body, start, carried| {
+                    let k = loop_body.add(&start, &k_lanes)?;
+                    let input_limit = loop_body.integer(config.input_size, DType::I32)?;
+                    let valid_k = loop_body.compare(Comparison::Less, &k, &input_limit)?;
+                    let k_i64 = loop_body.cast(&k, DType::I64)?;
+                    let input_offsets = loop_body.add(&schedule.source_base, &k_i64)?;
+                    let input_addresses = loop_body.add_pointer(&input, &input_offsets)?;
+                    let input_zero =
+                        loop_body.full_float(&[config.block_k], 0.0, config.dtype)?;
+                    let activation =
+                        loop_body.load_masked(&input_addresses, &valid_k, &input_zero)?;
+                    let activation = loop_body.cast(&activation, DType::F32)?;
+                    let activation = loop_body.expand_dimension(&activation, 1)?;
+
+                    let k_rows = loop_body.expand_dimension(&k_i64, 1)?;
+                    let packed_width_value = loop_body.integer(packed_width, DType::I64)?;
+                    let payload_rows = loop_body.multiply(&k_rows, &packed_width_value)?;
+                    let payload_rows = loop_body.add(&payload_rows, &payload_expert_base)?;
+                    let pairs_i64 = loop_body.cast(&pairs, DType::I64)?;
+                    let payload_columns = loop_body.expand_dimension(&pairs_i64, 0)?;
+                    let payload_offsets = loop_body.add(&payload_rows, &payload_columns)?;
+                    let payload_addresses = loop_body.add_pointer(&payload, &payload_offsets)?;
+                    let payload_mask = loop_body.mask_2d(&valid_k, &valid_even)?;
+                    let payload_zero =
+                        loop_body.full_integer(&[config.block_k, pair_n], 0, DType::U8)?;
+                    let packed = loop_body.load_masked(
+                        &payload_addresses,
+                        &payload_mask,
+                        &payload_zero,
+                    )?;
+                    let nibble =
+                        loop_body.full_integer(&[config.block_k, pair_n], 0x0f, DType::U8)?;
+                    let low_code = loop_body.bit_and(&packed, &nibble)?;
+                    let four =
+                        loop_body.full_integer(&[config.block_k, pair_n], 4, DType::U8)?;
+                    let high_code = loop_body.shift_right_logical(&packed, &four)?;
+                    let low = decode_e2m1(loop_body, &low_code)?;
+                    let high = decode_e2m1(loop_body, &high_code)?;
+
+                    let scale_lanes = loop_body.range(0, scale_n as i32)?;
+                    let eight = loop_body.integer(8, DType::I32)?;
+                    let scale_column_start = loop_body.divide(&pair_start, &eight)?;
+                    let scale_columns = loop_body.add(&scale_column_start, &scale_lanes)?;
+                    let scale_limit = loop_body.integer(scale_width, DType::I32)?;
+                    let valid_scale_columns =
+                        loop_body.compare(Comparison::Less, &scale_columns, &scale_limit)?;
+                    let scale_width_value = loop_body.integer(scale_width, DType::I64)?;
+                    let scale_rows = loop_body.multiply(&k_rows, &scale_width_value)?;
+                    let scale_rows = loop_body.add(&scale_rows, &scale_expert_base)?;
+                    let scale_columns_i64 = loop_body.cast(&scale_columns, DType::I64)?;
+                    let scale_columns_i64 =
+                        loop_body.expand_dimension(&scale_columns_i64, 0)?;
+                    let scale_offsets = loop_body.add(&scale_rows, &scale_columns_i64)?;
+                    let scale_addresses =
+                        loop_body.add_pointer(&block_scales, &scale_offsets)?;
+                    let scale_mask = loop_body.mask_2d(&valid_k, &valid_scale_columns)?;
+                    let scale_zero = loop_body.full_integer(
+                        &[config.block_k, scale_n],
+                        0,
+                        DType::U8,
+                    )?;
+                    let scales = loop_body.load_masked(
+                        &scale_addresses,
+                        &scale_mask,
+                        &scale_zero,
+                    )?;
+                    let scales = decode_e4m3fn(loop_body, &scales)?;
+                    let scales =
+                        loop_body.reshape(&scales, &[config.block_k, scale_n, 1])?;
+                    let scales =
+                        loop_body.broadcast(&scales, &[config.block_k, scale_n, 8])?;
+                    let scales = loop_body.reshape(&scales, &[config.block_k, pair_n])?;
+                    let low = loop_body.multiply(&low, &scales)?;
+                    let high = loop_body.multiply(&high, &scales)?;
+                    let low = loop_body.multiply(&low, &global)?;
+                    let high = loop_body.multiply(&high, &global)?;
+                    let low = loop_body.multiply(&low, &activation)?;
+                    let high = loop_body.multiply(&high, &activation)?;
+                    let low = loop_body.reduce(Reduction::Sum, &low, 0)?;
+                    let high = loop_body.reduce(Reduction::Sum, &high, 0)?;
+                    Ok(vec![
+                        loop_body.add(&carried[0], &low)?,
+                        loop_body.add(&carried[1], &high)?,
+                    ])
+                },
+            )
+        },
+        |body| {
+            Ok(vec![
+                body.full_float(&[pair_n], 0.0, DType::F32)?,
+                body.full_float(&[pair_n], 0.0, DType::F32)?,
+            ])
+        },
+    )?;
+    let mut even = accumulators[0].clone();
+    let mut odd = accumulators[1].clone();
+
+    let expert_i64 = builder.cast(&schedule.address_expert, DType::I64)?;
+    let output_width = builder.integer(config.output_size, DType::I64)?;
+    let bias_base = builder.multiply(&expert_i64, &output_width)?;
+    let even_i64 = builder.cast(&even_columns, DType::I64)?;
+    let odd_i64 = builder.cast(&odd_columns, DType::I64)?;
+    let even_bias_offsets = builder.add(&bias_base, &even_i64)?;
+    let odd_bias_offsets = builder.add(&bias_base, &odd_i64)?;
+    let even_bias_addresses = builder.add_pointer(&bias, &even_bias_offsets)?;
+    let odd_bias_addresses = builder.add_pointer(&bias, &odd_bias_offsets)?;
+    let even_mask = builder.bit_and(&valid_even, &schedule.execute)?;
+    let odd_mask = builder.bit_and(&valid_odd, &schedule.execute)?;
+    let bias_zero = builder.full_float(&[pair_n], 0.0, config.dtype)?;
+    let even_bias =
+        builder.load_masked(&even_bias_addresses, &even_mask, &bias_zero)?;
+    let odd_bias = builder.load_masked(&odd_bias_addresses, &odd_mask, &bias_zero)?;
+    let even_bias = builder.cast(&even_bias, DType::F32)?;
+    let odd_bias = builder.cast(&odd_bias, DType::F32)?;
+    even = builder.add(&even, &even_bias)?;
+    odd = builder.add(&odd, &odd_bias)?;
+
+    let routing_address =
+        builder.add_pointer(&routing_weights, &schedule.address_assignment)?;
+    let routing_zero = builder.float(0.0, config.dtype)?;
+    let routing = builder.load_masked(&routing_address, &schedule.execute, &routing_zero)?;
+    let routing = builder.cast(&routing, DType::F32)?;
+    even = builder.multiply(&even, &routing)?;
+    odd = builder.multiply(&odd, &routing)?;
+
+    let assignment_i64 = builder.cast(&schedule.address_assignment, DType::I64)?;
+    let output_base = builder.multiply(&assignment_i64, &output_width)?;
+    let even_offsets = builder.add(&output_base, &even_i64)?;
+    let odd_offsets = builder.add(&output_base, &odd_i64)?;
+    let even_addresses = builder.add_pointer(&output, &even_offsets)?;
+    let odd_addresses = builder.add_pointer(&output, &odd_offsets)?;
+    let even = builder.cast(&even, config.dtype)?;
+    let odd = builder.cast(&odd, config.dtype)?;
+    let even_store = builder.bit_and(&valid_even, &schedule.store)?;
+    let odd_store = builder.bit_and(&valid_odd, &schedule.store)?;
+    builder.store_masked(&even_addresses, &even, &even_store)?;
+    builder.store_masked(&odd_addresses, &odd, &odd_store)?;
+    builder.return_void()?;
+    builder.finish()
+}
+
 fn clamped_residual_swiglu(
     builder: &mut Builder,
-    gate: super::Value,
-    up: super::Value,
-    dtype: DType,
-) -> Result<super::Value, Error> {
+    gate: Value,
+    up: Value,
+) -> Result<Value, Error> {
     let gate = builder.cast(&gate, DType::F32)?;
     let up = builder.cast(&up, DType::F32)?;
     let gate_limit = builder.full_float_like(&gate, 7.0)?;
@@ -596,8 +1590,7 @@ fn clamped_residual_swiglu(
     let sigmoid = builder.divide(&one, &denominator)?;
     let swish = builder.multiply(&gate, &sigmoid)?;
     let residual = builder.add(&up, &one)?;
-    let activated = builder.multiply(&residual, &swish)?;
-    builder.cast(&activated, dtype)
+    builder.multiply(&residual, &swish)
 }
 
 fn pointer(builder: &mut Builder, name: &str, dtype: DType) -> Result<super::Value, Error> {
@@ -625,28 +1618,41 @@ fn decode_e2m1(builder: &mut Builder, code: &super::Value) -> Result<super::Valu
     let shape = code_shape(code)?;
     let magnitude_mask = builder.full_integer(&shape, 0x07, DType::U8)?;
     let magnitude = builder.bit_and(code, &magnitude_mask)?;
-    let one_i8 = builder.full_integer(&shape, 1, DType::U8)?;
-    let mantissa = builder.bit_and(&magnitude, &one_i8)?;
-    let one_shift = builder.full_integer(&shape, 1, DType::U8)?;
-    let group = builder.shift_right_logical(&magnitude, &one_shift)?;
-    let magnitude_f32 = builder.cast(&magnitude, DType::F32)?;
-    let half = builder.full_float(&shape, 0.5, DType::F32)?;
-    let subnormal = builder.multiply(&magnitude_f32, &half)?;
-    let group = builder.cast(&group, DType::F32)?;
-    let one = builder.full_float(&shape, 1.0, DType::F32)?;
-    let exponent = builder.subtract(&group, &one)?;
-    let power = builder.exp2(&exponent)?;
-    let mantissa = builder.cast(&mantissa, DType::F32)?;
-    let mantissa = builder.multiply(&mantissa, &half)?;
-    let significand = builder.add(&one, &mantissa)?;
-    let normal = builder.multiply(&power, &significand)?;
+
+    // E2M1's eight magnitudes map directly onto IEEE F32 fields. Magnitudes
+    // two through seven have exponent `(magnitude >> 1) + 126` and use the low
+    // code bit as the F32 0.5 mantissa. Zero and 0.5 are the only exceptions.
+    // Constructing bits is both exact and substantially cheaper than deriving
+    // a dynamic exponent through `math.exp2` for every logical weight.
+    let one_u8 = builder.full_integer(&shape, 1, DType::U8)?;
+    let mantissa = builder.bit_and(&magnitude, &one_u8)?;
+    let group = builder.shift_right_logical(&magnitude, &one_u8)?;
+    let group = builder.cast(&group, DType::I32)?;
+    let exponent_bias = builder.full_integer(&shape, 126, DType::I32)?;
+    let exponent = builder.add(&group, &exponent_bias)?;
+    let exponent_place = builder.full_integer(&shape, 1 << 23, DType::I32)?;
+    let normal_bits = builder.multiply(&exponent, &exponent_place)?;
+    let mantissa = builder.cast(&mantissa, DType::I32)?;
+    let mantissa_place = builder.full_integer(&shape, 1 << 22, DType::I32)?;
+    let mantissa_bits = builder.multiply(&mantissa, &mantissa_place)?;
+    let normal_bits = builder.add(&normal_bits, &mantissa_bits)?;
+
+    let magnitude_i32 = builder.cast(&magnitude, DType::I32)?;
+    let half_bits = builder.full_integer(&shape, 0x3f00_0000, DType::I32)?;
+    let small_bits = builder.multiply(&magnitude_i32, &half_bits)?;
     let two = builder.full_integer(&shape, 2, DType::U8)?;
-    let is_subnormal = builder.compare(Comparison::Less, &magnitude, &two)?;
-    let magnitude = builder.select(&is_subnormal, &subnormal, &normal)?;
-    let sign_boundary = builder.full_integer(&shape, 8, DType::U8)?;
-    let positive = builder.compare(Comparison::Less, code, &sign_boundary)?;
-    let negative = builder.negate(&magnitude)?;
-    builder.select(&positive, &magnitude, &negative)
+    let is_small = builder.compare(Comparison::Less, &magnitude, &two)?;
+    let magnitude_bits = builder.select(&is_small, &small_bits, &normal_bits)?;
+
+    // Preserve E2M1 negative zero by transferring the code's sign into the
+    // exact F32 sign bit before reinterpreting the integer tensor.
+    let three = builder.full_integer(&shape, 3, DType::U8)?;
+    let sign = builder.shift_right_logical(code, &three)?;
+    let sign = builder.cast(&sign, DType::I32)?;
+    let sign_place = builder.full_integer(&shape, i64::from(i32::MIN), DType::I32)?;
+    let sign_bits = builder.multiply(&sign, &sign_place)?;
+    let value_bits = builder.add(&magnitude_bits, &sign_bits)?;
+    builder.bitcast(&value_bits, DType::F32)
 }
 
 fn decode_e4m3fn(builder: &mut Builder, bits: &super::Value) -> Result<super::Value, Error> {
@@ -657,21 +1663,69 @@ fn decode_e4m3fn(builder: &mut Builder, bits: &super::Value) -> Result<super::Va
     let exponent = builder.bit_and(&exponent, &exponent_mask)?;
     let fraction_mask = builder.full_integer(&shape, 0x07, DType::U8)?;
     let fraction = builder.bit_and(bits, &fraction_mask)?;
-    let fraction = builder.cast(&fraction, DType::F32)?;
-    let subnormal_factor = builder.full_float(&shape, 2.0f64.powi(-9), DType::F32)?;
-    let subnormal = builder.multiply(&fraction, &subnormal_factor)?;
-    let eight = builder.full_float(&shape, 8.0, DType::F32)?;
-    let fraction = builder.divide(&fraction, &eight)?;
-    let one = builder.full_float(&shape, 1.0, DType::F32)?;
-    let significand = builder.add(&one, &fraction)?;
-    let exponent_f32 = builder.cast(&exponent, DType::F32)?;
-    let seven = builder.full_float(&shape, 7.0, DType::F32)?;
-    let exponent_f32 = builder.subtract(&exponent_f32, &seven)?;
-    let power = builder.exp2(&exponent_f32)?;
-    let normal = builder.multiply(&significand, &power)?;
+
+    // Normal E4M3FN values become F32 by rebiasing the exponent from seven to
+    // 127 and placing the three mantissa bits at the top of F32's mantissa.
+    // NVFP4 block scales are validated as non-negative before upload, so the
+    // source sign bit is not part of the accepted execution domain.
+    let exponent_i32 = builder.cast(&exponent, DType::I32)?;
+    let f32_bias_delta = builder.full_integer(&shape, 120, DType::I32)?;
+    let f32_exponent = builder.add(&exponent_i32, &f32_bias_delta)?;
+    let exponent_place = builder.full_integer(&shape, 1 << 23, DType::I32)?;
+    let normal_bits = builder.multiply(&f32_exponent, &exponent_place)?;
+    let fraction_i32 = builder.cast(&fraction, DType::I32)?;
+    let fraction_place = builder.full_integer(&shape, 1 << 20, DType::I32)?;
+    let fraction_bits = builder.multiply(&fraction_i32, &fraction_place)?;
+    let normal_bits = builder.add(&normal_bits, &fraction_bits)?;
+
+    // Exponent zero has only eight cases. These three exact integer pieces
+    // cover 0, 2^-9, the 2^-8 pair, and the four 2^-7 values without a table
+    // load, division, or transcendental operation.
+    let zero_u8 = builder.full_integer(&shape, 0, DType::U8)?;
+    let one_u8 = builder.full_integer(&shape, 1, DType::U8)?;
+    let two_u8 = builder.full_integer(&shape, 2, DType::U8)?;
+    let four_u8 = builder.full_integer(&shape, 4, DType::U8)?;
+    let two_i32 = builder.cast(&two_u8, DType::I32)?;
+    let fraction_minus_two = builder.subtract(&fraction_i32, &two_i32)?;
+    let mid_step = builder.full_integer(&shape, 1 << 22, DType::I32)?;
+    let mid_bits = builder.multiply(&fraction_minus_two, &mid_step)?;
+    let mid_base = builder.full_integer(&shape, 0x3b80_0000, DType::I32)?;
+    let mid_bits = builder.add(&mid_base, &mid_bits)?;
+    let four_i32 = builder.cast(&four_u8, DType::I32)?;
+    let fraction_minus_four = builder.subtract(&fraction_i32, &four_i32)?;
+    let high_step = builder.full_integer(&shape, 1 << 21, DType::I32)?;
+    let high_bits = builder.multiply(&fraction_minus_four, &high_step)?;
+    let high_base = builder.full_integer(&shape, 0x3c00_0000, DType::I32)?;
+    let high_bits = builder.add(&high_base, &high_bits)?;
+    let is_below_four = builder.compare(Comparison::Less, &fraction, &four_u8)?;
+    let subnormal_bits = builder.select(&is_below_four, &mid_bits, &high_bits)?;
+    let one_bits = builder.full_integer(&shape, 0x3b00_0000, DType::I32)?;
+    let is_one = builder.compare(Comparison::Equal, &fraction, &one_u8)?;
+    let subnormal_bits = builder.select(&is_one, &one_bits, &subnormal_bits)?;
+    let zero_bits = builder.full_integer(&shape, 0, DType::I32)?;
+    let is_zero_fraction = builder.compare(Comparison::Equal, &fraction, &zero_u8)?;
+    let subnormal_bits = builder.select(&is_zero_fraction, &zero_bits, &subnormal_bits)?;
+
     let zero = builder.full_integer(&shape, 0, DType::U8)?;
     let is_zero_exponent = builder.compare(Comparison::Equal, &exponent, &zero)?;
-    builder.select(&is_zero_exponent, &subnormal, &normal)
+    let value_bits = builder.select(&is_zero_exponent, &subnormal_bits, &normal_bits)?;
+
+    // The scalar representation rejects negative scales and E4M3FN NaN. A
+    // malformed component cannot report an error from inside a custom call,
+    // so poison those unreachable encodings with a canonical F32 NaN instead
+    // of silently interpreting them as a valid positive scale.
+    let sign_boundary = builder.full_integer(&shape, 0x80, DType::U8)?;
+    let has_sign = builder.compare(Comparison::GreaterEqual, bits, &sign_boundary)?;
+    let fifteen = builder.full_integer(&shape, 15, DType::U8)?;
+    let seven = builder.full_integer(&shape, 7, DType::U8)?;
+    let exponent_is_fifteen = builder.compare(Comparison::Equal, &exponent, &fifteen)?;
+    let fraction_is_seven = builder.compare(Comparison::Equal, &fraction, &seven)?;
+    let is_nan = builder.bit_and(&exponent_is_fifteen, &fraction_is_seven)?;
+    let true_value = builder.full_integer(&shape, 1, DType::I1)?;
+    let invalid = builder.select(&has_sign, &true_value, &is_nan)?;
+    let nan_bits = builder.full_integer(&shape, 0x7fc0_0000, DType::I32)?;
+    let value_bits = builder.select(&invalid, &nan_bits, &value_bits)?;
+    builder.bitcast(&value_bits, DType::F32)
 }
 
 fn code_shape(value: &super::Value) -> Result<Vec<i64>, Error> {

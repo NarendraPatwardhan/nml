@@ -695,6 +695,17 @@ Kernel configuration is selected from a finite, source-owned family keyed by:
 Do not compile a unique kernel for every request sequence length. Runtime M
 tails use masks within bounded families.
 
+For the retained pre-Blackwell Triton path, `M = 1` is a separate compact GEMV
+family: one useful output tile per program, packed-pair loads, exact bitwise
+E2M1/E4M3FN decoding, one scale load broadcast across its representation
+block, and F32 reduction without a dead-row `tt.dot`. Decode ordinary,
+gate/up, and down projections all follow this rule. Multi-row prefill retains
+the finite tensor-core family established by ZML's grouped-MoE policy: small M
+uses 64 output columns, 128 reduction lanes, four warps, and four stages;
+larger regimes widen output tiles only when activation reuse justifies them.
+These are named compiled families, not an autotuner hidden inside request
+execution.
+
 ### 10.2 GPT-OSS grouped experts
 
 GPT-OSS is MoE, so quantized grouped projection is part of the first vertical,
@@ -712,10 +723,28 @@ Required cases include:
 - capacity/tail masking; and
 - expert-axis sharding.
 
+Routing has two distinct quantities. `capacity` is the maximum statically
+allocated schedule extent required by XLA shapes; `active_blocks` is the
+runtime prefix that may execute. When the route set is sparse relative to the
+expert set, each selected assignment owns one padded block directly and launch
+capacity is exactly the number of selected routes. Otherwise the aligned
+schedule carries its active prefix explicitly. An inactive or non-local Triton
+program returns zero before it forms a compact-weight address. Masking input
+rows while clamping an invalid expert to expert zero is forbidden: it still
+loads and decodes an entire unselected matrix and destroys MoE sparsity.
+
 Fusion should begin with transformations that remove unavoidable memory
 traffic and have an exact model semantic boundary: bias, gated activation, and
 the paired expert projections where numerically appropriate. Broad arbitrary
 fusion is not a goal. Every fused path retains an unfused CPU oracle.
+
+The expert interface itself is fixed: gate/up performs the paired contractions,
+adds paired biases, applies the selected activation exactly once, and writes
+`[assignments, intermediate]`. Down accepts only that activated tensor, then
+adds down bias and applies routing weight. Down must not receive an interleaved
+gate/up tensor or recompute activation per output tile. This boundary is shared
+by dense and NVFP4 lowering; representation-specific code may choose matrix or
+GEMV geometry but may not change model semantics.
 
 ### 10.3 Embedding and output projection
 
@@ -768,7 +797,7 @@ The load pipeline is transactional:
 
 ```text
 bounded SafeTensors/index parse
-  -> immutable artifact-manifest validation
+  -> authenticated artifact-manifest and materialization-receipt validation
   -> logical ParameterSpec construction
   -> sharding plan validation
   -> physical component allocation/upload
@@ -780,6 +809,14 @@ bounded SafeTensors/index parse
 Failure before the final step releases all partial allocations. A prepared
 parameter is immutable and may be shared by all compiled executables for the
 same platform/topology.
+
+Full payload hashing belongs to the artifact materializer that precedes this
+pipeline. It authenticates the pinned manifest, hashes every declared payload,
+makes the verified materialization read-only, and atomically issues a bounded
+filesystem-identity receipt. The load pipeline hashes only the small manifest
+and rejects a missing, writable, or stale receipt. It never turns an invalid
+receipt into an implicit multi-gigabyte scan, so launch latency is independent
+of checkpoint size while ingestion retains byte-exact verification.
 
 Preparation rules:
 
@@ -863,7 +900,7 @@ The complete selected GPT-OSS model must compare:
 - embedding and representative layer outputs;
 - attention sinks and alternating attention windows;
 - router logits, selected experts, expert outputs, and combined MoE output;
-- final logits and greedy tokens;
+- final logits plus explicit-greedy and fixed-seed stochastic tokens;
 - Harmony channel structure and incremental decoding; and
 - a fixed set of end-to-end prompts
 
@@ -1059,7 +1096,9 @@ NVFP4 may be marked complete only when every applicable item is true:
 - [x] Packed host and device storage never retains a full dense copy.
 - [x] CPU codec, embedding, linear, and grouped MoE execute correctly.
 - [ ] CPU has a measured optimized path on x86-64 and a retained AArch64 design.
-- [x] SM75 fused emulation launches and passes on the local GPU.
+- [ ] The current SM75 exact-decode/GEMV adapter launches and passes on a real
+  device. Its established activation-boundary predecessor passed locally; the
+  refactored source is compile-gated but is not reused as evidence for SM8x.
 - [x] SM8x fused emulation launches and passes on a real suitable GPU. The
   immutable full contract image at digest
   `sha256:17040fd252bac543bb3b02e9abc253d309d05a7b64cf6ee7b8c6cc8b64c426b4`

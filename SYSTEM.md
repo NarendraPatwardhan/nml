@@ -296,11 +296,15 @@ a statically large index geometry that cannot enter an I32 kernel ABI stays on
 the portable I64 graph instead of truncating values.
 
 GPT-OSS authors paged attention even while the single-request engine owns one
-contiguous donated cache buffer. The graph views that buffer as one identity
-page and supplies the logical sequence length, so its supported CUDA geometry
-always selects FA2, FA3, or Triton rather than an ordinary-attention runtime
-branch over unused cache capacity. Continuous batching can replace the page
-table and cache owner without changing model semantics.
+contiguous donated cache buffer. The graph views that storage as 16-token
+physical pages behind an identity page table and supplies the logical sequence
+length, so its supported CUDA geometry always selects FA2, FA3, or Triton
+rather than an ordinary-attention runtime branch over unused cache capacity.
+Physical page width and kernel tile width are separate contracts: CUDA decode
+tiles are capped at 64 even when another product chooses coarser pages, so
+allocation policy cannot silently create a register-spilling attention kernel.
+Continuous batching can replace the page table and cache owner without
+changing model semantics.
 
 ## 7. Sharding and distributed execution
 
@@ -436,9 +440,22 @@ Shardy, sampling, and runtime substrate. It implements the selected artifact's
 exact configuration and tensor mapping,
 attention-sink denominator bias, clamped/residual SwiGLU semantics, alternating
 dense/window attention schedule, `o200k_harmony` tokenization behavior, Harmony
-roles/channels, and end-to-end output contract. The private adapter validates
-the byte-exact artifact manifest before opening its manifest-selected
-SafeTensors index and declares 411 logical parameters over 703 compact physical
+roles/channels, and end-to-end output contract. The private adapter
+authenticates the small, byte-exact artifact manifest and validates its
+ingestion-issued materialization receipt before opening the manifest-selected
+SafeTensors index. The expensive content hash of every payload is an ingestion
+operation, never a model-start operation. Successful materialization makes the
+manifest and payloads read-only and atomically records each file's device,
+inode, size, mode, modification time, and change time. Startup compares that
+bounded receipt with the authenticated manifest and current filesystem
+identities; a missing or stale receipt is a hard error that requires
+rematerialization, not a fallback full scan. This protects the deployment
+lifecycle from incomplete or accidentally mutated artifacts. It assumes the
+artifact host administrator is trusted: an actor who can replace both payload
+and receipt is outside the local receipt's threat model and requires an
+externally signed or filesystem-verified deployment boundary.
+
+The adapter declares 411 logical parameters over 703 compact physical
 components. Each finite prefill/decode shape family contains four bounded
 executables: embedding, one reusable sliding-attention layer, one reusable
 full-attention layer, and the final normalization/output head. Structural
@@ -454,6 +471,13 @@ and cache capacities use finite power-of-two/page buckets so compiled families
 are reusable across requests without making XLA compile a monolithic 24-layer
 module. This lifecycle does not claim continuous batching or cross-request
 cache sharing; those require the separate server-owned arena and scheduler.
+
+Loaded executables resolve immutable result arity once at compilation. A hot
+enqueue must not reacquire an executable metadata handle merely to rediscover
+its output count. Product timing separates end-to-end device execution from
+host submission at the embedding, sliding-layer, full-layer, and head
+boundaries; submission counters never add synchronization and are not labeled
+as GPU kernel timings.
 
 Readable full-checkpoint generation and independent-oracle acceptance are two
 explicit executions of the same product contract. Both require the immutable
@@ -539,6 +563,13 @@ cross the custom-call boundary. Split-K paged attention keeps its producer
 sink-free and supplies learned sinks only to the global segment reduction,
 where their softmax correction is applied exactly once.
 
+Paged-attention page addressing is lane-wise and therefore permits a compute
+tile to cross physical page boundaries. Launch selection uses that property to
+bound decode tile width independently of cache allocation granularity. Product
+cache pages remain small for memory utilization; the framework cap prevents a
+different product's large pages from becoming unbounded per-program register
+state.
+
 The retained CUDA paths use Triton for unified paged attention and grouped
 expert projections on Ampere and newer GPUs. The pinned XLA Triton compiler
 rejects pre-Ampere devices, so SM75 uses portable XLA CUDA. Kernel source and
@@ -561,6 +592,28 @@ Portable MoE performs top-k routing, stable assignment construction, grouped
 expert execution, weighting, and combination in StableHLO. Shardy owns expert
 partitioning. Private Triton kernels specialize grouped expert projections on
 SM80 and newer; CPU and SM75 use the portable graph.
+
+Static schedule capacity is not executable work. Sparse decode uses one expert
+block per selected route when `assignments * 4 <= experts`, matching ZML's
+direct assignment crossover. General routing retains an aligned expert
+schedule plus an explicit active-block scalar. Every grouped CUDA kernel tests
+that scalar and expert locality before forming a weight address, decoding a
+scale, or entering a contraction; an inactive/non-local block contributes zero
+for the later expert-parallel reduction. Clamping an invalid expert to expert
+zero is prohibited because a masked activation does not prevent weight
+traffic. Decode and larger-batch tiles use ZML's finite, source-owned threshold
+family, including eight-warps above 128 tokens on all retained Triton-capable
+NVIDIA generations, rather than request-specific heuristics.
+
+Every expert backend shares one semantic projection boundary. Gate/up performs
+both paired contractions, owns its bias and activation exactly once, and emits
+`[assignments, intermediate]`; down consumes that activated tensor and owns
+only its bias and route weighting. This prevents an output-tiled down kernel
+from recomputing the same nonlinearity and keeps dense, compact CPU, SM75, and
+SM80+ lowering interchangeable at the graph boundary. Private compact CUDA
+lowering selects a dedicated F32-accumulating GEMV for `M = 1`; prefill retains
+the finite tensor-core matrix family. Weight/scale decode is register-local and
+exact, and one scale load is reused across its complete representation block.
 
 The operation substrate presently includes:
 
@@ -660,9 +713,13 @@ target.
 Model weights are never ordinary OCI image layers. Local execution mounts an
 exact local artifact; RunPod either downloads the same revision into ephemeral
 storage or mounts an explicitly selected persistent model-cache volume. The
-container receives a fixed model path and verifies the declared artifact
-identity before loading it. Registry references used for execution are exact
-digests. Mutable tags may be human-facing aliases but never acceptance inputs.
+download/materialization workflow fully hashes the pinned manifest and every
+declared payload once, removes write permissions, and atomically publishes the
+local materialization receipt. The container receives a fixed model path,
+authenticates the small pinned manifest, and verifies that bounded receipt
+before loading it. It never rehashes checkpoint payloads during ordinary
+startup. Registry references used for execution are exact digests. Mutable
+tags may be human-facing aliases but never acceptance inputs.
 
 `rules_img` is NML's only OCI construction rule set. Its provider-oriented
 image graph, shallow base pulls, compact layer representation, Rust runfiles
@@ -853,6 +910,9 @@ Performance contracts report compilation, parameter upload, first execution,
 steady execution, and download separately. CPU and CUDA performance statements
 must identify build mode, workload, device, and phase rather than folding
 compiler or transfer time into a misleading single number.
+Product reports additionally separate asynchronous host submission by
+component class. GPU kernel attribution comes from a device profiler or
+compiler diagnostics; host timers must not be relabeled as device time.
 
 ## 14. Capability boundary and forward work
 
@@ -1005,6 +1065,12 @@ table is a compact compatibility index, not a migration checklist.
 | D-056 | GPT-OSS shape families compose bounded embedding, reusable layer-kind, and head executables through asynchronous PJRT dependencies; a full transformer is not one compiler module. |
 | D-057 | GPT-OSS compilation profiles are complete before parameter residency; request execution selects an existing bounded profile and never invokes XLA. |
 | D-058 | Every Triton custom call binds StableHLO tensors against the immutable builder-authored TTIR ABI; mismatched count, order, address space, or element type fails before XLA. |
+| D-059 | Static MoE capacity never implies expert work: sparse decode launches only selected route blocks, general schedules carry an active-block scalar, and inactive/non-local kernels touch no weights. |
+| D-060 | GPT-OSS cache pages are 16 tokens; CUDA attention tile width is independently bounded so cache allocation policy cannot create spill-heavy kernels. |
+| D-061 | Loaded PJRT executable arity is resolved once, and product timings distinguish asynchronous component submission from synchronized device execution. |
+| D-062 | GPT-OSS generation uses explicit-state runtime top-k/temperature/top-p/min-p sampling by default; greedy decoding is an explicit `top_k = 1` request, not product policy. |
+| D-063 | Every grouped expert backend exposes gate/up plus one activation as `[assignments, intermediate]`; down never receives interleaved gate/up channels or recomputes their activation. |
+| D-064 | Compact CUDA decode uses dedicated `M = 1` GEMV with exact register-local E2M1/E4M3FN decoding and block-scale reuse; tensor-core matrix tiles remain the distinct prefill family. |
 
 ## 16. Provenance and reference relationships
 

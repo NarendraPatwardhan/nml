@@ -8,7 +8,12 @@ use super::checkpoint::{BoxError, Checkpoint, DecoderLayer, Result, message};
 use super::config::{AttentionKind, Config};
 use nml::{DataType, Graph, Shape, Tensor};
 
-pub(super) const CACHE_PAGE_SIZE: usize = 256;
+// Sixteen-token physical pages provide useful allocation granularity for a
+// future shared cache arena. CUDA compute-tile width is an independent kernel
+// policy, so changing this product allocation constant cannot by itself create
+// a wider, spill-heavy attention specialization.
+pub(super) const CACHE_PAGE_SIZE: usize = 16;
+pub(super) const MAXIMUM_TOP_K: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum Phase {
@@ -294,6 +299,14 @@ pub(super) fn build_head(
         shape(DataType::Bf16, &[1, sequence, hidden_size])?,
     );
     let last_index = graph.input("last_index", shape(DataType::I32, &[])?);
+    let sampling_state_input = graph.input(
+        "sampling_state",
+        shape(DataType::U64, &[2])?,
+    );
+    let top_k = graph.input("top_k", shape(DataType::I32, &[])?);
+    let temperature = graph.input("temperature", shape(DataType::F32, &[])?);
+    let top_p = graph.input("top_p", shape(DataType::F32, &[])?);
+    let min_p = graph.input("min_p", shape(DataType::F32, &[])?);
     let zero = nml(graph.scalar(0_i32))?;
     let last = nml(graph.dynamic_slice(
         hidden,
@@ -309,9 +322,26 @@ pub(super) fn build_head(
     ))?;
     let last = nml(graph.reshape(last, shape(DataType::Bf16, &[1, hidden_size])?))?;
     let logits = nml(graph.linear(last, &checkpoint.lm_head.weight, None))?;
-    let (_, token) = nml(graph.argmax(logits, 1))?;
+    let sampling_state = nml(graph.random_state(sampling_state_input))?;
+    let (sampling_state, token) = nml(graph.sample_tokens_dynamic(
+        logits,
+        sampling_state,
+        1,
+        top_k,
+        temperature,
+        top_p,
+        min_p,
+        MAXIMUM_TOP_K,
+    ))?;
+    let sampling_state = nml(graph.reuse_buffer(
+        sampling_state.into_tensor(),
+        sampling_state_input,
+    ))?;
     let token = nml(graph.reshape(token, shape(DataType::I32, &[1, 1])?))?;
-    let mut outputs = vec![("token".to_owned(), token)];
+    let mut outputs = vec![
+        ("token".to_owned(), token),
+        ("sampling_state".to_owned(), sampling_state),
+    ];
     if family.phase() == Phase::Decode {
         let position = graph.input("position", shape(DataType::I32, &[])?);
         let one = nml(graph.scalar(1_i32))?;
@@ -468,9 +498,9 @@ mod tests {
         assert_single_layer_identity!(decode_layer, 1);
 
         let prefill_head = finish!(|graph| build_head(graph, &checkpoint, &config, prefill));
-        assert_contract!(prefill_head, 2, 4, 1, &[None]);
+        assert_contract!(prefill_head, 7, 4, 2, &[None, Some(2)]);
         let decode_head = finish!(|graph| build_head(graph, &checkpoint, &config, decode));
-        assert_contract!(decode_head, 3, 4, 2, &[None, None]);
+        assert_contract!(decode_head, 8, 4, 3, &[None, Some(2), None]);
     }
 
     fn selected_config() -> Config {

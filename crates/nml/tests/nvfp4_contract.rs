@@ -9,7 +9,6 @@ use nml_parameter::nvfp4::{dequantize_row, global_scale, quantize_row};
 use nml_parameter::{ComponentRole, Parameter};
 use nml_types::{BFloat16, DType, F16, Shape};
 
-const BATCH: usize = 3;
 const INPUTS: usize = 16;
 const OUTPUTS: usize = 5;
 
@@ -24,10 +23,12 @@ struct EncodedParameter {
 fn compact_parameters_compile_bind_and_execute_through_pjrt() {
     let platform = platform();
     for dtype in [DType::F16, DType::Bf16] {
-        execute_linear(&platform, dtype, false);
-        execute_linear(&platform, dtype, true);
+        execute_linear(&platform, dtype, 3, false);
+        execute_linear(&platform, dtype, 3, true);
+        execute_linear(&platform, dtype, 1, true);
         execute_embedding(&platform, dtype);
-        execute_experts(&platform, dtype);
+        execute_experts(&platform, dtype, 2);
+        execute_experts(&platform, dtype, 1);
     }
 }
 
@@ -44,8 +45,13 @@ fn platform() -> nml::Platform {
     }
 }
 
-fn execute_linear(platform: &nml::Platform, dtype: DType, with_bias: bool) {
-    let input_shape = Shape::new(dtype, &[BATCH as i64, INPUTS as i64]).unwrap();
+fn execute_linear(
+    platform: &nml::Platform,
+    dtype: DType,
+    rows: usize,
+    with_bias: bool,
+) {
+    let input_shape = Shape::new(dtype, &[rows as i64, INPUTS as i64]).unwrap();
     let logical_weight_shape = Shape::new(dtype, &[OUTPUTS as i64, INPUTS as i64]).unwrap();
     let bias_shape = Shape::new(dtype, &[OUTPUTS as i64]).unwrap();
     let weight = Parameter::nvfp4("weight", "model.weight", logical_weight_shape).unwrap();
@@ -59,7 +65,7 @@ fn execute_linear(platform: &nml::Platform, dtype: DType, with_bias: bool) {
     let placement = nml::Sharding::single();
     let executable = platform.compile(&program, placement.clone()).unwrap();
 
-    let input_values = (0..BATCH * INPUTS)
+    let input_values = (0..rows * INPUTS)
         .map(|index| (index as f32 - 19.0) / 13.0)
         .collect::<Vec<_>>();
     let source_weight = (0..OUTPUTS * INPUTS)
@@ -72,6 +78,7 @@ fn execute_linear(platform: &nml::Platform, dtype: DType, with_bias: bool) {
         &input_values,
         &encoded_weight.decoded,
         if with_bias { &bias_values } else { &no_bias },
+        rows,
     );
 
     let mut arguments = executable.args();
@@ -170,8 +177,7 @@ fn execute_embedding(platform: &nml::Platform, dtype: DType) {
     assert_close(dtype, &bytes, &expected);
 }
 
-fn execute_experts(platform: &nml::Platform, dtype: DType) {
-    const TOKENS: usize = 2;
+fn execute_experts(platform: &nml::Platform, dtype: DType, tokens: usize) {
     const EXPERTS: usize = 3;
     const HIDDEN: usize = 4;
     const INTERMEDIATE: usize = 5;
@@ -204,8 +210,8 @@ fn execute_experts(platform: &nml::Platform, dtype: DType) {
         Shape::new(dtype, &[EXPERTS as i64, HIDDEN as i64]).unwrap(),
     )
     .unwrap();
-    let hidden_shape = Shape::new(dtype, &[TOKENS as i64, HIDDEN as i64]).unwrap();
-    let router_shape = Shape::new(DType::F32, &[TOKENS as i64, EXPERTS as i64]).unwrap();
+    let hidden_shape = Shape::new(dtype, &[tokens as i64, HIDDEN as i64]).unwrap();
+    let router_shape = Shape::new(DType::F32, &[tokens as i64, EXPERTS as i64]).unwrap();
     let mut builder = nml_ir::ProgramBuilder::new();
     let hidden = builder.input("hidden", hidden_shape);
     let router = builder.input("router", router_shape);
@@ -218,8 +224,12 @@ fn execute_experts(platform: &nml::Platform, dtype: DType) {
     let placement = nml::Sharding::single();
     let executable = platform.compile(&program, placement.clone()).unwrap();
 
-    let hidden_values = [1.0, -0.5, 0.25, 2.0, -1.0, 0.75, 1.5, -0.25];
-    let router_values = [2.0_f32, -1.0, 0.5, -0.25, 1.75, 0.75];
+    let hidden_values = (0..tokens * HIDDEN)
+        .map(|index| ((index * 7 % 19) as f32 - 9.0) / 4.0)
+        .collect::<Vec<_>>();
+    let router_values = (0..tokens * EXPERTS)
+        .map(|index| ((index * 5 % 13) as f32 - 6.0) / 3.0)
+        .collect::<Vec<_>>();
     let gate_source = (0..EXPERTS * HIDDEN * 2 * INTERMEDIATE)
         .map(|index| (index as f32 - 41.0) / 23.0)
         .collect::<Vec<_>>();
@@ -242,7 +252,7 @@ fn execute_experts(platform: &nml::Platform, dtype: DType) {
         &gate_bias_values,
         &down_encoded.decoded,
         &down_bias_values,
-        TOKENS,
+        tokens,
         EXPERTS,
         HIDDEN,
         INTERMEDIATE,
@@ -393,9 +403,9 @@ fn encode(dtype: DType, values: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-fn reference(input: &[f32], weight: &[f32], bias: &[f32]) -> Vec<f32> {
-    let mut output = vec![0.0; BATCH * OUTPUTS];
-    for row in 0..BATCH {
+fn reference(input: &[f32], weight: &[f32], bias: &[f32], rows: usize) -> Vec<f32> {
+    let mut output = vec![0.0; rows * OUTPUTS];
+    for row in 0..rows {
         for output_index in 0..OUTPUTS {
             let mut value = bias[output_index];
             for input_index in 0..INPUTS {

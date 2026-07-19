@@ -25,6 +25,8 @@ pub struct GroupedProjectionConfig {
     pub block_m: i64,
     pub block_n: i64,
     pub block_k: i64,
+    /// `Some` selects paired gate/up contraction plus activation and makes
+    /// `output_size` the activated intermediate width. `None` selects down.
     pub gated_activation: Option<GatedActivation>,
     pub multiply_routing_weight: bool,
 }
@@ -46,7 +48,9 @@ impl GroupedProjectionConfig {
             || self.block_n > 128
             || self.block_k > 128
             || self.input_size.checked_mul(self.output_size).is_none()
-            || (self.gated_activation.is_some() && self.input_size.checked_mul(2).is_none())
+            || (self.gated_activation.is_some() && self.multiply_routing_weight)
+            || (self.gated_activation.is_none() && !self.multiply_routing_weight)
+            || (self.gated_activation.is_some() && self.output_size.checked_mul(2).is_none())
         {
             return Err(Error::InvalidKernelSpec(
                 "invalid grouped expert-projection specialization",
@@ -56,8 +60,8 @@ impl GroupedProjectionConfig {
     }
 }
 
-/// Builds either the gate/up or down expert projection. The function name is
-/// part of XLA's custom-call ABI and intentionally fixed by the semantic role.
+/// Builds either activated gate/up or down. The activation boundary is part of
+/// the kernel contract: down never receives interleaved gate/up channels.
 pub fn build_grouped_projection(config: GroupedProjectionConfig) -> Result<Kernel, Error> {
     let config = config.validate()?;
     let name = if config.multiply_routing_weight {
@@ -69,6 +73,7 @@ pub fn build_grouped_projection(config: GroupedProjectionConfig) -> Result<Kerne
     let input = pointer(&mut builder, "input", config.dtype)?;
     let sorted_assignments = pointer(&mut builder, "sorted_assignments", DType::I32)?;
     let block_experts = pointer(&mut builder, "block_experts", DType::I32)?;
+    let active_blocks_pointer = pointer(&mut builder, "active_blocks", DType::I32)?;
     let weights = pointer(&mut builder, "weights", config.dtype)?;
     let expert_offset_pointer = pointer(&mut builder, "expert_offset", DType::I32)?;
     let routing_weights = config
@@ -79,6 +84,8 @@ pub fn build_grouped_projection(config: GroupedProjectionConfig) -> Result<Kerne
 
     let block_index = builder.program_id(0)?;
     let output_block = builder.program_id(1)?;
+    let active_blocks = builder.load(&active_blocks_pointer)?;
+    let active_block = builder.compare(Comparison::Less, &block_index, &active_blocks)?;
     let row_lanes = builder.range(0, config.block_m as i32)?;
     let column_lanes = builder.range(0, config.block_n as i32)?;
     let block_m = builder.integer(config.block_m, DType::I32)?;
@@ -107,13 +114,9 @@ pub fn build_grouped_projection(config: GroupedProjectionConfig) -> Result<Kerne
     let local_experts = builder.integer(config.local_experts, DType::I32)?;
     let before_last_expert = builder.compare(Comparison::Less, &expert, &local_experts)?;
     let valid_expert = builder.bit_and(&after_first_expert, &before_last_expert)?;
-    let compute_rows = builder.bit_and(&valid_assignment, &valid_expert)?;
-    // Masked loads still require an in-bounds pointer. Clamp non-local and
-    // padding-block expert ids to an arbitrary local expert; `compute_rows`
-    // keeps their input tile zero, so the loaded weights cannot contribute.
-    let last_local_expert = builder.integer(config.local_experts - 1, DType::I32)?;
-    let address_expert = builder.maximum(&expert, &zero_i32)?;
-    let address_expert = builder.minimum(&address_expert, &last_local_expert)?;
+    let execute_block = builder.bit_and(&active_block, &valid_expert)?;
+    let store_rows = builder.bit_and(&valid_assignment, &active_block)?;
+    let compute_rows = builder.bit_and(&store_rows, &valid_expert)?;
     let columns = builder.add(&column_start, &column_lanes)?;
     let output_size = builder.integer(config.output_size, DType::I32)?;
     let valid_columns = builder.compare(Comparison::Less, &columns, &output_size)?;
@@ -122,78 +125,149 @@ pub fn build_grouped_projection(config: GroupedProjectionConfig) -> Result<Kerne
     let source_rows = builder.divide(&address_assignment, &divisor)?;
     let source_rows = builder.cast(&source_rows, DType::I64)?;
     let input_size_i64 = builder.integer(config.input_size, DType::I64)?;
-    let input_stride = if config.gated_activation.is_some() {
-        config
-            .input_size
-            .checked_mul(2)
-            .ok_or(Error::InvalidKernelSpec(
-                "gated expert-projection input stride overflows",
-            ))?
-    } else {
-        config.input_size
-    };
-    let input_stride = builder.integer(input_stride, DType::I64)?;
+    let input_stride = builder.integer(config.input_size, DType::I64)?;
     let source_bases = builder.multiply(&source_rows, &input_stride)?;
     let source_bases = builder.expand_dimension(&source_bases, 1)?;
 
-    let expert = builder.cast(&address_expert, DType::I64)?;
+    let weight_output_size = if config.gated_activation.is_some() {
+        config
+            .output_size
+            .checked_mul(2)
+            .ok_or(Error::InvalidKernelSpec("gated expert width overflows"))?
+    } else {
+        config.output_size
+    };
     let expert_stride =
         config
             .input_size
-            .checked_mul(config.output_size)
+            .checked_mul(weight_output_size)
             .ok_or(Error::InvalidKernelSpec(
                 "grouped expert-projection weight stride overflows",
             ))?;
     let expert_stride = builder.integer(expert_stride, DType::I64)?;
-    let expert_base = builder.multiply(&expert, &expert_stride)?;
     let columns_i64 = builder.cast(&columns, DType::I64)?;
-    let weight_rows = builder.multiply(&columns_i64, &input_size_i64)?;
-    let weight_rows = builder.add(&expert_base, &weight_rows)?;
-    let weight_rows = builder.expand_dimension(&weight_rows, 0)?;
-
-    let input_zero = builder.full_float(&[config.block_m, config.block_k], 0.0, config.dtype)?;
-    let weight_zero = builder.full_float(&[config.block_k, config.block_n], 0.0, config.dtype)?;
-    let accumulator = builder.full_float(&[config.block_m, config.block_n], 0.0, DType::F32)?;
-    let k_lanes = builder.range(0, config.block_k as i32)?;
-    let input_size = builder.integer(config.input_size, DType::I32)?;
-    let k_lower = builder.integer(0, DType::I32)?;
-    let k_step = builder.integer(config.block_k, DType::I32)?;
-    // Keep one K-tile body in TTIR. Expanding one dot per tile makes compiler
-    // work proportional to model width; Triton and ZML represent this as an
-    // SCF loop so realistic hidden sizes remain compact specializations.
-    let accumulated = builder.for_loop(
-        &k_lower,
-        &input_size,
-        &k_step,
-        std::slice::from_ref(&accumulator),
-        |body, k_start, carried| {
-            let k = body.add(&k_start, &k_lanes)?;
-            let valid_k = body.compare(Comparison::Less, &k, &input_size)?;
-            let input_mask = body.mask_2d(&compute_rows, &valid_k)?;
-            let weight_mask = body.mask_2d(&valid_k, &valid_columns)?;
-
-            let k_i64 = body.cast(&k, DType::I64)?;
-            let input_columns = body.expand_dimension(&k_i64, 0)?;
-            let input_offsets = body.add(&source_bases, &input_columns)?;
-            let input_addresses = body.add_pointer(&input, &input_offsets)?;
-            let mut input_tile = body.load_masked(&input_addresses, &input_mask, &input_zero)?;
-            if let Some(activation) = config.gated_activation {
-                let value_offset = body.integer(config.input_size, DType::I64)?;
-                let value_offsets = body.add(&input_offsets, &value_offset)?;
-                let value_addresses = body.add_pointer(&input, &value_offsets)?;
-                let value_tile = body.load_masked(&value_addresses, &input_mask, &input_zero)?;
-                input_tile =
-                    gated_activation(body, input_tile, value_tile, activation, config.dtype)?;
-            }
-
-            let weight_inputs = body.expand_dimension(&k_i64, 1)?;
-            let weight_offsets = body.add(&weight_rows, &weight_inputs)?;
-            let weight_addresses = body.add_pointer(&weights, &weight_offsets)?;
-            let weight_tile = body.load_masked(&weight_addresses, &weight_mask, &weight_zero)?;
-            Ok(vec![body.dot(&input_tile, &weight_tile, &carried[0])?])
-        },
-    )?;
-    let mut accumulator = accumulated[0].clone();
+    let mut accumulated = builder
+        .if_then_else(
+            &execute_block,
+            |body| {
+                // Weight addressing and contraction exist only in the live,
+                // locally owned branch. A capacity block or non-local expert
+                // cannot issue a weight load, dequantization, or dot product.
+                let expert = body.cast(&expert, DType::I64)?;
+                let expert_base = body.multiply(&expert, &expert_stride)?;
+                let gate_columns = if config.gated_activation.is_some() {
+                    let two = body.integer(2, DType::I64)?;
+                    body.multiply(&columns_i64, &two)?
+                } else {
+                    columns_i64.clone()
+                };
+                let gate_weight_rows = body.multiply(&gate_columns, &input_size_i64)?;
+                let gate_weight_rows = body.add(&expert_base, &gate_weight_rows)?;
+                let gate_weight_rows = body.expand_dimension(&gate_weight_rows, 0)?;
+                let up_weight_rows = if config.gated_activation.is_some() {
+                    let one = body.integer(1, DType::I64)?;
+                    let up_columns = body.add(&gate_columns, &one)?;
+                    let rows = body.multiply(&up_columns, &input_size_i64)?;
+                    let rows = body.add(&expert_base, &rows)?;
+                    Some(body.expand_dimension(&rows, 0)?)
+                } else {
+                    None
+                };
+                let input_zero =
+                    body.full_float(&[config.block_m, config.block_k], 0.0, config.dtype)?;
+                let weight_zero =
+                    body.full_float(&[config.block_k, config.block_n], 0.0, config.dtype)?;
+                let gate_accumulator =
+                    body.full_float(&[config.block_m, config.block_n], 0.0, DType::F32)?;
+                let mut initial = vec![gate_accumulator];
+                if config.gated_activation.is_some() {
+                    initial.push(body.full_float(
+                        &[config.block_m, config.block_n],
+                        0.0,
+                        DType::F32,
+                    )?);
+                }
+                let k_lanes = body.range(0, config.block_k as i32)?;
+                let input_size = body.integer(config.input_size, DType::I32)?;
+                let k_lower = body.integer(0, DType::I32)?;
+                let k_step = body.integer(config.block_k, DType::I32)?;
+                let accumulated = body.for_loop(
+                    &k_lower,
+                    &input_size,
+                    &k_step,
+                    &initial,
+                    |loop_body, k_start, carried| {
+                        let k = loop_body.add(&k_start, &k_lanes)?;
+                        let valid_k =
+                            loop_body.compare(Comparison::Less, &k, &input_size)?;
+                        let input_mask = loop_body.mask_2d(&compute_rows, &valid_k)?;
+                        let weight_mask = loop_body.mask_2d(&valid_k, &valid_columns)?;
+                        let k_i64 = loop_body.cast(&k, DType::I64)?;
+                        let input_columns = loop_body.expand_dimension(&k_i64, 0)?;
+                        let input_offsets = loop_body.add(&source_bases, &input_columns)?;
+                        let input_addresses = loop_body.add_pointer(&input, &input_offsets)?;
+                        let input_tile = loop_body.load_masked(
+                            &input_addresses,
+                            &input_mask,
+                            &input_zero,
+                        )?;
+                        let weight_inputs = loop_body.expand_dimension(&k_i64, 1)?;
+                        let gate_weight_offsets =
+                            loop_body.add(&gate_weight_rows, &weight_inputs)?;
+                        let gate_weight_addresses =
+                            loop_body.add_pointer(&weights, &gate_weight_offsets)?;
+                        let gate_weight_tile = loop_body.load_masked(
+                            &gate_weight_addresses,
+                            &weight_mask,
+                            &weight_zero,
+                        )?;
+                        let gate =
+                            loop_body.dot(&input_tile, &gate_weight_tile, &carried[0])?;
+                        if let Some(up_weight_rows) = &up_weight_rows {
+                            let up_weight_offsets =
+                                loop_body.add(up_weight_rows, &weight_inputs)?;
+                            let up_weight_addresses =
+                                loop_body.add_pointer(&weights, &up_weight_offsets)?;
+                            let up_weight_tile = loop_body.load_masked(
+                                &up_weight_addresses,
+                                &weight_mask,
+                                &weight_zero,
+                            )?;
+                            let up =
+                                loop_body.dot(&input_tile, &up_weight_tile, &carried[1])?;
+                            Ok(vec![gate, up])
+                        } else {
+                            Ok(vec![gate])
+                        }
+                    },
+                )?;
+                Ok(accumulated)
+            },
+            |body| {
+                let gate =
+                    body.full_float(&[config.block_m, config.block_n], 0.0, DType::F32)?;
+                if config.gated_activation.is_some() {
+                    Ok(vec![
+                        gate,
+                        body.full_float(
+                            &[config.block_m, config.block_n],
+                            0.0,
+                            DType::F32,
+                        )?,
+                    ])
+                } else {
+                    Ok(vec![gate])
+                }
+            },
+        )?;
+    let mut accumulator = if let Some(activation) = config.gated_activation {
+        let up = accumulated.remove(1);
+        let gate = accumulated.remove(0);
+        let activated = gated_activation(&mut builder, gate, up, activation, config.dtype)?;
+        builder.cast(&activated, DType::F32)?
+    } else {
+        accumulated.remove(0)
+    };
 
     if let Some(routing_weights) = routing_weights {
         let routing_addresses = builder.add_pointer(&routing_weights, &address_assignment)?;
@@ -215,7 +289,7 @@ pub fn build_grouped_projection(config: GroupedProjectionConfig) -> Result<Kerne
     // Every real assignment is written on every partition. Partitions that do
     // not own the assignment's expert write the zero accumulator, making the
     // following all-reduce independent of uninitialized output storage.
-    let output_mask = builder.mask_2d(&valid_assignment, &valid_columns)?;
+    let output_mask = builder.mask_2d(&store_rows, &valid_columns)?;
     let output_values = builder.cast(&accumulator, config.dtype)?;
     builder.store_masked(&output_addresses, &output_values, &output_mask)?;
     builder.return_void()?;
@@ -229,6 +303,12 @@ fn gated_activation(
     activation: GatedActivation,
     dtype: DType,
 ) -> Result<super::Value, Error> {
+    // Preserve the former two-kernel boundary exactly: each gate/up
+    // contraction was materialized at the declared activation dtype before
+    // the nonlinear operation. Fusing that boundary must not silently retain
+    // extra F32 precision and change model numerics.
+    let gate = builder.cast(&gate, dtype)?;
+    let value = builder.cast(&value, dtype)?;
     let shape = match activation {
         GatedActivation::Relu => {
             let zero = builder.full_float_like(&gate, 0.0)?;

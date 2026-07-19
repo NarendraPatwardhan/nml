@@ -222,3 +222,136 @@ fn routed_experts_preserve_interleaved_clamped_residual_swiglu_semantics() {
         assert!((f64::from(actual) - expected).abs() < 3.0e-5);
     }
 }
+
+#[test]
+fn routed_experts_match_the_independent_oracle_across_bounded_shapes() {
+    let mut state = 0x4e4d_4c4e_5646_5034u64;
+    for &(tokens, hidden_size, experts, intermediate, top_k) in
+        &[(1, 3, 4, 5, 2), (3, 5, 6, 7, 2), (4, 3, 7, 3, 3)]
+    {
+        let gate_values = generated_values(
+            &mut state,
+            experts * hidden_size * intermediate * 2,
+            2.5,
+        );
+        let down_values = generated_values(
+            &mut state,
+            experts * intermediate * hidden_size,
+            2.0,
+        );
+        let gate_encoded = encode(
+            &[experts, hidden_size, intermediate * 2],
+            &gate_values,
+        );
+        let down_encoded = encode(
+            &[experts, intermediate, hidden_size],
+            &down_values,
+        );
+        let gate = weight(
+            &[experts, hidden_size, intermediate * 2],
+            &gate_encoded,
+        );
+        let down = weight(
+            &[experts, intermediate, hidden_size],
+            &down_encoded,
+        );
+        let hidden = generated_values(&mut state, tokens * hidden_size, 1.25);
+        let gate_bias = generated_values(&mut state, experts * intermediate * 2, 0.2);
+        let down_bias = generated_values(&mut state, experts * hidden_size, 0.2);
+        let mut router_indices = Vec::with_capacity(tokens * top_k);
+        let mut routing_weights = Vec::with_capacity(tokens * top_k);
+        for token in 0..tokens {
+            let raw = (0..top_k)
+                .map(|route| 0.25 + generated_unit(&mut state) + route as f32 * 0.1)
+                .collect::<Vec<_>>();
+            let normalization = raw.iter().sum::<f32>();
+            for (route, value) in raw.into_iter().enumerate() {
+                // Leave the final expert empty while deliberately repeating
+                // others across tokens. This covers sparse, uneven routing.
+                router_indices.push((token * (route + 1) + route * 2) % (experts - 1));
+                routing_weights.push(value / normalization);
+            }
+        }
+
+        let mut output = vec![0.0; tokens * hidden_size];
+        routed_clamped_swiglu(
+            &hidden,
+            tokens,
+            &router_indices,
+            &routing_weights,
+            &gate,
+            &gate_bias,
+            &down,
+            &down_bias,
+            &mut output,
+        )
+        .unwrap();
+
+        let mut expected = vec![0.0f64; tokens * hidden_size];
+        for token in 0..tokens {
+            let token_hidden = &hidden[token * hidden_size..(token + 1) * hidden_size];
+            for route in 0..top_k {
+                let assignment = token * top_k + route;
+                let expert = router_indices[assignment];
+                let mut gate_up = oracle_project(
+                    token_hidden,
+                    expert,
+                    hidden_size,
+                    intermediate * 2,
+                    &gate_encoded,
+                );
+                for (column, value) in gate_up.iter_mut().enumerate() {
+                    *value += f64::from(gate_bias[expert * intermediate * 2 + column]);
+                }
+                let activated = (0..intermediate)
+                    .map(|index| {
+                        let gate = gate_up[index * 2].min(7.0);
+                        let up = gate_up[index * 2 + 1].clamp(-7.0, 7.0);
+                        (up + 1.0) * gate * (1.0 / (1.0 + (-1.702 * gate).exp()))
+                    })
+                    .collect::<Vec<_>>();
+                let projected = (0..hidden_size)
+                    .map(|output_index| {
+                        (0..intermediate).fold(
+                            f64::from(down_bias[expert * hidden_size + output_index]),
+                            |sum, input_index| {
+                                sum + activated[input_index]
+                                    * oracle_value(
+                                        &down_encoded,
+                                        hidden_size,
+                                        expert * intermediate + input_index,
+                                        output_index,
+                                    )
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                for output_index in 0..hidden_size {
+                    expected[token * hidden_size + output_index] +=
+                        f64::from(routing_weights[assignment]) * projected[output_index];
+                }
+            }
+        }
+
+        for (index, (actual, expected)) in output.into_iter().zip(expected).enumerate() {
+            let tolerance = 3.0e-4 * expected.abs().max(1.0);
+            assert!(
+                (f64::from(actual) - expected).abs() <= tolerance,
+                "shape tokens={tokens} hidden={hidden_size} experts={experts} intermediate={intermediate} top_k={top_k}, output {index}: actual {actual}, expected {expected}, tolerance {tolerance}"
+            );
+        }
+    }
+}
+
+fn generated_values(state: &mut u64, count: usize, magnitude: f32) -> Vec<f32> {
+    (0..count)
+        .map(|_| (generated_unit(state) * 2.0 - 1.0) * magnitude)
+        .collect()
+}
+
+fn generated_unit(state: &mut u64) -> f32 {
+    *state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    ((*state >> 40) as u32) as f32 / ((1u32 << 24) - 1) as f32
+}

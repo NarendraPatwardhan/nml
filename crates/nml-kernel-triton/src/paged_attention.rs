@@ -88,6 +88,12 @@ pub fn select_attention_launch(
         .page_size
         .checked_next_power_of_two()
         .ok_or(LaunchError::Overflow("decode tile"))?;
+    // Page geometry describes cache allocation, not the amount of K/V state a
+    // single program must retain. The addressing kernel already permits a tile
+    // to cross page boundaries lane by lane. Cap the decode tile so a product
+    // choosing coarse pages cannot accidentally manufacture a spill-heavy
+    // attention specialization.
+    let decode_tile_size = padded_page_size.min(64);
     let block_m = 16usize.max(padded_queries_per_kv);
     let block_q = block_m / padded_queries_per_kv;
     let total_query_blocks = geometry
@@ -105,7 +111,7 @@ pub fn select_attention_launch(
         return select_two_dimensional(
             geometry,
             padded_queries_per_kv,
-            padded_page_size,
+            decode_tile_size,
             block_m,
             block_q,
             total_query_blocks,
@@ -113,7 +119,7 @@ pub fn select_attention_launch(
     }
     select_split_k(
         geometry,
-        padded_page_size,
+        decode_tile_size,
         block_m,
         block_q,
         total_query_blocks,
@@ -123,14 +129,14 @@ pub fn select_attention_launch(
 fn select_two_dimensional(
     geometry: AttentionGeometry,
     padded_queries_per_kv: usize,
-    padded_page_size: usize,
+    decode_tile_size: usize,
     mut block_m: usize,
     mut block_q: usize,
     mut total_query_blocks: usize,
 ) -> Result<AttentionLaunch, LaunchError> {
     let maximum_stages = if geometry.head_dim <= 128 { 4 } else { 2 };
     let (mut stages, mut warps, mut tile_size) = if geometry.all_decode {
-        (3, 2, padded_page_size)
+        (3, 2, decode_tile_size)
     } else {
         (1, 2, 64)
     };
@@ -164,7 +170,7 @@ fn select_two_dimensional(
 
 fn select_split_k(
     geometry: AttentionGeometry,
-    padded_page_size: usize,
+    decode_tile_size: usize,
     block_m: usize,
     block_q: usize,
     total_query_blocks: usize,
@@ -182,8 +188,8 @@ fn select_split_k(
         .ok_or(LaunchError::Overflow("segment count"))?
         .min(128)
         .min(16)
-        .max(if geometry.page_size <= 16 { 16 } else { 8 });
-    let reduction_warps = if segments == if geometry.page_size <= 16 { 16 } else { 8 } {
+        .max(if decode_tile_size <= 16 { 16 } else { 8 });
+    let reduction_warps = if segments == if decode_tile_size <= 16 { 16 } else { 8 } {
         1
     } else {
         2
@@ -192,7 +198,7 @@ fn select_split_k(
     Ok(AttentionLaunch::SplitK {
         block_m,
         block_q,
-        tile_size: padded_page_size,
+        tile_size: decode_tile_size,
         total_query_blocks,
         segments,
         attention_grid: [total_query_blocks, geometry.num_kv_heads, segments],

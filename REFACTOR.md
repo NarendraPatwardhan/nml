@@ -1,189 +1,402 @@
-# GPT-OSS compilation, residency, and Triton ABI refactor
+# NVFP4 decode performance refactor
 
-Status: implementation contract
+Status: source corrections and BuildBuddy acceptance complete; the A40
+measurement gate remains
 
-This document records the correction to GPT-OSS lifecycle orchestration. It is
-deliberately product-scoped: NML's framework already exposes abstract parameter
-declarations, compilation, parameter upload, reusable executable slots, and
-PJRT execution as independent mechanisms.
+This document records the measured cause of GPT-OSS 20B's unacceptable decode
+performance on an NVIDIA A40 and defines the corrective architecture. It
+replaces earlier hypotheses about product orchestration with node-level CUDA
+evidence. Correctness of the current model execution is established; its
+performance is not accepted.
 
-## Problem
+The governing principle is simple: compact weights are useful on
+pre-Blackwell GPUs only when their decode path remains a bandwidth-oriented
+contraction. Expanding a four-bit code through expensive scalar arithmetic, or
+recomputing model nonlinearities for every output tile, defeats the reason for
+retaining compact storage.
 
-The original GPT-OSS owner combined three different states in one
-`CompiledModel`:
+The implementation now follows the architecture below: gate/up owns the one
+activation, down consumes only the activated intermediate, E2M1/E4M3FN decode
+is exact integer/bitcast arithmetic with one scale load per representation
+block, and every `M = 1` ordinary or routed projection selects a compact GEMV
+rather than a dead-row matrix tile. The same expert boundary is used by dense
+and NVFP4 lowering. Deterministic CPU oracles, generated-TTIR contracts, IR
+contracts, artifact-materialization contracts, the complete CPU suite,
+CUDA-remote suite, CUDA binary closure, and CUDA package suite all pass
+remotely through BuildBuddy. The accepted invocations are recorded in
+[`TASKS.md`](./TASKS.md). This is source/CPU/compiler evidence, not NVIDIA
+execution evidence. The next accepted performance statement must come from the
+complete A40 loop in section 8.3.
 
-1. the abstract model and checkpoint contract;
-2. a lazily populated map of compiled shape families;
-3. the complete resident checkpoint.
+## 1. Evidence identity
 
-`Generator::load` uploaded all 703 physical checkpoint components. The first
-request then selected its prefill and cache buckets and invoked XLA from
-`generate`. This reversed the lifecycle used by ZML and made production
-compilation/autotuning occur while the complete model was already resident on
-the accelerator. Individual kernel contracts did not exercise that ordering.
-
-The failure was incorrectly attributed to the number of Triton kernels and to
-possible compiler parallelism. Every isolated kernel path had passed its
-applicable standalone contract, and serializing XLA compilation reproduced the
-same failure. The first compiler backtrace identified where XLA terminated but
-was insufficient by itself. Exact-binary disassembly plus the completed-call
-register state subsequently proved a defective custom-call ABI.
-
-### Split-K learned-sink root cause
-
-The split-K paged-attention producer intentionally excludes learned sinks: each
-producer computes independent KV segments, and the segment reduction applies
-the sink correction exactly once. Its TTIR function therefore had 18 input
-pointers and three output pointers. The StableHLO lowering accidentally reused
-a shared operand list containing the sink, describing 19 inputs and three
-outputs.
-
-XLA creates kernel argument metadata from the StableHLO operands and results.
-After Triton compilation it annotates the resulting LLVM function arguments
-without first checking that the function has the same visible arity. At
-zero-based argument 21, the malformed 22-buffer call indexed one past NML's
-21-argument TTIR function and `llvm::Value::setName` interpreted the LLVM
-function object as an argument. The asynchronous completion worker was merely
-where this deterministic mismatch became undefined behavior; compiler
-parallelism and LLVM-context lifetime were not the cause.
-
-ZML avoids this class of failure because its declared input/output record also
-drives TTIR argument declaration. Its split-K kernel retains a fixed sink slot
-and passes a dummy value while sink semantics are disabled. NML keeps its
-different, cleaner semantic split—the producer is genuinely sink-free and the
-reducer owns the sink—but now carries the builder-authored function ABI with
-the verified TTIR into `KernelSpec`. Count, order, pointer address space, and
-element type must match the StableHLO tensor ABI before a custom call exists.
-
-## ZML reference
-
-ZML keeps model description, compilation, buffer loading, and session state
-separate. Its LLM entry point performs these operations in this order:
+The accepted correctness run and the profiler run used the immutable image:
 
 ```text
-parse and declare model
-        |
-        v
-compile prefill/decode executables
-        |
-        v
-load model buffers
-        |
-        v
-allocate session caches and execute
+ghcr.io/narendrapatwardhan/nml@
+sha256:91ea7415e50b820867c527c1d1c9db1df05bd0e81bdeddd29af8e806d0bdc042
 ```
 
-The referenced implementation explicitly loads buffers after compilation so
-the accelerator remains available to XLA autotuning. Model buffers are passed
-to reusable layer executables at invocation time; compiling an executable does
-not require those buffers to be resident.
-
-NML retains its existing improvements over that execution model: named and
-representation-aware parameter slots, ownership-checked donation, asynchronous
-PJRT dependency chaining, and finite reusable profile buckets. Those mechanisms
-do not justify reversing compilation and residency.
-
-## Required ownership states
-
-GPT-OSS uses four non-overlapping lifecycle states:
+The profiled source identity was:
 
 ```text
-ModelDefinition
-    immutable config, abstract Checkpoint, ParameterSet
-        |
-        | compile every configured profile
-        v
-ExecutionPlan
-    normalized profiles, bounded component executables
-        |
-        | upload the complete checkpoint only after compilation succeeds
-        v
-ResidentModel
-    ExecutionPlan plus LoadedCheckpoint
-        |
-        | select an existing profile
-        v
-RequestState
-    tokens, positions, page table, K/V buffers, parser state
+commit: 3a7ea04e419ae42d995510084022d269ff6b047c
+dirty source fingerprint:
+d42b1d32aba4301b85abe54fb8673e446203557458371ae482b2e882059f1d83
 ```
 
-The transition order is part of correctness:
+The execution device was a single NVIDIA A40, compute capability 8.6, with
+CUDA driver/runtime 13.1. The request used:
 
-- `ModelDefinition` performs artifact/schema work and allocates no device
-  parameter buffers.
-- `ExecutionPlan` compiles all distinct prefill/decode families before the
-  first parameter upload begins.
-- `ResidentModel` is constructed only after the complete plan exists.
-- `generate` may select and execute a plan but may not call XLA.
-- An unsupported request fails with a capacity error rather than compiling a
-  new family while the model is resident.
-- A failed compilation drops already-created executables and never begins
-  checkpoint upload. A failed upload drops the plan and any partial parameter
-  owners through their ordinary ownership paths.
+```text
+prompt tokens:       68
+generated tokens:   128
+prefill capacity:   256
+cache capacity:     512
+resident weights:   11,777,751,752 bytes
+KV-cache storage:   25,165,824 bytes
+```
 
-## Compilation profiles
+The complete node-level Nsight Systems report is retained outside Git in:
 
-Serving capacity is configuration, not an accidental property of the first
-request. One public `CompilationProfile` declares:
+```text
+references/runpod/reports/
+  20260719T082602Z-mnva1mt0kk4ec9-91ea7415e50b-nsys/
+```
 
-- maximum prompt tokens;
-- maximum total sequence tokens, including generated tokens.
+The directory contains the immutable attempt description, product output,
+profiler log, `.nsys-rep`, exported SQLite database, CUDA kernel summary,
+CUDA API summary, and kernel-launch summary. The paid profiling Pod was
+terminated after the report was collected.
 
-Profiles normalize to the established power-of-two prefill bucket and
-page-aligned power-of-two cache capacity. Duplicate normalized profiles and
-shared decode families compile once. Profile validation happens before the
-first compiler invocation and rejects zero, inverted, overflowing, or
-out-of-context capacities.
+## 2. Conclusion
 
-At request time the engine selects the smallest compiled profile that covers
-both the encoded prompt and the requested/required total sequence capacity.
-The prompt is padded to that profile's prefill family. Absence of a fitting
-profile is a configuration error and never a request-time compilation trigger.
+Nine tokens per second is not an A40 hardware limit, an attention problem, or
+a long-context spill. NML's current NVFP4 kernels consume essentially the
+entire decode budget.
 
-This is the bounded-profile analogue of ZML's fixed `seqlen`: it preserves
-compile-before-load while avoiding one unnecessarily maximal prefill program.
-Future continuous batching may add batch and chunk dimensions to the same
-explicit profile contract; it must not restore implicit JIT compilation in the
-request path.
+The node-level trace assigns GPU kernel time as follows:
 
-## Metrics and acceptance
+| Component | Trace share | Total over 128 model executions | Approximate cost per execution |
+| --- | ---: | ---: | ---: |
+| Grouped down projection | 61.9% | 8,876.2 ms | 69.3 ms |
+| Grouped gate/up projection | 21.3% | 3,054.5 ms | 23.9 ms |
+| Ordinary NVFP4 linears | 15.8% | 2,262.7 ms | 17.7 ms |
+| Paged attention kernels | about 0.2% | 26.9 ms | about 0.2 ms |
+| All remaining GPU work | less than 1% | remainder | less than 1 ms |
 
-Compilation timings are startup metrics owned by `ExecutionPlan`, not request
-metrics. Parameter upload starts after both prefill and decode compilation
-timers have stopped. Generation reports may expose these retained startup
-measurements, but repeated requests do not claim they recompiled anything.
+The totals include one prefill execution, so medians are more representative
+of steady decode. Their result is the same:
 
-Permanent contracts must establish:
+```text
+grouped down:       2.856 ms/layer * 24 = 68.5 ms/token
+grouped gate/up:    0.932 ms/layer * 24 = 22.4 ms/token
+ordinary linears:                         14.6 ms/token
+                                                    --------
+NVFP4 median floor:                      105.5 ms/token
+```
 
-- profile normalization, deduplication, ordering, and capacity selection;
-- rejection of requests not covered by the resident plan;
-- absence of a compilation path from `generate`;
-- compilation metrics are determined before parameter upload;
-- the full CUDA product follows definition -> plan -> residency -> request;
-- existing parameter rebinding, donation, cache, Harmony, and numerical
-  contracts remain unchanged.
+That floor predicts approximately 9.5 tokens/second before minor graph work,
+which agrees with the product measurement. The trace therefore explains the
+observed throughput rather than merely correlating with it.
 
-## Implementation ledger
+The model touches approximately 2 GB of compact active weight data per token.
+At nine tokens/second, effective useful weight bandwidth is only about
+18 GB/s, roughly 2.6% of the A40's approximately 696 GB/s peak bandwidth.
+Reaching 100 tokens/second would require roughly 200 GB/s, or about 29% of
+peak. That is an aggressive but credible target for purpose-built packed
+decode kernels; the current result is not.
 
-- [x] Introduce validated public compilation profiles.
-- [x] Split abstract definition, compiled execution plan, resident model, and
-  request state into distinct product-owned types.
-- [x] Compile and deduplicate every configured family before loading parameter
-  buffers.
-- [x] Remove lazy compilation and the mutable family cache from `generate`.
-- [x] Select the smallest fitting resident profile and hard-fail unsupported
-  requests.
-- [x] Move compilation accounting into startup metrics.
-- [x] Update the CLI and complete-checkpoint contracts to provide explicit
-  profiles.
-- [x] Update `SYSTEM.md` and `TASKS.md` with the permanent lifecycle invariant.
-- [x] Pass the focused product contract and the applicable repository CPU/CUDA
-  BuildBuddy gates.
-- [x] Remove the learned-sink operand from the split-K producer while retaining
-  it in the segment reduction.
-- [x] Replace raw TTIR strings at the call boundary with an immutable verified
-  kernel carrying its builder-authored name and argument ABI.
-- [x] Reject TTIR/custom-call count, order, pointer-address-space, and element-
-  type drift before StableHLO lowering.
-- [x] Cover split-K plus learned sinks in structural lowering and the unchanged
-  suitable-device numerical attention contract.
+## 3. Primary defect: SwiGLU is fused at the wrong boundary
+
+The grouped gate/up projection writes interleaved gate and up channels. The
+grouped down kernel then loads those channels and applies GPT-OSS clamped
+residual SwiGLU inside its K reduction loop.
+
+The down projection has 2,880 outputs and uses a 64-column output tile. It
+therefore has 45 output tiles. Each output tile independently reloads the same
+gate/up activation and recalculates the same SwiGLU values. Activation work
+that belongs once per routed intermediate element is repeated about 45 times
+per routed expert.
+
+This misplaced fusion also creates extreme register pressure. `ptxas` reports
+the following for `nvfp4_grouped_down`:
+
+```text
+720 bytes spill stores
+688 bytes spill loads
+```
+
+This explains the otherwise impossible relationship between the two expert
+projections: down reads about half as many compact weights as gate/up, yet a
+steady down launch takes roughly three times as long.
+
+### Required replacement
+
+Clamped residual SwiGLU belongs in the gate/up epilogue:
+
+```text
+hidden
+  -> grouped compact gate/up contraction
+  -> add paired gate/up biases
+  -> apply clamped residual SwiGLU once per pair
+  -> store [assignments, intermediate] activated values
+  -> grouped compact down contraction
+  -> apply routing weights and down bias
+```
+
+The gate/up kernel already owns both paired channels. Its output tile must pair
+the interleaved gate/up accumulators, apply the exact activation once, and
+write only the activated intermediate width. The down kernel must accept that
+ordinary activated tensor and contain no activation transcendental.
+
+NML's SM75 CUDA adapter already implements this boundary: its gate/up kernel
+accumulates paired channels, adds their biases, applies clamped residual
+SwiGLU once, and stores `[assignments, intermediate]`; its down kernel consumes
+that activated tensor. The SM8x Triton path diverged from the established
+design. The refactor therefore converges the Triton lowering on the proven
+SM75 semantic boundary rather than inventing a third expert interface.
+
+This is not an optional fusion experiment. It restores the model's natural
+semantic boundary, halves the gate/up intermediate storage, removes repeated
+work, and eliminates the register-spilling down-kernel composition.
+
+## 4. Second defect: quantized values are decoded with transcendental math
+
+The profiled E2M1 decoder derived every unpacked weight using dynamic floating
+point arithmetic and `exp2`. E2M1 has exactly sixteen bit patterns. It does not
+require a transcendental function.
+
+The profiled E4M3FN scale decoder also derived scale values through `exp2`.
+Worse, the one-per-16 scale is loaded into a full `[block_k, block_n]` weight
+tile, so the same scale is loaded and decoded repeatedly for each of its
+sixteen associated weight lanes.
+
+Every dense and grouped NVFP4 contraction pays this cost. The expert kernels
+alone process billions of active logical weights per token, turning a compact
+bandwidth workload into an instruction-heavy conversion workload.
+
+### Required replacement
+
+- Add typed integer bitcast support to the private Triton builder.
+- Decode normal E4M3FN values by constructing the exact IEEE/BF16 exponent and
+  mantissa bits; handle the small subnormal domain through a fixed exact map.
+- Decode E2M1 through an exact sixteen-entry mapping or equivalent integer bit
+  construction. No `exp2`, logarithm, division, or general exponentiation may
+  occur in weight decoding.
+- Load and decode one block scale for sixteen values, then broadcast it within
+  the register tile.
+- Preserve the independent scalar codec as the numerical oracle.
+- Add TTIR/generated-code contracts that reject `math.exp2` in E2M1 and E4M3
+  weight decoding. The real SwiGLU approximation may still use its declared
+  exponential in the gate/up epilogue.
+
+## 5. Third defect: decode uses a generic matrix tile instead of compact GEMV
+
+Autoregressive decode is `M=1`. The retained Triton linear family promotes it
+to `block_m=16` so it can feed an ordinary BF16 tensor-core dot. Fifteen rows
+are masked, but the contraction still performs the tile's arithmetic and
+carries the associated register state.
+
+That can be a reasonable correctness path or a prefill path. It is not the
+final decode design. The enormous 201,088-row output head and the repeated
+ordinary projections make the dense compact path alone cost approximately
+15--18 ms/token.
+
+### Required replacement
+
+NML needs finite, source-owned compact GEMV families for decode:
+
+- ordinary `[N, K]` projection, including the vocabulary head;
+- routed gate/up projection with paired epilogue activation; and
+- routed down projection over already-activated intermediates.
+
+Each decode kernel must:
+
+- map warps to useful output rows/columns without fifteen dead logical rows;
+- vector-load aligned packed payload and block scales;
+- unpack and scale only in registers;
+- reuse each decoded scale across its complete 16-value block;
+- accumulate in F32 and preserve the declared BF16 output semantics;
+- consume only selected experts; and
+- expose no full dequantized intermediate.
+
+The existing tensor-core family remains available for prefill shapes where M
+is large enough to reuse decoded weights. Decode and prefill must not be forced
+through one geometry merely to reduce the number of internal kernel types.
+
+If the source artifact layout prevents aligned/coalesced decode loads, the
+loader may create one immutable, versioned, device-prepared layout after
+upload. Preparation must be representation-aware, included in identity and
+accounting, verified against the scalar oracle, and release the obsolete
+source device buffers. Per-token repacking and persistent BF16 expansion are
+forbidden.
+
+## 6. Product orchestration is real but secondary
+
+The CUDA API trace records 3,200 `cuGraphLaunch` calls over 128 complete model
+executions: exactly 25 graph launches per execution. They correspond to the 24
+layer executables and the head; compact embedding is launched separately.
+
+This is a future latency floor, but it is not the present 12x--25x loss. GPU
+kernel execution already accounts for the measured approximately 110 ms/token.
+Public llama.cpp measurements also retain hundreds of tokens/second with their
+fusion and graph optimization disabled, showing that orchestration changes
+alone explain a modest fraction rather than this collapse.
+
+After the compact kernels approach their bandwidth target, compile/capture one
+token-level execution containing embedding, all layers, cache updates, head,
+and sampling state. It should reuse framework model construction and parameter
+bindings; it must not introduce a second eager scheduler or move product model
+semantics into the runtime.
+
+The implementation order matters. Combining the present kernels into one
+larger executable would make a 9-token/second path slightly less bad while
+hiding the actual defect.
+
+## 7. What is not responsible
+
+### Attention
+
+Paged attention and its segment reduction together consume about 0.2% of GPU
+kernel time at this request shape. Flash/paged attention work cannot recover
+the missing order of magnitude.
+
+### Context length or host spill
+
+The profiled request used cache capacity 512, 25 MB of KV-cache storage, and a
+fully GPU-resident 11.8 GB checkpoint. The roughly 9-token/second public failure
+mode at 128k context is caused by system-memory/PCIe spill. It is unrelated to
+this run.
+
+### Sampling, sorting, or token download
+
+Sorting and sampling kernels are individually measured in microseconds. Token
+downloads consumed less than one millisecond per token and do not explain the
+GPU-resident delay.
+
+### Artifact validation
+
+Full launch-time rehashing consumed approximately 225 seconds. It was a serious
+startup lifecycle defect, but it was outside steady decode. The artifact
+materializer now authenticates the pinned manifest, hashes every payload once,
+makes the materialization read-only, and atomically issues a receipt containing
+the exact filesystem identity of each verified file. Normal launch hashes only
+the small manifest and compares the receipt with cheap current metadata.
+Missing or stale proof hard-fails instead of triggering an implicit full scan.
+This removes checkpoint-size-dependent revalidation from startup; it does not
+change steady tokens/second.
+
+## 8. Verification ladder
+
+The refactor is accepted in ascending scope. Compile and CPU execution remain
+remote through BuildBuddy according to the repository workflow. GPU execution
+uses the appropriate real device.
+
+### 8.1 CPU semantic contracts
+
+- Exhaust every E2M1 code and relevant E4M3FN scale class.
+- Compare the new integer/lookup decode to the independent scalar codec.
+- Compare gate/up activation and down output against the existing analytic
+  reference for fixed and randomized bounded shapes.
+- Verify padding, nibble order, scale sharing, bias order, route weighting, and
+  BF16/F32 tolerance.
+
+### 8.2 Compiler and semantic acceptance before GPU rental
+
+- Compile both the SM75 CUDA adapter and SM80+ Triton path through BuildBuddy.
+- Reparse and verify every generated TTIR module through `KernelSpec`.
+- Reject `math.exp2` in quant decoding, reject `tt.dot` in `M = 1` kernels,
+  require F32 reductions, and require exactly one activation in gate/up and no
+  activation in down.
+- Compare fixed and deterministic randomized CPU shapes with the independent
+  scalar representation oracle, including odd widths, empty experts, uneven
+  routes, bias order, route weighting, nibble order, and scale sharing.
+- Compile the complete CUDA product and device-contract binaries without
+  claiming that a BuildBuddy worker executed them on NVIDIA hardware.
+
+The local SM75 adapter is a different implementation from the A40 Triton path.
+Running a reduced SM75 block would neither predict the Triton speedup nor be a
+better acceptance unit than the complete A40 model. It is therefore not part
+of this paid A40 performance loop. Its source remains compile-gated and its
+next runtime change requires separately authorized real-device evidence.
+
+### 8.3 End-to-end A40 acceptance
+
+- Run the unchanged immutable OCI image and exact verified checkpoint.
+- Run the complete deterministic compact-operation corpus through actual SM86
+  dispatch before the full model, in the same Pod and image.
+- Separate validation, compilation, upload, prefill, first decode, and steady
+  decode.
+- Profile M=1 ordinary, gate/up, and down nodes within the complete model;
+  confirm no quant-decode transcendental, no grouped-down spill, and useful
+  compact bandwidth rather than relying on host timing.
+- Compare representative prefill nodes so the retained matrix family has not
+  silently regressed.
+- Require numerically sensible Harmony output under the declared sampling
+  configuration.
+- Require at least 100 steady tokens/second at short context before further
+  serving features are prioritized.
+- Retain the complete profiler report and exact image/source identity.
+
+The 100-token/second threshold is a milestone gate, not a claim that it is the
+final ceiling. Once it is met, token-level execution capture and further
+layout/kernel tuning should pursue the device's truthful bandwidth limit.
+
+## 9. Implementation sequence
+
+1. [implemented] Refactor the semantic expert boundary so gate/up produces the activated
+   intermediate and down consumes it.
+2. [implemented] Implement exact non-transcendental E2M1/E4M3FN kernel decoding and one-scale-
+   per-block reuse.
+3. [implemented] Add CPU numerical and SM75/SM8x compiler contracts around the
+   new expert boundary; real SM8x evidence is the complete A40 loop.
+4. [implemented] Add dedicated M=1 compact GEMV families for ordinary and routed projection.
+5. [not indicated] Introduce a versioned prepared device layout only where profiling proves it
+   is required.
+6. [next] Rebuild the immutable product image and require the end-to-end A40 gate.
+7. [post-gate] Compose/capture token-level execution after the kernels no longer dominate.
+8. [implemented] Replace launch-time full hashing with trusted artifact
+   materialization and a bounded immutable receipt.
+
+Every step must retain one semantic graph surface and capability-selected
+private lowerings. There will be no slow generic fallback presented as
+acceleration, no benchmark-only backend override, and no duplicate product
+scheduler introduced to work around a framework boundary.
+
+## 10. Definition of done
+
+This refactor is complete only when all of the following are true:
+
+- clamped residual SwiGLU is evaluated once per routed intermediate element;
+- grouped down contains no SwiGLU exponential and no material register spill;
+- E2M1/E4M3FN weight decoding contains no transcendental arithmetic;
+- each block scale is decoded once and reused for its 16 values;
+- M=1 uses a purpose-built compact decode family;
+- CPU and rented SM8x results match the independent oracle; the modified SM75
+  adapter is never counted as runtime evidence until it is separately run;
+- the exact product image sustains at least 100 tokens/second on A40 at short
+  context;
+- the profiler shows attention and orchestration as measured secondary costs,
+  rather than assumptions; and
+- all measurements retain source, image, model, device, phase, and report
+  identity.
+
+## 11. External comparison
+
+The cited RunAIHome compilation reports 111--225 tokens/second on consumer
+NVIDIA GPUs at short context, while explaining that approximately 9
+tokens/second is a 128k-context host-spill failure mode:
+
+- <https://runaihome.com/blog/gpt-oss-20b-local-ai-hardware-guide-2026/>
+
+More directly, llama.cpp reports GPT-OSS 20B MXFP4 at 232 tokens/second on an
+RTX 4090 even with fusion and graph optimization disabled, and approximately
+272 tokens/second with them enabled:
+
+- <https://github.com/ggml-org/llama.cpp/discussions/17621>
+
+Those implementations use different storage recipes and hardware, so their
+numbers are comparison points rather than NML acceptance evidence. They do,
+however, rule out the claim that four-bit GPT-OSS inherently runs near nine
+tokens/second on pre-Blackwell NVIDIA devices.

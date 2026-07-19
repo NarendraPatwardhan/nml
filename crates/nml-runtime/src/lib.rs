@@ -11,7 +11,7 @@ use nml_pjrt::{Client, Device, LoadedExecutable};
 pub use nml_sharding::Sharding;
 use nml_tensor::Slice;
 use nml_types::{DType, DTypeClass, Shape};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error as StdError;
 use std::fmt;
 use std::sync::Arc;
@@ -1075,7 +1075,9 @@ pub struct Exe {
     device_count: usize,
     sharding: Sharding,
     inputs: Vec<Binding>,
+    input_indices: HashMap<String, usize>,
     outputs: Vec<OutputBinding>,
+    output_names: Arc<[String]>,
 }
 
 #[derive(Clone)]
@@ -1108,6 +1110,11 @@ impl Exe {
                 shape,
                 contract: contract.clone(),
             })
+            .collect::<Vec<_>>();
+        let input_indices = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, binding)| (binding.name.clone(), index))
             .collect();
         let outputs = program
             .outputs()
@@ -1117,7 +1124,12 @@ impl Exe {
                 shape,
                 alias_input,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let output_names = outputs
+            .iter()
+            .map(|output| output.name.clone())
+            .collect::<Vec<_>>()
+            .into();
         Ok(Self {
             backend,
             platform_id,
@@ -1125,7 +1137,9 @@ impl Exe {
             device_count,
             sharding,
             inputs,
+            input_indices,
             outputs,
+            output_names,
         })
     }
 
@@ -1149,11 +1163,7 @@ impl Exe {
             });
         }
         Ok(exe::Results {
-            names: self
-                .outputs
-                .iter()
-                .map(|output| output.name.clone())
-                .collect(),
+            names: Arc::clone(&self.output_names),
             buffers,
             completion,
         })
@@ -1161,7 +1171,7 @@ impl Exe {
 }
 
 pub mod exe {
-    use super::{Buffer, Error, Exe, LoadedParameter, Parameter};
+    use super::{Arc, Buffer, Error, Exe, LoadedParameter, Parameter};
 
     pub struct Arguments<'exe> {
         pub(super) executable: &'exe Exe,
@@ -1173,9 +1183,9 @@ pub mod exe {
         pub fn set(&mut self, name: &str, buffer: Buffer) -> Result<&mut Self, Error> {
             let index = self
                 .executable
-                .inputs
-                .iter()
-                .position(|binding| binding.name == name)
+                .input_indices
+                .get(name)
+                .copied()
                 .ok_or_else(|| Error::UnknownArgument(name.to_owned()))?;
             self.validate(index, &buffer)?;
             self.slots[index] = Some(buffer);
@@ -1253,9 +1263,9 @@ pub mod exe {
                 }
                 let index = self
                     .executable
-                    .inputs
-                    .iter()
-                    .position(|binding| binding.name == component.binding_name())
+                    .input_indices
+                    .get(component.binding_name())
+                    .copied()
                     .ok_or_else(|| Error::UnknownArgument(component.binding_name().to_owned()))?;
                 let binding = &self.executable.inputs[index];
                 let nml_ir::InputBinding::ParameterComponent(contract) = &binding.contract else {
@@ -1429,7 +1439,7 @@ pub mod exe {
     }
 
     pub struct Results {
-        pub(super) names: Vec<String>,
+        pub(super) names: Arc<[String]>,
         pub(super) buffers: Vec<Buffer>,
         pub(super) completion: Vec<nml_pjrt::Event>,
     }

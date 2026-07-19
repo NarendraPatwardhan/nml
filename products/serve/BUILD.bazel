@@ -12,6 +12,7 @@ nml_rust_library(
     name = "nml_serve",
     srcs = [
         "src/gpt_oss.rs",
+        "src/gpt_oss/artifact.rs",
         "src/gpt_oss/checkpoint.rs",
         "src/gpt_oss/config.rs",
         "src/gpt_oss/execution.rs",
@@ -166,6 +167,7 @@ nml_rust_test(
     size = "small",
     srcs = [
         "src/gpt_oss.rs",
+        "src/gpt_oss/artifact.rs",
         "src/gpt_oss/checkpoint.rs",
         "src/gpt_oss/config.rs",
         "src/gpt_oss/execution.rs",

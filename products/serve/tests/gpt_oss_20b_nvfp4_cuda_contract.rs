@@ -1,4 +1,6 @@
-use nml_serve::{CompilationProfile, Event, GenerationOptions, Timings};
+use nml_serve::{
+    CompilationProfile, Event, GenerationOptions, SamplingOptions, SubmissionTimings, Timings,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -17,13 +19,20 @@ const PROMPT: &str = "What is the capital of France?";
 const MAX_NEW_TOKENS: usize = 32;
 const MAX_PROMPT_TOKENS: usize = 128;
 const MAX_SEQUENCE_TOKENS: usize = 256;
+const SAMPLING: SamplingOptions = SamplingOptions {
+    seed: [0x4e4d_4c2d_4750_544f, 0x5353_2d32_3042_0001],
+    temperature: 1.0,
+    top_k: 50,
+    top_p: 1.0,
+    min_p: 0.0,
+};
 const RETURN_TOKEN: u32 = 200_002;
 const CALL_TOKEN: u32 = 200_012;
 const PHYSICAL_PARAMETER_COMPONENTS: usize = 703;
 const PARAMETER_SOURCE_BYTES: usize = 11_777_751_752;
 const PARAMETER_PEAK_STAGING_BYTES: usize = 2 * 16 * 1024 * 1024;
 const LAYERS: usize = 24;
-const CACHE_PAGE_SIZE: usize = 256;
+const CACHE_PAGE_SIZE: usize = 16;
 const KEY_VALUE_HEADS: usize = 8;
 const HEAD_DIMENSION: usize = 64;
 const BF16_BYTES: usize = 2;
@@ -70,6 +79,7 @@ fn full_checkpoint_executes_the_gpt_oss_nvfp4_cuda_product_contract() {
                 prompt: PROMPT.to_owned(),
                 max_new_tokens: MAX_NEW_TOKENS,
                 cache_capacity: None,
+                sampling: SAMPLING,
             },
             |event| -> Result<(), std::convert::Infallible> {
                 publish_completion(&event);
@@ -262,7 +272,7 @@ fn assert_cache_memory(report: &nml_serve::GenerationReport) {
     let expected_metadata = (pages + 1) * I32_BYTES;
     assert_eq!(
         report.cache_storage_bytes, expected_storage,
-        "cache storage must be 24 K/V pairs of fixed 256-token BF16 pages",
+        "cache storage must be 24 K/V pairs of fixed 16-token BF16 pages",
     );
     assert_eq!(
         report.cache_metadata_bytes, expected_metadata,
@@ -284,6 +294,7 @@ fn assert_runtime_timings(timings: &Timings, generated_tokens: usize) {
     ] {
         assert_nonzero_timing(name, duration);
     }
+    assert_submission("prefill", timings.prefill_submission);
     if generated_tokens > 1 {
         assert_nonzero_timing(
             "decode state initialization",
@@ -291,6 +302,7 @@ fn assert_runtime_timings(timings: &Timings, generated_tokens: usize) {
         );
         assert_nonzero_timing("first decode execution", timings.first_decode_execution);
         assert_nonzero_timing("decode download", timings.decode_download);
+        assert_submission("first decode", timings.first_decode_submission);
     } else {
         assert_eq!(timings.decode_state_initialization, Duration::ZERO);
         assert_eq!(timings.first_decode_execution, Duration::ZERO);
@@ -298,8 +310,20 @@ fn assert_runtime_timings(timings: &Timings, generated_tokens: usize) {
     }
     if generated_tokens > 2 {
         assert_nonzero_timing("steady decode execution", timings.steady_decode_execution);
+        assert_submission("steady decode", timings.steady_decode_submission);
     } else {
         assert_eq!(timings.steady_decode_execution, Duration::ZERO);
+    }
+}
+
+fn assert_submission(name: &str, timings: SubmissionTimings) {
+    for (component, duration) in [
+        ("embedding", timings.embedding),
+        ("sliding layers", timings.sliding_layers),
+        ("full layers", timings.full_layers),
+        ("head", timings.head),
+    ] {
+        assert_nonzero_timing(&format!("{name} {component} submission"), duration);
     }
 }
 
@@ -315,9 +339,20 @@ struct CheckedGenerationFixture {
     model: String,
     prompt: String,
     max_new_tokens: usize,
+    sampling: CheckedSamplingFixture,
     prompt_tokens: usize,
     generated_tokens: Vec<u32>,
     events: Vec<ObservedEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckedSamplingFixture {
+    seed: [u64; 2],
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    min_p: f32,
 }
 
 fn load_checked_fixture(path: &Path) -> CheckedGenerationFixture {
@@ -325,11 +360,16 @@ fn load_checked_fixture(path: &Path) -> CheckedGenerationFixture {
         File::open(path).expect("checked generation fixture must open"),
     ))
     .expect("checked generation fixture must be valid JSON");
-    assert_eq!(fixture.schema_version, 1);
+    assert_eq!(fixture.schema_version, 2);
     assert_eq!(fixture.artifact_manifest_sha256, ARTIFACT_MANIFEST_SHA256);
     assert_eq!(fixture.model, MODEL_IDENTITY);
     assert_eq!(fixture.prompt, PROMPT);
     assert_eq!(fixture.max_new_tokens, MAX_NEW_TOKENS);
+    assert_eq!(fixture.sampling.seed, SAMPLING.seed);
+    assert_eq!(fixture.sampling.temperature, SAMPLING.temperature);
+    assert_eq!(fixture.sampling.top_k, SAMPLING.top_k);
+    assert_eq!(fixture.sampling.top_p, SAMPLING.top_p);
+    assert_eq!(fixture.sampling.min_p, SAMPLING.min_p);
     fixture
 }
 

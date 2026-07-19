@@ -42,6 +42,7 @@ pub(crate) struct ExpertInputs<'context> {
     pub down_bias: Value<'context>,
     pub sorted_assignments: Value<'context>,
     pub block_experts: Value<'context>,
+    pub active_blocks: Value<'context>,
     pub expert_offset: Option<Value<'context>>,
     pub hidden_shape: Shape,
     pub routing_shape: Shape,
@@ -75,6 +76,14 @@ pub(crate) struct EmbeddingInputs<'context> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LinearPlan {
     config: NvFp4LinearConfig,
+    warps: i32,
+    stages: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GroupedPlan {
+    block_n: i64,
+    block_k: i64,
     warps: i32,
     stages: i32,
 }
@@ -208,7 +217,6 @@ pub(crate) fn lower_routed_swiglu<'context>(
             assignments,
             experts_per_token,
             local_experts,
-            gate_output,
             intermediate,
             hidden_size,
         )?
@@ -294,15 +302,15 @@ fn lower_triton_experts<'context>(
     assignments: i64,
     experts_per_token: i64,
     local_experts: i64,
-    gate_output: i64,
     intermediate: i64,
     hidden_size: i64,
 ) -> Result<Value<'context>, Error> {
     let dtype = kernel_dtype(inputs.hidden_shape.dtype(), "NVFP4 routed clamped SwiGLU")?;
     let block_m = i64::try_from(inputs.block_size)
         .map_err(|_| Error::InvalidMoe("NVFP4 expert block size exceeds I64"))?;
-    let block_n = 32_i64;
-    let block_k = 32_i64;
+    let plan = GroupedPlan::new(inputs.hidden_shape.dimensions()[0]);
+    let block_n = plan.block_n;
+    let block_k = plan.block_k;
     let expert_offset = match inputs.expert_offset {
         Some(value) => value,
         None => {
@@ -313,15 +321,16 @@ fn lower_triton_experts<'context>(
 
     let gate_config = NvFp4GroupedProjectionConfig {
         dtype,
+        tokens: inputs.hidden_shape.dimensions()[0],
         assignments,
         input_size: hidden_size,
-        output_size: gate_output,
+        output_size: intermediate,
         local_experts,
         source_row_divisor: experts_per_token,
         block_m,
         block_n,
         block_k,
-        role: NvFp4GroupedRole::GateUp,
+        role: NvFp4GroupedRole::GateUpActivated,
     };
     let gate_specification = KernelSpec::new(
         build_nvfp4_grouped_projection(gate_config).map_err(kernel_error)?,
@@ -329,13 +338,14 @@ fn lower_triton_experts<'context>(
             tensor(dtype, inputs.hidden_shape.dimensions())?,
             tensor(KernelDType::I32, inputs.schedule_shape.dimensions())?,
             tensor(KernelDType::I32, inputs.block_experts_shape.dimensions())?,
+            tensor(KernelDType::I32, &[])?,
             tensor(KernelDType::U8, inputs.gate_payload_shape.dimensions())?,
             tensor(KernelDType::U8, inputs.gate_scales_shape.dimensions())?,
             tensor(KernelDType::F32, inputs.gate_global_shape.dimensions())?,
             tensor(dtype, inputs.gate_bias_shape.dimensions())?,
             tensor(KernelDType::I32, &[])?,
         ],
-        vec![tensor(dtype, &[assignments, gate_output])?],
+        vec![tensor(dtype, &[assignments, intermediate])?],
         vec![],
     )
     .map_err(kernel_error)?;
@@ -346,6 +356,7 @@ fn lower_triton_experts<'context>(
                 ("input", inputs.hidden),
                 ("sorted_assignments", inputs.sorted_assignments),
                 ("block_experts", inputs.block_experts),
+                ("active_blocks", inputs.active_blocks),
                 ("payload", inputs.gate_payload),
                 ("block_scales", inputs.gate_scales),
                 ("global_scale", inputs.gate_global),
@@ -354,8 +365,10 @@ fn lower_triton_experts<'context>(
             ],
             grouped_launch(
                 inputs.block_experts_shape.dimensions()[0],
-                gate_output,
+                intermediate,
                 block_n,
+                plan.warps,
+                plan.stages,
             )?,
         )
         .map_err(kernel_error)?;
@@ -364,6 +377,7 @@ fn lower_triton_experts<'context>(
 
     let down_config = NvFp4GroupedProjectionConfig {
         dtype,
+        tokens: inputs.hidden_shape.dimensions()[0],
         assignments,
         input_size: intermediate,
         output_size: hidden_size,
@@ -372,14 +386,15 @@ fn lower_triton_experts<'context>(
         block_m,
         block_n,
         block_k,
-        role: NvFp4GroupedRole::ClampedSwiGluDown,
+        role: NvFp4GroupedRole::Down,
     };
     let down_specification = KernelSpec::new(
         build_nvfp4_grouped_projection(down_config).map_err(kernel_error)?,
         vec![
-            tensor(dtype, &[assignments, gate_output])?,
+            tensor(dtype, &[assignments, intermediate])?,
             tensor(KernelDType::I32, inputs.schedule_shape.dimensions())?,
             tensor(KernelDType::I32, inputs.block_experts_shape.dimensions())?,
+            tensor(KernelDType::I32, &[])?,
             tensor(KernelDType::U8, inputs.down_payload_shape.dimensions())?,
             tensor(KernelDType::U8, inputs.down_scales_shape.dimensions())?,
             tensor(KernelDType::F32, inputs.down_global_shape.dimensions())?,
@@ -398,6 +413,7 @@ fn lower_triton_experts<'context>(
                 ("input", gate_output_value),
                 ("sorted_assignments", inputs.sorted_assignments),
                 ("block_experts", inputs.block_experts),
+                ("active_blocks", inputs.active_blocks),
                 ("payload", inputs.down_payload),
                 ("block_scales", inputs.down_scales),
                 ("global_scale", inputs.down_global),
@@ -409,6 +425,8 @@ fn lower_triton_experts<'context>(
                 inputs.block_experts_shape.dimensions()[0],
                 hidden_size,
                 block_n,
+                plan.warps,
+                plan.stages,
             )?,
         )
         .map_err(kernel_error)?;
@@ -578,6 +596,7 @@ impl LinearPlan {
         } else {
             32
         };
+        let latency_sensitive = rows <= 32;
         Ok(Self {
             config: NvFp4LinearConfig {
                 dtype,
@@ -585,13 +604,57 @@ impl LinearPlan {
                 outputs,
                 inputs,
                 block_m,
-                block_n: 64,
-                block_k: 32,
+                block_n: if latency_sensitive { 64 } else { 128 },
+                block_k: if latency_sensitive { 128 } else { 64 },
                 has_bias,
             },
-            warps: 4,
-            stages: 3,
+            warps: if rows > 128 && capabilities.supports_warp_group_mma() {
+                8
+            } else {
+                4
+            },
+            stages: if latency_sensitive { 4 } else { 3 },
         })
+    }
+}
+
+impl GroupedPlan {
+    /// Selects from a finite, reviewable tile family. Decode and small batches
+    /// are dominated by expert-weight traffic, so they use a wider K tile and
+    /// four pipeline stages. Larger M exposes activation reuse and uses wider
+    /// output tiles; sufficiently large batches employ eight warps on every
+    /// retained Triton-capable NVIDIA generation. These boundaries deliberately
+    /// match ZML's built-in grouped-MoE policy.
+    const fn new(tokens: i64) -> Self {
+        if tokens <= 32 {
+            Self {
+                block_n: 64,
+                block_k: 128,
+                warps: 4,
+                stages: 4,
+            }
+        } else if tokens <= 64 {
+            Self {
+                block_n: 64,
+                block_k: 128,
+                warps: 4,
+                stages: 3,
+            }
+        } else if tokens <= 128 {
+            Self {
+                block_n: 128,
+                block_k: 64,
+                warps: 4,
+                stages: 3,
+            }
+        } else {
+            Self {
+                block_n: 128,
+                block_k: 64,
+                warps: 8,
+                stages: 3,
+            }
+        }
     }
 }
 
@@ -692,7 +755,13 @@ fn require_triton_emulation(
     })
 }
 
-fn grouped_launch(blocks: i64, output_size: i64, block_n: i64) -> Result<KernelLaunch, Error> {
+fn grouped_launch(
+    blocks: i64,
+    output_size: i64,
+    block_n: i64,
+    warps: i32,
+    stages: i32,
+) -> Result<KernelLaunch, Error> {
     let columns = output_size
         .checked_add(block_n - 1)
         .and_then(|value| value.checked_div(block_n))
@@ -705,8 +774,8 @@ fn grouped_launch(blocks: i64, output_size: i64, block_n: i64) -> Result<KernelL
                 .map_err(|_| Error::InvalidMoe("NVFP4 expert output grid exceeds I32"))?,
             1,
         ],
-        warps: 4,
-        stages: 3,
+        warps,
+        stages,
     })
 }
 

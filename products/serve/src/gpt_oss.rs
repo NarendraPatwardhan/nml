@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+mod artifact;
 mod checkpoint;
 mod config;
 mod execution;
@@ -14,7 +15,7 @@ pub(crate) mod protocol;
 
 use checkpoint::{BoxError, Result};
 use config::Config;
-use crate::CompilationProfile;
+use crate::{CompilationProfile, SamplingOptions, SubmissionTimings};
 use execution::{ModelDefinition, PreparedRequest, ResidentModel, RunMetrics, StartupMetrics};
 use nml::io::ParameterSet;
 use nml::safetensors::TensorRegistry;
@@ -35,6 +36,12 @@ const ARTIFACT_MANIFEST_SHA256: &str =
 const ARTIFACT_FILE_COUNT: usize = 20;
 const ARTIFACT_TOTAL_BYTES: u64 = 11_805_933_892;
 const ARTIFACT_RECIPE: &str = "nml-nvfp4-weight-v1";
+const ARTIFACT_RECIPE_SHA256: &str =
+    "ca5335749edbee2bf45b2220195b8e7f4551a4217cd8b99184cc772fb3d21014";
+const SOURCE_MANIFEST_SHA256: &str =
+    "4f9fd730e12e0535cf6788a11a9b1604749f4520738a5c7ea643e27bf4b5ccb1";
+const TENSOR_MANIFEST_SHA256: &str =
+    "fd7c6833d00eca158bc1145dc2577ad8d38d8f4ed977ef3e3dfc0c2a72ea5cae";
 const SOURCE_REPOSITORY: &str = "unsloth/gpt-oss-20b-BF16";
 const SOURCE_REVISION: &str = "cc89b3e7fd423253264883a80a4fa5abc619649f";
 
@@ -74,6 +81,9 @@ pub(crate) struct ProductTimings {
     pub(crate) first_decode_execution: Duration,
     pub(crate) steady_decode_execution: Duration,
     pub(crate) decode_download: Duration,
+    pub(crate) prefill_submission: SubmissionTimings,
+    pub(crate) first_decode_submission: SubmissionTimings,
+    pub(crate) steady_decode_submission: SubmissionTimings,
 }
 
 impl<'platform> Generator<'platform> {
@@ -103,6 +113,7 @@ impl<'platform> Generator<'platform> {
         prompt: String,
         max_new_tokens: usize,
         cache_capacity: Option<usize>,
+        sampling: SamplingOptions,
         mut emit: impl FnMut(protocol::Event) -> Result<()>,
     ) -> Result<ProductReport> {
         let tokenization_started = Instant::now();
@@ -119,6 +130,7 @@ impl<'platform> Generator<'platform> {
             tokens,
             max_new_tokens,
             cache_capacity,
+            sampling,
             self.model.config().context_limit(),
             tokenization,
         )?;
@@ -173,11 +185,31 @@ fn timings(
         first_decode_execution: run.first_decode_execution,
         steady_decode_execution: run.steady_decode_execution,
         decode_download: run.decode_download,
+        prefill_submission: run.prefill_submission,
+        first_decode_submission: run.first_decode_submission,
+        steady_decode_submission: run.steady_decode_submission,
     }
 }
 
 fn validate_artifact(model_directory: &Path) -> std::result::Result<(), ArtifactError> {
     let manifest_path = model_directory.join(ARTIFACT_MANIFEST);
+    let manifest_metadata = std::fs::symlink_metadata(&manifest_path)?;
+    if !manifest_metadata.file_type().is_file() {
+        return Err(ArtifactError(format!(
+            "artifact manifest is not a regular file: {}",
+            manifest_path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if manifest_metadata.mode() & 0o222 != 0 {
+            return Err(ArtifactError(
+                "artifact manifest is writable; rematerialize the artifact before launch"
+                    .to_owned(),
+            ));
+        }
+    }
     let manifest_hash = sha256(&manifest_path)?;
     if manifest_hash != ARTIFACT_MANIFEST_SHA256 {
         return Err(ArtifactError(format!(
@@ -188,47 +220,62 @@ fn validate_artifact(model_directory: &Path) -> std::result::Result<(), Artifact
         serde_json::from_reader(BufReader::new(File::open(&manifest_path)?)).map_err(|error| {
             ArtifactError(format!("artifact manifest is invalid JSON: {error}"))
         })?;
+    validate_manifest_identity(&manifest)?;
+    validate_checkpoint_entries(
+        &manifest.files,
+        model_directory.join(DIRECT_CHECKPOINT).is_file(),
+    )?;
+    let total = manifest.files.iter().try_fold(0u64, |total, file| {
+        if !is_sha256(&file.sha256) {
+            return Err(ArtifactError(format!(
+                "artifact file {:?} has an invalid SHA-256",
+                file.path
+            )));
+        }
+        total
+            .checked_add(file.size)
+            .ok_or_else(|| ArtifactError("artifact byte count overflows u64".to_owned()))
+    })?;
+    if total != ARTIFACT_TOTAL_BYTES {
+        return Err(ArtifactError(format!(
+            "artifact files total {total} bytes, expected {ARTIFACT_TOTAL_BYTES}"
+        )));
+    }
+    artifact::validate_materialization(
+        model_directory,
+        ARTIFACT_MANIFEST_SHA256,
+        manifest.files.iter().map(|file| artifact::ExpectedFile {
+            path: &file.path,
+            size: file.size,
+        }),
+    )?;
+    Ok(())
+}
+
+fn validate_manifest_identity(
+    manifest: &ArtifactManifest,
+) -> std::result::Result<(), ArtifactError> {
     if manifest.schema_version != 1
         || manifest.recipe != ARTIFACT_RECIPE
+        || manifest.recipe_sha256 != ARTIFACT_RECIPE_SHA256
+        || manifest.source_manifest_sha256 != SOURCE_MANIFEST_SHA256
         || manifest.source_repository != SOURCE_REPOSITORY
         || manifest.source_revision != SOURCE_REVISION
+        || manifest.tensor_manifest_sha256 != TENSOR_MANIFEST_SHA256
         || manifest.files.len() != ARTIFACT_FILE_COUNT
     {
         return Err(ArtifactError(
             "artifact manifest identity does not match the selected GPT-OSS revision".to_owned(),
         ));
     }
-    validate_checkpoint_entries(
-        &manifest.files,
-        model_directory.join(DIRECT_CHECKPOINT).is_file(),
-    )?;
-    let mut total = 0u64;
-    for file in manifest.files {
-        let path = model_directory.join(&file.path);
-        let size = path.metadata()?.len();
-        if size != file.size {
-            return Err(ArtifactError(format!(
-                "artifact file {:?} is {size} bytes, expected {}",
-                file.path, file.size
-            )));
-        }
-        let actual = sha256(&path)?;
-        if actual != file.sha256 {
-            return Err(ArtifactError(format!(
-                "artifact file {:?} SHA-256 is {actual}, expected {}",
-                file.path, file.sha256
-            )));
-        }
-        total = total
-            .checked_add(size)
-            .ok_or_else(|| ArtifactError("artifact byte count overflows u64".to_owned()))?;
-    }
-    if total != ARTIFACT_TOTAL_BYTES {
-        return Err(ArtifactError(format!(
-            "artifact files total {total} bytes, expected {ARTIFACT_TOTAL_BYTES}"
-        )));
-    }
     Ok(())
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_checkpoint_entries(
@@ -267,15 +314,20 @@ fn sha256(path: &Path) -> std::result::Result<String, ArtifactError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ArtifactManifest {
     schema_version: u32,
     recipe: String,
+    recipe_sha256: String,
+    source_manifest_sha256: String,
     source_repository: String,
     source_revision: String,
+    tensor_manifest_sha256: String,
     files: Vec<ArtifactFile>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ArtifactFile {
     path: String,
     sha256: String,
@@ -287,6 +339,12 @@ struct ArtifactError(String);
 
 impl From<std::io::Error> for ArtifactError {
     fn from(error: std::io::Error) -> Self {
+        Self(error.to_string())
+    }
+}
+
+impl From<artifact::Error> for ArtifactError {
+    fn from(error: artifact::Error) -> Self {
         Self(error.to_string())
     }
 }
@@ -310,10 +368,20 @@ where
 mod tests {
     use super::*;
 
+    #[test]
+    fn checked_in_manifest_matches_the_product_contract() {
+        let runfiles = std::env::var_os("TEST_SRCDIR").expect("Bazel provides TEST_SRCDIR");
+        let path = Path::new(&runfiles)
+            .join("_main/artifacts/gpt-oss-20b-nvfp4/artifact-manifest.json");
+        let manifest: ArtifactManifest =
+            serde_json::from_reader(BufReader::new(File::open(path).unwrap())).unwrap();
+        validate_manifest_identity(&manifest).unwrap();
+    }
+
     fn entry(path: &str) -> ArtifactFile {
         ArtifactFile {
             path: path.to_owned(),
-            sha256: String::new(),
+            sha256: "0".repeat(64),
             size: 0,
         }
     }

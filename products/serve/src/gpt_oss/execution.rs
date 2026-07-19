@@ -6,10 +6,10 @@ use super::checkpoint::{
 };
 use super::config::{AttentionKind, Config};
 use super::graph::{
-    CACHE_PAGE_SIZE, Phase, ShapeFamily, build_embedding, build_head, build_layer, cache_shape,
-    page_table_shape,
+    CACHE_PAGE_SIZE, MAXIMUM_TOP_K, Phase, ShapeFamily, build_embedding, build_head, build_layer,
+    cache_shape, page_table_shape,
 };
-use crate::CompilationProfile;
+use crate::{CompilationProfile, SamplingOptions, SubmissionTimings};
 use nml::exe::{Arguments, Results};
 use nml::io::{LoadAccounting, LoadOptions, ParameterSet};
 use nml::{Buffer, Exe, Graph, Memory, Platform, Shape, Sharding, Slice};
@@ -21,6 +21,7 @@ const MIN_PREFILL_BUCKET: usize = 16;
 pub(super) struct PreparedRequest {
     pub(super) tokens: Vec<u32>,
     pub(super) max_new_tokens: usize,
+    pub(super) sampling: SamplingOptions,
     required_cache_capacity: usize,
     pub(super) tokenization: Duration,
 }
@@ -30,6 +31,7 @@ impl PreparedRequest {
         tokens: Vec<u32>,
         max_new_tokens: usize,
         requested_cache_capacity: Option<usize>,
+        sampling: SamplingOptions,
         context_limit: usize,
         tokenization: Duration,
     ) -> Result<Self> {
@@ -47,9 +49,24 @@ impl PreparedRequest {
         if requested > context_limit {
             return Err(message("GPT-OSS request exceeds the model context limit"));
         }
+        if sampling.top_k == 0 || sampling.top_k > MAXIMUM_TOP_K {
+            return Err(message(
+                "GPT-OSS top-k must be between one and the compiled candidate capacity",
+            ));
+        }
+        if !sampling.temperature.is_finite() || sampling.temperature <= 0.0 {
+            return Err(message("GPT-OSS sampling temperature must be finite and positive"));
+        }
+        if !sampling.top_p.is_finite() || sampling.top_p <= 0.0 || sampling.top_p > 1.0 {
+            return Err(message("GPT-OSS top-p must be in (0, 1]"));
+        }
+        if !sampling.min_p.is_finite() || !(0.0..=1.0).contains(&sampling.min_p) {
+            return Err(message("GPT-OSS min-p must be in [0, 1]"));
+        }
         Ok(Self {
             tokens,
             max_new_tokens,
+            sampling,
             required_cache_capacity: requested,
             tokenization,
         })
@@ -131,6 +148,9 @@ pub(super) struct RunMetrics {
     pub(super) first_decode_execution: Duration,
     pub(super) steady_decode_execution: Duration,
     pub(super) decode_download: Duration,
+    pub(super) prefill_submission: SubmissionTimings,
+    pub(super) first_decode_submission: SubmissionTimings,
+    pub(super) steady_decode_submission: SubmissionTimings,
 }
 
 pub(super) struct RunReport {
@@ -438,13 +458,41 @@ impl ResidentModel<'_> {
                 .map_err(|_| message("GPT-OSS last prompt index exceeds I32"))?,
             placement,
         )?;
+        let sampling_state = upload_u64(
+            platform,
+            Shape::new(nml::DataType::U64, &[2]).map_err(boxed)?,
+            &request.sampling.seed,
+            placement,
+        )?;
+        let top_k = upload_scalar(
+            platform,
+            i32::try_from(request.sampling.top_k)
+                .map_err(|_| message("GPT-OSS top-k exceeds I32"))?,
+            placement,
+        )?;
+        let temperature = upload_f32_scalar(platform, request.sampling.temperature, placement)?;
+        let top_p = upload_f32_scalar(platform, request.sampling.top_p, placement)?;
+        let min_p = upload_f32_scalar(platform, request.sampling.min_p, placement)?;
+        for head in [&mut prefill_head, &mut decode_head] {
+            head.set("top_k", top_k.clone()).map_err(boxed)?;
+            head.set("temperature", temperature.clone()).map_err(boxed)?;
+            head.set("top_p", top_p.clone()).map_err(boxed)?;
+            head.set("min_p", min_p.clone()).map_err(boxed)?;
+        }
         let prompt_upload = prompt_upload_started.elapsed();
 
         let prefill_started = Instant::now();
+        let mut prefill_submission = SubmissionTimings::default();
+        let submission_started = Instant::now();
         prefill_embedding.set("tokens", prompt).map_err(boxed)?;
         let mut hidden = one(prefill_embedding.enqueue().map_err(boxed)?)?;
-        for (arguments, cache) in prefill_layers.iter_mut().zip(&mut caches) {
-            hidden = execute_layer(
+        prefill_submission.embedding = submission_started.elapsed();
+        for ((arguments, cache), kind) in prefill_layers
+            .iter_mut()
+            .zip(&mut caches)
+            .zip(config.layer_types())
+        {
+            let (next_hidden, elapsed) = execute_layer(
                 arguments,
                 hidden,
                 prefill_position.clone(),
@@ -452,17 +500,32 @@ impl ResidentModel<'_> {
                 page_table.clone(),
                 cache,
             )?;
+            hidden = next_hidden;
+            record_layer_submission(&mut prefill_submission, *kind, elapsed);
         }
+        let submission_started = Instant::now();
         prefill_head.set("hidden", hidden).map_err(boxed)?;
         prefill_head
             .set("last_index", last_index)
             .map_err(boxed)?;
-        let prefill_results = prefill_head.enqueue().map_err(boxed)?;
-        let mut prefill_outputs = prefill_results.into_buffers();
-        if prefill_outputs.len() != 1 {
-            return Err(message("GPT-OSS prefill head returned an invalid result count"));
+        prefill_head
+            .set("sampling_state", sampling_state)
+            .map_err(boxed)?;
+        let mut prefill_outputs = prefill_head
+            .enqueue()
+            .map_err(boxed)?
+            .into_buffers()
+            .into_iter();
+        let mut token_buffer = prefill_outputs
+            .next()
+            .ok_or_else(|| message("GPT-OSS prefill head omitted its token"))?;
+        let mut sampling_state = prefill_outputs
+            .next()
+            .ok_or_else(|| message("GPT-OSS prefill head omitted its sampling state"))?;
+        if prefill_outputs.next().is_some() {
+            return Err(message("GPT-OSS prefill head returned extra buffers"));
         }
-        let mut token_buffer = prefill_outputs.remove(0);
+        prefill_submission.head = submission_started.elapsed();
         token_buffer.wait().map_err(boxed)?;
         let prefill_execution = prefill_started.elapsed();
         let download_started = Instant::now();
@@ -484,6 +547,8 @@ impl ResidentModel<'_> {
         let mut first_decode_execution = Duration::ZERO;
         let mut steady_decode_execution = Duration::ZERO;
         let mut decode_download = Duration::ZERO;
+        let mut first_decode_submission = SubmissionTimings::default();
+        let mut steady_decode_submission = SubmissionTimings::default();
         for generated_index in 0..request.max_new_tokens {
             let is_stop = super::protocol::is_stop_token(next_token);
             emit(next_token, is_stop)?;
@@ -497,12 +562,19 @@ impl ResidentModel<'_> {
             }
 
             let decode_started = Instant::now();
+            let mut decode_submission = SubmissionTimings::default();
+            let submission_started = Instant::now();
             decode_embedding
                 .set("tokens", token_buffer)
                 .map_err(boxed)?;
             let mut hidden = one(decode_embedding.enqueue().map_err(boxed)?)?;
-            for (arguments, cache) in decode_layers.iter_mut().zip(&mut caches) {
-                hidden = execute_layer(
+            decode_submission.embedding = submission_started.elapsed();
+            for ((arguments, cache), kind) in decode_layers
+                .iter_mut()
+                .zip(&mut caches)
+                .zip(config.layer_types())
+            {
+                let (next_hidden, elapsed) = execute_layer(
                     arguments,
                     hidden,
                     position.clone(),
@@ -510,10 +582,16 @@ impl ResidentModel<'_> {
                     page_table.clone(),
                     cache,
                 )?;
+                hidden = next_hidden;
+                record_layer_submission(&mut decode_submission, *kind, elapsed);
             }
+            let submission_started = Instant::now();
             decode_head.set("hidden", hidden).map_err(boxed)?;
             decode_head
                 .set("last_index", decode_last_index.clone())
+                .map_err(boxed)?;
+            decode_head
+                .set("sampling_state", sampling_state)
                 .map_err(boxed)?;
             decode_head.set("position", position).map_err(boxed)?;
             let mut outputs = decode_head
@@ -524,18 +602,24 @@ impl ResidentModel<'_> {
             token_buffer = outputs
                 .next()
                 .ok_or_else(|| message("GPT-OSS decode head omitted its token"))?;
+            sampling_state = outputs
+                .next()
+                .ok_or_else(|| message("GPT-OSS decode head omitted its sampling state"))?;
             position = outputs
                 .next()
                 .ok_or_else(|| message("GPT-OSS decode head omitted its position"))?;
             if outputs.next().is_some() {
                 return Err(message("GPT-OSS decode head returned extra buffers"));
             }
+            decode_submission.head = submission_started.elapsed();
             token_buffer.wait().map_err(boxed)?;
             let execution_elapsed = decode_started.elapsed();
             if generated_index == 0 {
                 first_decode_execution = execution_elapsed;
+                first_decode_submission = decode_submission;
             } else {
                 steady_decode_execution += execution_elapsed;
+                add_submission(&mut steady_decode_submission, decode_submission);
             }
             let download_started = Instant::now();
             next_token = download_token(&token_buffer)?;
@@ -557,6 +641,9 @@ impl ResidentModel<'_> {
                 first_decode_execution,
                 steady_decode_execution,
                 decode_download,
+                prefill_submission,
+                first_decode_submission,
+                steady_decode_submission,
             },
         })
     }
@@ -736,7 +823,8 @@ fn execute_layer(
     sequence_lengths: Option<Buffer>,
     page_table: Buffer,
     cache: &mut LayerCache,
-) -> Result<Buffer> {
+) -> Result<(Buffer, Duration)> {
+    let started = Instant::now();
     let (key, value) = cache.take()?;
     arguments.set("hidden", hidden).map_err(boxed)?;
     arguments.set("position", position).map_err(boxed)?;
@@ -766,7 +854,25 @@ fn execute_layer(
         return Err(message("GPT-OSS layer returned extra buffers"));
     }
     cache.install(key, value)?;
-    Ok(hidden)
+    Ok((hidden, started.elapsed()))
+}
+
+fn record_layer_submission(
+    timings: &mut SubmissionTimings,
+    kind: AttentionKind,
+    elapsed: Duration,
+) {
+    match kind {
+        AttentionKind::SlidingAttention => timings.sliding_layers += elapsed,
+        AttentionKind::FullAttention => timings.full_layers += elapsed,
+    }
+}
+
+fn add_submission(total: &mut SubmissionTimings, value: SubmissionTimings) {
+    total.embedding += value.embedding;
+    total.sliding_layers += value.sliding_layers;
+    total.full_layers += value.full_layers;
+    total.head += value.head;
 }
 
 fn compile(
@@ -809,6 +915,31 @@ fn upload_i32(
     placement: &Sharding,
 ) -> Result<Buffer> {
     let slice = Slice::from_typed(shape, values).map_err(boxed)?;
+    platform
+        .upload(&slice, placement.clone(), Memory::Default)
+        .map_err(boxed)
+}
+
+fn upload_u64(
+    platform: &Platform,
+    shape: Shape,
+    values: &[u64],
+    placement: &Sharding,
+) -> Result<Buffer> {
+    let slice = Slice::from_typed(shape, values).map_err(boxed)?;
+    platform
+        .upload(&slice, placement.clone(), Memory::Default)
+        .map_err(boxed)
+}
+
+fn upload_f32_scalar(
+    platform: &Platform,
+    value: f32,
+    placement: &Sharding,
+) -> Result<Buffer> {
+    let shape = Shape::new(nml::DataType::F32, &[]).map_err(boxed)?;
+    let values = [value];
+    let slice = Slice::from_typed(shape, &values).map_err(boxed)?;
     platform
         .upload(&slice, placement.clone(), Memory::Default)
         .map_err(boxed)
@@ -872,6 +1003,7 @@ mod tests {
             vec![7; 17],
             5,
             None,
+            SamplingOptions::default(),
             131_072,
             Duration::from_millis(1),
         )
@@ -893,9 +1025,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(small.prefill.sequence(), 32);
-        assert_eq!(small.decode.cache_capacity(), CACHE_PAGE_SIZE);
+        assert_eq!(small.decode.cache_capacity(), 2 * CACHE_PAGE_SIZE);
         assert_eq!(large.prefill.sequence(), 128);
-        assert_eq!(large.decode.cache_capacity(), 2 * CACHE_PAGE_SIZE);
+        assert_eq!(large.decode.cache_capacity(), 32 * CACHE_PAGE_SIZE);
         assert_eq!(select_profile(&[large, small], &request).unwrap(), small);
     }
 
@@ -932,14 +1064,83 @@ mod tests {
     fn requests_reject_unrepresentable_or_undersized_families() {
         assert!(normalize_profiles(&[], 131_072).is_err());
         assert!(
-            PreparedRequest::new(vec![], 1, None, 131_072, Duration::ZERO).is_err()
+            PreparedRequest::new(
+                vec![],
+                1,
+                None,
+                SamplingOptions::default(),
+                131_072,
+                Duration::ZERO,
+            )
+            .is_err()
         );
-        assert!(
-            PreparedRequest::new(vec![1; 17], 5, Some(21), 131_072, Duration::ZERO).is_err()
-        );
-        assert!(
-            PreparedRequest::new(vec![1; 17], 5, Some(131_073), 131_072, Duration::ZERO)
+        for sampling in [
+            SamplingOptions {
+                top_k: 0,
+                ..SamplingOptions::default()
+            },
+            SamplingOptions {
+                top_k: MAXIMUM_TOP_K + 1,
+                ..SamplingOptions::default()
+            },
+            SamplingOptions {
+                temperature: 0.0,
+                ..SamplingOptions::default()
+            },
+            SamplingOptions {
+                temperature: f32::NAN,
+                ..SamplingOptions::default()
+            },
+            SamplingOptions {
+                top_p: 0.0,
+                ..SamplingOptions::default()
+            },
+            SamplingOptions {
+                top_p: 1.01,
+                ..SamplingOptions::default()
+            },
+            SamplingOptions {
+                min_p: -0.01,
+                ..SamplingOptions::default()
+            },
+            SamplingOptions {
+                min_p: 1.01,
+                ..SamplingOptions::default()
+            },
+        ] {
+            assert!(
+                PreparedRequest::new(
+                    vec![1],
+                    1,
+                    None,
+                    sampling,
+                    131_072,
+                    Duration::ZERO,
+                )
                 .is_err()
+            );
+        }
+        assert!(
+            PreparedRequest::new(
+                vec![1; 17],
+                5,
+                Some(21),
+                SamplingOptions::default(),
+                131_072,
+                Duration::ZERO,
+            )
+            .is_err()
+        );
+        assert!(
+            PreparedRequest::new(
+                vec![1; 17],
+                5,
+                Some(131_073),
+                SamplingOptions::default(),
+                131_072,
+                Duration::ZERO,
+            )
+            .is_err()
         );
         assert!(
             ExecutionProfile::new(
@@ -973,11 +1174,25 @@ mod tests {
             131_072,
         )
         .unwrap();
-        let oversized_prompt =
-            PreparedRequest::new(vec![1; 33], 1, None, 131_072, Duration::ZERO).unwrap();
+        let oversized_prompt = PreparedRequest::new(
+            vec![1; 33],
+            1,
+            None,
+            SamplingOptions::default(),
+            131_072,
+            Duration::ZERO,
+        )
+        .unwrap();
         assert!(select_profile(&[profile], &oversized_prompt).is_err());
-        let oversized_sequence =
-            PreparedRequest::new(vec![1; 16], 241, None, 131_072, Duration::ZERO).unwrap();
+        let oversized_sequence = PreparedRequest::new(
+            vec![1; 16],
+            241,
+            None,
+            SamplingOptions::default(),
+            131_072,
+            Duration::ZERO,
+        )
+        .unwrap();
         assert!(select_profile(&[profile], &oversized_sequence).is_err());
     }
 }
