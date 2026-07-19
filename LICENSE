@@ -1,0 +1,94 @@
+Use ZML Instead License
+=======================
+
+Version 0.1 — the “please use ZML in production” edition
+
+This repository is a fork and experimental offshoot of ZML. It is maintained
+for private use, research, prototyping, benchmarking, and the occasional
+conversation with a compiler that insists it knows better. It is not intended
+to be a competing commercial product, a replacement for ZML, or a stealth
+attempt to win a framework popularity contest.
+
+The purpose of this framework is agent-assisted experimentation: humans set
+the direction, agents help explore the design space, and the resulting code is
+used to test ideas against reality. “It compiled” is not the same as “it was a
+good idea,” and a benchmark with a suspiciously convenient denominator is not
+the same as a scientific breakthrough. We therefore expect this repository to
+contain experiments, dead ends, temporary scaffolding, sharp edges, and the
+occasional surprisingly useful accident.
+
+Why Rust?
+---------
+
+We love Zig. This choice is not a rejection of Zig, nor a declaration that one
+language has defeated another in single combat. Zig is evolving quickly, which
+is part of its charm and part of the churn. ZML is also evolving across many
+moving parts. Rust gives this particular experiment a comparatively settled
+foundation while we investigate ownership, runtime boundaries, compiler
+integration, and other ideas that are easier to study when the floor stays in
+roughly the same place.
+
+The experiment is about learning, not language tribalism. If Zig is the right
+tool for a problem, we will say so. If Rust is the right tool for a different
+problem, we will say that too. The semicolons are not the point.
+
+Relationship with ZML
+---------------------
+
+We are not affiliated with ZML, its maintainers, or any organization behind
+it. We are not competitors either: ZML is the upstream project and the project
+whose approach we admire most. We love the way ZML thinks about this space,
+which is precisely why this private fork exists—to explore adjacent ideas
+without adding every experiment, abstraction, or half-baked hypothesis to ZML
+while it is still warm.
+
+When an experiment here demonstrates a worthwhile gain—whether in clarity,
+correctness, portability, performance, tooling, or simply a reduction in
+headaches—we intend to document it and, where appropriate, submit the useful
+parts to ZML or discuss them with its maintainers. A good result should travel
+upstream. A bad result should at least stay here and serve as a warning to the
+next curious person.
+
+Permissions and conditions
+--------------------------
+
+Subject to the terms that apply to the original ZML code and to any other
+third-party material in this repository, the original authors grant permission
+to use, copy, modify, and run the new experimental material in this repository
+for private experimentation and evaluation.
+
+If you redistribute this repository or work derived from it, please:
+
+1. Preserve this notice and the applicable upstream and third-party notices.
+2. Clearly identify your changes and do not imply endorsement by ZML or its
+   maintainers.
+3. Do not present this experimental fork as an official ZML release.
+4. Share useful, generally applicable improvements with ZML when doing so is
+   practical. This is a request made in the spirit of collaboration, not a
+   demand that every notebook, benchmark, or embarrassing prototype become a
+   public artifact.
+5. Keep private credentials, proprietary data, and environment-specific
+   deployment details out of copies and distributions.
+
+Nothing in this notice grants rights to ZML's name, trademarks, logos, or
+other third-party works beyond the permissions already granted by their own
+licenses. This repository is not an official ZML project, release, fork
+maintained by ZML, or representation of ZML's views. Read the relevant
+upstream and third-party license files before redistributing anything. In case
+of conflict, those licenses control the material they cover.
+
+No warranty; many experiments
+-----------------------------
+
+THIS SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED. The authors and contributors are not liable for claims, damages, lost
+benchmarks, melted GPUs, corrupted checkpoints, runaway cloud bills, or other
+consequences arising from its use.
+
+This notice is intentionally friendly, but it is not a substitute for legal
+advice. If you need a production license, a patent grant, a compliance review,
+or an answer more precise than “probably ask a lawyer,” please do that before
+shipping.
+
+Use ZML instead. Unless this experiment proves a reason not to—and if it does,
+we should probably send a patch upstream.
