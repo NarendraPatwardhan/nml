@@ -34,7 +34,10 @@ const DIRECT_CHECKPOINT: &str = "model.safetensors";
 const ARTIFACT_MANIFEST_SHA256: &str =
     "3c36a89cbc0f908b3e782550fe32f3b6890ef3f857232d11710bc8e0dbcea71d";
 const ARTIFACT_FILE_COUNT: usize = 20;
-const ARTIFACT_TOTAL_BYTES: u64 = 11_805_938_322;
+// The manifest authenticates these twenty payload/metadata files. Its own
+// 4,118 bytes are authenticated by ARTIFACT_MANIFEST_SHA256 and therefore are
+// not counted a second time as a declared artifact file.
+const ARTIFACT_TOTAL_BYTES: u64 = 11_805_934_204;
 const ARTIFACT_RECIPE: &str = "nml-nvfp4-weight-v2";
 const ARTIFACT_RECIPE_SHA256: &str =
     "68bad1480e9a68e4fa3d36c17315b8bcd5490e777cfd738f15c71101f6bb6603";

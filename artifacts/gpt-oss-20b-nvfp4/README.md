@@ -22,7 +22,8 @@ at immutable revision `704c34282b2d84cc6a4e5ce7de14b6f6fc1286e9`.
 [`artifact-manifest.json`](./artifact-manifest.json) is the byte-exact public
 manifest downloaded back from that revision. Its SHA-256 is
 `3c36a89cbc0f908b3e782550fe32f3b6890ef3f857232d11710bc8e0dbcea71d`.
-The 20 payload/metadata files total 11,805,938,322 bytes.
+The 20 payload/metadata files total 11,805,934,204 bytes. The separately
+authenticated artifact manifest itself is 4,118 bytes.
 
 The permanent auditor at `//tools/nvfp4:audit_published_artifact` can derive a
 complete physical tensor inventory from bounded SafeTensor header reads. The
