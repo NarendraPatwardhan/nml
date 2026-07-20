@@ -951,8 +951,8 @@ impl GroupedPlan {
     const fn new(tokens: i64) -> Self {
         if tokens == 1 {
             Self {
-                block_n: 8,
-                block_k: 64,
+                block_n: 32,
+                block_k: 256,
                 warps: 4,
                 stages: 1,
             }
