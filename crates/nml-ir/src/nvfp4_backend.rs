@@ -5,11 +5,11 @@
 //! W4A16 Triton kernel. The source payload and scale tensors are passed through
 //! unchanged; decoding is tile-local inside the contraction kernel.
 
-use crate::{Error, device_capabilities::CudaCapabilities};
+use crate::{device_capabilities::CudaCapabilities, Error};
 use nml_kernel_triton::{
+    build_nvfp4_embedding, build_nvfp4_grouped_projection, build_nvfp4_linear,
     DType as KernelDType, KernelLaunch, KernelSpec, NvFp4EmbeddingConfig,
     NvFp4GroupedProjectionConfig, NvFp4GroupedRole, NvFp4LinearConfig, TensorSpec,
-    build_nvfp4_embedding, build_nvfp4_grouped_projection, build_nvfp4_linear,
 };
 use nml_mlir::{Block, Context, Region, Type, Value};
 use nml_types::{DType, Partition, Shape};
@@ -167,7 +167,8 @@ pub(crate) fn lower_routed_swiglu<'context>(
             return Err(Error::UnsupportedTarget {
                 operation: "NVFP4 routed clamped SwiGLU",
                 target: "sharded CUDA SM75 execution".to_owned(),
-                requirement: "the Turing grouped adapter currently owns one complete local expert set",
+                requirement:
+                    "the Turing grouped adapter currently owns one complete local expert set",
             });
         }
         require_unsharded_experts(&inputs)?;
@@ -596,11 +597,15 @@ impl LinearPlan {
             ));
         }
 
-        // Decode is a distinct bandwidth kernel. It uses narrow output rows,
-        // a wider contiguous K tile, and no artificial tensor-core rows.
-        // retain a 64-row tile once enough rows exist for warp-group MMA;
-        // Ampere/Ada use the smaller tile accepted by their ordinary tt.dot
-        // lowering. This is private tuning, not an architecture-facing API.
+        // Decode (M=1) GEMV is a memory-bandwidth-bound problem. Each program
+        // handles 32 output columns (2 warps × 16 columns each) over a 128-wide
+        // K tile. Two pipeline stages overlap weight loads with arithmetic.
+        // Two warps leave SM resources for concurrent CTAs. The inner loop
+        // uses streaming weight loads (`.cg`) to avoid polluting L1 with
+        // once-through weight data while keeping activation tiles cached.
+        // Prefill uses the tensor-core matrix family. Small batches get
+        // narrower output tiles and deeper pipelines; large batches widen
+        // the output tile and optionally use 8 warps for warp-group MMA.
         let block_m = if rows == 1 {
             1
         } else if rows <= 16 {
@@ -619,14 +624,14 @@ impl LinearPlan {
                 inputs,
                 block_m,
                 block_n: if rows == 1 {
-                    if outputs >= 65_536 { 32 } else { 8 }
+                    32
                 } else if latency_sensitive {
                     64
                 } else {
                     128
                 },
                 block_k: if rows == 1 {
-                    256
+                    128
                 } else if latency_sensitive {
                     128
                 } else {
@@ -634,30 +639,37 @@ impl LinearPlan {
                 },
                 has_bias,
             },
-            warps: if rows > 128 && capabilities.supports_warp_group_mma() {
+            warps: if rows == 1 {
+                2
+            } else if rows > 128 && capabilities.supports_warp_group_mma() {
                 8
             } else {
                 4
             },
-            stages: if rows == 1 { 1 } else if latency_sensitive { 4 } else { 3 },
+            stages: if rows == 1 {
+                2
+            } else if latency_sensitive {
+                4
+            } else {
+                3
+            },
         })
     }
 }
 
 impl GroupedPlan {
-    /// Selects from a finite, reviewable tile family. Decode and small batches
-    /// are dominated by expert-weight traffic, so they use a wider K tile and
-    /// four pipeline stages. Larger M exposes activation reuse and uses wider
-    /// output tiles; sufficiently large batches employ eight warps on every
-    /// retained Triton-capable NVIDIA generation. These boundaries deliberately
-    /// match ZML's built-in grouped-MoE policy.
+    /// Selects from a finite, reviewable tile family. Decode (M=1) uses 32
+    /// output columns and a 128-wide K tile with 2 warps and 2 pipeline
+    /// stages, matching the ordinary GEMV configuration. Smaller batch prefill
+    /// uses wider output tiles and deeper pipelines; larger batches use wider
+    /// tiles and optionally 8 warps.
     const fn new(tokens: i64) -> Self {
         if tokens == 1 {
             Self {
-                block_n: 8,
-                block_k: 256,
-                warps: 4,
-                stages: 1,
+                block_n: 32,
+                block_k: 128,
+                warps: 2,
+                stages: 2,
             }
         } else if tokens <= 32 {
             Self {

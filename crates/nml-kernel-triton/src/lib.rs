@@ -20,16 +20,16 @@ mod paged_attention;
 mod specification;
 mod unified_attention;
 
-pub use moe::{GatedActivation, GroupedProjectionConfig, build_grouped_projection};
+pub use moe::{build_grouped_projection, GatedActivation, GroupedProjectionConfig};
 pub use nvfp4::{
-    NvFp4EmbeddingConfig, NvFp4GroupedProjectionConfig, NvFp4GroupedRole, NvFp4LinearConfig,
     build_nvfp4_embedding, build_nvfp4_grouped_projection, build_nvfp4_linear,
+    NvFp4EmbeddingConfig, NvFp4GroupedProjectionConfig, NvFp4GroupedRole, NvFp4LinearConfig,
 };
-pub use paged_attention::{AttentionGeometry, AttentionLaunch, select_attention_launch};
+pub use paged_attention::{select_attention_launch, AttentionGeometry, AttentionLaunch};
 pub use specification::{KernelLaunch, KernelSpec, OutputAlias, TensorSpec};
 pub use unified_attention::{
-    PagedAttention2dConfig, PagedAttention3dConfig, SegmentReductionConfig,
     build_paged_attention_2d, build_paged_attention_3d, build_segment_reduction,
+    PagedAttention2dConfig, PagedAttention3dConfig, SegmentReductionConfig,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1554,6 +1554,40 @@ impl Builder {
             result.clone(),
             format!(
                 "\"tt.load\"({}, {}, {}) <{{cache = 1 : i32, evict = 1 : i32, isVolatile = false, operandSegmentSizes = array<i32: 1, 1, 1>}}> : ({}, {}, {}) -> {}",
+                pointer.id,
+                mask.id,
+                other.id,
+                pointer.value_type.spelling(),
+                mask.value_type.spelling(),
+                other.value_type.spelling(),
+                result.spelling(),
+            ),
+        )
+    }
+
+    /// Load with `.cg` (streaming) cache modifier for once-through weight data.
+    ///
+    /// Pre-Blackwell PTX accepts `.cg` with normal eviction; combining it with
+    /// `.evict_first`/`.evict_last` is illegal, so eviction is left at normal.
+    /// Use this for weight payloads and block scales that are never reused,
+    /// keeping the default `load_masked` (`.ca`) for activations.
+    pub fn load_masked_streaming(
+        &mut self,
+        pointer: &Value,
+        mask: &Value,
+        other: &Value,
+    ) -> Result<Value, Error> {
+        self.require_values(&[pointer, mask, other])?;
+        let result = pointer.value_type.loaded().ok_or(Error::ExpectedPointer)?;
+        if mask.value_type != result.condition_type() || other.value_type != result {
+            return Err(Error::TypeMismatch {
+                operation: "masked streaming load",
+            });
+        }
+        self.emit_value(
+            result.clone(),
+            format!(
+                "\"tt.load\"({}, {}, {}) <{{cache = 2 : i32, evict = 1 : i32, isVolatile = false, operandSegmentSizes = array<i32: 1, 1, 1>}}> : ({}, {}, {}) -> {}",
                 pointer.id,
                 mask.id,
                 other.id,
