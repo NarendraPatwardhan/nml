@@ -286,9 +286,10 @@ persistent dense weight expansion.
 - [x] Move CPU, SM75, Triton matrix, and Triton decode consumers together to
   recipe v3. Remove implicit output-major indexing and keep runtime repacking,
   prepared dense copies, and earlier-recipe compatibility absent.
-- [x] Add typed Triton load policies and assign streaming/evict-first intent to
-  one-pass compact weights while retaining activation tiles with
-  cache-all/evict-last intent.
+- [x] Add typed Triton load policies and assign the portable streaming cache
+  operator to one-pass compact weights while retaining activation tiles with
+  cache-all. Keep the independent eviction attribute normal: redundant
+  cache-plus-eviction combinations are illegal in pre-Blackwell PTX.
 - [x] Parallelize ordinary decode projections over bounded split K and reduce
   F32 partials in a dedicated bias-owning finalizer. Matrix-shaped prefill
   remains on its tensor-core family.

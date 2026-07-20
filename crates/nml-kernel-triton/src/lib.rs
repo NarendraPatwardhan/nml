@@ -298,44 +298,27 @@ impl CacheModifier {
     }
 }
 
-/// Reuse priority communicated to Triton's NVIDIA load lowering.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EvictionPolicy {
-    Normal,
-    First,
-    Last,
-}
-
-impl EvictionPolicy {
-    const fn dialect_value(self) -> i32 {
-        match self {
-            Self::Normal => 1,
-            Self::First => 2,
-            Self::Last => 3,
-        }
-    }
-}
-
-/// A typed load policy. Compact weights stream through L1 while the much
-/// smaller activation tile is retained across output tiles.
+/// A typed load policy. Compact weights use PTX's streaming cache operator,
+/// whose contract already gives the line first-eviction priority, while the
+/// much smaller activation tile uses cache-all. We deliberately leave the
+/// independent Triton eviction attribute at `normal`: on pre-Blackwell PTX,
+/// combining `.cs` with `.evict_first` or `.ca` with `.evict_last` is illegal.
+/// One semantic intent therefore lowers to one portable cache control instead
+/// of two redundant target-specific hints.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LoadPolicy {
     cache: CacheModifier,
-    eviction: EvictionPolicy,
 }
 
 impl LoadPolicy {
     pub const DEFAULT: Self = Self {
         cache: CacheModifier::Default,
-        eviction: EvictionPolicy::Normal,
     };
     pub const STREAMING: Self = Self {
         cache: CacheModifier::Streaming,
-        eviction: EvictionPolicy::First,
     };
     pub const REUSED: Self = Self {
         cache: CacheModifier::CacheAll,
-        eviction: EvictionPolicy::Last,
     };
 }
 
@@ -1631,7 +1614,7 @@ impl Builder {
                 mask.id,
                 other.id,
                 policy.cache.dialect_value(),
-                policy.eviction.dialect_value(),
+                1,
                 pointer.value_type.spelling(),
                 mask.value_type.spelling(),
                 other.value_type.spelling(),

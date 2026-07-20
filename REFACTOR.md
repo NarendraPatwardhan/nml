@@ -52,9 +52,11 @@ E4M3FN register decode, and F32 partials. One gate/up finalizer reduces K,
 adds bias, and applies clamped SwiGLU once. One down finalizer reduces K, adds
 the selected expert bias, applies route weights, and reduces top-k directly
 into `[token, hidden]`. Matrix-shaped prefill keeps its tensor-core schedule.
-The typed builder owns cache and eviction intent instead of embedding dialect
-integers in kernels. BuildBuddy contracts establish construction and CPU
-semantics only; performance remains unpromoted until a newly converted
+The typed builder owns cache intent instead of embedding dialect integers in
+kernels. Streaming and cache-all use the normal independent eviction policy;
+this is the portable pre-Blackwell PTX form and avoids illegal redundant hint
+combinations. BuildBuddy contracts establish construction and CPU semantics
+only; performance remains unpromoted until a newly converted
 immutable recipe-v3 artifact completes the whole-model GDB/Nsight gate.
 
 The same tranche reuses baked argument owners across decode iterations and

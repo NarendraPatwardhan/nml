@@ -136,12 +136,16 @@ fn nvfp4_decode_linear_uses_compact_gemv_without_dead_matrix_rows() {
     assert!(!ttir.contains("tt.dot"), "{ttir}");
     assert!(!ttir.contains("math.exp2"), "{ttir}");
     assert!(
-        ttir.contains("cacheModifier = cs evictionPolicy = evict_first"),
-        "compact weights must stream with evict-first intent: {ttir}"
+        ttir.contains("cacheModifier = cs"),
+        "compact weights must use the portable streaming policy: {ttir}"
     );
     assert!(
-        ttir.contains("cacheModifier = ca evictionPolicy = evict_last"),
-        "activation fragments must retain cache-all/evict-last intent: {ttir}"
+        ttir.contains("cacheModifier = ca"),
+        "activation fragments must use the portable cache-all policy: {ttir}"
+    );
+    assert!(
+        !ttir.contains("evictionPolicy"),
+        "portable cache policies must not add a target-specific eviction modifier: {ttir}"
     );
 }
 
