@@ -5,7 +5,7 @@
 //! sampling. Model depth remains an execution-plan concern and never duplicates
 //! the reusable component bodies in StableHLO.
 
-use super::checkpoint::{BoxError, Checkpoint, DecoderLayer, Result, message};
+use super::checkpoint::{message, BoxError, Checkpoint, DecoderLayer, Result};
 use super::config::{AttentionKind, Config};
 use nml::{DataType, Graph, Shape, Tensor};
 
@@ -46,10 +46,14 @@ impl ShapeFamily {
             return Err(message("GPT-OSS prefill bucket exceeds cache capacity"));
         }
         if cache_capacity > i32::MAX as usize {
-            return Err(message("GPT-OSS cache capacity exceeds the I32 index domain"));
+            return Err(message(
+                "GPT-OSS cache capacity exceeds the I32 index domain",
+            ));
         }
         if !cache_capacity.is_multiple_of(CACHE_PAGE_SIZE) {
-            return Err(message("GPT-OSS cache capacity must contain complete pages"));
+            return Err(message(
+                "GPT-OSS cache capacity must contain complete pages",
+            ));
         }
         Ok(Self {
             phase,
@@ -89,7 +93,11 @@ pub(super) fn build_embedding(
     require_shape(
         hidden,
         DataType::Bf16,
-        &[1, dimension(family.sequence())?, dimension(config.hidden_size())?],
+        &[
+            1,
+            dimension(family.sequence())?,
+            dimension(config.hidden_size())?,
+        ],
     )?;
     Ok(vec![("hidden".to_owned(), hidden)])
 }
@@ -230,12 +238,8 @@ fn apply_layer(
 
     let residual = hidden_input;
     let input_norm = nml(graph.parameter_value(&layer.input_layernorm.weight))?;
-    let mut hidden = nml(graph.rms_norm(
-        hidden_input,
-        Some(input_norm),
-        2,
-        config.rms_norm_epsilon(),
-    ))?;
+    let mut hidden =
+        nml(graph.rms_norm(hidden_input, Some(input_norm), 2, config.rms_norm_epsilon()))?;
     let query = nml(graph.linear(
         hidden,
         &layer.self_attn.q_proj.weight,
@@ -257,17 +261,11 @@ fn apply_layer(
     ))?;
     let key = nml(graph.reshape(
         key,
-        shape(
-            DataType::Bf16,
-            &[1, sequence, key_value_heads, head_dim],
-        )?,
+        shape(DataType::Bf16, &[1, sequence, key_value_heads, head_dim])?,
     ))?;
     let value = nml(graph.reshape(
         value,
-        shape(
-            DataType::Bf16,
-            &[1, sequence, key_value_heads, head_dim],
-        )?,
+        shape(DataType::Bf16, &[1, sequence, key_value_heads, head_dim])?,
     ))?;
     let rope = nml::attention::RopeOptions {
         base: config.rope_theta(),
@@ -296,16 +294,9 @@ fn apply_layer(
     )?;
     let dense_key = nml(graph.reshape(key_input, dense_cache_shape))?;
     let dense_value = nml(graph.reshape(value_input, dense_cache_shape))?;
-    let dense_key = nml(graph.dynamic_update_slice(
-        dense_key,
-        key,
-        &[zero, position, zero, zero],
-    ))?;
-    let dense_value = nml(graph.dynamic_update_slice(
-        dense_value,
-        value,
-        &[zero, position, zero, zero],
-    ))?;
+    let dense_key = nml(graph.dynamic_update_slice(dense_key, key, &[zero, position, zero, zero]))?;
+    let dense_value =
+        nml(graph.dynamic_update_slice(dense_value, value, &[zero, position, zero, zero]))?;
     let key_cache = nml(graph.reshape(dense_key, cache_shape))?;
     let value_cache = nml(graph.reshape(dense_value, cache_shape))?;
     let key_cache = nml(graph.reuse_buffer(key_cache, key_input))?;
@@ -346,16 +337,8 @@ fn apply_layer(
 
     let residual = hidden;
     let post_norm = nml(graph.parameter_value(&layer.post_attention_layernorm.weight))?;
-    hidden = nml(graph.rms_norm(
-        hidden,
-        Some(post_norm),
-        2,
-        config.rms_norm_epsilon(),
-    ))?;
-    let routed = nml(graph.reshape(
-        hidden,
-        shape(DataType::Bf16, &[sequence, hidden_size])?,
-    ))?;
+    hidden = nml(graph.rms_norm(hidden, Some(post_norm), 2, config.rms_norm_epsilon()))?;
+    let routed = nml(graph.reshape(hidden, shape(DataType::Bf16, &[sequence, hidden_size])?))?;
     let router_logits = nml(graph.linear(
         routed,
         &layer.mlp.router.weight,
@@ -388,27 +371,15 @@ pub(super) fn build_head(
         shape(DataType::Bf16, &[1, sequence, hidden_size])?,
     );
     let last_index = graph.input("last_index", shape(DataType::I32, &[])?);
-    let sampling_state_input = graph.input(
-        "sampling_state",
-        shape(DataType::U64, &[2])?,
-    );
+    let sampling_state_input = graph.input("sampling_state", shape(DataType::U64, &[2])?);
     let top_k = graph.input("top_k", shape(DataType::I32, &[])?);
     let temperature = graph.input("temperature", shape(DataType::F32, &[])?);
     let top_p = graph.input("top_p", shape(DataType::F32, &[])?);
     let min_p = graph.input("min_p", shape(DataType::F32, &[])?);
     let zero = nml(graph.scalar(0_i32))?;
-    let last = nml(graph.dynamic_slice(
-        hidden,
-        &[zero, last_index, zero],
-        &[1, 1, hidden_size],
-    ))?;
+    let last = nml(graph.dynamic_slice(hidden, &[zero, last_index, zero], &[1, 1, hidden_size]))?;
     let final_norm = nml(graph.parameter_value(&checkpoint.model.norm.weight))?;
-    let last = nml(graph.rms_norm(
-        last,
-        Some(final_norm),
-        2,
-        config.rms_norm_epsilon(),
-    ))?;
+    let last = nml(graph.rms_norm(last, Some(final_norm), 2, config.rms_norm_epsilon()))?;
     let last = nml(graph.reshape(last, shape(DataType::Bf16, &[1, hidden_size])?))?;
     let logits = nml(graph.linear(last, &checkpoint.lm_head.weight, None))?;
     let sampling_state = nml(graph.random_state(sampling_state_input))?;
@@ -422,10 +393,8 @@ pub(super) fn build_head(
         min_p,
         MAXIMUM_TOP_K,
     ))?;
-    let sampling_state = nml(graph.reuse_buffer(
-        sampling_state.into_tensor(),
-        sampling_state_input,
-    ))?;
+    let sampling_state =
+        nml(graph.reuse_buffer(sampling_state.into_tensor(), sampling_state_input))?;
     let token = nml(graph.reshape(token, shape(DataType::I32, &[1, 1])?))?;
     let mut outputs = vec![
         ("token".to_owned(), token),
@@ -462,11 +431,7 @@ fn hidden_shape(config: &Config, family: ShapeFamily) -> Result<Shape> {
     )
 }
 
-fn sequence_lengths(
-    graph: &mut Graph,
-    family: ShapeFamily,
-    position: Tensor,
-) -> Result<Tensor> {
+fn sequence_lengths(graph: &mut Graph, family: ShapeFamily, position: Tensor) -> Result<Tensor> {
     match family.phase() {
         Phase::Prefill => Ok(graph.input("sequence_lengths", shape(DataType::I32, &[1])?)),
         Phase::Decode => {
@@ -478,10 +443,7 @@ fn sequence_lengths(
 }
 
 pub(super) fn page_table_shape(family: ShapeFamily) -> Result<Shape> {
-    shape(
-        DataType::I32,
-        &[1, dimension(family.page_count())?],
-    )
+    shape(DataType::I32, &[1, dimension(family.page_count())?])
 }
 
 fn require_shape(tensor: Tensor, dtype: DataType, dimensions: &[i64]) -> Result<()> {
@@ -566,12 +528,8 @@ mod tests {
         let embedding = finish!(|graph| build_embedding(graph, &checkpoint, &config, prefill));
         assert_contract!(embedding, 1, 3, 1, &[None]);
 
-        let sliding = representative_layer(
-            &checkpoint,
-            &config,
-            AttentionKind::SlidingAttention,
-        )
-        .unwrap();
+        let sliding =
+            representative_layer(&checkpoint, &config, AttentionKind::SlidingAttention).unwrap();
         let prefill_layer = finish!(|graph| {
             build_layer(
                 graph,
@@ -581,21 +539,16 @@ mod tests {
                 AttentionKind::SlidingAttention,
             )
         });
-        assert_contract!(
-            prefill_layer,
-            6,
-            29,
-            3,
-            &[Some(0), Some(4), Some(5)],
-        );
-        assert!(prefill_layer.input_names().any(|name| name == "sequence_lengths"));
+        assert_contract!(prefill_layer, 6, 29, 3, &[Some(0), Some(4), Some(5)],);
+        assert!(prefill_layer
+            .input_names()
+            .any(|name| name == "sequence_lengths"));
         assert_single_layer_identity!(prefill_layer, 0);
 
-        let full = representative_layer(&checkpoint, &config, AttentionKind::FullAttention)
-            .unwrap();
-        let decode_layer = finish!(|graph| {
-            build_decode_layer_pair(graph, sliding, full, &config, decode)
-        });
+        let full =
+            representative_layer(&checkpoint, &config, AttentionKind::FullAttention).unwrap();
+        let decode_layer =
+            finish!(|graph| { build_decode_layer_pair(graph, sliding, full, &config, decode) });
         assert_contract!(
             decode_layer,
             7,
@@ -603,7 +556,9 @@ mod tests {
             5,
             &[Some(0), Some(3), Some(4), Some(5), Some(6)],
         );
-        assert!(!decode_layer.input_names().any(|name| name == "sequence_lengths"));
+        assert!(!decode_layer
+            .input_names()
+            .any(|name| name == "sequence_lengths"));
         let layer_names = decode_layer
             .input_names()
             .filter(|name| name.starts_with("model.layers."))
@@ -611,10 +566,15 @@ mod tests {
         assert!(
             layer_names
                 .iter()
-                .all(|name| name.starts_with("model.layers.0.") || name.starts_with("model.layers.1."))
+                .all(|name| name.starts_with("model.layers.0.")
+                    || name.starts_with("model.layers.1."))
         );
-        assert!(layer_names.iter().any(|name| name.starts_with("model.layers.0.")));
-        assert!(layer_names.iter().any(|name| name.starts_with("model.layers.1.")));
+        assert!(layer_names
+            .iter()
+            .any(|name| name.starts_with("model.layers.0.")));
+        assert!(layer_names
+            .iter()
+            .any(|name| name.starts_with("model.layers.1.")));
 
         let prefill_head = finish!(|graph| build_head(graph, &checkpoint, &config, prefill));
         assert_contract!(prefill_head, 7, 4, 2, &[None, Some(2)]);
@@ -644,5 +604,4 @@ mod tests {
         )
         .unwrap()
     }
-
 }

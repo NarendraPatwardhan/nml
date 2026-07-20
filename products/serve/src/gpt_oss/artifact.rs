@@ -120,8 +120,7 @@ pub(super) fn validate_materialization<'a>(
         }
         validate_file(root, &file)?;
     }
-    if observed.len() != expected.len()
-        || expected.keys().any(|path| !observed.contains_key(*path))
+    if observed.len() != expected.len() || expected.keys().any(|path| !observed.contains_key(*path))
     {
         return Err(Error::Contract(
             "artifact materialization receipt omits a manifest file".to_owned(),
@@ -310,7 +309,9 @@ mod tests {
             }],
         )
         .unwrap_err();
-        assert!(error.to_string().contains("changed after content verification"));
+        assert!(error
+            .to_string()
+            .contains("changed after content verification"));
     }
 
     #[test]

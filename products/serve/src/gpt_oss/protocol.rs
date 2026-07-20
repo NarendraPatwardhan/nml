@@ -109,7 +109,6 @@ impl HarmonyProtocol {
     pub fn parser(&self) -> HarmonyParser<'_> {
         HarmonyParser::new(&self.tokenizer)
     }
-
 }
 
 pub const fn is_stop_token(token: u32) -> bool {
@@ -1410,7 +1409,9 @@ mod tests {
         assert!(!streamed_before_stop.is_empty());
         assert!(content.starts_with(&streamed_before_stop));
         assert!(
-            !events.iter().any(|event| matches!(event, Event::Message(_))),
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Message(_))),
             "a message is complete only after its Harmony delimiter"
         );
 
@@ -1453,24 +1454,20 @@ mod tests {
             .find_map(Result::err)
             .unwrap();
         assert!(error.to_string().contains("must end with <|return|>"));
-        assert!(
-            parser
-                .process(RETURN)
-                .unwrap_err()
-                .to_string()
-                .contains("cannot continue after a previous failure")
-        );
+        assert!(parser
+            .process(RETURN)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot continue after a previous failure"));
 
         let mut parser = protocol.parser();
         assert!(parser.process(RETURN).is_err());
-        assert!(
-            protocol
-                .render_for_completion(&Conversation::new([Message::ToolCall {
-                    recipient: "functions.bad tool".to_owned(),
-                    arguments: "{}".to_owned(),
-                }]))
-                .is_err()
-        );
+        assert!(protocol
+            .render_for_completion(&Conversation::new([Message::ToolCall {
+                recipient: "functions.bad tool".to_owned(),
+                arguments: "{}".to_owned(),
+            }]))
+            .is_err());
     }
 
     #[test]
@@ -1501,19 +1498,15 @@ mod tests {
             })
             .collect::<String>();
         assert_eq!(text, "bounded answer");
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, Event::Message(_) | Event::ToolCall(_)))
-        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, Event::Message(_) | Event::ToolCall(_))));
         assert_eq!(events.last(), Some(&Event::Done(StopReason::Length)));
-        assert!(
-            parser
-                .finish()
-                .unwrap_err()
-                .to_string()
-                .contains("without <|return|> or <|call|>")
-        );
+        assert!(parser
+            .finish()
+            .unwrap_err()
+            .to_string()
+            .contains("without <|return|> or <|call|>"));
     }
 
     #[test]

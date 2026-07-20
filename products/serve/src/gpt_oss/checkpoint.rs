@@ -141,7 +141,9 @@ pub(super) fn bind_tree_components<T: ParameterTree>(
         loaded_parameters.push((path.to_owned(), parameter.clone()));
     });
     if slot_parameters.len() != loaded_parameters.len() {
-        return Err(message("reusable parameter trees have different leaf counts"));
+        return Err(message(
+            "reusable parameter trees have different leaf counts",
+        ));
     }
     for ((slot_path, slot), (loaded_path, parameter)) in
         slot_parameters.into_iter().zip(loaded_parameters)
@@ -277,8 +279,7 @@ fn shape(dimensions: &[usize]) -> Result<Shape> {
         .map(i64::try_from)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|_| message("GPT-OSS parameter dimension exceeds I64"))?;
-    Shape::new(nml::DataType::Bf16, &dimensions)
-        .map_err(|error| Box::new(error) as BoxError)
+    Shape::new(nml::DataType::Bf16, &dimensions).map_err(|error| Box::new(error) as BoxError)
 }
 
 pub(super) fn message(message: &'static str) -> BoxError {

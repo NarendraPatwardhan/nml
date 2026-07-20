@@ -5,7 +5,7 @@
   "artifact_manifest_path": "nml-artifact-manifest.json",
   "artifact_manifest_sha256": "3c36a89cbc0f908b3e782550fe32f3b6890ef3f857232d11710bc8e0dbcea71d",
   "artifact_file_count": 20,
-  "artifact_total_bytes": 11805938322,
+  "artifact_total_bytes": 11805934204,
   "conversion_device": "cpu",
   "conversion_compute_capability": null
 }

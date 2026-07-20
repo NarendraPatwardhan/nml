@@ -1,13 +1,13 @@
 //! Definition, compilation, residency, and request-local execution state.
 
 use super::checkpoint::{
-    BoxError, Checkpoint, LoadedCheckpoint, LoadedDecoderLayer, Result, bind_tree,
-    bind_tree_components, message, representative_layer,
+    bind_tree, bind_tree_components, message, representative_layer, BoxError, Checkpoint,
+    LoadedCheckpoint, LoadedDecoderLayer, Result,
 };
 use super::config::{AttentionKind, Config};
 use super::graph::{
-    CACHE_PAGE_SIZE, MAXIMUM_TOP_K, Phase, ShapeFamily, build_decode_layer_pair, build_embedding,
-    build_head, build_layer, cache_shape, page_table_shape,
+    build_decode_layer_pair, build_embedding, build_head, build_layer, cache_shape,
+    page_table_shape, Phase, ShapeFamily, CACHE_PAGE_SIZE, MAXIMUM_TOP_K,
 };
 use crate::{CompilationProfile, SamplingOptions, SubmissionTimings};
 use nml::exe::{Arguments, Results};
@@ -44,7 +44,9 @@ impl PreparedRequest {
             .ok_or_else(|| message("GPT-OSS request length overflows usize"))?;
         let requested = requested_cache_capacity.unwrap_or(required.max(1));
         if requested < required {
-            return Err(message("GPT-OSS cache capacity is smaller than the request"));
+            return Err(message(
+                "GPT-OSS cache capacity is smaller than the request",
+            ));
         }
         if requested > context_limit {
             return Err(message("GPT-OSS request exceeds the model context limit"));
@@ -55,7 +57,9 @@ impl PreparedRequest {
             ));
         }
         if !sampling.temperature.is_finite() || sampling.temperature <= 0.0 {
-            return Err(message("GPT-OSS sampling temperature must be finite and positive"));
+            return Err(message(
+                "GPT-OSS sampling temperature must be finite and positive",
+            ));
         }
         if !sampling.top_p.is_finite() || sampling.top_p <= 0.0 || sampling.top_p > 1.0 {
             return Err(message("GPT-OSS top-p must be in (0, 1]"));
@@ -82,7 +86,9 @@ struct ExecutionProfile {
 impl ExecutionProfile {
     fn new(profile: CompilationProfile, context_limit: usize) -> Result<Self> {
         if profile.max_prompt_tokens == 0 || profile.max_sequence_tokens == 0 {
-            return Err(message("GPT-OSS compilation profile capacities must be nonzero"));
+            return Err(message(
+                "GPT-OSS compilation profile capacities must be nonzero",
+            ));
         }
         if profile.max_prompt_tokens > profile.max_sequence_tokens {
             return Err(message(
@@ -191,12 +197,7 @@ impl ModelDefinition {
         platform: &'platform Platform,
         profiles: &[CompilationProfile],
     ) -> Result<CompiledDefinition<'platform>> {
-        let plan = ExecutionPlan::compile(
-            platform,
-            &self.checkpoint,
-            &self.config,
-            profiles,
-        )?;
+        let plan = ExecutionPlan::compile(platform, &self.checkpoint, &self.config, profiles)?;
         Ok(CompiledDefinition {
             definition: self,
             plan,
@@ -306,9 +307,7 @@ fn normalize_profiles(
     context_limit: usize,
 ) -> Result<BTreeSet<ExecutionProfile>> {
     if requested.is_empty() {
-        return Err(message(
-            "GPT-OSS requires at least one compilation profile",
-        ));
+        return Err(message("GPT-OSS requires at least one compilation profile"));
     }
     requested
         .iter()
@@ -325,15 +324,8 @@ fn select_profile(
         .iter()
         .copied()
         .filter(|profile| profile.supports(request))
-        .min_by_key(|profile| {
-            (
-                profile.decode.cache_capacity(),
-                profile.prefill.sequence(),
-            )
-        })
-        .ok_or_else(|| {
-            message("GPT-OSS request is not covered by a compiled execution profile")
-        })
+        .min_by_key(|profile| (profile.decode.cache_capacity(), profile.prefill.sequence()))
+        .ok_or_else(|| message("GPT-OSS request is not covered by a compiled execution profile"))
 }
 
 /// Process-resident model. Its execution plan is complete before the first
@@ -392,23 +384,14 @@ impl ResidentModel<'_> {
 
         let mut prefill_embedding = prefill_executables.embedding.args();
         bind_embedding(&mut prefill_embedding, checkpoint, parameters)?;
-        let mut prefill_layers = bind_layers(
-            prefill_executables,
-            checkpoint,
-            parameters,
-            config,
-        )?;
+        let mut prefill_layers = bind_layers(prefill_executables, checkpoint, parameters, config)?;
         let mut prefill_head = prefill_executables.head.args();
         bind_head(&mut prefill_head, parameters)?;
 
         let mut decode_embedding = decode_executables.embedding.args();
         bind_embedding(&mut decode_embedding, checkpoint, parameters)?;
-        let mut decode_pairs = bind_decode_pairs(
-            decode_executables,
-            checkpoint,
-            parameters,
-            config,
-        )?;
+        let mut decode_pairs =
+            bind_decode_pairs(decode_executables, checkpoint, parameters, config)?;
         let mut decode_head = decode_executables.head.args();
         bind_head(&mut decode_head, parameters)?;
 
@@ -439,8 +422,7 @@ impl ResidentModel<'_> {
         }
         let prompt = upload_i32(
             platform,
-            Shape::new(nml::DataType::I32, &[1, usize_i64(prefill.sequence())?])
-                .map_err(boxed)?,
+            Shape::new(nml::DataType::I32, &[1, usize_i64(prefill.sequence())?]).map_err(boxed)?,
             &padded,
             placement,
         )?;
@@ -475,7 +457,8 @@ impl ResidentModel<'_> {
         let min_p = upload_f32_scalar(platform, request.sampling.min_p, placement)?;
         for head in [&mut prefill_head, &mut decode_head] {
             head.set("top_k", top_k.clone()).map_err(boxed)?;
-            head.set("temperature", temperature.clone()).map_err(boxed)?;
+            head.set("temperature", temperature.clone())
+                .map_err(boxed)?;
             head.set("top_p", top_p.clone()).map_err(boxed)?;
             head.set("min_p", min_p.clone()).map_err(boxed)?;
         }
@@ -505,9 +488,7 @@ impl ResidentModel<'_> {
         }
         let submission_started = Instant::now();
         prefill_head.set("hidden", hidden).map_err(boxed)?;
-        prefill_head
-            .set("last_index", last_index)
-            .map_err(boxed)?;
+        prefill_head.set("last_index", last_index).map_err(boxed)?;
         prefill_head
             .set("sampling_state", sampling_state)
             .map_err(boxed)?;
@@ -682,20 +663,12 @@ impl ComponentFamily {
                     )
                 })?,
                 full: compile(platform, placement, |graph| {
-                    build_layer(
-                        graph,
-                        full,
-                        config,
-                        family,
-                        AttentionKind::FullAttention,
-                    )
+                    build_layer(graph, full, config, family, AttentionKind::FullAttention)
                 })?,
             },
-            Phase::Decode => LayerExecutables::DecodePair(compile(
-                platform,
-                placement,
-                |graph| build_decode_layer_pair(graph, sliding, full, config, family),
-            )?),
+            Phase::Decode => LayerExecutables::DecodePair(compile(platform, placement, |graph| {
+                build_decode_layer_pair(graph, sliding, full, config, family)
+            })?),
         };
         let head = compile(platform, placement, |graph| {
             build_head(graph, checkpoint, config, family)
@@ -709,7 +682,9 @@ impl ComponentFamily {
 
     fn prefill_layer(&self, kind: AttentionKind) -> Result<&Exe> {
         let LayerExecutables::Prefill { sliding, full } = &self.layers else {
-            return Err(message("decode family does not contain single-layer executables"));
+            return Err(message(
+                "decode family does not contain single-layer executables",
+            ));
         };
         Ok(match kind {
             AttentionKind::SlidingAttention => sliding,
@@ -737,12 +712,20 @@ impl LayerCache {
         Ok(Self {
             key: Some(
                 platform
-                    .upload(&Slice::alloc(shape).map_err(boxed)?, placement.clone(), Memory::Default)
+                    .upload(
+                        &Slice::alloc(shape).map_err(boxed)?,
+                        placement.clone(),
+                        Memory::Default,
+                    )
                     .map_err(boxed)?,
             ),
             value: Some(
                 platform
-                    .upload(&Slice::alloc(shape).map_err(boxed)?, placement.clone(), Memory::Default)
+                    .upload(
+                        &Slice::alloc(shape).map_err(boxed)?,
+                        placement.clone(),
+                        Memory::Default,
+                    )
                     .map_err(boxed)?,
             ),
         })
@@ -782,10 +765,7 @@ fn bind_embedding(
     )
 }
 
-fn bind_head(
-    arguments: &mut Arguments<'_>,
-    parameters: &LoadedCheckpoint,
-) -> Result<()> {
+fn bind_head(arguments: &mut Arguments<'_>, parameters: &LoadedCheckpoint) -> Result<()> {
     arguments
         .set_parameter(&parameters.model.norm.weight)
         .map_err(boxed)?;
@@ -848,7 +828,9 @@ fn bind_decode_pairs<'family>(
             if config.layer_types()[first] != AttentionKind::SlidingAttention
                 || config.layer_types()[first + 1] != AttentionKind::FullAttention
             {
-                return Err(message("GPT-OSS decode pair violates the alternating schedule"));
+                return Err(message(
+                    "GPT-OSS decode pair violates the alternating schedule",
+                ));
             }
             bind_layer_pair(family.decode_pair()?, slots, loaded)
         })
@@ -896,9 +878,7 @@ fn execute_layer(
     arguments.set("hidden", hidden).map_err(boxed)?;
     arguments.set("position", position).map_err(boxed)?;
     if let Some(lengths) = sequence_lengths {
-        arguments
-            .set("sequence_lengths", lengths)
-            .map_err(boxed)?;
+        arguments.set("sequence_lengths", lengths).map_err(boxed)?;
     }
     arguments.set("page_table", page_table).map_err(boxed)?;
     arguments.set("cache.key", key).map_err(boxed)?;
@@ -932,7 +912,9 @@ fn execute_layer_pair(
     caches: &mut [LayerCache],
 ) -> Result<(Buffer, Duration)> {
     let [sliding, full] = caches else {
-        return Err(message("GPT-OSS decode execution requires exactly two caches"));
+        return Err(message(
+            "GPT-OSS decode execution requires exactly two caches",
+        ));
     };
     let started = Instant::now();
     let (sliding_key, sliding_value) = sliding.take()?;
@@ -1005,9 +987,7 @@ fn compile(
     let mut graph = Graph::new();
     let outputs = build(&mut graph)?;
     let program = graph.finish_named(&outputs).map_err(boxed)?;
-    platform
-        .compile(&program, placement.clone())
-        .map_err(boxed)
+    platform.compile(&program, placement.clone()).map_err(boxed)
 }
 
 fn identity_page_table(
@@ -1054,11 +1034,7 @@ fn upload_u64(
         .map_err(boxed)
 }
 
-fn upload_f32_scalar(
-    platform: &Platform,
-    value: f32,
-    placement: &Sharding,
-) -> Result<Buffer> {
+fn upload_f32_scalar(platform: &Platform, value: f32, placement: &Sharding) -> Result<Buffer> {
     let shape = Shape::new(nml::DataType::F32, &[]).map_err(boxed)?;
     let values = [value];
     let slice = Slice::from_typed(shape, &values).map_err(boxed)?;
@@ -1079,7 +1055,9 @@ fn download_token(buffer: &Buffer) -> Result<u32> {
 fn one(results: Results) -> Result<Buffer> {
     let mut buffers = results.into_buffers();
     if buffers.len() != 1 {
-        return Err(message("GPT-OSS component returned an invalid result count"));
+        return Err(message(
+            "GPT-OSS component returned an invalid result count",
+        ));
     }
     Ok(buffers.remove(0))
 }
@@ -1185,17 +1163,15 @@ mod tests {
     #[test]
     fn requests_reject_unrepresentable_or_undersized_families() {
         assert!(normalize_profiles(&[], 131_072).is_err());
-        assert!(
-            PreparedRequest::new(
-                vec![],
-                1,
-                None,
-                SamplingOptions::default(),
-                131_072,
-                Duration::ZERO,
-            )
-            .is_err()
-        );
+        assert!(PreparedRequest::new(
+            vec![],
+            1,
+            None,
+            SamplingOptions::default(),
+            131_072,
+            Duration::ZERO,
+        )
+        .is_err());
         for sampling in [
             SamplingOptions {
                 top_k: 0,
@@ -1231,59 +1207,43 @@ mod tests {
             },
         ] {
             assert!(
-                PreparedRequest::new(
-                    vec![1],
-                    1,
-                    None,
-                    sampling,
-                    131_072,
-                    Duration::ZERO,
-                )
-                .is_err()
+                PreparedRequest::new(vec![1], 1, None, sampling, 131_072, Duration::ZERO,).is_err()
             );
         }
-        assert!(
-            PreparedRequest::new(
-                vec![1; 17],
-                5,
-                Some(21),
-                SamplingOptions::default(),
-                131_072,
-                Duration::ZERO,
-            )
-            .is_err()
-        );
-        assert!(
-            PreparedRequest::new(
-                vec![1; 17],
-                5,
-                Some(131_073),
-                SamplingOptions::default(),
-                131_072,
-                Duration::ZERO,
-            )
-            .is_err()
-        );
-        assert!(
-            ExecutionProfile::new(
-                CompilationProfile {
-                    max_prompt_tokens: 513,
-                    max_sequence_tokens: 512,
-                },
-                131_072,
-            )
-            .is_err()
-        );
-        assert!(
-            ExecutionProfile::new(
-                CompilationProfile {
-                    max_prompt_tokens: 16,
-                    max_sequence_tokens: 131_073,
-                },
-                131_072,
-            )
-            .is_err()
-        );
+        assert!(PreparedRequest::new(
+            vec![1; 17],
+            5,
+            Some(21),
+            SamplingOptions::default(),
+            131_072,
+            Duration::ZERO,
+        )
+        .is_err());
+        assert!(PreparedRequest::new(
+            vec![1; 17],
+            5,
+            Some(131_073),
+            SamplingOptions::default(),
+            131_072,
+            Duration::ZERO,
+        )
+        .is_err());
+        assert!(ExecutionProfile::new(
+            CompilationProfile {
+                max_prompt_tokens: 513,
+                max_sequence_tokens: 512,
+            },
+            131_072,
+        )
+        .is_err());
+        assert!(ExecutionProfile::new(
+            CompilationProfile {
+                max_prompt_tokens: 16,
+                max_sequence_tokens: 131_073,
+            },
+            131_072,
+        )
+        .is_err());
     }
 
     #[test]

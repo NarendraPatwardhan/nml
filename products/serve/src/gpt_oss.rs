@@ -13,9 +13,9 @@ mod execution;
 mod graph;
 pub(crate) mod protocol;
 
+use crate::{CompilationProfile, SamplingOptions, SubmissionTimings};
 use checkpoint::{BoxError, Result};
 use config::Config;
-use crate::{CompilationProfile, SamplingOptions, SubmissionTimings};
 use execution::{ModelDefinition, PreparedRequest, ResidentModel, RunMetrics, StartupMetrics};
 use nml::io::ParameterSet;
 use nml::safetensors::TensorRegistry;
@@ -34,7 +34,7 @@ const DIRECT_CHECKPOINT: &str = "model.safetensors";
 const ARTIFACT_MANIFEST_SHA256: &str =
     "3c36a89cbc0f908b3e782550fe32f3b6890ef3f857232d11710bc8e0dbcea71d";
 const ARTIFACT_FILE_COUNT: usize = 20;
-const ARTIFACT_TOTAL_BYTES: u64 = 11_805_938_322;
+const ARTIFACT_TOTAL_BYTES: u64 = 11_805_934_204;
 const ARTIFACT_RECIPE: &str = "nml-nvfp4-weight-v2";
 const ARTIFACT_RECIPE_SHA256: &str =
     "68bad1480e9a68e4fa3d36c17315b8bcd5490e777cfd738f15c71101f6bb6603";
@@ -103,13 +103,10 @@ impl<'platform> Generator<'platform> {
         let artifact_validation = validation_started.elapsed();
         let config = Config::from_file(model_directory.join("config.json")).map_err(boxed)?;
         let protocol = HarmonyProtocol::load(model_directory).map_err(boxed)?;
-        let registry = TensorRegistry::from_path(model_directory.join(CHECKPOINT_INDEX))
-            .map_err(boxed)?;
-        let definition = ModelDefinition::declare(
-            config,
-            ParameterSet::new(registry),
-            artifact_validation,
-        )?;
+        let registry =
+            TensorRegistry::from_path(model_directory.join(CHECKPOINT_INDEX)).map_err(boxed)?;
+        let definition =
+            ModelDefinition::declare(config, ParameterSet::new(registry), artifact_validation)?;
         let model = definition.compile(platform, profiles)?.make_resident()?;
         Ok(Self { protocol, model })
     }
@@ -172,11 +169,7 @@ impl<'platform> Generator<'platform> {
     }
 }
 
-fn timings(
-    tokenization: Duration,
-    startup: StartupMetrics,
-    run: RunMetrics,
-) -> ProductTimings {
+fn timings(tokenization: Duration, startup: StartupMetrics, run: RunMetrics) -> ProductTimings {
     ProductTimings {
         tokenization,
         artifact_validation: startup.artifact_validation,
@@ -404,8 +397,8 @@ mod tests {
     #[test]
     fn checked_in_manifest_matches_the_product_contract() {
         let runfiles = std::env::var_os("TEST_SRCDIR").expect("Bazel provides TEST_SRCDIR");
-        let path = Path::new(&runfiles)
-            .join("_main/artifacts/gpt-oss-20b-nvfp4/artifact-manifest.json");
+        let path =
+            Path::new(&runfiles).join("_main/artifacts/gpt-oss-20b-nvfp4/artifact-manifest.json");
         let manifest: ArtifactManifest =
             serde_json::from_reader(BufReader::new(File::open(path).unwrap())).unwrap();
         validate_manifest_identity(&manifest).unwrap();
