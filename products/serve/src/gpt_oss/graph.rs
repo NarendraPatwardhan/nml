@@ -148,6 +148,8 @@ pub(super) fn build_layer(
 /// compiler constant. The pair shares position and page-table inputs, owns two
 /// independent donated cache pairs, and aliases the final hidden state back to
 /// the original input. Prefill deliberately retains single-layer components.
+// Kept for unit tests; production uses the fused `build_decode_full` instead.
+#[allow(dead_code)]
 pub(super) fn build_decode_layer_pair(
     graph: &mut Graph,
     sliding: &DecoderLayer,
