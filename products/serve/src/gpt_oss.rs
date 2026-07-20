@@ -32,15 +32,12 @@ const ARTIFACT_MANIFEST: &str = "nml-artifact-manifest.json";
 const CHECKPOINT_INDEX: &str = "model.safetensors.index.json";
 const DIRECT_CHECKPOINT: &str = "model.safetensors";
 const ARTIFACT_MANIFEST_SHA256: &str =
-    "a3e8d0f77a85a9b1625c105fdb0853c285be0776efcfe44a1a2e3abd7ea286e9";
+    "3c36a89cbc0f908b3e782550fe32f3b6890ef3f857232d11710bc8e0dbcea71d";
 const ARTIFACT_FILE_COUNT: usize = 20;
-// The manifest authenticates these twenty payload/metadata files. Its own
-// 4,118 bytes are authenticated by ARTIFACT_MANIFEST_SHA256 and therefore are
-// not counted a second time as a declared artifact file.
-const ARTIFACT_TOTAL_BYTES: u64 = 11_805_934_314;
-const ARTIFACT_RECIPE: &str = "nml-nvfp4-weight-v3";
+const ARTIFACT_TOTAL_BYTES: u64 = 11_805_938_322;
+const ARTIFACT_RECIPE: &str = "nml-nvfp4-weight-v2";
 const ARTIFACT_RECIPE_SHA256: &str =
-    "7679e52e5139be4007e2efbe4c6028ec6ebcb5b370e48b6905e48b87f79677ee";
+    "68bad1480e9a68e4fa3d36c17315b8bcd5490e777cfd738f15c71101f6bb6603";
 const SOURCE_MANIFEST_SHA256: &str =
     "4f9fd730e12e0535cf6788a11a9b1604749f4520738a5c7ea643e27bf4b5ccb1";
 const TENSOR_MANIFEST_SHA256: &str =
@@ -48,9 +45,9 @@ const TENSOR_MANIFEST_SHA256: &str =
 const SOURCE_REPOSITORY: &str = "unsloth/gpt-oss-20b-BF16";
 const SOURCE_REVISION: &str = "cc89b3e7fd423253264883a80a4fa5abc619649f";
 const CONVERTER_NAME: &str = "nml-nvfp4-converter";
-const CONVERTER_VERSION: u32 = 3;
+const CONVERTER_VERSION: u32 = 2;
 const CONVERTER_SCRIPT_SHA256: &str =
-    "5b0626f16fbd7dfe5a0e914b46a7fdab84907a7d01b5ec720a6abf8b3e643fd5";
+    "ca9a7a714798a8095d3eca1b873af8fed8637ba23b7ea984926c2c64de1c4079";
 const CONVERTER_REQUIREMENTS_SHA256: &str =
     "f384757dfae59e89aa0dfad0ea75a651005a336437903981119636ed58de8c8e";
 

@@ -1244,11 +1244,10 @@ impl ProgramBuilder {
 
     /// Routed clamped, interleaved residual SwiGLU experts.
     ///
-    /// Gate/up and down weights use the framework-wide logical shapes
-    /// `[experts, 2 * intermediate, hidden]` and
-    /// `[experts, hidden, intermediate]`. K remains the final quantized axis;
-    /// representation lowering alone chooses recipe v3's physical
-    /// `[experts, packed K, N]` contraction order. Biases
+    /// Gate/up and down weights use the framework-wide output-major logical
+    /// shapes `[experts, 2 * intermediate, hidden]` and
+    /// `[experts, hidden, intermediate]`. K is consequently the final,
+    /// quantized axis for both dense and compact expert contractions. Biases
     /// remain ordinary dense
     /// parameters. Dense and NVFP4 weights share this exact routing and
     /// activation contract; representation selects only the private
@@ -6016,7 +6015,6 @@ impl Program {
                 if let Some(cuda) = capabilities.cuda_capabilities() {
                     let operands = [
                         mlir_value(&values, *hidden),
-                        mlir_value(&values, *expert_ids),
                         mlir_value(&values, *routing_weights),
                         mlir_value(&values, *gate_payload),
                         mlir_value(&values, *gate_scales),
@@ -6032,7 +6030,6 @@ impl Program {
                     ];
                     let shapes = [
                         self.values[*hidden].shape,
-                        self.values[*expert_ids].shape,
                         self.values[*routing_weights].shape,
                         self.values[*gate_payload].shape,
                         self.values[*gate_scales].shape,
@@ -6046,7 +6043,7 @@ impl Program {
                         self.values[*block_experts].shape,
                         self.values[*active_blocks].shape,
                     ];
-                    let lowered = match shapes[3].partitions()[0] {
+                    let lowered = match shapes[2].partitions()[0] {
                         Partition::Sharded(expert_axis) => lower_expert_parallel(
                             context,
                             &mut block,
@@ -6056,7 +6053,7 @@ impl Program {
                             types[*result],
                             self.values[*result].shape,
                             expert_axis,
-                            3,
+                            2,
                             operation_index,
                             |local_block, local_inputs, local_shapes, local_result, offset| {
                                 nvfp4_backend::lower_routed_swiglu(
@@ -9231,37 +9228,35 @@ fn nvfp4_expert_inputs<'context>(
     block_size: usize,
     expert_offset: Option<MlirValue<'context>>,
 ) -> nvfp4_backend::ExpertInputs<'context> {
-    debug_assert_eq!(operands.len(), 14);
-    debug_assert_eq!(shapes.len(), 14);
+    debug_assert_eq!(operands.len(), 13);
+    debug_assert_eq!(shapes.len(), 13);
     nvfp4_backend::ExpertInputs {
         hidden: operands[0],
-        expert_ids: operands[1],
-        routing_weights: operands[2],
-        gate_payload: operands[3],
-        gate_scales: operands[4],
-        gate_global: operands[5],
-        gate_bias: operands[6],
-        down_payload: operands[7],
-        down_scales: operands[8],
-        down_global: operands[9],
-        down_bias: operands[10],
-        sorted_assignments: operands[11],
-        block_experts: operands[12],
-        active_blocks: operands[13],
+        routing_weights: operands[1],
+        gate_payload: operands[2],
+        gate_scales: operands[3],
+        gate_global: operands[4],
+        gate_bias: operands[5],
+        down_payload: operands[6],
+        down_scales: operands[7],
+        down_global: operands[8],
+        down_bias: operands[9],
+        sorted_assignments: operands[10],
+        block_experts: operands[11],
+        active_blocks: operands[12],
         expert_offset,
         hidden_shape: shapes[0],
-        expert_ids_shape: shapes[1],
-        routing_shape: shapes[2],
-        gate_payload_shape: shapes[3],
-        gate_scales_shape: shapes[4],
-        gate_global_shape: shapes[5],
-        gate_bias_shape: shapes[6],
-        down_payload_shape: shapes[7],
-        down_scales_shape: shapes[8],
-        down_global_shape: shapes[9],
-        down_bias_shape: shapes[10],
-        schedule_shape: shapes[11],
-        block_experts_shape: shapes[12],
+        routing_shape: shapes[1],
+        gate_payload_shape: shapes[2],
+        gate_scales_shape: shapes[3],
+        gate_global_shape: shapes[4],
+        gate_bias_shape: shapes[5],
+        down_payload_shape: shapes[6],
+        down_scales_shape: shapes[7],
+        down_global_shape: shapes[8],
+        down_bias_shape: shapes[9],
+        schedule_shape: shapes[10],
+        block_experts_shape: shapes[11],
         result_type,
         block_size,
     }

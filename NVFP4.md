@@ -465,17 +465,14 @@ block scales         [N, ceil(K / 16)] E4M3 bytes before padding/swizzle
 global factor        scalar or artifact-declared fiber shape
 ```
 
-NML recipe v3 derives physical storage from the operation. Indexed embedding
-keeps the rowwise form above because lookup selects a complete vocabulary row.
-Contractions retain logical `[N, K]`, `[E, 2I, K]`, and `[E, H, I]` shapes but
-store their encoded components as `[packed K, N]`, `[E, packed K, 2I]`, and
-`[E, packed I, H]`; block scales use the same order with `K/16`. This makes
-adjacent lanes consume adjacent outputs for one reduction slice. The converter
-first transposes GPT-OSS source experts into logical `[E, N, K]`, quantizes K
-blocks, and only then swaps the encoded component axes. CPU, SM75, Triton
-matrix, and Triton decode kernels consume these components directly. There is
-no runtime transpose, second prepared copy, or earlier-recipe compatibility
-path.
+NML recipe v2 makes that rowwise form canonical rather than optional. Every
+compact contraction is output-major with K contiguous: ordinary projections
+are `[N, K]`, gate/up experts are `[E, 2I, K]`, and down experts are
+`[E, H, I]`. The converter transposes source expert tensors into those logical
+shapes before quantization, so payload and scale blocks always advance along
+the actual reduction axis. CPU, SM75, Triton matrix, and Triton decode kernels
+consume the same representation. There is no runtime transpose, no second
+prepared copy, and no recipe-v1 compatibility path.
 
 The selected artifact may differ. Every physical extent uses checked
 arithmetic. Odd K, incomplete blocks, padding bytes, and scale padding have a
@@ -491,9 +488,9 @@ shards from those logical ranges:
 - N/expert-axis shards slice payload, scale, and global factors together.
 - Expert sharding must not create a hidden all-gather of all expert weights.
 - A future prepared layout is local to its logical shard; it is never produced
-  by preparing the whole model and slicing opaque bytes afterward. Recipe v3
-  currently requires no prepared layout because its operation-shaped forms
-  are directly consumable by every retained backend.
+  by preparing the whole model and slicing opaque bytes afterward. Recipe v2
+  currently requires no prepared layout because its canonical K-contiguous
+  form is directly consumable by every retained backend.
 
 The physical representation carries a mapping from each logical axis to
 payload and scale axes. Generic `Shape::byte_count` and ordinary `Slice`

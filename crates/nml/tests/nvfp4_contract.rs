@@ -119,7 +119,7 @@ fn execute_linear(
 fn execute_embedding(platform: &nml::Platform, dtype: DType) {
     const VOCABULARY: usize = 7;
     const WIDTH: usize = 17;
-    let weight = Parameter::nvfp4_embedding(
+    let weight = Parameter::nvfp4(
         "embedding",
         "model.embedding",
         Shape::new(dtype, &[VOCABULARY as i64, WIDTH as i64]).unwrap(),
@@ -341,60 +341,23 @@ fn upload_nvfp4(
     placement: &nml::Sharding,
 ) -> nml::LoadedParameter {
     let global = encoded.global.to_ne_bytes();
-    let contraction_major = parameter
-        .nvfp4_spec()
-        .is_some_and(|spec| spec.is_contraction_major());
     let components = parameter
         .components()
         .iter()
         .map(|component| {
             let bytes = match component.role() {
-                ComponentRole::Payload if contraction_major => {
-                    transpose_encoded_rows(&encoded.payload, parameter.shape(), 2)
-                }
-                ComponentRole::Payload => encoded.payload.clone(),
-                ComponentRole::BlockScales if contraction_major => {
-                    transpose_encoded_rows(&encoded.block_scales, parameter.shape(), 16)
-                }
-                ComponentRole::BlockScales => encoded.block_scales.clone(),
-                ComponentRole::GlobalScale => global.to_vec(),
+                ComponentRole::Payload => encoded.payload.as_slice(),
+                ComponentRole::BlockScales => encoded.block_scales.as_slice(),
+                ComponentRole::GlobalScale => global.as_slice(),
                 ComponentRole::Values => unreachable!(),
             };
-            let slice = nml::Slice::from_bytes(component.storage().shape(), &bytes).unwrap();
+            let slice = nml::Slice::from_bytes(component.storage().shape(), bytes).unwrap();
             platform
                 .upload(&slice, placement.clone(), nml::Memory::Default)
                 .unwrap()
         })
         .collect();
     nml::LoadedParameter::new(parameter, components).unwrap()
-}
-
-/// Converts the fixture codec's logical `[... N, encoded K]` rows into the
-/// recipe-v3 contraction component order `[... encoded K, N]`. Production
-/// artifacts perform this once in the converter; the test must model those
-/// exact persisted bytes rather than relying on a shape-only reinterpretation.
-fn transpose_encoded_rows(bytes: &[u8], logical: Shape, values_per_byte: usize) -> Vec<u8> {
-    let dimensions = logical.dimensions();
-    let outputs = usize::try_from(dimensions[dimensions.len() - 2]).unwrap();
-    let inputs = usize::try_from(dimensions[dimensions.len() - 1]).unwrap();
-    let encoded_k = inputs.div_ceil(values_per_byte);
-    let batches = dimensions[..dimensions.len() - 2]
-        .iter()
-        .try_fold(1_usize, |product, &dimension| {
-            product.checked_mul(usize::try_from(dimension).ok()?)
-        })
-        .unwrap();
-    assert_eq!(bytes.len(), batches * outputs * encoded_k);
-    let mut physical = vec![0_u8; bytes.len()];
-    for batch in 0..batches {
-        let base = batch * outputs * encoded_k;
-        for output in 0..outputs {
-            for k in 0..encoded_k {
-                physical[base + k * outputs + output] = bytes[base + output * encoded_k + k];
-            }
-        }
-    }
-    physical
 }
 
 fn upload_dense(

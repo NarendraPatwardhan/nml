@@ -7,13 +7,13 @@
 #![forbid(unsafe_code)]
 
 use nml_sharding::Sharding;
-use nml_types::{DType, Layout, Shape, ShapeError};
+use nml_types::{DType, Shape, ShapeError};
 use std::error::Error as StdError;
 use std::fmt;
 use std::sync::Arc;
 
-/// Version of NML's selected operation-shaped weight-only NVFP4 recipe.
-pub const NVFP4_RECIPE_VERSION: u16 = 3;
+/// Version of NML's selected rowwise weight-only NVFP4 recipe.
+pub const NVFP4_RECIPE_VERSION: u16 = 2;
 pub const NVFP4_BLOCK_SIZE: i64 = 16;
 pub const NVFP4_VALUES_PER_PAYLOAD_BYTE: i64 = 2;
 
@@ -46,7 +46,7 @@ pub struct DenseSpec {
     component: ComponentSpec,
 }
 
-/// NML recipe v3: operation-shaped, last-axis NVFP4 weight scaling.
+/// NML recipe v2: output-major, last-axis NVFP4 weight scaling.
 ///
 /// Every consecutive group of sixteen logical values owns one positive
 /// E4M3FN block scale. Two E2M1 codes are packed low-nibble first, and one F32
@@ -56,19 +56,6 @@ pub struct DenseSpec {
 pub struct NvFp4Spec {
     components: [ComponentSpec; 3],
     quantized_axis: u8,
-    layout: NvFp4Layout,
-}
-
-/// The two physical layouts justified by NML's semantic NVFP4 operations.
-///
-/// This remains private: model authors choose an operation (`linear` or
-/// `embedding`), not an arbitrary packing strategy. Projection storage places
-/// the encoded contraction axis before the contiguous output axis; embedding
-/// storage keeps complete vocabulary rows contiguous for indexed lookup.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NvFp4Layout {
-    ContractionMajor,
-    RowwiseLookup,
 }
 
 /// Stable recipe identity used by executable and loaded-parameter contracts.
@@ -171,7 +158,7 @@ impl Parameter {
         })
     }
 
-    /// Creates NML's contraction-major compact NVFP4 representation.
+    /// Creates NML's selected compact rowwise NVFP4 representation.
     ///
     /// The converter and checkpoint manifest own `artifact_base`; the three
     /// physical records are named `<base>.payload`, `<base>.block_scales`, and
@@ -183,45 +170,12 @@ impl Parameter {
         artifact_base: impl Into<String>,
         logical_shape: Shape,
     ) -> Result<Self, Error> {
-        Self::nvfp4_with_layout(
-            logical_name,
-            artifact_base,
-            logical_shape,
-            NvFp4Layout::ContractionMajor,
-        )
-    }
-
-    /// Creates the rowwise compact representation used only by embedding
-    /// lookup. Keeping vocabulary rows contiguous avoids turning one indexed
-    /// row into a vocabulary-strided gather while leaving every contraction on
-    /// recipe v3's K-major/N-contiguous layout.
-    pub fn nvfp4_embedding(
-        logical_name: impl Into<String>,
-        artifact_base: impl Into<String>,
-        logical_shape: Shape,
-    ) -> Result<Self, Error> {
-        Self::nvfp4_with_layout(
-            logical_name,
-            artifact_base,
-            logical_shape,
-            NvFp4Layout::RowwiseLookup,
-        )
-    }
-
-    fn nvfp4_with_layout(
-        logical_name: impl Into<String>,
-        artifact_base: impl Into<String>,
-        logical_shape: Shape,
-        layout: NvFp4Layout,
-    ) -> Result<Self, Error> {
         let logical_name = require_name(logical_name.into(), Error::EmptyLogicalName)?;
         let artifact_base = require_name(artifact_base.into(), Error::EmptyArtifactName)?;
         if !matches!(logical_shape.dtype(), DType::F16 | DType::Bf16) {
             return Err(Error::InvalidNvFp4LogicalDType(logical_shape.dtype()));
         }
-        if logical_shape.rank() == 0
-            || matches!(layout, NvFp4Layout::ContractionMajor) && logical_shape.rank() < 2
-        {
+        if logical_shape.rank() == 0 {
             return Err(Error::InvalidNvFp4Rank);
         }
         let quantized_axis = logical_shape.rank() - 1;
@@ -230,19 +184,18 @@ impl Parameter {
             return Err(Error::EmptyNvFp4QuantizedAxis);
         }
 
-        let component_shape = |divisor| match layout {
-            NvFp4Layout::ContractionMajor => {
-                contraction_shape(logical_shape, ceil_div(logical_extent, divisor), DType::U8)
-            }
-            NvFp4Layout::RowwiseLookup => encoded_shape(
-                logical_shape,
-                quantized_axis,
-                ceil_div(logical_extent, divisor),
-                DType::U8,
-            ),
-        };
-        let payload_shape = component_shape(NVFP4_VALUES_PER_PAYLOAD_BYTE)?;
-        let scale_shape = component_shape(NVFP4_BLOCK_SIZE)?;
+        let payload_shape = encoded_shape(
+            logical_shape,
+            quantized_axis,
+            ceil_div(logical_extent, NVFP4_VALUES_PER_PAYLOAD_BYTE),
+            DType::U8,
+        )?;
+        let scale_shape = encoded_shape(
+            logical_shape,
+            quantized_axis,
+            ceil_div(logical_extent, NVFP4_BLOCK_SIZE),
+            DType::U8,
+        )?;
         let global_shape = Shape::new(DType::F32, &[])?;
 
         let component = |role, suffix: &str, storage| ComponentSpec {
@@ -284,7 +237,6 @@ impl Parameter {
                 representation: RepresentationSpec::NvFp4(NvFp4Spec {
                     components,
                     quantized_axis: quantized_axis as u8,
-                    layout,
                 }),
             }),
         })
@@ -404,10 +356,6 @@ impl NvFp4Spec {
     pub const fn earlier_value_uses_low_nibble(&self) -> bool {
         true
     }
-
-    pub const fn is_contraction_major(&self) -> bool {
-        matches!(self.layout, NvFp4Layout::ContractionMajor)
-    }
 }
 
 impl ComponentSpec {
@@ -438,7 +386,7 @@ impl StorageSpec {
     }
 }
 
-/// Exact scalar and row codec shared by NML NVFP4 recipe v3 components.
+/// Exact scalar and row codec shared by NML NVFP4 recipe v2 components.
 ///
 /// This is permanent product/reference code shared by checkpoint inspection
 /// and the CPU implementation. It deliberately exposes no graph dtype.
@@ -672,19 +620,6 @@ fn encoded_shape(
         .with_axis_tags(logical.axis_tags())?
         .with_partitions(logical.partitions())?
         .with_layout(logical.layout())?)
-}
-
-fn contraction_shape(logical: Shape, encoded_extent: i64, dtype: DType) -> Result<Shape, Error> {
-    let rank = logical.rank();
-    let mut permutation = (0..rank).collect::<Vec<_>>();
-    permutation.swap(rank - 2, rank - 1);
-    let permuted = logical.permuted(&permutation)?;
-    let mut dimensions = permuted.dimensions().to_vec();
-    dimensions[rank - 2] = encoded_extent;
-    Ok(Shape::new(dtype, &dimensions)?
-        .with_axis_tags(permuted.axis_tags())?
-        .with_partitions(permuted.partitions())?
-        .with_layout(Layout::row_major(rank)?)?)
 }
 
 impl fmt::Display for Error {

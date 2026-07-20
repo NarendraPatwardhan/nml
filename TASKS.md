@@ -268,55 +268,7 @@ persistent dense weight expansion.
   projection or orchestration experiment. Promotion requires correct text,
   numerical contracts, durable trace evidence, and at least 143.12 steady
   device tokens/s, a 2.5-fold improvement over the restored 57.248-token/s
-  baseline. Image digest `d4da39627c61...` from source commit `feaf370` ran
-  320 tokens normally on an A40 and generated coherent text under the combined
-  harness. It reached 100.083 steady device tokens/s, 99.777 overall device
-  decode tokens/s, and 92.660 decode-loop tokens/s. The durable report is
-  `references/runpod/reports/20260720T074402Z-ylcav28r6vy6kf-d4da39627c61-diagnostic`;
-  Pod `ylcav28r6vy6kf` was terminated and deletion confirmed. The runtime path
-  is real and 1.75-fold faster than the restored baseline, but this task remains
-  open because it misses the accepted 143.12-token/s performance gate.
-
-### Operation-shaped compact projection tranche
-
-- [x] Replace recipe-v2 contraction storage with recipe v3: encoded K is the
-  leading contraction component axis and N is contiguous; embedding retains a
-  separately derived rowwise lookup layout. Logical model shapes and the public
-  representation kind remain unchanged.
-- [x] Move CPU, SM75, Triton matrix, and Triton decode consumers together to
-  recipe v3. Remove implicit output-major indexing and keep runtime repacking,
-  prepared dense copies, and earlier-recipe compatibility absent.
-- [x] Add typed Triton load policies and assign the portable streaming cache
-  operator to one-pass compact weights while retaining activation tiles with
-  cache-all. Keep the independent eviction attribute normal: redundant
-  cache-plus-eviction combinations are illegal in pre-Blackwell PTX.
-- [x] Parallelize ordinary decode projections over bounded split K and reduce
-  F32 partials in a dedicated bias-owning finalizer. Matrix-shaped prefill
-  remains on its tensor-core family.
-- [x] Parallelize decode gate/up and down over bounded split K. Gate/up
-  finalization owns paired bias and clamped residual SwiGLU; down finalization
-  owns expert bias, route weighting, and the top-k reduction directly into the
-  token result. No atomics, duplicated activation, or separate HLO route
-  reduction remain on this path.
-- [x] Preserve the sparse expert schedule and expert-parallel contract through
-  the new finalizers: global expert IDs are translated by the local offset and
-  nonlocal contributions are explicit zeroes before the existing cross-shard
-  reduction.
-- [x] Convert and publish the immutable GPT-OSS 20B recipe-v3 artifact and
-  replace the checked artifact identity. The selected public revision is
-  `ca87f4e7932aec1a80ab8866d13dd28776cfdc17`; its byte-exact manifest hashes
-  to `a3e8d0f77a85a9b1625c105fdb0853c285be0776efcfe44a1a2e3abd7ea286e9`.
-- [x] Build and publish the recipe-v3 serving OCI image, then run the complete
-  A40 GDB+Nsight acceptance loop. Corrected image
-  `sha256:881acf6a63ddc3e8b4170cbdbb079d70acf539dab318fb6f24bf4baefe4ace8a`
-  from source `85e5e89362951189d5c1d45a1c7df81d337a0754` completed a coherent
-  320-token generation normally. Durable evidence is in
-  `references/runpod/reports/20260720T105545Z-1nty175dxjdf8b-881acf6a63dd-diagnostic`;
-  pod `1nty175dxjdf8b` was terminated and deletion confirmed.
-- [ ] Promote recipe v3 against the 143.12-token/s performance gate. The
-  verified run sustained 64.654 steady device tokens/s, 64.582 overall
-  device-decode tokens/s, and 62.975 decode-loop tokens/s, so runtime
-  correctness is proven but the performance tranche remains open.
+  baseline.
 
 ## Next milestone: continuous batching and shared paged state
 

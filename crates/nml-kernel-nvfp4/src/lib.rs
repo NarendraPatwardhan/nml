@@ -49,20 +49,12 @@ impl CpuImplementation {
 /// private CPU kernel boundary.
 pub struct Weight<'a> {
     dimensions: Vec<usize>,
-    layout: WeightLayout,
-    outputs: usize,
     row_width: usize,
     packed_width: usize,
     scale_width: usize,
     payload: &'a [u8],
     block_scales: &'a [u8],
     global_scale: f32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WeightLayout {
-    ContractionMajor,
-    RowwiseLookup,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,49 +107,16 @@ pub enum Error {
 }
 
 impl<'a> Weight<'a> {
-    pub fn contraction(
+    pub fn new(
         logical_shape: Shape,
         payload: &'a [u8],
         block_scales: &'a [u8],
         global_scale: f32,
-    ) -> Result<Self, Error> {
-        Self::new(
-            logical_shape,
-            payload,
-            block_scales,
-            global_scale,
-            WeightLayout::ContractionMajor,
-        )
-    }
-
-    pub fn rowwise(
-        logical_shape: Shape,
-        payload: &'a [u8],
-        block_scales: &'a [u8],
-        global_scale: f32,
-    ) -> Result<Self, Error> {
-        Self::new(
-            logical_shape,
-            payload,
-            block_scales,
-            global_scale,
-            WeightLayout::RowwiseLookup,
-        )
-    }
-
-    fn new(
-        logical_shape: Shape,
-        payload: &'a [u8],
-        block_scales: &'a [u8],
-        global_scale: f32,
-        layout: WeightLayout,
     ) -> Result<Self, Error> {
         if !matches!(logical_shape.dtype(), DType::F16 | DType::Bf16) {
             return Err(Error::InvalidLogicalDType(logical_shape.dtype()));
         }
-        if logical_shape.rank() == 0
-            || matches!(layout, WeightLayout::ContractionMajor) && logical_shape.rank() < 2
-        {
+        if logical_shape.rank() == 0 {
             return Err(Error::InvalidLogicalShape);
         }
         let dimensions = logical_shape
@@ -196,44 +155,19 @@ impl<'a> Weight<'a> {
             });
         }
 
-        let outputs = if dimensions.len() >= 2 {
-            dimensions[dimensions.len() - 2]
-        } else {
-            rows
-        };
-        let packed_at = |row: usize, pair: usize| match layout {
-            WeightLayout::RowwiseLookup => row * packed_width + pair,
-            WeightLayout::ContractionMajor => {
-                let outer_index = row / outputs;
-                let output = row % outputs;
-                (outer_index * packed_width + pair) * outputs + output
-            }
-        };
-        let scale_at = |row: usize, block: usize| match layout {
-            WeightLayout::RowwiseLookup => row * scale_width + block,
-            WeightLayout::ContractionMajor => {
-                let outer_index = row / outputs;
-                let output = row % outputs;
-                (outer_index * scale_width + block) * outputs + output
-            }
-        };
         for row in 0..rows {
-            if row_width & 1 != 0 && payload[packed_at(row, packed_width - 1)] & 0xf0 != 0 {
+            if row_width & 1 != 0 && payload[row * packed_width + packed_width - 1] & 0xf0 != 0 {
                 return Err(Error::NonZeroPadding);
             }
             for block in 0..scale_width {
-                let scale_bits = block_scales[scale_at(row, block)];
+                let scale_bits = block_scales[row * scale_width + block];
                 let scale =
                     decode_e4m3fn_scale(scale_bits).map_err(|_| Error::InvalidScale(scale_bits))?;
                 if scale == 0.0 {
                     let start = block * BLOCK_SIZE;
                     let end = row_width.min(start + BLOCK_SIZE);
                     if (start..end)
-                        .any(|column| {
-                            let byte = payload[packed_at(row, column / 2)];
-                            let code = if column & 1 == 0 { byte & 0x0f } else { byte >> 4 };
-                            code & 0x07 != 0
-                        })
+                        .any(|column| nibble(payload, row * packed_width, column) & 0x07 != 0)
                     {
                         return Err(Error::ZeroScaleWithNonZeroValue);
                     }
@@ -243,8 +177,6 @@ impl<'a> Weight<'a> {
 
         Ok(Self {
             dimensions,
-            layout,
-            outputs,
             row_width,
             packed_width,
             scale_width,
@@ -259,39 +191,12 @@ impl<'a> Weight<'a> {
     }
 
     fn value(&self, row: usize, column: usize) -> f32 {
-        let code = self.code(row, column);
+        let code = nibble(self.payload, row * self.packed_width, column);
         let scale =
-            decode_e4m3fn_scale(self.block_scales[self.scale_offset(row, column / BLOCK_SIZE)])
+            decode_e4m3fn_scale(self.block_scales[row * self.scale_width + column / BLOCK_SIZE])
                 .expect("Weight construction validates all scale encodings");
         decode_e2m1(code).expect("a nibble always contains a valid E2M1 code")
             * (scale * self.global_scale)
-    }
-
-    fn packed_offset(&self, row: usize, pair: usize) -> usize {
-        match self.layout {
-            WeightLayout::RowwiseLookup => row * self.packed_width + pair,
-            WeightLayout::ContractionMajor => {
-                let outer = row / self.outputs;
-                let output = row % self.outputs;
-                (outer * self.packed_width + pair) * self.outputs + output
-            }
-        }
-    }
-
-    fn scale_offset(&self, row: usize, block: usize) -> usize {
-        match self.layout {
-            WeightLayout::RowwiseLookup => row * self.scale_width + block,
-            WeightLayout::ContractionMajor => {
-                let outer = row / self.outputs;
-                let output = row % self.outputs;
-                (outer * self.scale_width + block) * self.outputs + output
-            }
-        }
-    }
-
-    fn code(&self, row: usize, column: usize) -> u8 {
-        let byte = self.payload[self.packed_offset(row, column / 2)];
-        if column & 1 == 0 { byte & 0x0f } else { byte >> 4 }
     }
 }
 
@@ -360,7 +265,7 @@ pub fn linear(
     Ok(())
 }
 
-/// Applies a logical `[experts, N, K]` projection to routed assignments.
+/// Applies an output-major `[experts, N, K]` projection to routed assignments.
 ///
 /// `expert_indices` has one entry per input row. Empty experts require no
 /// special case; uneven routing changes work distribution but not semantics.
@@ -596,6 +501,15 @@ fn dot_row(
         .enumerate()
         .map(|(column, activation)| activation * weight.value(row, column))
         .sum()
+}
+
+fn nibble(payload: &[u8], row_offset: usize, column: usize) -> u8 {
+    let byte = payload[row_offset + column / 2];
+    if column & 1 == 0 {
+        byte & 0x0f
+    } else {
+        byte >> 4
+    }
 }
 
 fn require_rank(

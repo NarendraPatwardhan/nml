@@ -23,41 +23,34 @@ improvement over the original approximately 9-token/s baseline. BuildBuddy
 invocations and the durable A40 evidence are recorded in
 [`TASKS.md`](./TASKS.md) and below.
 
-## CURRENT: operation-shaped recipe v3 and parallel compact decode
+## CURRENT: canonical compact projection and bounded orchestration
 
-The current implementation tranche replaces recipe v2 with operation-shaped
-recipe v3. Logical ordinary, gate/up, and down weights remain `[N, K]`,
-`[E, 2I, K]`, and `[E, H, I]`; encoded contraction components store
-`[packed K, N]`, `[E, packed K, 2I]`, and `[E, packed I, H]` so adjacent lanes
-consume adjacent output bytes for one K slice. Embedding alone remains rowwise
-because indexed lookup selects complete vocabulary rows. GPT-OSS source expert
-tensors are transposed before quantization and encoded component axes are
-swapped by the converter, never per request or on device. CPU, SM75, Triton
-prefill, and Triton decode consume these operation-shaped components directly.
-There is no runtime preparation, persistent BF16 expansion, or compatibility
-path for an earlier artifact recipe.
+The current implementation tranche replaces recipe v1 with a single
+output-major, K-contiguous recipe v2. Ordinary projections use `[N, K]`, expert
+gate/up uses `[E, 2I, K]`, and expert down uses `[E, H, I]`. GPT-OSS source
+expert tensors are transposed before quantization, not per request or on the
+device. CPU, SM75, Triton prefill, and Triton decode now consume the same packed
+components. This removes strided reduction-axis reads without introducing a
+second representation, runtime preparation, persistent BF16 expansion, or a
+legacy compatibility path.
 
 This does not reinstate the rejected direct-kernel experiment under a new
 name. That experiment kept recipe-v1 expert storage and generated K-leading
 two-dimensional program tensors whose adjacent lanes did not follow contiguous
 weight bytes; its grouped kernels paid the measured strided-memory penalty.
-Recipe v3 changes the artifact itself and makes output lanes contiguous in
-TTIR while split programs traverse disjoint K slices. The source layout and
-generated access geometry are both different, while the accepted expert
-activation boundary remains unchanged.
+Recipe v2 changes the artifact itself, and the rowwise programs keep K as the
+final TTIR dimension. The source layout and generated access geometry are both
+different, while the accepted expert activation boundary remains unchanged.
 
-The decode Triton family is a finite split-K GEMV design: contiguous output
-tiles, streaming packed-weight loads, retained activation loads, exact E2M1 /
-E4M3FN register decode, and F32 partials. One gate/up finalizer reduces K,
-adds bias, and applies clamped SwiGLU once. One down finalizer reduces K, adds
-the selected expert bias, applies route weights, and reduces top-k directly
-into `[token, hidden]`. Matrix-shaped prefill keeps its tensor-core schedule.
-The typed builder owns cache intent instead of embedding dialect integers in
-kernels. Streaming and cache-all use the normal independent eviction policy;
-this is the portable pre-Blackwell PTX form and avoids illegal redundant hint
-combinations. BuildBuddy contracts establish construction and CPU semantics
-only; performance remains unpromoted until a newly converted
-immutable recipe-v3 artifact completes the whole-model GDB/Nsight gate.
+The decode Triton family is a finite rowwise GEMV design: contiguous packed K
+loads, one decoded E4M3 scale per 16 values, exact E2M1 register decode, F32
+reduction, and direct BF16 result storage. Gate/up still owns the clamped
+SwiGLU epilogue; down consumes only activated intermediates. Matrix-shaped
+prefill keeps its tensor-core schedule over the same recipe. Focused IR,
+portable compact, and generated-TTIR contracts are green remotely. The next
+truthful evidence boundary is a newly converted immutable recipe-v2 artifact
+and a whole-model A40 GDB/Nsight run; compile-only success cannot promote its
+performance.
 
 The same tranche reuses baked argument owners across decode iterations and
 compiles two-layer decode executables matching the actual alternating attention
@@ -65,46 +58,12 @@ schedule. This reduces the recurring layer submissions from 24 to 12 without
 reviving the rejected six-layer composition. Sampling remains device-resident
 and the host receives only the chosen token. These orchestration changes are
 structurally complete, but their performance is deliberately not inferred from
-compile contracts. Recipe v3, its kernels, and layer-pair execution are promoted
+compile contracts. Recipe v2, its kernels, and layer-pair execution are promoted
 together only after the immutable whole-model A40 measurement. The current
 promotion gate is at least 143.12 steady device tokens/s: a 2.5-fold improvement
 over the restored 57.248-token/s profiled baseline. The earlier 100-token/s gate
 below is retained as historical context, not the acceptance threshold for this
 tranche.
-
-Recipe v3 has now completed its immutable whole-model runtime gate. Image
-`sha256:881acf6a63ddc3e8b4170cbdbb079d70acf539dab318fb6f24bf4baefe4ace8a`
-from source commit `85e5e89362951189d5c1d45a1c7df81d337a0754` generated 320 coherent
-tokens on an A40 and exited normally under the combined GDB/Nsight harness.
-It sustained 64.654 steady device tokens/s, 64.582 overall device-decode
-tokens/s, and 62.975 decode-loop tokens/s. The complete durable report is
-`references/runpod/reports/20260720T105545Z-1nty175dxjdf8b-881acf6a63dd-diagnostic`.
-This proves the recipe-v3 artifact and runtime path, but it does not pass the
-143.12-token/s promotion threshold; optimization remains current work.
-
-The first recipe-v3 image,
-`sha256:620b240cc662cfe5851ec2fec585a3b8ab38a90448a5f93c05730452ecc1804e`,
-failed before launch because the typed load policy redundantly paired Triton
-`.cs` with `.evict_first` and `.ca` with `.evict_last`, combinations rejected
-by SM86 `ptxas`. The framework correction maps streaming intent to `.cs` and
-reuse intent to `.ca` while leaving the independent eviction policy at its
-canonical default. The contract now requires both cache operators and forbids
-a non-default eviction attribute, preventing recurrence across supported
-pre-Blackwell targets.
-
-The first immutable recipe-v2 run used image digest
-`sha256:d4da39627c61edf0b37b8ea980f329df9a090b13ca31bb810e1cb9a73d692298`
-from source commit `feaf370410c299a161f606521ecb16e6063d2710`. It completed
-320 tokens normally on an A40 under the combined GDB/Nsight harness, generated
-coherent technical text, and sustained 100.083 steady device tokens/s, 99.777
-overall device-decode tokens/s, and 92.660 decode-loop tokens/s. This validates
-the recipe, runtime dispatch, and orchestration, and is a 1.75-fold improvement
-over the restored 57.248-token/s baseline. It does not pass the 143.12-token/s
-gate. The trace still assigns 30.4% of GPU kernel time to grouped gate/up GEMV,
-15.9% to grouped down GEMV, and 32.0% across the three ordinary compact GEMV
-families, so compact projection remains the next optimization boundary rather
-than attention. The complete durable report is
-`references/runpod/reports/20260720T074402Z-ylcav28r6vy6kf-d4da39627c61-diagnostic`.
 
 ## Failed composed-decode/direct-kernel experiment
 

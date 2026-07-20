@@ -27,53 +27,12 @@ fn encode(dimensions: &[usize], values: &[f32]) -> Encoded {
     }
 }
 
-fn rowwise_weight<'a>(dimensions: &[usize], encoded: &'a Encoded) -> Weight<'a> {
+fn weight<'a>(dimensions: &[usize], encoded: &'a Encoded) -> Weight<'a> {
     let dimensions = dimensions
         .iter()
         .map(|&value| value as i64)
         .collect::<Vec<_>>();
-    Weight::rowwise(
-        Shape::new(DType::Bf16, &dimensions).unwrap(),
-        &encoded.payload,
-        &encoded.scales,
-        encoded.global,
-    )
-    .unwrap()
-}
-
-fn contraction_storage(dimensions: &[usize], encoded: &Encoded) -> Encoded {
-    let inputs = *dimensions.last().unwrap();
-    let outputs = dimensions[dimensions.len() - 2];
-    let outer = dimensions[..dimensions.len() - 2].iter().product::<usize>();
-    let packed_inputs = inputs.div_ceil(2);
-    let scale_inputs = inputs.div_ceil(16);
-    let mut payload = vec![0; encoded.payload.len()];
-    let mut scales = vec![0; encoded.scales.len()];
-    for batch in 0..outer {
-        for output in 0..outputs {
-            for input in 0..packed_inputs {
-                payload[(batch * packed_inputs + input) * outputs + output] =
-                    encoded.payload[(batch * outputs + output) * packed_inputs + input];
-            }
-            for input in 0..scale_inputs {
-                scales[(batch * scale_inputs + input) * outputs + output] =
-                    encoded.scales[(batch * outputs + output) * scale_inputs + input];
-            }
-        }
-    }
-    Encoded {
-        payload,
-        scales,
-        global: encoded.global,
-    }
-}
-
-fn contraction_weight<'a>(dimensions: &[usize], encoded: &'a Encoded) -> Weight<'a> {
-    let dimensions = dimensions
-        .iter()
-        .map(|&value| value as i64)
-        .collect::<Vec<_>>();
-    Weight::contraction(
+    Weight::new(
         Shape::new(DType::Bf16, &dimensions).unwrap(),
         &encoded.payload,
         &encoded.scales,
@@ -131,7 +90,7 @@ fn embedding_decodes_only_selected_rows_including_odd_widths() {
         .map(|value| value as f32 / 8.0 - 3.0)
         .collect::<Vec<_>>();
     let encoded = encode(&[3, 17], &values);
-    let weight = rowwise_weight(&[3, 17], &encoded);
+    let weight = weight(&[3, 17], &encoded);
     let mut output = vec![0.0; 34];
     embedding(&weight, &[2, 0], &mut output).unwrap();
 
@@ -150,8 +109,7 @@ fn linear_accumulates_compact_weights_without_dense_expansion() {
         .map(|value| value as f32 / 11.0 - 2.5)
         .collect::<Vec<_>>();
     let encoded = encode(&[4, 17], &values);
-    let physical = contraction_storage(&[4, 17], &encoded);
-    let weight = contraction_weight(&[4, 17], &physical);
+    let weight = weight(&[4, 17], &encoded);
     let input = (0..34)
         .map(|value| value as f32 / 13.0 - 1.0)
         .collect::<Vec<_>>();
@@ -176,8 +134,7 @@ fn grouped_projection_handles_uneven_and_empty_experts() {
         .map(|value| value as f32 / 17.0 - 3.0)
         .collect::<Vec<_>>();
     let encoded = encode(&[4, 10, 3], &values);
-    let physical = contraction_storage(&[4, 10, 3], &encoded);
-    let weight = contraction_weight(&[4, 10, 3], &physical);
+    let weight = weight(&[4, 10, 3], &encoded);
     let input = [1.0, 2.0, -1.0, -0.5, 1.5, 3.0, 2.0, 0.0, 0.25];
     let experts = [2, 2, 0];
     let bias = (0..40)
@@ -212,10 +169,8 @@ fn routed_experts_preserve_interleaved_clamped_residual_swiglu_semantics() {
         .collect::<Vec<_>>();
     let gate_encoded = encode(&[3, 8, 2], &gate_values);
     let down_encoded = encode(&[3, 2, 4], &down_values);
-    let gate_physical = contraction_storage(&[3, 8, 2], &gate_encoded);
-    let down_physical = contraction_storage(&[3, 2, 4], &down_encoded);
-    let gate = contraction_weight(&[3, 8, 2], &gate_physical);
-    let down = contraction_weight(&[3, 2, 4], &down_physical);
+    let gate = weight(&[3, 8, 2], &gate_encoded);
+    let down = weight(&[3, 2, 4], &down_encoded);
     let hidden = [1.0, -0.5, 0.25, 2.0];
     let router_indices = [0, 2, 2, 0];
     let routing_weights = [0.75, 0.25, 0.4, 0.6];
@@ -292,19 +247,13 @@ fn routed_experts_match_the_independent_oracle_across_bounded_shapes() {
             &[experts, hidden_size, intermediate],
             &down_values,
         );
-        let gate_physical = contraction_storage(
+        let gate = weight(
             &[experts, intermediate * 2, hidden_size],
             &gate_encoded,
         );
-        let down_physical =
-            contraction_storage(&[experts, hidden_size, intermediate], &down_encoded);
-        let gate = contraction_weight(
-            &[experts, intermediate * 2, hidden_size],
-            &gate_physical,
-        );
-        let down = contraction_weight(
+        let down = weight(
             &[experts, hidden_size, intermediate],
-            &down_physical,
+            &down_encoded,
         );
         let hidden = generated_values(&mut state, tokens * hidden_size, 1.25);
         let gate_bias = generated_values(&mut state, experts * intermediate * 2, 0.2);

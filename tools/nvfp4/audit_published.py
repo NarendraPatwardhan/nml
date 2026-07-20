@@ -156,7 +156,7 @@ def require_identity(published: dict[str, Any], artifact: dict[str, Any]) -> Non
     for name in required_strings:
         if not isinstance(published.get(name), str) or not published[name]:
             fail(f"published identity has invalid {name!r}")
-    if artifact.get("recipe") != "nml-nvfp4-weight-v3":
+    if artifact.get("recipe") != "nml-nvfp4-weight-v2":
         fail("published artifact does not use the admitted NVFP4 recipe")
 
 
