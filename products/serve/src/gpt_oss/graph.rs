@@ -1,9 +1,11 @@
 //! Bounded GPT-OSS component graphs.
 //!
 //! The compiler sees one bounded fusion domain at a time: embedding, one full
-//! prefill layer, one alternating decode-layer pair, or final projection and
-//! sampling. Model depth remains an execution-plan concern and never duplicates
-//! the reusable component bodies in StableHLO.
+//! prefill layer, or final projection and sampling. Decode uses a single fused
+//! graph covering all 24 transformer layers, embedding, and the sampling head
+//! to collapse recurring CUDA graph launch overhead. Prefill retains single-
+//! layer components because each prefill step touches every KV cache exactly
+//! once per layer and does not repeat per token.
 
 use super::checkpoint::{message, BoxError, Checkpoint, DecoderLayer, Result};
 use super::config::{AttentionKind, Config};
@@ -201,6 +203,116 @@ pub(super) fn build_decode_layer_pair(
         ("full.cache.key".to_owned(), full_key),
         ("full.cache.value".to_owned(), full_value),
     ])
+}
+
+/// Builds a single fused graph for the entire decode pipeline: embedding, all
+/// 24 alternating layers, and the sampling head. This collapses the per-token
+/// launch overhead from 14 CUDA graphs to 1, eliminating ~1.5 ms of recurring
+/// cuGraphLaunch, cuGraphExecKernelNodeSetParams_v2, and PJRT dispatch cost.
+///
+/// Unlike `build_decode_layer_pair` this makes model depth a compiler constant
+/// — the returned executable covers every transformer layer in one StableHLO
+/// program. KV caches use per-layer input/output slots named `cache.{i}.key`
+/// and `cache.{i}.value` so the runtime can donate each physical page table
+/// independently.
+pub fn build_decode_full(
+    graph: &mut Graph,
+    checkpoint: &Checkpoint,
+    config: &Config,
+    family: ShapeFamily,
+) -> Result<Vec<(String, Tensor)>> {
+    if family.phase() != Phase::Decode {
+        return Err(message("GPT-OSS full decode graph is decode-only"));
+    }
+    let hidden_size = dimension(config.hidden_size())?;
+    let cache_shape = cache_shape(config, family)?;
+    let zero = nml(graph.scalar(0_i32))?;
+    let one = nml(graph.scalar(1_i32))?;
+
+    // ---- Embedding ----
+    let tokens = graph.input(
+        "tokens",
+        shape(DataType::I32, &[1, dimension(family.sequence())?])?,
+    );
+    let mut hidden = nml(graph.token_embedding(&checkpoint.model.embed_tokens.weight, tokens))?;
+
+    // ---- Shared layer inputs ----
+    let position = graph.input("position", shape(DataType::I32, &[])?);
+    let page_table = graph.input("page_table", page_table_shape(family)?);
+
+    // Pre-compute positions once (XLA will CSE repeated computation anyway,
+    // but computing it here is cleaner and avoids multiple iota/broadcast ops).
+    let sequence_lengths = sequence_lengths(graph, family, position)?;
+
+    // ---- Per-layer KV cache inputs and outputs ----
+    // Create all 48 cache input slots upfront, then thread them through
+    // apply_layer and collect the donated output tensors for the result tuple.
+    let mut key_outputs: Vec<Tensor> = Vec::with_capacity(config.layers());
+    let mut value_outputs: Vec<Tensor> = Vec::with_capacity(config.layers());
+
+    for (i, layer) in checkpoint.model.layers.iter().enumerate() {
+        let key_input = graph.input(&format!("cache.{i}.key"), cache_shape);
+        let value_input = graph.input(&format!("cache.{i}.value"), cache_shape);
+
+        let attention_kind = config.layer_types()[i];
+        let (new_hidden, new_key, new_value) = apply_layer(
+            graph,
+            layer,
+            config,
+            family,
+            attention_kind,
+            hidden,
+            position,
+            sequence_lengths,
+            page_table,
+            key_input,
+            value_input,
+        )?;
+        hidden = new_hidden;
+        key_outputs.push(new_key);
+        value_outputs.push(new_value);
+    }
+
+    // ---- Head (final norm, lm_head linear, sampling, position++) ----
+    let last_index = graph.input("last_index", shape(DataType::I32, &[])?);
+    let sampling_state_input = graph.input("sampling_state", shape(DataType::U64, &[2])?);
+    let top_k = graph.input("top_k", shape(DataType::I32, &[])?);
+    let temperature = graph.input("temperature", shape(DataType::F32, &[])?);
+    let top_p = graph.input("top_p", shape(DataType::F32, &[])?);
+    let min_p = graph.input("min_p", shape(DataType::F32, &[])?);
+
+    let last = nml(graph.dynamic_slice(hidden, &[zero, last_index, zero], &[1, 1, hidden_size]))?;
+    let final_norm = nml(graph.parameter_value(&checkpoint.model.norm.weight))?;
+    let last = nml(graph.rms_norm(last, Some(final_norm), 2, config.rms_norm_epsilon()))?;
+    let last = nml(graph.reshape(last, shape(DataType::Bf16, &[1, hidden_size])?))?;
+    let logits = nml(graph.linear(last, &checkpoint.lm_head.weight, None))?;
+    let sampling_state = nml(graph.random_state(sampling_state_input))?;
+    let (sampling_state, token) = nml(graph.sample_tokens_dynamic(
+        logits,
+        sampling_state,
+        1,
+        top_k,
+        temperature,
+        top_p,
+        min_p,
+        MAXIMUM_TOP_K,
+    ))?;
+    let sampling_state =
+        nml(graph.reuse_buffer(sampling_state.into_tensor(), sampling_state_input))?;
+    let token = nml(graph.reshape(token, shape(DataType::I32, &[1, 1])?))?;
+    let position_out = nml(graph.add(position, one))?;
+
+    // ---- Collect outputs in execution order ----
+    let mut outputs: Vec<(String, Tensor)> = vec![
+        ("token".to_owned(), token),
+        ("sampling_state".to_owned(), sampling_state),
+        ("position".to_owned(), position_out),
+    ];
+    for i in 0..config.layers() {
+        outputs.push((format!("cache.{i}.key"), key_outputs[i].clone()));
+        outputs.push((format!("cache.{i}.value"), value_outputs[i].clone()));
+    }
+    Ok(outputs)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -580,6 +692,97 @@ mod tests {
         assert_contract!(prefill_head, 7, 4, 2, &[None, Some(2)]);
         let decode_head = finish!(|graph| build_head(graph, &checkpoint, &config, decode));
         assert_contract!(decode_head, 8, 4, 3, &[None, Some(2), None]);
+    }
+
+    #[test]
+    fn fused_decode_full_graph_contract() {
+        let config = selected_config();
+        let checkpoint = synthetic_checkpoint(&config);
+        let decode = ShapeFamily::decode(512).unwrap();
+        let layers = config.layers();
+
+        let program = finish!(|graph| { build_decode_full(graph, &checkpoint, &config, decode) });
+
+        let activations = program
+            .inputs()
+            .filter(|(_, _, binding)| !binding.is_parameter_component())
+            .count();
+        let parameters = program
+            .inputs()
+            .filter(|(_, _, binding)| binding.is_parameter_component())
+            .count();
+        let outputs = program.outputs().count();
+
+        // 57 activation inputs: tokens + position + page_table + 48 caches
+        // + last_index + sampling_state + top_k + temperature + top_p + min_p
+        assert_eq!(activations, 57, "fused decode activation input count");
+        // 703 parameter components: 24 layers × 29 + 3 (embed) + 1 (norm) + 3 (lm_head)
+        assert_eq!(
+            parameters,
+            layers * 29 + 7,
+            "fused decode parameter component count"
+        );
+        // 51 outputs: token + sampling_state + position + 48 caches
+        assert_eq!(outputs, 3 + layers * 2, "fused decode output count");
+
+        // Activation inputs are interleaved with parameter component slots.
+        // Input ordering (0-indexed):
+        //   0: tokens (activation)
+        //   1-3: embed_tokens.weight (parameter, NVFP4 = 3 components)
+        //   4: position (activation)
+        //   5: page_table (activation)
+        //   6 + 31*i: cache.{i}.key (activation)
+        //   6 + 31*i + 1: cache.{i}.value (activation)
+        //   8 + 31*i .. 36 + 31*i: layer i parameters (29 slots)
+        //   750: last_index (activation)
+        //   751: sampling_state (activation) — aliased to output sampling_state
+        //   752-755: top_k, temperature, top_p, min_p (activation)
+        //   756: norm.weight (parameter)
+        //   757-759: lm_head.weight (parameter)
+        let cache_base = 6usize;
+        let stride = 31usize; // 2 cache slots + 29 parameter components per layer
+        let sampling_state_index = 751usize;
+        let mut expected_aliases: Vec<Option<usize>> = vec![None, Some(sampling_state_index), None];
+        for i in 0..layers {
+            expected_aliases.push(Some(cache_base + stride * i));
+            expected_aliases.push(Some(cache_base + stride * i + 1));
+        }
+        assert_eq!(
+            program.output_aliases().collect::<Vec<_>>(),
+            expected_aliases,
+            "fused decode output aliases",
+        );
+
+        // Verify all 24 layers' parameters appear in the input names
+        let layer_names: Vec<_> = program
+            .input_names()
+            .filter(|name| name.starts_with("model.layers."))
+            .collect();
+        assert!(!layer_names.is_empty());
+        for i in 0..layers {
+            assert!(
+                layer_names
+                    .iter()
+                    .any(|name| { name.starts_with(&format!("model.layers.{i}.")) }),
+                "fused decode includes layer {i} parameters",
+            );
+        }
+
+        // Verify cache inputs are named with per-layer indices
+        for i in 0..layers {
+            assert!(
+                program
+                    .input_names()
+                    .any(|name| name == format!("cache.{i}.key")),
+                "fused decode has cache.{i}.key input",
+            );
+            assert!(
+                program
+                    .input_names()
+                    .any(|name| name == format!("cache.{i}.value")),
+                "fused decode has cache.{i}.value input",
+            );
+        }
     }
 
     fn selected_config() -> Config {

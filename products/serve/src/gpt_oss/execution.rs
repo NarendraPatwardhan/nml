@@ -6,8 +6,8 @@ use super::checkpoint::{
 };
 use super::config::{AttentionKind, Config};
 use super::graph::{
-    build_decode_layer_pair, build_embedding, build_head, build_layer, cache_shape,
-    page_table_shape, Phase, ShapeFamily, CACHE_PAGE_SIZE, MAXIMUM_TOP_K,
+    build_decode_full, build_embedding, build_head, build_layer, cache_shape, page_table_shape,
+    Phase, ShapeFamily, CACHE_PAGE_SIZE, MAXIMUM_TOP_K,
 };
 use crate::{CompilationProfile, SamplingOptions, SubmissionTimings};
 use nml::exe::{Arguments, Results};
@@ -388,12 +388,12 @@ impl ResidentModel<'_> {
         let mut prefill_head = prefill_executables.head.args();
         bind_head(&mut prefill_head, parameters)?;
 
-        let mut decode_embedding = decode_executables.embedding.args();
-        bind_embedding(&mut decode_embedding, checkpoint, parameters)?;
-        let mut decode_pairs =
-            bind_decode_pairs(decode_executables, checkpoint, parameters, config)?;
-        let mut decode_head = decode_executables.head.args();
-        bind_head(&mut decode_head, parameters)?;
+        let mut fused_decode = bind_decode_full(
+            decode_executables.decode_full()?,
+            checkpoint,
+            parameters,
+            config,
+        )?;
 
         let allocation_started = Instant::now();
         let cache_tensor_shape = cache_shape(config, prefill)?;
@@ -413,6 +413,9 @@ impl ResidentModel<'_> {
             .map_err(boxed)?
             .checked_add(std::mem::size_of::<i32>())
             .ok_or_else(|| message("GPT-OSS cache metadata accounting overflows usize"))?;
+        fused_decode
+            .set("page_table", page_table.clone())
+            .map_err(boxed)?;
 
         let prompt_upload_started = Instant::now();
         let mut padded = vec![0_i32; prefill.sequence()];
@@ -455,7 +458,7 @@ impl ResidentModel<'_> {
         let temperature = upload_f32_scalar(platform, request.sampling.temperature, placement)?;
         let top_p = upload_f32_scalar(platform, request.sampling.top_p, placement)?;
         let min_p = upload_f32_scalar(platform, request.sampling.min_p, placement)?;
-        for head in [&mut prefill_head, &mut decode_head] {
+        for head in [&mut prefill_head, &mut fused_decode] {
             head.set("top_k", top_k.clone()).map_err(boxed)?;
             head.set("temperature", temperature.clone())
                 .map_err(boxed)?;
@@ -543,53 +546,68 @@ impl ResidentModel<'_> {
             }
 
             let decode_started = Instant::now();
-            let mut decode_submission = SubmissionTimings::default();
             let submission_started = Instant::now();
-            decode_embedding
-                .set("tokens", token_buffer)
-                .map_err(boxed)?;
-            let mut hidden = one(decode_embedding.enqueue().map_err(boxed)?)?;
-            decode_submission.embedding = submission_started.elapsed();
-            for (arguments, caches) in decode_pairs.iter_mut().zip(caches.chunks_exact_mut(2)) {
-                let (next_hidden, elapsed) = execute_layer_pair(
-                    arguments,
-                    hidden,
-                    position.clone(),
-                    page_table.clone(),
-                    caches,
-                )?;
-                hidden = next_hidden;
-                decode_submission.layer_pairs += elapsed;
-            }
-            let submission_started = Instant::now();
-            decode_head.set("hidden", hidden).map_err(boxed)?;
-            decode_head
-                .set("last_index", decode_last_index.clone())
-                .map_err(boxed)?;
-            decode_head
+
+            // One fused enqueue replaces 14 separate graph launches.
+            fused_decode.set("tokens", token_buffer).map_err(boxed)?;
+            fused_decode.set("position", position).map_err(boxed)?;
+            fused_decode
                 .set("sampling_state", sampling_state)
                 .map_err(boxed)?;
-            decode_head.set("position", position).map_err(boxed)?;
-            let mut outputs = decode_head
+            // last_index is always 0 for single-token decode
+            fused_decode
+                .set("last_index", decode_last_index.clone())
+                .map_err(boxed)?;
+
+            for (i, cache) in caches.iter_mut().enumerate() {
+                let (key, value) = cache.take()?;
+                fused_decode
+                    .set(&format!("cache.{i}.key"), key)
+                    .map_err(boxed)?;
+                fused_decode
+                    .set(&format!("cache.{i}.value"), value)
+                    .map_err(boxed)?;
+            }
+
+            let mut outputs = fused_decode
                 .enqueue()
                 .map_err(boxed)?
                 .into_buffers()
                 .into_iter();
+
             token_buffer = outputs
                 .next()
-                .ok_or_else(|| message("GPT-OSS decode head omitted its token"))?;
+                .ok_or_else(|| message("GPT-OSS fused decode omitted its token"))?;
             sampling_state = outputs
                 .next()
-                .ok_or_else(|| message("GPT-OSS decode head omitted its sampling state"))?;
+                .ok_or_else(|| message("GPT-OSS fused decode omitted its sampling state"))?;
             position = outputs
                 .next()
-                .ok_or_else(|| message("GPT-OSS decode head omitted its position"))?;
-            if outputs.next().is_some() {
-                return Err(message("GPT-OSS decode head returned extra buffers"));
+                .ok_or_else(|| message("GPT-OSS fused decode omitted its position"))?;
+
+            for cache in caches.iter_mut() {
+                let key = outputs
+                    .next()
+                    .ok_or_else(|| message("GPT-OSS fused decode omitted a cache key"))?;
+                let value = outputs
+                    .next()
+                    .ok_or_else(|| message("GPT-OSS fused decode omitted a cache value"))?;
+                cache.install(key, value)?;
             }
-            decode_submission.head = submission_started.elapsed();
+
+            if outputs.next().is_some() {
+                return Err(message("GPT-OSS fused decode returned extra buffers"));
+            }
+
+            let submission_elapsed = submission_started.elapsed();
             token_buffer.wait().map_err(boxed)?;
             let execution_elapsed = decode_started.elapsed();
+            let decode_submission = SubmissionTimings {
+                embedding: submission_elapsed,
+                head: submission_elapsed,
+                ..Default::default()
+            };
+
             if generated_index == 0 {
                 first_decode_execution = execution_elapsed;
                 first_decode_submission = decode_submission;
@@ -597,6 +615,7 @@ impl ResidentModel<'_> {
                 steady_decode_execution += execution_elapsed;
                 add_submission(&mut steady_decode_submission, decode_submission);
             }
+
             let download_started = Instant::now();
             next_token = download_token(&token_buffer)?;
             decode_download += download_started.elapsed();
@@ -633,7 +652,7 @@ struct ComponentFamily {
 
 enum LayerExecutables {
     Prefill { sliding: Exe, full: Exe },
-    DecodePair(Exe),
+    DecodeFull(Exe),
 }
 
 impl ComponentFamily {
@@ -644,8 +663,6 @@ impl ComponentFamily {
         config: &Config,
         family: ShapeFamily,
     ) -> Result<Self> {
-        // Deliberately compile bounded modules sequentially. This is startup
-        // scheduling, not a global XLA flag, and has no execution-time cost.
         let embedding = compile(platform, placement, |graph| {
             build_embedding(graph, checkpoint, config, family)
         })?;
@@ -666,8 +683,8 @@ impl ComponentFamily {
                     build_layer(graph, full, config, family, AttentionKind::FullAttention)
                 })?,
             },
-            Phase::Decode => LayerExecutables::DecodePair(compile(platform, placement, |graph| {
-                build_decode_layer_pair(graph, sliding, full, config, family)
+            Phase::Decode => LayerExecutables::DecodeFull(compile(platform, placement, |graph| {
+                build_decode_full(graph, checkpoint, config, family)
             })?),
         };
         let head = compile(platform, placement, |graph| {
@@ -692,12 +709,10 @@ impl ComponentFamily {
         })
     }
 
-    fn decode_pair(&self) -> Result<&Exe> {
+    fn decode_full(&self) -> Result<&Exe> {
         match &self.layers {
-            LayerExecutables::DecodePair(executable) => Ok(executable),
-            LayerExecutables::Prefill { .. } => {
-                Err(message("prefill family does not contain a decode pair"))
-            }
+            LayerExecutables::DecodeFull(executable) => Ok(executable),
+            _ => Err(message("family does not contain a fused decode executable")),
         }
     }
 }
@@ -801,42 +816,6 @@ fn bind_layers<'family>(
         .collect()
 }
 
-fn bind_decode_pairs<'family>(
-    family: &'family ComponentFamily,
-    checkpoint: &Checkpoint,
-    parameters: &LoadedCheckpoint,
-    config: &Config,
-) -> Result<Vec<Arguments<'family>>> {
-    if checkpoint.model.layers.len() != parameters.model.layers.len()
-        || checkpoint.model.layers.len() != config.layer_types().len()
-        || !checkpoint.model.layers.len().is_multiple_of(2)
-    {
-        return Err(message(
-            "GPT-OSS decode pairing requires one complete alternating layer schedule",
-        ));
-    }
-    let slots = checkpoint.model.layers.get(0..2).ok_or_else(|| {
-        message("GPT-OSS decode pairing requires sliding and full representatives")
-    })?;
-    parameters
-        .model
-        .layers
-        .chunks_exact(2)
-        .enumerate()
-        .map(|(pair, loaded)| {
-            let first = pair * 2;
-            if config.layer_types()[first] != AttentionKind::SlidingAttention
-                || config.layer_types()[first + 1] != AttentionKind::FullAttention
-            {
-                return Err(message(
-                    "GPT-OSS decode pair violates the alternating schedule",
-                ));
-            }
-            bind_layer_pair(family.decode_pair()?, slots, loaded)
-        })
-        .collect()
-}
-
 fn bind_layer<'family>(
     executable: &'family Exe,
     slots: &super::checkpoint::DecoderLayer,
@@ -847,20 +826,38 @@ fn bind_layer<'family>(
     Ok(arguments)
 }
 
-fn bind_layer_pair<'family>(
+fn bind_decode_full<'family>(
     executable: &'family Exe,
-    slots: &[super::checkpoint::DecoderLayer],
-    loaded: &[LoadedDecoderLayer],
+    checkpoint: &Checkpoint,
+    parameters: &LoadedCheckpoint,
+    config: &Config,
 ) -> Result<Arguments<'family>> {
-    let [sliding_slot, full_slot] = slots else {
-        return Err(message("GPT-OSS decode pair slot count is not two"));
-    };
-    let [sliding_loaded, full_loaded] = loaded else {
-        return Err(message("GPT-OSS decode pair parameter count is not two"));
-    };
+    if checkpoint.model.layers.len() != parameters.model.layers.len()
+        || checkpoint.model.layers.len() != config.layer_types().len()
+    {
+        return Err(message(
+            "GPT-OSS fused decode requires the complete layer schedule",
+        ));
+    }
     let mut arguments = executable.args();
-    bind_tree_components(&mut arguments, sliding_slot, sliding_loaded)?;
-    bind_tree_components(&mut arguments, full_slot, full_loaded)?;
+
+    // Embedding parameters
+    bind_tree_components(
+        &mut arguments,
+        &checkpoint.model.embed_tokens,
+        &parameters.model.embed_tokens,
+    )?;
+    // All 24 layers' parameters
+    for (slot, loaded) in checkpoint.model.layers.iter().zip(&parameters.model.layers) {
+        bind_tree_components(&mut arguments, slot, loaded)?;
+    }
+    // Head parameters
+    arguments
+        .set_parameter(&parameters.model.norm.weight)
+        .map_err(boxed)?;
+    arguments
+        .set_parameter(&parameters.lm_head.weight)
+        .map_err(boxed)?;
     arguments.bake().map_err(boxed)?;
     Ok(arguments)
 }
@@ -901,62 +898,6 @@ fn execute_layer(
         return Err(message("GPT-OSS layer returned extra buffers"));
     }
     cache.install(key, value)?;
-    Ok((hidden, started.elapsed()))
-}
-
-fn execute_layer_pair(
-    arguments: &mut Arguments<'_>,
-    hidden: Buffer,
-    position: Buffer,
-    page_table: Buffer,
-    caches: &mut [LayerCache],
-) -> Result<(Buffer, Duration)> {
-    let [sliding, full] = caches else {
-        return Err(message(
-            "GPT-OSS decode execution requires exactly two caches",
-        ));
-    };
-    let started = Instant::now();
-    let (sliding_key, sliding_value) = sliding.take()?;
-    let (full_key, full_value) = full.take()?;
-    arguments.set("hidden", hidden).map_err(boxed)?;
-    arguments.set("position", position).map_err(boxed)?;
-    arguments.set("page_table", page_table).map_err(boxed)?;
-    arguments
-        .set("sliding.cache.key", sliding_key)
-        .map_err(boxed)?;
-    arguments
-        .set("sliding.cache.value", sliding_value)
-        .map_err(boxed)?;
-    arguments.set("full.cache.key", full_key).map_err(boxed)?;
-    arguments
-        .set("full.cache.value", full_value)
-        .map_err(boxed)?;
-    let mut outputs = arguments
-        .enqueue()
-        .map_err(boxed)?
-        .into_buffers()
-        .into_iter();
-    let hidden = outputs
-        .next()
-        .ok_or_else(|| message("GPT-OSS layer pair omitted hidden state"))?;
-    let sliding_key = outputs
-        .next()
-        .ok_or_else(|| message("GPT-OSS layer pair omitted sliding key cache"))?;
-    let sliding_value = outputs
-        .next()
-        .ok_or_else(|| message("GPT-OSS layer pair omitted sliding value cache"))?;
-    let full_key = outputs
-        .next()
-        .ok_or_else(|| message("GPT-OSS layer pair omitted full key cache"))?;
-    let full_value = outputs
-        .next()
-        .ok_or_else(|| message("GPT-OSS layer pair omitted full value cache"))?;
-    if outputs.next().is_some() {
-        return Err(message("GPT-OSS layer pair returned extra buffers"));
-    }
-    sliding.install(sliding_key, sliding_value)?;
-    full.install(full_key, full_value)?;
     Ok((hidden, started.elapsed()))
 }
 
