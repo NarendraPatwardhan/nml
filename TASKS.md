@@ -268,7 +268,14 @@ persistent dense weight expansion.
   projection or orchestration experiment. Promotion requires correct text,
   numerical contracts, durable trace evidence, and at least 143.12 steady
   device tokens/s, a 2.5-fold improvement over the restored 57.248-token/s
-  baseline.
+  baseline. Image digest `d4da39627c61...` from source commit `feaf370` ran
+  320 tokens normally on an A40 and generated coherent text under the combined
+  harness. It reached 100.083 steady device tokens/s, 99.777 overall device
+  decode tokens/s, and 92.660 decode-loop tokens/s. The durable report is
+  `references/runpod/reports/20260720T074402Z-ylcav28r6vy6kf-d4da39627c61-diagnostic`;
+  Pod `ylcav28r6vy6kf` was terminated and deletion confirmed. The runtime path
+  is real and 1.75-fold faster than the restored baseline, but this task remains
+  open because it misses the accepted 143.12-token/s performance gate.
 
 ## Next milestone: continuous batching and shared paged state
 

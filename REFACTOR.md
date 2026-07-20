@@ -65,6 +65,20 @@ over the restored 57.248-token/s profiled baseline. The earlier 100-token/s gate
 below is retained as historical context, not the acceptance threshold for this
 tranche.
 
+The first immutable recipe-v2 run used image digest
+`sha256:d4da39627c61edf0b37b8ea980f329df9a090b13ca31bb810e1cb9a73d692298`
+from source commit `feaf370410c299a161f606521ecb16e6063d2710`. It completed
+320 tokens normally on an A40 under the combined GDB/Nsight harness, generated
+coherent technical text, and sustained 100.083 steady device tokens/s, 99.777
+overall device-decode tokens/s, and 92.660 decode-loop tokens/s. This validates
+the recipe, runtime dispatch, and orchestration, and is a 1.75-fold improvement
+over the restored 57.248-token/s baseline. It does not pass the 143.12-token/s
+gate. The trace still assigns 30.4% of GPU kernel time to grouped gate/up GEMV,
+15.9% to grouped down GEMV, and 32.0% across the three ordinary compact GEMV
+families, so compact projection remains the next optimization boundary rather
+than attention. The complete durable report is
+`references/runpod/reports/20260720T074402Z-ylcav28r6vy6kf-d4da39627c61-diagnostic`.
+
 ## Failed composed-decode/direct-kernel experiment
 
 The follow-on output-owner/direct-kernel approach is rejected. Immutable image
