@@ -72,6 +72,26 @@ over the restored 57.248-token/s profiled baseline. The earlier 100-token/s gate
 below is retained as historical context, not the acceptance threshold for this
 tranche.
 
+Recipe v3 has now completed its immutable whole-model runtime gate. Image
+`sha256:881acf6a63ddc3e8b4170cbdbb079d70acf539dab318fb6f24bf4baefe4ace8a`
+from source commit `85e5e89362951189d5c1d45a1c7df81d337a0754` generated 320 coherent
+tokens on an A40 and exited normally under the combined GDB/Nsight harness.
+It sustained 64.654 steady device tokens/s, 64.582 overall device-decode
+tokens/s, and 62.975 decode-loop tokens/s. The complete durable report is
+`references/runpod/reports/20260720T105545Z-1nty175dxjdf8b-881acf6a63dd-diagnostic`.
+This proves the recipe-v3 artifact and runtime path, but it does not pass the
+143.12-token/s promotion threshold; optimization remains current work.
+
+The first recipe-v3 image,
+`sha256:620b240cc662cfe5851ec2fec585a3b8ab38a90448a5f93c05730452ecc1804e`,
+failed before launch because the typed load policy redundantly paired Triton
+`.cs` with `.evict_first` and `.ca` with `.evict_last`, combinations rejected
+by SM86 `ptxas`. The framework correction maps streaming intent to `.cs` and
+reuse intent to `.ca` while leaving the independent eviction policy at its
+canonical default. The contract now requires both cache operators and forbids
+a non-default eviction attribute, preventing recurrence across supported
+pre-Blackwell targets.
+
 The first immutable recipe-v2 run used image digest
 `sha256:d4da39627c61edf0b37b8ea980f329df9a090b13ca31bb810e1cb9a73d692298`
 from source commit `feaf370410c299a161f606521ecb16e6063d2710`. It completed

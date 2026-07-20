@@ -306,9 +306,17 @@ persistent dense weight expansion.
   replace the checked artifact identity. The selected public revision is
   `ca87f4e7932aec1a80ab8866d13dd28776cfdc17`; its byte-exact manifest hashes
   to `a3e8d0f77a85a9b1625c105fdb0853c285be0776efcfe44a1a2e3abd7ea286e9`.
-- [ ] Build and publish the recipe-v3 serving OCI image, then run the complete
-  A40 GDB+Nsight acceptance loop. Compile evidence cannot close this task or
-  assert the 143.12-token/s performance gate.
+- [x] Build and publish the recipe-v3 serving OCI image, then run the complete
+  A40 GDB+Nsight acceptance loop. Corrected image
+  `sha256:881acf6a63ddc3e8b4170cbdbb079d70acf539dab318fb6f24bf4baefe4ace8a`
+  from source `85e5e89362951189d5c1d45a1c7df81d337a0754` completed a coherent
+  320-token generation normally. Durable evidence is in
+  `references/runpod/reports/20260720T105545Z-1nty175dxjdf8b-881acf6a63dd-diagnostic`;
+  pod `1nty175dxjdf8b` was terminated and deletion confirmed.
+- [ ] Promote recipe v3 against the 143.12-token/s performance gate. The
+  verified run sustained 64.654 steady device tokens/s, 64.582 overall
+  device-decode tokens/s, and 62.975 decode-loop tokens/s, so runtime
+  correctness is proven but the performance tranche remains open.
 
 ## Next milestone: continuous batching and shared paged state
 
