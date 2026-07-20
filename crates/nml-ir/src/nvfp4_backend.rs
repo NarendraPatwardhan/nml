@@ -110,7 +110,7 @@ pub(crate) fn lower_linear<'context>(
     let rows = plan.config.rows;
     let outputs = plan.config.outputs;
     let output_shape = [rows, outputs];
-    let use_split_k_gemv = rows == 1 && plan.config.split_k > 1;
+    let use_split_k_gemv = rows == 1;
     let mut argument_specs = vec![
         tensor(plan.config.dtype, inputs.activation_shape.dimensions())?,
         tensor(KernelDType::U8, inputs.payload_shape.dimensions())?,
@@ -879,16 +879,11 @@ impl LinearPlan {
             ));
         }
 
-        // Decode (M=1) is a memory-bandwidth-bound GEMV. It needs 4 warps and
-        // 4 pipeline stages for memory-latency hiding and a large K tile
-        // (128) so each program streams through K values contiguously with
-        // few loop iterations. Split-K parallelism is not used because its
-        // strided activation access pattern thrashes L2 cache and its
-        // per-split partial-sum traffic wastes bandwidth on an already
-        // bandwidth-bound problem. The matrix-kernel path writes directly to
-        // the output buffer (no intermediate partials or separate finalize
-        // kernel), keeps 4 warps for occupancy, and uses 4 pipeline stages
-        // for software prefetching.
+        // Decode (M=1) is a memory-bandwidth-bound GEMV. GEMV with
+        // block_n=8 (2 cache lines per K step per program), block_k=256
+        // (20 K iterations for hidden=5120), 4 warps (occupancy), and
+        // stages=1 (small working set makes prefetching unnecessary).
+        // No split-K: each program owns a contiguous output tile.
         //
         // Prefill uses the tensor-core matrix family. Small batches get
         // narrower output tiles and deeper pipelines; large batches widen
@@ -911,14 +906,14 @@ impl LinearPlan {
                 inputs,
                 block_m,
                 block_n: if rows == 1 {
-                    64
+                    8
                 } else if latency_sensitive {
                     64
                 } else {
                     128
                 },
                 block_k: if rows == 1 {
-                    128
+                    256
                 } else if latency_sensitive {
                     128
                 } else {
@@ -935,7 +930,7 @@ impl LinearPlan {
                 4
             },
             stages: if rows == 1 {
-                4
+                1
             } else if latency_sensitive {
                 4
             } else {
@@ -956,10 +951,10 @@ impl GroupedPlan {
     const fn new(tokens: i64) -> Self {
         if tokens == 1 {
             Self {
-                block_n: 64,
+                block_n: 8,
                 block_k: 64,
                 warps: 4,
-                stages: 4,
+                stages: 1,
             }
         } else if tokens <= 32 {
             Self {

@@ -185,15 +185,7 @@ impl NvFp4LinearConfig {
 
 pub fn build_nvfp4_linear(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
     config.validate()?;
-    // For M=1 with split-K: use the dedicated GEMV kernel that writes F32
-    // partials for later reduction by the finalize kernel.
-    //
-    // For M=1 without split-K: use the matrix kernel. It writes directly
-    // to the output buffer (no intermediate partials or finalize pass),
-    // uses 4 warps for memory-latency hiding, and streams K contiguously
-    // with few loop iterations. The matrix kernel's block_m=1 tile avoids
-    // the GEMV path's 1-warp occupancy collapse.
-    if config.rows == 1 && config.split_k != 1 {
+    if config.rows == 1 {
         return build_nvfp4_linear_gemv(config);
     }
     build_nvfp4_linear_matrix(config)
