@@ -291,7 +291,7 @@ fn measure_nvfp4_workloads(platform: &nml::Platform) {
 fn measure_nvfp4_embedding(platform: &nml::Platform) {
     const TOKENS: usize = 128;
     let index_shape = Shape::new(DType::I32, &[TOKENS as i64]).unwrap();
-    let embedding = Parameter::nvfp4(
+    let embedding = Parameter::nvfp4_embedding(
         "embedding",
         "model.embed_tokens.weight",
         Shape::new(

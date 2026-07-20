@@ -146,18 +146,18 @@ unsafe fn execute_linear(frame: &mut sys::XLA_FFI_CallFrame) -> Result<(), Handl
         return Err(invalid("NVFP4 CPU linear received invalid ranks"));
     }
     let inputs = to_usize(*activation_dimensions.last().unwrap(), "input width")?;
-    let outputs = to_usize(payload_dimensions[0], "output width")?;
+    let outputs = to_usize(payload_dimensions[1], "output width")?;
     if inputs == 0
         || outputs == 0
-        || payload_dimensions[1] != i64::try_from(inputs.div_ceil(2)).unwrap_or(i64::MAX)
+        || payload_dimensions[0] != i64::try_from(inputs.div_ceil(2)).unwrap_or(i64::MAX)
         || scale_dimensions
             != [
-                payload_dimensions[0],
                 i64::try_from(inputs.div_ceil(16)).unwrap_or(i64::MAX),
+                payload_dimensions[1],
             ]
         || output_dimensions[..output_dimensions.len() - 1]
             != activation_dimensions[..activation_dimensions.len() - 1]
-        || output_dimensions[output_dimensions.len() - 1] != payload_dimensions[0]
+        || output_dimensions[output_dimensions.len() - 1] != payload_dimensions[1]
     {
         return Err(invalid("NVFP4 CPU linear buffer shapes are inconsistent"));
     }
@@ -170,7 +170,7 @@ unsafe fn execute_linear(frame: &mut sys::XLA_FFI_CallFrame) -> Result<(), Handl
         return Err(invalid("NVFP4 CPU linear buffer dtypes are inconsistent"));
     }
     if let Some(bias) = bias
-        && (dimensions(bias)? != [payload_dimensions[0]] || bias.dtype != activation.dtype)
+        && (dimensions(bias)? != [payload_dimensions[1]] || bias.dtype != activation.dtype)
     {
         return Err(invalid(
             "NVFP4 CPU linear bias must be a length-N vector matching the activation dtype",
@@ -212,7 +212,7 @@ unsafe fn execute_linear(frame: &mut sys::XLA_FFI_CallFrame) -> Result<(), Handl
     };
     let logical_shape = Shape::new(dtype, &[outputs as i64, inputs as i64])
         .map_err(|error| invalid(&error.to_string()))?;
-    let weight = Weight::new(logical_shape, payload_values, scale_values, global_value)
+    let weight = Weight::contraction(logical_shape, payload_values, scale_values, global_value)
         .map_err(|error| invalid(&error.to_string()))?;
     let input = read_activation(activation, activation_count)?;
     let bias = bias
@@ -287,25 +287,25 @@ unsafe fn execute_routed_swiglu(
     if tokens != to_usize(routing_dimensions[0], "routing token count")?
         || hidden_size != gate_inputs
         || experts == 0
-        || gate_payload_dimensions[1] != doubled_intermediate as i64
-        || gate_payload_dimensions[2]
+        || gate_payload_dimensions[1]
             != i64::try_from(hidden_size.div_ceil(2)).unwrap_or(i64::MAX)
+        || gate_payload_dimensions[2] != doubled_intermediate as i64
         || gate_scale_dimensions
             != [
                 gate_payload_dimensions[0],
-                doubled_intermediate as i64,
                 i64::try_from(hidden_size.div_ceil(16)).unwrap_or(i64::MAX),
+                doubled_intermediate as i64,
             ]
         || gate_bias_dimensions != [gate_payload_dimensions[0], doubled_intermediate as i64]
         || down_payload_dimensions[0] != gate_payload_dimensions[0]
-        || down_payload_dimensions[1] != hidden_size as i64
-        || down_payload_dimensions[2]
+        || down_payload_dimensions[1]
             != i64::try_from(intermediate.div_ceil(2)).unwrap_or(i64::MAX)
+        || down_payload_dimensions[2] != hidden_size as i64
         || down_scale_dimensions
             != [
                 gate_payload_dimensions[0],
-                hidden_size as i64,
                 i64::try_from(intermediate.div_ceil(16)).unwrap_or(i64::MAX),
+                hidden_size as i64,
             ]
         || down_bias_dimensions != [gate_payload_dimensions[0], hidden_size as i64]
     {
@@ -391,14 +391,14 @@ unsafe fn execute_routed_swiglu(
         &[experts as i64, hidden_size as i64, intermediate as i64],
     )
     .map_err(|error| invalid(&error.to_string()))?;
-    let gate = Weight::new(
+    let gate = Weight::contraction(
         gate_shape,
         unsafe { bytes(gate_payload, gate_payload_count)? },
         unsafe { bytes(gate_scales, gate_scale_count)? },
         unsafe { *gate_global.data.cast::<f32>() },
     )
     .map_err(|error| invalid(&error.to_string()))?;
-    let down = Weight::new(
+    let down = Weight::contraction(
         down_shape,
         unsafe { bytes(down_payload, down_payload_count)? },
         unsafe { bytes(down_scales, down_scale_count)? },
@@ -511,7 +511,7 @@ unsafe fn execute_embedding(frame: &mut sys::XLA_FFI_CallFrame) -> Result<(), Ha
     };
     let logical_shape = Shape::new(dtype, &[vocabulary as i64, width as i64])
         .map_err(|error| invalid(&error.to_string()))?;
-    let weight = Weight::new(logical_shape, payload_values, scale_values, global_value)
+    let weight = Weight::rowwise(logical_shape, payload_values, scale_values, global_value)
         .map_err(|error| invalid(&error.to_string()))?;
     let indices = read_indices(indices, index_count)?;
     let mut computed = vec![0.0f32; output_count];

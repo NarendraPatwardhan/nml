@@ -190,12 +190,16 @@ dtype or an arbitrary tuple of tensors. The representation must remain packed
 through loading and device residency and lower through capability-selected CPU,
 pre-Blackwell emulation, or native Blackwell kernels.
 
-Its canonical recipe-v2 contraction layout is output-major and K-contiguous:
-`[N, K]` for ordinary projections, `[E, 2I, K]` for expert gate/up, and
-`[E, H, I]` for expert down. Source expert tensors are transposed before
-quantization. Every retained backend consumes this one physical mapping;
-runtime repacking, a second prepared copy, and recipe-v1 compatibility are not
-part of the architecture.
+Its canonical recipe-v3 storage is operation-shaped. Logical contraction
+weights remain `[N, K]`, `[E, 2I, K]`, and `[E, H, I]`, while payload and
+block-scale components store encoded K before contiguous N:
+`[packed K, N]`, `[E, packed K, 2I]`, and `[E, packed I, H]`. Indexed
+embeddings alone remain rowwise because lookup selects complete vocabulary
+rows. Source expert tensors are transposed into logical `[E, N, K]` before
+quantization, then encoded contraction components swap their final two axes.
+CPU, SM75, and Triton consume these operation-shaped components directly;
+runtime repacking, a second prepared copy, and earlier-recipe compatibility
+are not part of the architecture.
 
 W4A16 and W8A8 remain later independent product goals. Implementing NVFP4 does
 not select their signedness, calibration, grouping, scale, or checkpoint

@@ -23,7 +23,8 @@ mod unified_attention;
 pub use moe::{GatedActivation, GroupedProjectionConfig, build_grouped_projection};
 pub use nvfp4::{
     NvFp4EmbeddingConfig, NvFp4GroupedProjectionConfig, NvFp4GroupedRole, NvFp4LinearConfig,
-    build_nvfp4_embedding, build_nvfp4_grouped_projection, build_nvfp4_linear,
+    build_nvfp4_embedding, build_nvfp4_grouped_projection,
+    build_nvfp4_grouped_projection_finalize, build_nvfp4_linear, build_nvfp4_linear_finalize,
 };
 pub use paged_attention::{AttentionGeometry, AttentionLaunch, select_attention_launch};
 pub use specification::{KernelLaunch, KernelSpec, OutputAlias, TensorSpec};
@@ -274,6 +275,68 @@ pub enum Comparison {
 pub enum Reduction {
     Sum,
     Maximum,
+}
+
+/// Source-level cache intent for a Triton memory operation.
+///
+/// These values deliberately mirror the pinned Triton dialect rather than
+/// exposing its integer attribute encoding to kernel authors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CacheModifier {
+    Default,
+    CacheAll,
+    Streaming,
+}
+
+impl CacheModifier {
+    const fn dialect_value(self) -> i32 {
+        match self {
+            Self::Default => 1,
+            Self::CacheAll => 2,
+            Self::Streaming => 5,
+        }
+    }
+}
+
+/// Reuse priority communicated to Triton's NVIDIA load lowering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvictionPolicy {
+    Normal,
+    First,
+    Last,
+}
+
+impl EvictionPolicy {
+    const fn dialect_value(self) -> i32 {
+        match self {
+            Self::Normal => 1,
+            Self::First => 2,
+            Self::Last => 3,
+        }
+    }
+}
+
+/// A typed load policy. Compact weights stream through L1 while the much
+/// smaller activation tile is retained across output tiles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LoadPolicy {
+    cache: CacheModifier,
+    eviction: EvictionPolicy,
+}
+
+impl LoadPolicy {
+    pub const DEFAULT: Self = Self {
+        cache: CacheModifier::Default,
+        eviction: EvictionPolicy::Normal,
+    };
+    pub const STREAMING: Self = Self {
+        cache: CacheModifier::Streaming,
+        eviction: EvictionPolicy::First,
+    };
+    pub const REUSED: Self = Self {
+        cache: CacheModifier::CacheAll,
+        eviction: EvictionPolicy::Last,
+    };
 }
 
 /// Storage interpretation for one `tt.dot_scaled` operand.
@@ -1543,6 +1606,16 @@ impl Builder {
         mask: &Value,
         other: &Value,
     ) -> Result<Value, Error> {
+        self.load_masked_with(pointer, mask, other, LoadPolicy::DEFAULT)
+    }
+
+    pub(crate) fn load_masked_with(
+        &mut self,
+        pointer: &Value,
+        mask: &Value,
+        other: &Value,
+        policy: LoadPolicy,
+    ) -> Result<Value, Error> {
         self.require_values(&[pointer, mask, other])?;
         let result = pointer.value_type.loaded().ok_or(Error::ExpectedPointer)?;
         if mask.value_type != result.condition_type() || other.value_type != result {
@@ -1553,10 +1626,12 @@ impl Builder {
         self.emit_value(
             result.clone(),
             format!(
-                "\"tt.load\"({}, {}, {}) <{{cache = 1 : i32, evict = 1 : i32, isVolatile = false, operandSegmentSizes = array<i32: 1, 1, 1>}}> : ({}, {}, {}) -> {}",
+                "\"tt.load\"({}, {}, {}) <{{cache = {} : i32, evict = {} : i32, isVolatile = false, operandSegmentSizes = array<i32: 1, 1, 1>}}> : ({}, {}, {}) -> {}",
                 pointer.id,
                 mask.id,
                 other.id,
+                policy.cache.dialect_value(),
+                policy.eviction.dialect_value(),
                 pointer.value_type.spelling(),
                 mask.value_type.spelling(),
                 other.value_type.spelling(),

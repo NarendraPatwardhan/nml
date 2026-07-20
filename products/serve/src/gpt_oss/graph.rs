@@ -641,6 +641,10 @@ mod tests {
                 nml::Parameter::nvfp4(name, name, shape)
                     .map_err(|error| Box::new(error) as BoxError)
             },
+            &mut |name, shape| {
+                nml::Parameter::nvfp4_embedding(name, name, shape)
+                    .map_err(|error| Box::new(error) as BoxError)
+            },
         )
         .unwrap()
     }

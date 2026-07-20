@@ -432,6 +432,12 @@ pub mod io {
         prefix: String,
     }
 
+    #[derive(Clone, Copy)]
+    enum NvFp4Use {
+        Contraction,
+        Embedding,
+    }
+
     /// Exact physical-transfer accounting for one transactional parameter load.
     ///
     /// Logical parameter count is deliberately absent: tied parameters and
@@ -566,7 +572,8 @@ pub mod io {
                 .map_err(super::Error::Parameter)
         }
 
-        /// Resolves the three physical records of NML NVFP4 recipe v2.
+        /// Resolves the three physical records of a contraction-major NML
+        /// NVFP4 recipe-v3 parameter.
         ///
         /// A base `<name>` owns `<name>.payload`, `<name>.block_scales`, and
         /// `<name>.global_scale`. Partially present bases are rejected rather
@@ -578,6 +585,29 @@ pub mod io {
             logical_shape: nml_types::Shape,
             aliases: &[&str],
         ) -> Result<Parameter, super::Error> {
+            self.nvfp4_with(name, logical_shape, aliases, NvFp4Use::Contraction)
+        }
+
+        /// Resolves the rowwise recipe-v3 representation used by semantic
+        /// embedding lookup. Artifact suffixes stay identical; component
+        /// shapes make mixing rowwise and contraction-major records fail
+        /// before allocation.
+        pub fn nvfp4_embedding(
+            &self,
+            name: &str,
+            logical_shape: nml_types::Shape,
+            aliases: &[&str],
+        ) -> Result<Parameter, super::Error> {
+            self.nvfp4_with(name, logical_shape, aliases, NvFp4Use::Embedding)
+        }
+
+        fn nvfp4_with(
+            &self,
+            name: &str,
+            logical_shape: nml_types::Shape,
+            aliases: &[&str],
+            use_: NvFp4Use,
+        ) -> Result<Parameter, super::Error> {
             let logical_name = join(&self.prefix, name);
             let mut bases = Vec::with_capacity(aliases.len() + 1);
             bases.push(logical_name.clone());
@@ -585,8 +615,15 @@ pub mod io {
 
             let mut complete = Vec::new();
             for base in bases {
-                let parameter = Parameter::nvfp4(&logical_name, &base, logical_shape)
-                    .map_err(super::Error::Parameter)?;
+                let parameter = match use_ {
+                    NvFp4Use::Contraction => {
+                        Parameter::nvfp4(&logical_name, &base, logical_shape)
+                    }
+                    NvFp4Use::Embedding => {
+                        Parameter::nvfp4_embedding(&logical_name, &base, logical_shape)
+                    }
+                }
+                .map_err(super::Error::Parameter)?;
                 let present = parameter
                     .components()
                     .iter()

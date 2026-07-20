@@ -43,7 +43,7 @@ fn nvfp4_parameters_derive_exact_physical_components() {
         parameter.representation_id().kind(),
         RepresentationKind::NvFp4
     );
-    assert_eq!(parameter.representation_id().version(), 2);
+    assert_eq!(parameter.representation_id().version(), 3);
     let spec = parameter.nvfp4_spec().unwrap();
     assert_eq!(spec.quantized_axis(), 1);
     assert_eq!(spec.block_size(), 16);
@@ -61,7 +61,7 @@ fn nvfp4_parameters_derive_exact_physical_components() {
         StorageEncoding::PackedE2M1x2
     );
     assert_eq!(components[0].storage().shape().dtype(), DType::U8);
-    assert_eq!(components[0].storage().shape().dimensions(), &[3, 9]);
+    assert_eq!(components[0].storage().shape().dimensions(), &[9, 3]);
 
     assert_eq!(components[1].role(), ComponentRole::BlockScales);
     assert_eq!(
@@ -72,12 +72,22 @@ fn nvfp4_parameters_derive_exact_physical_components() {
         components[1].storage().encoding(),
         StorageEncoding::E4M3FnBits
     );
-    assert_eq!(components[1].storage().shape().dimensions(), &[3, 2]);
+    assert_eq!(components[1].storage().shape().dimensions(), &[2, 3]);
 
     assert_eq!(components[2].role(), ComponentRole::GlobalScale);
     assert_eq!(components[2].storage().shape().dtype(), DType::F32);
     assert_eq!(components[2].storage().shape().dimensions(), &[]);
     assert!(parameter.dense_component().is_none());
+}
+
+#[test]
+fn nvfp4_embeddings_retain_rowwise_lookup_storage() {
+    let shape = Shape::new(DType::Bf16, &[3, 17]).unwrap();
+    let parameter =
+        Parameter::nvfp4_embedding("model.embedding", "checkpoint.embedding", shape).unwrap();
+    assert_eq!(parameter.representation_id().version(), 3);
+    assert_eq!(parameter.components()[0].storage().shape().dimensions(), &[3, 9]);
+    assert_eq!(parameter.components()[1].storage().shape().dimensions(), &[3, 2]);
 }
 
 #[test]
@@ -159,14 +169,14 @@ fn nvfp4_sharding_derives_co_sharded_components_and_replicates_global_scale() {
             .shard_shape(parameter.components()[0].storage().shape())
             .unwrap()
             .dimensions(),
-        &[16, 720]
+        &[720, 16]
     );
     assert_eq!(
         sharding
             .shard_shape(parameter.components()[1].storage().shape())
             .unwrap()
             .dimensions(),
-        &[16, 90]
+        &[90, 16]
     );
     assert_eq!(
         sharding

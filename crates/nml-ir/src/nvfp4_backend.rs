@@ -9,7 +9,8 @@ use crate::{Error, device_capabilities::CudaCapabilities};
 use nml_kernel_triton::{
     DType as KernelDType, KernelLaunch, KernelSpec, NvFp4EmbeddingConfig,
     NvFp4GroupedProjectionConfig, NvFp4GroupedRole, NvFp4LinearConfig, TensorSpec,
-    build_nvfp4_embedding, build_nvfp4_grouped_projection, build_nvfp4_linear,
+    build_nvfp4_embedding, build_nvfp4_grouped_projection,
+    build_nvfp4_grouped_projection_finalize, build_nvfp4_linear, build_nvfp4_linear_finalize,
 };
 use nml_mlir::{Block, Context, Region, Type, Value};
 use nml_types::{DType, Partition, Shape};
@@ -31,6 +32,7 @@ pub(crate) struct LinearInputs<'context> {
 
 pub(crate) struct ExpertInputs<'context> {
     pub hidden: Value<'context>,
+    pub expert_ids: Value<'context>,
     pub routing_weights: Value<'context>,
     pub gate_payload: Value<'context>,
     pub gate_scales: Value<'context>,
@@ -45,6 +47,7 @@ pub(crate) struct ExpertInputs<'context> {
     pub active_blocks: Value<'context>,
     pub expert_offset: Option<Value<'context>>,
     pub hidden_shape: Shape,
+    pub expert_ids_shape: Shape,
     pub routing_shape: Shape,
     pub gate_payload_shape: Shape,
     pub gate_scales_shape: Shape,
@@ -113,13 +116,17 @@ pub(crate) fn lower_linear<'context>(
         tensor(KernelDType::U8, inputs.block_scales_shape.dimensions())?,
         tensor(KernelDType::F32, inputs.global_scale_shape.dimensions())?,
     ];
-    if let Some(shape) = inputs.bias_shape {
+    if rows != 1 && let Some(shape) = inputs.bias_shape {
         argument_specs.push(tensor(plan.config.dtype, shape.dimensions())?);
     }
     let specification = KernelSpec::new(
         build_nvfp4_linear(plan.config).map_err(kernel_error)?,
         argument_specs,
-        vec![tensor(plan.config.dtype, &output_shape)?],
+        vec![if rows == 1 {
+            tensor(KernelDType::F32, &[plan.config.split_k, outputs])?
+        } else {
+            tensor(plan.config.dtype, &output_shape)?
+        }],
         vec![],
     )
     .map_err(kernel_error)?;
@@ -129,7 +136,7 @@ pub(crate) fn lower_linear<'context>(
         ("block_scales", inputs.block_scales),
         ("global_scale", inputs.global_scale),
     ];
-    if let Some(bias) = inputs.bias {
+    if rows != 1 && let Some(bias) = inputs.bias {
         arguments.push(("bias", bias));
     }
     let call = specification
@@ -145,6 +152,44 @@ pub(crate) fn lower_linear<'context>(
         .map_err(kernel_error)?;
     let result = call.result(0)?;
     block.append_operation(call)?;
+
+    let result = if rows == 1 {
+        let mut final_specs = vec![tensor(KernelDType::F32, &[plan.config.split_k, outputs])?];
+        let mut final_arguments = vec![("partials", result)];
+        if let (Some(bias), Some(shape)) = (inputs.bias, inputs.bias_shape) {
+            final_specs.push(tensor(plan.config.dtype, shape.dimensions())?);
+            final_arguments.push(("bias", bias));
+        }
+        let finalize = KernelSpec::new(
+            build_nvfp4_linear_finalize(plan.config).map_err(kernel_error)?,
+            final_specs,
+            vec![tensor(plan.config.dtype, &output_shape)?],
+            vec![],
+        )
+        .map_err(kernel_error)?;
+        let call = finalize
+            .lower(
+                context,
+                &final_arguments,
+                KernelLaunch {
+                    grid: [
+                        i32::try_from(ceil_div(outputs, plan.config.block_n)
+                            .ok_or(Error::InvalidLinearAlgebra("NVFP4 finalizer grid overflows"))?)
+                            .map_err(|_| Error::InvalidLinearAlgebra("NVFP4 finalizer grid exceeds I32"))?,
+                        1,
+                        1,
+                    ],
+                    warps: 1,
+                    stages: 1,
+                },
+            )
+            .map_err(kernel_error)?;
+        let result = call.result(0)?;
+        block.append_operation(call)?;
+        result
+    } else {
+        result
+    };
 
     if result.type_().text() == inputs.result_type.text() {
         return Ok(result);
@@ -200,10 +245,10 @@ pub(crate) fn lower_routed_swiglu<'context>(
         .checked_add(1)
         .ok_or(Error::InvalidMoe("NVFP4 intermediate width overflows"))?
         / 2;
-    if inputs.gate_payload_shape.dimensions()[2] != packed_hidden
-        || inputs.gate_payload_shape.dimensions()[1] != gate_output
-        || inputs.down_payload_shape.dimensions()[1] != down_output
-        || inputs.down_payload_shape.dimensions()[2] != packed_intermediate
+    if inputs.gate_payload_shape.dimensions()[1] != packed_hidden
+        || inputs.gate_payload_shape.dimensions()[2] != gate_output
+        || inputs.down_payload_shape.dimensions()[2] != down_output
+        || inputs.down_payload_shape.dimensions()[1] != packed_intermediate
         || down_output != hidden_size
     {
         return Err(Error::InvalidMoe(
@@ -232,6 +277,12 @@ pub(crate) fn lower_routed_swiglu<'context>(
             hidden_size,
         )?
     };
+    if !use_turing_adapter && tokens == 1 {
+        // Decode finalization already performs the top-k route reduction and
+        // returns the semantic token result. Prefill and SM75 retain the
+        // assignment-shaped result consumed by the portable reduction below.
+        return Ok(down);
+    }
 
     let grouped_type = context.ranked_tensor_type(
         inputs.hidden_shape.dtype(),
@@ -329,6 +380,20 @@ fn lower_triton_experts<'context>(
             constant(context, block, type_, "0")?
         }
     };
+    if inputs.hidden_shape.dimensions()[0] == 1 {
+        return lower_triton_decode_experts(
+            context,
+            block,
+            inputs,
+            assignments,
+            experts_per_token,
+            local_experts,
+            intermediate,
+            hidden_size,
+            expert_offset,
+            plan,
+        );
+    }
 
     let gate_config = NvFp4GroupedProjectionConfig {
         dtype,
@@ -341,6 +406,7 @@ fn lower_triton_experts<'context>(
         block_m,
         block_n,
         block_k,
+        split_k: if inputs.hidden_shape.dimensions()[0] == 1 { 4 } else { 1 },
         role: NvFp4GroupedRole::GateUpActivated,
     };
     let gate_specification = KernelSpec::new(
@@ -397,6 +463,7 @@ fn lower_triton_experts<'context>(
         block_m,
         block_n,
         block_k,
+        split_k: if inputs.hidden_shape.dimensions()[0] == 1 { 4 } else { 1 },
         role: NvFp4GroupedRole::Down,
     };
     let down_specification = KernelSpec::new(
@@ -445,6 +512,221 @@ fn lower_triton_experts<'context>(
     block.append_operation(down_call)?;
 
     Ok(down)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_triton_decode_experts<'context>(
+    context: &'context Context,
+    block: &mut Block<'context>,
+    inputs: &ExpertInputs<'context>,
+    assignments: i64,
+    experts_per_token: i64,
+    local_experts: i64,
+    intermediate: i64,
+    hidden_size: i64,
+    expert_offset: Value<'context>,
+    plan: GroupedPlan,
+) -> Result<Value<'context>, Error> {
+    let dtype = kernel_dtype(inputs.hidden_shape.dtype(), "NVFP4 routed clamped SwiGLU")?;
+    let block_m = i64::try_from(inputs.block_size)
+        .map_err(|_| Error::InvalidMoe("NVFP4 expert block size exceeds I64"))?;
+    let split_k = 4;
+    let gate_config = NvFp4GroupedProjectionConfig {
+        dtype,
+        tokens: 1,
+        assignments,
+        input_size: hidden_size,
+        output_size: intermediate,
+        local_experts,
+        source_row_divisor: experts_per_token,
+        block_m,
+        block_n: plan.block_n,
+        block_k: plan.block_k,
+        split_k,
+        role: NvFp4GroupedRole::GateUpActivated,
+    };
+    let gate_partials_shape = [assignments, split_k, intermediate * 2];
+    let gate_specification = KernelSpec::new(
+        build_nvfp4_grouped_projection(gate_config).map_err(kernel_error)?,
+        vec![
+            tensor(dtype, inputs.hidden_shape.dimensions())?,
+            tensor(KernelDType::I32, inputs.schedule_shape.dimensions())?,
+            tensor(KernelDType::I32, inputs.block_experts_shape.dimensions())?,
+            tensor(KernelDType::I32, &[])?,
+            tensor(KernelDType::U8, inputs.gate_payload_shape.dimensions())?,
+            tensor(KernelDType::U8, inputs.gate_scales_shape.dimensions())?,
+            tensor(KernelDType::F32, inputs.gate_global_shape.dimensions())?,
+            tensor(KernelDType::I32, &[])?,
+        ],
+        vec![tensor(KernelDType::F32, &gate_partials_shape)?],
+        vec![],
+    )
+    .map_err(kernel_error)?;
+    let mut launch = grouped_launch(
+        inputs.block_experts_shape.dimensions()[0],
+        intermediate,
+        plan.block_n,
+        plan.warps,
+        plan.stages,
+    )?;
+    launch.grid[2] = i32::try_from(split_k)
+        .map_err(|_| Error::InvalidMoe("NVFP4 grouped split count exceeds I32"))?;
+    let gate_call = gate_specification
+        .lower(
+            context,
+            &[
+                ("input", inputs.hidden),
+                ("sorted_assignments", inputs.sorted_assignments),
+                ("block_experts", inputs.block_experts),
+                ("active_blocks", inputs.active_blocks),
+                ("payload", inputs.gate_payload),
+                ("block_scales", inputs.gate_scales),
+                ("global_scale", inputs.gate_global),
+                ("expert_offset", expert_offset),
+            ],
+            launch,
+        )
+        .map_err(kernel_error)?;
+    let gate_partials = gate_call.result(0)?;
+    block.append_operation(gate_call)?;
+
+    let activated_shape = [assignments, intermediate];
+    let gate_finalize = KernelSpec::new(
+        build_nvfp4_grouped_projection_finalize(gate_config).map_err(kernel_error)?,
+        vec![
+            tensor(KernelDType::F32, &gate_partials_shape)?,
+            tensor(KernelDType::I32, inputs.expert_ids_shape.dimensions())?,
+            tensor(dtype, inputs.gate_bias_shape.dimensions())?,
+            tensor(KernelDType::I32, &[])?,
+        ],
+        vec![tensor(dtype, &activated_shape)?],
+        vec![],
+    )
+    .map_err(kernel_error)?;
+    let gate_call = gate_finalize
+        .lower(
+            context,
+            &[
+                ("partials", gate_partials),
+                ("expert_ids", inputs.expert_ids),
+                ("bias", inputs.gate_bias),
+                ("expert_offset", expert_offset),
+            ],
+            KernelLaunch {
+                grid: [
+                    i32::try_from(assignments)
+                        .map_err(|_| Error::InvalidMoe("NVFP4 assignment count exceeds I32"))?,
+                    i32::try_from(ceil_div(intermediate, plan.block_n)
+                        .ok_or(Error::InvalidMoe("NVFP4 gate output grid overflows"))?)
+                        .map_err(|_| Error::InvalidMoe("NVFP4 gate output grid exceeds I32"))?,
+                    1,
+                ],
+                warps: 1,
+                stages: 1,
+            },
+        )
+        .map_err(kernel_error)?;
+    let activated = gate_call.result(0)?;
+    block.append_operation(gate_call)?;
+
+    let down_config = NvFp4GroupedProjectionConfig {
+        dtype,
+        tokens: 1,
+        assignments,
+        input_size: intermediate,
+        output_size: hidden_size,
+        local_experts,
+        source_row_divisor: 1,
+        block_m,
+        block_n: plan.block_n,
+        block_k: plan.block_k,
+        split_k,
+        role: NvFp4GroupedRole::Down,
+    };
+    let down_partials_shape = [assignments, split_k, hidden_size];
+    let down_specification = KernelSpec::new(
+        build_nvfp4_grouped_projection(down_config).map_err(kernel_error)?,
+        vec![
+            tensor(dtype, &activated_shape)?,
+            tensor(KernelDType::I32, inputs.schedule_shape.dimensions())?,
+            tensor(KernelDType::I32, inputs.block_experts_shape.dimensions())?,
+            tensor(KernelDType::I32, &[])?,
+            tensor(KernelDType::U8, inputs.down_payload_shape.dimensions())?,
+            tensor(KernelDType::U8, inputs.down_scales_shape.dimensions())?,
+            tensor(KernelDType::F32, inputs.down_global_shape.dimensions())?,
+            tensor(KernelDType::I32, &[])?,
+        ],
+        vec![tensor(KernelDType::F32, &down_partials_shape)?],
+        vec![],
+    )
+    .map_err(kernel_error)?;
+    let mut launch = grouped_launch(
+        inputs.block_experts_shape.dimensions()[0],
+        hidden_size,
+        plan.block_n,
+        plan.warps,
+        plan.stages,
+    )?;
+    launch.grid[2] = i32::try_from(split_k)
+        .map_err(|_| Error::InvalidMoe("NVFP4 grouped split count exceeds I32"))?;
+    let down_call = down_specification
+        .lower(
+            context,
+            &[
+                ("input", activated),
+                ("sorted_assignments", inputs.sorted_assignments),
+                ("block_experts", inputs.block_experts),
+                ("active_blocks", inputs.active_blocks),
+                ("payload", inputs.down_payload),
+                ("block_scales", inputs.down_scales),
+                ("global_scale", inputs.down_global),
+                ("expert_offset", expert_offset),
+            ],
+            launch,
+        )
+        .map_err(kernel_error)?;
+    let down_partials = down_call.result(0)?;
+    block.append_operation(down_call)?;
+
+    let down_finalize = KernelSpec::new(
+        build_nvfp4_grouped_projection_finalize(down_config).map_err(kernel_error)?,
+        vec![
+            tensor(KernelDType::F32, &down_partials_shape)?,
+            tensor(KernelDType::I32, inputs.expert_ids_shape.dimensions())?,
+            tensor(dtype, inputs.routing_shape.dimensions())?,
+            tensor(dtype, inputs.down_bias_shape.dimensions())?,
+            tensor(KernelDType::I32, &[])?,
+        ],
+        vec![tensor(dtype, &[1, hidden_size])?],
+        vec![],
+    )
+    .map_err(kernel_error)?;
+    let down_call = down_finalize
+        .lower(
+            context,
+            &[
+                ("partials", down_partials),
+                ("expert_ids", inputs.expert_ids),
+                ("routing_weights", inputs.routing_weights),
+                ("bias", inputs.down_bias),
+                ("expert_offset", expert_offset),
+            ],
+            KernelLaunch {
+                grid: [
+                    1,
+                    i32::try_from(ceil_div(hidden_size, plan.block_n)
+                        .ok_or(Error::InvalidMoe("NVFP4 down output grid overflows"))?)
+                        .map_err(|_| Error::InvalidMoe("NVFP4 down output grid exceeds I32"))?,
+                    1,
+                ],
+                warps: 1,
+                stages: 1,
+            },
+        )
+        .map_err(kernel_error)?;
+    let result = down_call.result(0)?;
+    block.append_operation(down_call)?;
+    Ok(result)
 }
 
 pub(crate) fn lower_embedding<'context>(
@@ -619,23 +901,32 @@ impl LinearPlan {
                 inputs,
                 block_m,
                 block_n: if rows == 1 {
-                    if outputs >= 65_536 { 32 } else { 8 }
+                    if outputs >= 65_536 { 256 } else { 128 }
                 } else if latency_sensitive {
                     64
                 } else {
                     128
                 },
                 block_k: if rows == 1 {
-                    256
+                    16
                 } else if latency_sensitive {
                     128
                 } else {
                     64
                 },
                 has_bias,
+                split_k: if rows != 1 || outputs >= 65_536 {
+                    1
+                } else if outputs <= 512 {
+                    32
+                } else {
+                    4
+                },
             },
             warps: if rows > 128 && capabilities.supports_warp_group_mma() {
                 8
+            } else if rows == 1 {
+                1
             } else {
                 4
             },
@@ -645,18 +936,18 @@ impl LinearPlan {
 }
 
 impl GroupedPlan {
-    /// Selects from a finite, reviewable tile family. Decode and small batches
-    /// are dominated by expert-weight traffic, so they use a wider K tile and
-    /// four pipeline stages. Larger M exposes activation reuse and uses wider
-    /// output tiles; sufficiently large batches employ eight warps on every
-    /// retained Triton-capable NVIDIA generation. These boundaries deliberately
-    /// match ZML's built-in grouped-MoE policy.
+    /// Selects from a finite, reviewable tile family. Decode uses one warp over
+    /// a wide contiguous output tile and obtains K parallelism from the bounded
+    /// split dimension. Larger M exposes activation reuse to the tensor-core
+    /// family and increases pipeline depth; sufficiently large batches use
+    /// eight warps. No runtime autotuner or benchmark-only selector enters the
+    /// semantic graph.
     const fn new(tokens: i64) -> Self {
         if tokens == 1 {
             Self {
-                block_n: 8,
-                block_k: 256,
-                warps: 4,
+                block_n: 128,
+                block_k: 16,
+                warps: 1,
                 stages: 1,
             }
         } else if tokens <= 32 {
@@ -810,6 +1101,12 @@ fn grouped_launch(
         warps,
         stages,
     })
+}
+
+fn ceil_div(value: i64, divisor: i64) -> Option<i64> {
+    value
+        .checked_add(divisor.checked_sub(1)?)?
+        .checked_div(divisor)
 }
 
 fn kernel_dtype(dtype: DType, operation: &'static str) -> Result<KernelDType, Error> {

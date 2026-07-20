@@ -21,22 +21,17 @@ pub(super) fn available() -> bool {
 /// # Safety
 ///
 /// The caller has checked AVX2 support and that `block_start..block_start+16`
-/// lies inside the logical row. `Weight::new` has already validated the
+/// lies inside the logical row. `Weight` construction has already validated the
 /// corresponding packed and scale extents.
 #[target_feature(enable = "avx2")]
 unsafe fn decode_block(weight: &Weight<'_>, row: usize, block_start: usize) -> (__m256, __m256) {
-    let payload_offset = row * weight.packed_width + block_start / 2;
-    // SAFETY: the caller supplies a complete logical block, which occupies
-    // exactly eight validated payload bytes.
-    let packed = unsafe {
-        _mm_loadl_epi64(
-            weight
-                .payload
-                .as_ptr()
-                .add(payload_offset)
-                .cast::<__m128i>(),
-        )
-    };
+    let pair_start = block_start / 2;
+    let mut bytes = [0u8; 8];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = weight.payload[weight.packed_offset(row, pair_start + index)];
+    }
+    // SAFETY: `bytes` owns exactly the eight bytes required by the load.
+    let packed = unsafe { _mm_loadl_epi64(bytes.as_ptr().cast::<__m128i>()) };
     let nibble_mask = _mm_set1_epi8(0x0f);
     let low = _mm_and_si128(packed, nibble_mask);
     let high = _mm_and_si128(_mm_srli_epi16(packed, 4), nibble_mask);
@@ -45,7 +40,7 @@ unsafe fn decode_block(weight: &Weight<'_>, row: usize, block_start: usize) -> (
     let second_codes = _mm256_cvtepu8_epi32(_mm_srli_si128(interleaved, 8));
     let first = unsafe { _mm256_i32gather_ps(E2M1_VALUES.as_ptr(), first_codes, 4) };
     let second = unsafe { _mm256_i32gather_ps(E2M1_VALUES.as_ptr(), second_codes, 4) };
-    let scale_bits = weight.block_scales[row * weight.scale_width + block_start / BLOCK_SIZE];
+    let scale_bits = weight.block_scales[weight.scale_offset(row, block_start / BLOCK_SIZE)];
     let scale = decode_e4m3fn_scale(scale_bits)
         .expect("Weight construction validates E4M3FN scales")
         * weight.global_scale;

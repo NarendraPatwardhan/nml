@@ -93,6 +93,11 @@ pub(super) fn declare(parameters: &ParameterSet, config: &Config) -> Result<Chec
                 .nvfp4(name, shape, &[])
                 .map_err(|error| Box::new(error) as BoxError)
         },
+        &mut |name, shape| {
+            parameters
+                .nvfp4_embedding(name, shape, &[])
+                .map_err(|error| Box::new(error) as BoxError)
+        },
     )
 }
 
@@ -160,6 +165,7 @@ pub(super) fn declare_with(
     config: &Config,
     dense: &mut impl FnMut(&str, Shape) -> Result<Parameter>,
     nvfp4: &mut impl FnMut(&str, Shape) -> Result<Parameter>,
+    nvfp4_embedding: &mut impl FnMut(&str, Shape) -> Result<Parameter>,
 ) -> Result<Checkpoint> {
     let hidden = config.hidden_size();
     let query = config.query_width();
@@ -241,7 +247,7 @@ pub(super) fn declare_with(
     Ok(Checkpoint {
         model: Transformer {
             embed_tokens: Weight {
-                weight: nvfp4(
+                weight: nvfp4_embedding(
                     "model.embed_tokens.weight",
                     shape(&[config.vocabulary(), hidden])?,
                 )?,

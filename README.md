@@ -232,7 +232,7 @@ manifest once, then accepts fresh activation buffers on each call.
 | Paged attention | Portable blockwise CPU/CUDA path complete; optimized Triton execution passed on SM86 and SM90. |
 | MoE | Portable CPU/CUDA execution complete; four-device CPU expert sharding executes numerically; grouped Triton execution passed on SM86 and SM90. |
 | Distributed execution | Real Shardy placement and collectives are verified on CPU. Multi-GPU CUDA execution remains hardware-deferred. |
-| Quantization | NVFP4 recipe v2 has one output-major/K-contiguous compact checkpoint layout with CPU, SM75 CUDA, and SM80+ Triton execution paths. W4A16 and W8A8 remain independent future verticals. |
+| Quantization | NVFP4 recipe v3 derives rowwise embedding storage and contraction-major `[packed K, N]` storage from one logical representation, with CPU, SM75 CUDA, and SM80+ Triton execution paths. W4A16 and W8A8 remain independent future verticals. |
 | Training | No autograd engine and no supplied analytic backward graph library yet. |
 
 The SM80-class and SM90 attention and grouped-MoE paths have real suitable-GPU

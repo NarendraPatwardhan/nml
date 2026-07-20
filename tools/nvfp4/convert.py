@@ -1,4 +1,4 @@
-"""Convert the pinned GPT-OSS 20B BF16 source into NML NVFP4 recipe v2.
+"""Convert the pinned GPT-OSS 20B BF16 source into NML NVFP4 recipe v3.
 
 This is a deterministic artifact-production tool, not an inference runtime.
 It validates the checked source manifest before interpreting weights, converts
@@ -223,7 +223,7 @@ def main() -> int:
         "recipe_sha256": sha256(arguments.recipe),
         "converter": {
             "name": "nml-nvfp4-converter",
-            "version": 2,
+            "version": 3,
             "device": "cpu",
             "python": platform.python_version(),
             "torch": torch.__version__,
@@ -314,6 +314,9 @@ def convert_shard(
                 payload, scales, global_factor = quantize_tensor(
                     tensor, chunk_rows, device, torch
                 )
+                if record["role"] != "embedding":
+                    payload = contraction_major(payload)
+                    scales = contraction_major(scales)
                 converted[f"{name}.payload"] = payload
                 converted[f"{name}.block_scales"] = scales
                 converted[f"{name}.global_scale"] = global_factor
@@ -335,12 +338,12 @@ def convert_shard(
     save_file(
         converted,
         destination,
-        metadata={"format": "pt", "nml_recipe": "nml-nvfp4-weight-v2"},
+        metadata={"format": "pt", "nml_recipe": "nml-nvfp4-weight-v3"},
     )
 
 
 def logical_tensor(tensor: Any, record: dict[str, Any]) -> Any:
-    """Maps source storage into NML's one output-major contraction layout.
+    """Maps source storage into the logical output-major weight shape.
 
     The source GPT-OSS expert tensors are input-major. Transposition happens
     before quantization so the representation block remains the contraction K
@@ -352,6 +355,21 @@ def logical_tensor(tensor: Any, record: dict[str, Any]) -> Any:
             fail(f"{role} source tensor must have rank three")
         return tensor.permute(0, 2, 1).contiguous()
     return tensor.contiguous()
+
+
+def contraction_major(component: Any) -> Any:
+    """Moves encoded K before contiguous N without changing quantization.
+
+    Quantization is deliberately performed over logical output rows first, so
+    every sixteen-value block retains the selected K-axis scale. Only the
+    already encoded payload/scale tensors are then permuted into recipe v3's
+    kernel-facing `[... encoded_K, N]` layout.
+    """
+    if component.ndim < 2:
+        fail("contraction-major NVFP4 components require rank at least two")
+    axes = list(range(component.ndim))
+    axes[-2], axes[-1] = axes[-1], axes[-2]
+    return component.permute(*axes).contiguous()
 
 
 def quantize_tensor(tensor: Any, chunk_rows: int, device: Any, torch: Any) -> tuple[Any, Any, Any]:
@@ -456,8 +474,8 @@ def require_contract(
 ) -> None:
     if source.get("schema_version") != 1 or recipe.get("schema_version") != 1:
         fail("unsupported source or recipe schema")
-    if recipe.get("recipe") != "nml-nvfp4-weight-v2":
-        fail("converter only implements nml-nvfp4-weight-v2")
+    if recipe.get("recipe") != "nml-nvfp4-weight-v3":
+        fail("converter only implements nml-nvfp4-weight-v3")
     if recipe.get("source_repository") != source.get("repository") or recipe.get(
         "source_revision"
     ) != source.get("revision"):
@@ -574,7 +592,7 @@ def write_model_card(path: Path, source: dict[str, Any], recipe: dict[str, Any])
         "---\nlicense: apache-2.0\nlibrary_name: nml\nbase_model: openai/gpt-oss-20b\n"
         "tags:\n- gpt_oss\n- nvfp4\n- nml\n---\n\n"
         "# GPT-OSS 20B NVFP4\n\n"
-        "This is the deterministic NML NVFP4 recipe-v2 conversion of "
+        "This is the deterministic NML NVFP4 recipe-v3 conversion of "
         f"`{source['repository']}@{source['revision']}`. It uses last-axis "
         "one-dimensional blocks of 16 weights, low-nibble-first E2M1 payloads, "
         "positive E4M3FN block scales, and one F32 global factor per quantized "

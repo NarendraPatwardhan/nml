@@ -15,19 +15,25 @@ source shard, dtype, logical shape, byte extent, role, mapping, transpose, and
 whether the NML artifact retains them as BF16 or converts them to NVFP4.
 [`recipe.json`](./recipe.json) is the exact conversion and output contract.
 
-The public generated artifact is
+The selected public generated artifact is
 [`narendra747/gpt-oss-20b-nvfp4`](https://huggingface.co/narendra747/gpt-oss-20b-nvfp4)
-at immutable revision `704c34282b2d84cc6a4e5ce7de14b6f6fc1286e9`.
+at immutable revision `ca87f4e7932aec1a80ab8866d13dd28776cfdc17`.
 [`published.json`](./published.json) records that identity and
 [`artifact-manifest.json`](./artifact-manifest.json) is the byte-exact public
 manifest downloaded back from that revision. Its SHA-256 is
-`3c36a89cbc0f908b3e782550fe32f3b6890ef3f857232d11710bc8e0dbcea71d`.
-The 20 payload/metadata files total 11,805,934,204 bytes. The separately
+`a3e8d0f77a85a9b1625c105fdb0853c285be0776efcfe44a1a2e3abd7ea286e9`.
+The 20 payload/metadata files total 11,805,934,314 bytes. The separately
 authenticated artifact manifest itself is 4,118 bytes.
+
+That immutable revision uses operation-shaped recipe v3. Contraction weights
+store encoded K before output lanes, while embedding weights retain row-major
+lookup order. The product validates this identity before loading any payload;
+there is no compatibility reinterpretation of superseded recipes.
 
 The permanent auditor at `//tools/nvfp4:audit_published_artifact` can derive a
 complete physical tensor inventory from bounded SafeTensor header reads. The
 companion `//tools/nvfp4:extract_execution_fixture` target can then freeze exact
 compact rows and independent decoded projections. Recipe-v1 inventories and
 fixtures were deleted when recipe v2 became authoritative; generated evidence
-is admitted only when it names the immutable recipe-v2 revision above.
+is admitted only when it names the immutable recipe-v3 revision selected by
+the product.

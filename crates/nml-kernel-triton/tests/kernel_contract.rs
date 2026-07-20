@@ -5,7 +5,8 @@ use nml_kernel_triton::{
     NvFp4GroupedProjectionConfig, NvFp4GroupedRole, NvFp4LinearConfig, OutputAlias,
     PagedAttention2dConfig, PagedAttention3dConfig, Reduction, ScaleDotElement,
     SegmentReductionConfig, TensorSpec, build_grouped_projection, build_nvfp4_embedding,
-    build_nvfp4_grouped_projection, build_nvfp4_linear, build_paged_attention_2d,
+    build_nvfp4_grouped_projection, build_nvfp4_grouped_projection_finalize,
+    build_nvfp4_linear, build_paged_attention_2d,
     build_paged_attention_3d, build_segment_reduction, select_attention_launch,
 };
 use nml_mlir::{Block, Context, Region};
@@ -65,6 +66,7 @@ fn nvfp4_linear_decodes_compact_tiles_inside_one_verified_kernel() {
         block_m: 16,
         block_n: 32,
         block_k: 32,
+        split_k: 1,
         has_bias: true,
     };
     assert_eq!(config.launch_grid().unwrap(), [4, 1, 1]);
@@ -121,9 +123,10 @@ fn nvfp4_decode_linear_uses_compact_gemv_without_dead_matrix_rows() {
         block_m: 16,
         block_n: 64,
         block_k: 128,
+        split_k: 4,
         has_bias: false,
     };
-    assert_eq!(config.launch_grid().unwrap(), [3_142, 1, 1]);
+    assert_eq!(config.launch_grid().unwrap(), [3_142, 4, 1]);
     let ttir = build_nvfp4_linear(config).unwrap();
     let ttir = ttir.text();
     assert!(ttir.contains("@nvfp4_linear_gemv"), "{ttir}");
@@ -132,6 +135,14 @@ fn nvfp4_decode_linear_uses_compact_gemv_without_dead_matrix_rows() {
     assert!(ttir.contains("tt.reshape"), "{ttir}");
     assert!(!ttir.contains("tt.dot"), "{ttir}");
     assert!(!ttir.contains("math.exp2"), "{ttir}");
+    assert!(
+        ttir.contains("cacheModifier = cs evictionPolicy = evict_first"),
+        "compact weights must stream with evict-first intent: {ttir}"
+    );
+    assert!(
+        ttir.contains("cacheModifier = ca evictionPolicy = evict_last"),
+        "activation fragments must retain cache-all/evict-last intent: {ttir}"
+    );
 }
 
 #[test]
@@ -179,6 +190,7 @@ fn nvfp4_grouped_experts_keep_routing_and_decode_inside_verified_kernels() {
             block_m: 16,
             block_n: 32,
             block_k: 32,
+            split_k: 1,
             role: NvFp4GroupedRole::GateUpActivated,
         })
         .unwrap();
@@ -205,6 +217,7 @@ fn nvfp4_grouped_experts_keep_routing_and_decode_inside_verified_kernels() {
             block_m: 16,
             block_n: 32,
             block_k: 32,
+            split_k: 1,
             role: NvFp4GroupedRole::Down,
         })
         .unwrap();
@@ -235,14 +248,35 @@ fn nvfp4_decode_experts_use_selected_expert_gemv_kernels() {
             block_m: 16,
             block_n: 32,
             block_k: 32,
+            split_k: 4,
             role: NvFp4GroupedRole::GateUpActivated,
         })
         .unwrap();
         let gate_up = gate_up.text();
         assert!(gate_up.contains("@nvfp4_grouped_gate_up_gemv"), "{gate_up}");
         assert_eq!(gate_up.matches(" = \"tt.reduce\"").count(), 2, "{gate_up}");
-        assert_eq!(gate_up.matches("math.exp2").count(), 1, "{gate_up}");
+        assert!(!gate_up.contains("math.exp2"), "{gate_up}");
         assert!(!gate_up.contains("tt.dot"), "{gate_up}");
+        let gate_finalize = build_nvfp4_grouped_projection_finalize(
+            NvFp4GroupedProjectionConfig {
+                dtype,
+                tokens: 1,
+                assignments: 4,
+                input_size: 64,
+                output_size: 64,
+                local_experts: 4,
+                source_row_divisor: 4,
+                block_m: 16,
+                block_n: 32,
+                block_k: 32,
+                split_k: 4,
+                role: NvFp4GroupedRole::GateUpActivated,
+            },
+        )
+        .unwrap();
+        let gate_finalize = gate_finalize.text();
+        assert!(gate_finalize.contains("@nvfp4_grouped_gate_up_gemv_finalize"));
+        assert_eq!(gate_finalize.matches("math.exp2").count(), 1, "{gate_finalize}");
 
         let down = build_nvfp4_grouped_projection(NvFp4GroupedProjectionConfig {
             dtype,
@@ -255,6 +289,7 @@ fn nvfp4_decode_experts_use_selected_expert_gemv_kernels() {
             block_m: 16,
             block_n: 32,
             block_k: 32,
+            split_k: 4,
             role: NvFp4GroupedRole::Down,
         })
         .unwrap();
@@ -263,6 +298,26 @@ fn nvfp4_decode_experts_use_selected_expert_gemv_kernels() {
         assert_eq!(down.matches(" = \"tt.reduce\"").count(), 1, "{down}");
         assert!(!down.contains("math.exp2"), "{down}");
         assert!(!down.contains("tt.dot"), "{down}");
+        let down_finalize = build_nvfp4_grouped_projection_finalize(
+            NvFp4GroupedProjectionConfig {
+                dtype,
+                tokens: 1,
+                assignments: 4,
+                input_size: 64,
+                output_size: 64,
+                local_experts: 4,
+                source_row_divisor: 1,
+                block_m: 16,
+                block_n: 32,
+                block_k: 32,
+                split_k: 4,
+                role: NvFp4GroupedRole::Down,
+            },
+        )
+        .unwrap();
+        let down_finalize = down_finalize.text();
+        assert!(down_finalize.contains("@nvfp4_grouped_down_gemv_finalize"));
+        assert!(down_finalize.contains("scf.for"), "{down_finalize}");
     }
 }
 

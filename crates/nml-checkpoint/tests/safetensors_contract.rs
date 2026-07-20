@@ -160,7 +160,7 @@ fn nvfp4_resolution_requires_one_complete_shape_exact_component_set() {
     std::fs::create_dir_all(&root).unwrap();
     let payload = TensorData {
         dtype: Dtype::U8,
-        shape: vec![2, 9],
+        shape: vec![9, 2],
         bytes: vec![0; 18],
     };
     let block_scales = TensorData {

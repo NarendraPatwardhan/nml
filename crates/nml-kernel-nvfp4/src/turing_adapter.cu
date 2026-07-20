@@ -87,8 +87,6 @@ __global__ void linear_kernel(const Element *__restrict__ activation,
   const int64_t row_base = static_cast<int64_t>(blockIdx.y) * kWmmaTile;
   const int64_t output_base = static_cast<int64_t>(blockIdx.x) * kWmmaTile;
   const int lane = threadIdx.x;
-  const int64_t packed_width = (inputs + 1) / 2;
-  const int64_t scale_width = (inputs + 15) / 16;
 
   nvcuda::wmma::fragment<nvcuda::wmma::accumulator, kWmmaTile, kWmmaTile,
                          kWmmaTile, float>
@@ -106,18 +104,18 @@ __global__ void linear_kernel(const Element *__restrict__ activation,
                               activation[row * inputs + activation_column]))
                         : __float2half(0.0f);
 
-      // WMMA's column-major B tile uses [K, N]. The checkpoint owns [N, K],
-      // so its natural logical row is already the required matrix column.
+      // Recipe v3 owns the exact [packed K, N] contraction order required by
+      // this B tile. No launch-time transpose or prepared device copy exists.
       const int64_t output_column = output_base + tile_column;
       const int64_t weight_column = start + tile_row;
       float weight = 0.0f;
       if (output_column < outputs && weight_column < inputs) {
         const uint8_t packed =
-            payload[output_column * packed_width + weight_column / 2];
+            payload[(weight_column / 2) * outputs + output_column];
         const uint8_t code =
             static_cast<uint8_t>((packed >> ((weight_column & 1) * 4)) & 0x0f);
         const uint8_t scale_bits =
-            block_scales[output_column * scale_width + weight_column / 16];
+            block_scales[(weight_column / 16) * outputs + output_column];
         weight = decode_e2m1(code) * decode_e4m3fn(scale_bits) *
                  global_scale[0];
       }
@@ -170,16 +168,15 @@ __global__ void linear_gemv_kernel(
   }
 
   const int64_t packed_width = (inputs + 1) / 2;
-  const int64_t scale_width = (inputs + 15) / 16;
   const float tensor_scale = global_scale[0];
   float accumulator = 0.0f;
   for (int64_t pair = lane; pair < packed_width; pair += 32) {
     const int64_t even = pair * 2;
-    const uint8_t packed = payload[output_column * packed_width + pair];
+    const uint8_t packed = payload[pair * outputs + output_column];
     float block_scale = 0.0f;
     if ((lane & 7) == 0) {
       block_scale = decode_e4m3fn(
-          block_scales[output_column * scale_width + even / 16]);
+          block_scales[(even / 16) * outputs + output_column]);
     }
     block_scale = __shfl_sync(0xffffffffu, block_scale, lane & ~7);
     const float scale = block_scale * tensor_scale;
@@ -233,16 +230,19 @@ __global__ void embedding_kernel(
                   global_scale[0]);
 }
 
-__device__ __forceinline__ float compact_value(
+__device__ __forceinline__ float compact_contraction_value(
     const uint8_t *payload, const uint8_t *block_scales,
-    const float *global_scale, int64_t row, int64_t column, int64_t width) {
-  const int64_t packed_width = (width + 1) / 2;
-  const int64_t scale_width = (width + 15) / 16;
-  const uint8_t packed = payload[row * packed_width + column / 2];
+    const float *global_scale, int64_t expert, int64_t output, int64_t input,
+    int64_t outputs, int64_t inputs) {
+  const int64_t packed_width = (inputs + 1) / 2;
+  const int64_t scale_width = (inputs + 15) / 16;
+  const uint8_t packed =
+      payload[(expert * packed_width + input / 2) * outputs + output];
   const uint8_t code =
-      static_cast<uint8_t>((packed >> ((column & 1) * 4)) & 0x0f);
+      static_cast<uint8_t>((packed >> ((input & 1) * 4)) & 0x0f);
   return decode_e2m1(code) *
-         decode_e4m3fn(block_scales[row * scale_width + column / 16]) *
+         decode_e4m3fn(block_scales[
+             (expert * scale_width + input / 16) * outputs + output]) *
          global_scale[0];
 }
 
@@ -305,13 +305,12 @@ __global__ void expert_gate_up_kernel(
       float up_weight = 0.0f;
       if (expert >= 0 && expert < experts && intermediate < intermediate_size &&
           weight_input < hidden_size) {
-        const int64_t gate_row =
-            static_cast<int64_t>(expert) * logical_width + 2 * intermediate;
-        const int64_t up_row = gate_row + 1;
-        gate_weight = compact_value(payload, block_scales, global_scale,
-                                    gate_row, weight_input, hidden_size);
-        up_weight = compact_value(payload, block_scales, global_scale,
-                                  up_row, weight_input, hidden_size);
+        gate_weight = compact_contraction_value(
+            payload, block_scales, global_scale, expert, 2 * intermediate,
+            weight_input, logical_width, hidden_size);
+        up_weight = compact_contraction_value(
+            payload, block_scales, global_scale, expert,
+            2 * intermediate + 1, weight_input, logical_width, hidden_size);
       }
       const int right_index = tile_column * kWmmaTile + tile_row;
       gate_right[right_index] = __float2half_rn(gate_weight);
@@ -412,10 +411,9 @@ __global__ void expert_down_kernel(
       float weight = 0.0f;
       if (expert >= 0 && expert < experts && output_column < hidden_size &&
           weight_input < intermediate_size) {
-        const int64_t weight_row =
-            static_cast<int64_t>(expert) * hidden_size + output_column;
-        weight = compact_value(payload, block_scales, global_scale, weight_row,
-                               weight_input, intermediate_size);
+        weight = compact_contraction_value(
+            payload, block_scales, global_scale, expert, output_column,
+            weight_input, hidden_size, intermediate_size);
       }
       right[tile_column * kWmmaTile + tile_row] = __float2half_rn(weight);
     }
@@ -492,16 +490,17 @@ __global__ void expert_gate_up_gemv_kernel(
             : 0.0f;
     __syncthreads();
     if (intermediate < intermediate_size) {
-      const int64_t gate_row =
-          static_cast<int64_t>(expert) * logical_rows + 2 * intermediate;
-      const int64_t up_row = gate_row + 1;
       for (int block = 0;
            block < kInputTile && start + block < hidden_size; block += 16) {
         const int64_t scale_column = (start + block) / 16;
-        const float gate_scale = decode_e4m3fn(
-            block_scales[gate_row * scale_width + scale_column]);
-        const float up_scale = decode_e4m3fn(
-            block_scales[up_row * scale_width + scale_column]);
+        const float gate_scale = decode_e4m3fn(block_scales[
+            (static_cast<int64_t>(expert) * scale_width + scale_column) *
+                logical_rows +
+            2 * intermediate]);
+        const float up_scale = decode_e4m3fn(block_scales[
+            (static_cast<int64_t>(expert) * scale_width + scale_column) *
+                logical_rows +
+            2 * intermediate + 1]);
         for (int lane = 0;
              lane < 16 && block + lane < kInputTile &&
              start + block + lane < hidden_size;
@@ -510,10 +509,14 @@ __global__ void expert_gate_up_gemv_kernel(
           const int64_t input_column = start + offset;
           const int64_t packed_column = input_column / 2;
           const int shift = static_cast<int>((input_column & 1) * 4);
-          const uint8_t gate_packed =
-              payload[gate_row * packed_width + packed_column];
-          const uint8_t up_packed =
-              payload[up_row * packed_width + packed_column];
+          const uint8_t gate_packed = payload[
+              (static_cast<int64_t>(expert) * packed_width + packed_column) *
+                  logical_rows +
+              2 * intermediate];
+          const uint8_t up_packed = payload[
+              (static_cast<int64_t>(expert) * packed_width + packed_column) *
+                  logical_rows +
+              2 * intermediate + 1];
           const float activation = tensor_scale * activation_tile[offset];
           gate_accumulator += decode_e2m1((gate_packed >> shift) & 0x0f) *
                               gate_scale * activation;
@@ -579,18 +582,21 @@ __global__ void expert_down_gemv_kernel(
             : 0.0f;
     __syncthreads();
     if (even < hidden_size) {
-      const int64_t even_row =
-          static_cast<int64_t>(expert) * hidden_size + even;
-      const int64_t odd_row = even_row + 1;
       for (int block = 0;
            block < kInputTile && start + block < intermediate_size;
            block += 16) {
         const int64_t scale_column = (start + block) / 16;
-        const float even_scale = decode_e4m3fn(
-            block_scales[even_row * scale_width + scale_column]);
+        const float even_scale = decode_e4m3fn(block_scales[
+            (static_cast<int64_t>(expert) * scale_width + scale_column) *
+                hidden_size +
+            even]);
         const float odd_scale = odd < hidden_size
                                     ? decode_e4m3fn(block_scales[
-                                          odd_row * scale_width + scale_column])
+                                          (static_cast<int64_t>(expert) *
+                                               scale_width +
+                                           scale_column) *
+                                                  hidden_size +
+                                              odd])
                                     : 0.0f;
         for (int lane = 0;
              lane < 16 && block + lane < kInputTile &&
@@ -600,14 +606,18 @@ __global__ void expert_down_gemv_kernel(
           const int64_t input_column = start + offset;
           const int64_t packed_column = input_column / 2;
           const int shift = static_cast<int>((input_column & 1) * 4);
-          const uint8_t even_packed =
-              payload[even_row * packed_width + packed_column];
+          const uint8_t even_packed = payload[
+              (static_cast<int64_t>(expert) * packed_width + packed_column) *
+                  hidden_size +
+              even];
           const float activation = tensor_scale * activation_tile[offset];
           even_accumulator += decode_e2m1((even_packed >> shift) & 0x0f) *
                               even_scale * activation;
           if (odd < hidden_size) {
-            const uint8_t odd_packed =
-                payload[odd_row * packed_width + packed_column];
+            const uint8_t odd_packed = payload[
+                (static_cast<int64_t>(expert) * packed_width + packed_column) *
+                    hidden_size +
+                odd];
             odd_accumulator += decode_e2m1((odd_packed >> shift) & 0x0f) *
                                odd_scale * activation;
           }

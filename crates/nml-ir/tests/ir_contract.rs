@@ -73,8 +73,8 @@ fn nvfp4_linear_is_one_semantic_operation_with_three_physical_components() {
     let text = program.stablehlo().unwrap();
 
     assert_eq!(text.matches("nml.nvfp4.linear").count(), 1, "{text}");
-    assert!(text.contains("tensor<4x8xui8>"), "{text}");
-    assert!(text.contains("tensor<4x1xui8>"), "{text}");
+    assert!(text.contains("tensor<8x4xui8>"), "{text}");
+    assert!(text.contains("tensor<1x4xui8>"), "{text}");
     assert!(text.contains("tensor<f32>"), "{text}");
     assert!(text.contains("api_version = 4 : i32"), "{text}");
     assert!(!text.contains("stablehlo.add"), "{text}");
@@ -141,7 +141,7 @@ fn nvfp4_linear_validates_optional_bias_before_authoring_the_compact_operation()
 
 #[test]
 fn nvfp4_embedding_preserves_index_shape_and_decodes_only_selected_rows() {
-    let weight = Parameter::nvfp4(
+    let weight = Parameter::nvfp4_embedding(
         "embedding.weight",
         "model.embedding.weight",
         Shape::new(DType::F16, &[32, 17]).unwrap(),
@@ -241,8 +241,8 @@ fn clamped_swiglu_moe_keeps_model_semantics_above_weight_representation() {
         "{compact}"
     );
     assert!(compact.contains("stablehlo.sort"), "{compact}");
-    assert!(compact.contains("tensor<3x10x2xui8>"), "{compact}");
-    assert!(compact.contains("tensor<3x4x3xui8>"), "{compact}");
+    assert!(compact.contains("tensor<3x2x10xui8>"), "{compact}");
+    assert!(compact.contains("tensor<3x3x4xui8>"), "{compact}");
     Context::new()
         .parse_module(&compact)
         .unwrap()
@@ -329,9 +329,10 @@ fn decode_shaped_moe_launches_only_selected_expert_blocks() {
     assert!(text.contains("tensor<4xi32>"), "{text}");
     assert_eq!(
         text.matches("grid_x = 4 : i32").count(),
-        2,
-        "gate/up and down must launch exactly one block per selected route: {text}"
+        3,
+        "both contractions and the gate epilogue must launch once per selected route: {text}"
     );
+    assert_eq!(text.matches("__gpu$xla.gpu.triton").count(), 4, "{text}");
     assert!(text.contains("stablehlo.pad"), "{text}");
     assert_eq!(text.matches("scf.if").count(), 2, "{text}");
 }
@@ -3039,6 +3040,6 @@ fn expert_parallel_nvfp4_derives_local_components_inside_the_shared_manual_bound
     assert!(text.contains("nvfp4_grouped_gate_up"), "{text}");
     assert!(text.contains("nvfp4_grouped_down"), "{text}");
     assert_eq!(text.matches("stablehlo.all_reduce").count(), 1, "{text}");
-    assert!(text.contains("tensor<2x64x16xui8>"), "{text}");
-    assert!(text.contains("tensor<2x64x2xui8>"), "{text}");
+    assert!(text.contains("tensor<2x16x64xui8>"), "{text}");
+    assert!(text.contains("tensor<2x2x64xui8>"), "{text}");
 }
