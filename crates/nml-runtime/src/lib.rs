@@ -890,7 +890,7 @@ struct BufferStorage {
     shards: Vec<nml_pjrt::Buffer>,
 }
 
-/// In-flight download of one replicated logical buffer.
+/// In-flight download of one unsharded logical buffer.
 pub struct BufferDownload<'transfer> {
     transfer: nml_pjrt::HostDownload<'transfer>,
 }
@@ -993,15 +993,15 @@ impl Buffer {
         Ok(result)
     }
 
-    /// Starts a nonblocking download of a replicated logical buffer.
+    /// Starts a nonblocking download of an unsharded logical buffer.
     /// Sharded downloads require host-side placement assembly and therefore
     /// retain the synchronous `to_slice` path.
     pub fn download_to<'transfer>(
         &'transfer self,
         destination: &'transfer mut Slice<'_>,
     ) -> Result<BufferDownload<'transfer>, Error> {
-        if !self.sharding.is_replicated() {
-            return Err(Error::AsyncDownloadRequiresReplicatedSharding);
+        if !self.sharding.is_replicated() && !self.sharding.is_single() {
+            return Err(Error::AsyncDownloadRequiresUnshardedPlacement);
         }
         let transfer = self.storage.shards[0]
             .to_slice_async(destination)
@@ -1548,7 +1548,7 @@ pub enum Error {
     DonationRequiresUniqueOwnership(String),
     ParameterDonation(String),
     DeletionRequiresUniqueOwnership,
-    AsyncDownloadRequiresReplicatedSharding,
+    AsyncDownloadRequiresUnshardedPlacement,
     ResultCount {
         expected: usize,
         actual: usize,
@@ -1645,8 +1645,8 @@ impl fmt::Display for Error {
             Self::DeletionRequiresUniqueOwnership => {
                 f.write_str("shared buffer storage cannot be explicitly deleted")
             }
-            Self::AsyncDownloadRequiresReplicatedSharding => {
-                f.write_str("asynchronous downloads require replicated buffer placement")
+            Self::AsyncDownloadRequiresUnshardedPlacement => {
+                f.write_str("asynchronous downloads require unsharded buffer placement")
             }
             Self::ResultCount { expected, actual } => write!(
                 f,
