@@ -530,6 +530,16 @@ impl ResidentModel<'_> {
         let mut decode_download = Duration::ZERO;
         let mut first_decode_submission = SubmissionTimings::default();
         let mut steady_decode_submission = SubmissionTimings::default();
+        let (first_decode_pair, remaining_decode_pairs) = decode_pairs
+            .split_first_mut()
+            .ok_or_else(|| message("GPT-OSS decode schedule contains no layer pair"))?;
+        if caches.len() < 2 {
+            return Err(message(
+                "GPT-OSS decode schedule contains no first cache pair",
+            ));
+        }
+        let (first_decode_caches, remaining_decode_caches) = caches.split_at_mut(2);
+        let mut lookahead = None;
         for generated_index in 0..request.max_new_tokens {
             let is_stop = super::protocol::is_stop_token(next_token);
             emit(next_token, is_stop)?;
@@ -543,14 +553,23 @@ impl ResidentModel<'_> {
             }
 
             let decode_started = Instant::now();
-            let mut decode_submission = SubmissionTimings::default();
-            let submission_started = Instant::now();
-            decode_embedding
-                .set("tokens", token_buffer)
-                .map_err(boxed)?;
-            let mut hidden = one(decode_embedding.enqueue().map_err(boxed)?)?;
-            decode_submission.embedding = submission_started.elapsed();
-            for (arguments, caches) in decode_pairs.iter_mut().zip(caches.chunks_exact_mut(2)) {
+            let prefix = match lookahead.take() {
+                Some(prefix) => prefix,
+                None => enqueue_decode_prefix(
+                    &mut decode_embedding,
+                    first_decode_pair,
+                    token_buffer.clone(),
+                    position.clone(),
+                    page_table.clone(),
+                    first_decode_caches,
+                )?,
+            };
+            let mut hidden = prefix.hidden;
+            let mut decode_submission = prefix.submission;
+            for (arguments, caches) in remaining_decode_pairs
+                .iter_mut()
+                .zip(remaining_decode_caches.chunks_exact_mut(2))
+            {
                 let (next_hidden, elapsed) = execute_layer_pair(
                     arguments,
                     hidden,
@@ -588,6 +607,24 @@ impl ResidentModel<'_> {
                 return Err(message("GPT-OSS decode head returned extra buffers"));
             }
             decode_submission.head = submission_started.elapsed();
+
+            // The head outputs carry readiness dependencies, so the next token
+            // can enter embedding and the first bounded layer pair before the
+            // host observes it. This queues enough useful work to cover both
+            // the head-to-embedding and embedding-to-first-pair bubbles while
+            // limiting terminal speculation to two request-local layer caches.
+            // Keep one token of budget beyond the speculative input: otherwise
+            // the lookahead would compute a token the caller never requested.
+            if should_enqueue_lookahead(generated_index, request.max_new_tokens) {
+                lookahead = Some(enqueue_decode_prefix(
+                    &mut decode_embedding,
+                    first_decode_pair,
+                    token_buffer.clone(),
+                    position.clone(),
+                    page_table.clone(),
+                    first_decode_caches,
+                )?);
+            }
             token_buffer.wait().map_err(boxed)?;
             let execution_elapsed = decode_started.elapsed();
             if generated_index == 0 {
@@ -705,6 +742,11 @@ impl ComponentFamily {
 struct LayerCache {
     key: Option<Buffer>,
     value: Option<Buffer>,
+}
+
+struct DecodePrefix {
+    hidden: Buffer,
+    submission: SubmissionTimings,
 }
 
 impl LayerCache {
@@ -863,6 +905,29 @@ fn bind_layer_pair<'family>(
     bind_tree_components(&mut arguments, full_slot, full_loaded)?;
     arguments.bake().map_err(boxed)?;
     Ok(arguments)
+}
+
+fn enqueue_decode_prefix(
+    embedding: &mut Arguments<'_>,
+    first_pair: &mut Arguments<'_>,
+    token: Buffer,
+    position: Buffer,
+    page_table: Buffer,
+    caches: &mut [LayerCache],
+) -> Result<DecodePrefix> {
+    let mut submission = SubmissionTimings::default();
+    let started = Instant::now();
+    embedding.set("tokens", token).map_err(boxed)?;
+    let hidden = one(embedding.enqueue().map_err(boxed)?)?;
+    submission.embedding = started.elapsed();
+    let (hidden, elapsed) =
+        execute_layer_pair(first_pair, hidden, position, page_table, caches)?;
+    submission.layer_pairs = elapsed;
+    Ok(DecodePrefix { hidden, submission })
+}
+
+const fn should_enqueue_lookahead(generated_index: usize, max_new_tokens: usize) -> bool {
+    max_new_tokens.saturating_sub(generated_index) > 2
 }
 
 fn execute_layer(
@@ -1096,6 +1161,18 @@ fn usize_i64(value: usize) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_lookahead_never_crosses_the_visible_token_budget() {
+        assert!(!should_enqueue_lookahead(0, 0));
+        assert!(!should_enqueue_lookahead(0, 1));
+        assert!(!should_enqueue_lookahead(0, 2));
+        assert!(should_enqueue_lookahead(0, 3));
+        assert!(!should_enqueue_lookahead(1, 3));
+        assert!(should_enqueue_lookahead(0, 4));
+        assert!(should_enqueue_lookahead(1, 4));
+        assert!(!should_enqueue_lookahead(2, 4));
+    }
 
     #[test]
     fn profiles_normalize_and_select_the_smallest_fitting_family() {
