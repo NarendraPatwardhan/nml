@@ -4337,12 +4337,82 @@ impl ProgramBuilder {
         self.add(product, bias)
     }
 
+    /// Three projections over one activation, specialized as one compact QKV
+    /// scheduling domain when every weight is NVFP4. Dense or mixed storage
+    /// retains the ordinary three-linear semantics.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_qkv(
+        &mut self,
+        input: Tensor,
+        query_weight: &Parameter,
+        query_bias: Option<&Parameter>,
+        key_weight: &Parameter,
+        key_bias: Option<&Parameter>,
+        value_weight: &Parameter,
+        value_bias: Option<&Parameter>,
+    ) -> Result<(Tensor, Tensor, Tensor), Error> {
+        self.require_local(input)?;
+        if input.shape.rank() == 0 {
+            return Err(Error::InvalidLinearAlgebra(
+                "QKV linear input requires at least one dimension",
+            ));
+        }
+        if ![
+            query_weight.representation(),
+            key_weight.representation(),
+            value_weight.representation(),
+        ]
+        .into_iter()
+        .all(|representation| matches!(representation, RepresentationSpec::NvFp4(_)))
+        {
+            return Ok((
+                self.linear(input, query_weight, query_bias)?,
+                self.linear(input, key_weight, key_bias)?,
+                self.linear(input, value_weight, value_bias)?,
+            ));
+        }
+
+        let query = self.nvfp4_linear_binding(input, query_weight, query_bias)?;
+        let key = self.nvfp4_linear_binding(input, key_weight, key_bias)?;
+        let value = self.nvfp4_linear_binding(input, value_weight, value_bias)?;
+        let query_result = self.push_value("nvfp4_query", query.shape);
+        let key_result = self.push_value("nvfp4_key", key.shape);
+        let value_result = self.push_value("nvfp4_value", value.shape);
+        self.operations.push(Operation::NvFp4Qkv {
+            input: input.value,
+            query: query.operation(query_result.value),
+            key: key.operation(key_result.value),
+            value: value.operation(value_result.value),
+        });
+        Ok((query_result, key_result, value_result))
+    }
+
     fn nvfp4_linear(
         &mut self,
         input: Tensor,
         weight: &Parameter,
         bias: Option<&Parameter>,
     ) -> Result<Tensor, Error> {
+        let binding = self.nvfp4_linear_binding(input, weight, bias)?;
+        let result = self.push_value("nvfp4_linear", binding.shape);
+        let operation = binding.operation(result.value);
+        self.operations.push(Operation::NvFp4Linear {
+            input: input.value,
+            payload: operation.payload,
+            block_scales: operation.block_scales,
+            global_scale: operation.global_scale,
+            bias: operation.bias,
+            result: operation.result,
+        });
+        Ok(result)
+    }
+
+    fn nvfp4_linear_binding(
+        &mut self,
+        input: Tensor,
+        weight: &Parameter,
+        bias: Option<&Parameter>,
+    ) -> Result<NvFp4LinearBinding, Error> {
         let logical = weight.shape();
         if logical.rank() != 2 {
             return Err(Error::InvalidParameter(format!(
@@ -4412,16 +4482,13 @@ impl ProgramBuilder {
             }
             None => None,
         };
-        let result = self.push_value("nvfp4_linear", shape);
-        self.operations.push(Operation::NvFp4Linear {
-            input: input.value,
-            payload: payload.value,
-            block_scales: scales.value,
-            global_scale: global.value,
-            bias: bias.map(|bias| bias.value),
-            result: result.value,
-        });
-        Ok(result)
+        Ok(NvFp4LinearBinding {
+            payload,
+            block_scales: scales,
+            global_scale: global,
+            bias,
+            shape,
+        })
     }
 
     pub fn dot_general(
@@ -6169,6 +6236,73 @@ impl Program {
                 block.append_operation(call)?;
                 continue;
             }
+            if let Operation::NvFp4Qkv {
+                input,
+                query,
+                key,
+                value,
+            } = operation
+            {
+                let projections = [query, key, value];
+                if let Some(cuda) = capabilities.cuda_capabilities() {
+                    let projection_inputs = |projection: &NvFp4ProjectionOperation| {
+                        nvfp4_backend::QkvProjectionInputs {
+                            payload: mlir_value(&values, projection.payload),
+                            block_scales: mlir_value(&values, projection.block_scales),
+                            global_scale: mlir_value(&values, projection.global_scale),
+                            bias: projection.bias.map(|bias| mlir_value(&values, bias)),
+                            payload_shape: self.values[projection.payload].shape,
+                            block_scales_shape: self.values[projection.block_scales].shape,
+                            global_scale_shape: self.values[projection.global_scale].shape,
+                            bias_shape: projection.bias.map(|bias| self.values[bias].shape),
+                            result_shape: self.values[projection.result].shape,
+                            result_type: types[projection.result],
+                        }
+                    };
+                    let lowered = nvfp4_backend::lower_qkv(
+                        context,
+                        &mut block,
+                        nvfp4_backend::QkvInputs {
+                            activation: mlir_value(&values, *input),
+                            activation_shape: self.values[*input].shape,
+                            query: projection_inputs(query),
+                            key: projection_inputs(key),
+                            value: projection_inputs(value),
+                        },
+                        cuda,
+                    )?;
+                    for (projection, lowered) in projections.into_iter().zip(lowered) {
+                        values[projection.result] = Some(constrain_compound_result(
+                            context,
+                            &mut block,
+                            lowered,
+                            types[projection.result],
+                            sharding,
+                            self.values[projection.result].shape,
+                        )?);
+                    }
+                    continue;
+                }
+                for projection in projections {
+                    let mut operands = vec![
+                        mlir_value(&values, *input),
+                        mlir_value(&values, projection.payload),
+                        mlir_value(&values, projection.block_scales),
+                        mlir_value(&values, projection.global_scale),
+                    ];
+                    if let Some(bias) = projection.bias {
+                        operands.push(mlir_value(&values, bias));
+                    }
+                    let call = context.ffi_custom_call(
+                        "nml.nvfp4.linear",
+                        &operands,
+                        &[types[projection.result]],
+                    )?;
+                    values[projection.result] = Some(call.result(0)?);
+                    block.append_operation(call)?;
+                }
+                continue;
+            }
             if let Operation::NvFp4Linear {
                 input,
                 payload,
@@ -7309,6 +7443,7 @@ impl Program {
                     )
                 }
                 Operation::NvFp4Linear { .. }
+                | Operation::NvFp4Qkv { .. }
                 | Operation::NvFp4Embedding { .. }
                 | Operation::NvFp4RoutedSwiGlu { .. } => {
                     unreachable!("NVFP4 operation is lowered before scalar operations")
@@ -7380,6 +7515,39 @@ struct Value {
     shape: Shape,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct NvFp4LinearBinding {
+    payload: Tensor,
+    block_scales: Tensor,
+    global_scale: Tensor,
+    bias: Option<Tensor>,
+    shape: Shape,
+}
+
+impl NvFp4LinearBinding {
+    const fn operation(self, result: usize) -> NvFp4ProjectionOperation {
+        NvFp4ProjectionOperation {
+            payload: self.payload.value,
+            block_scales: self.block_scales.value,
+            global_scale: self.global_scale.value,
+            bias: match self.bias {
+                Some(bias) => Some(bias.value),
+                None => None,
+            },
+            result,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NvFp4ProjectionOperation {
+    payload: usize,
+    block_scales: usize,
+    global_scale: usize,
+    bias: Option<usize>,
+    result: usize,
+}
+
 #[derive(Debug)]
 enum Operation {
     NvFp4RoutedSwiGlu {
@@ -7414,6 +7582,12 @@ enum Operation {
         global_scale: usize,
         bias: Option<usize>,
         result: usize,
+    },
+    NvFp4Qkv {
+        input: usize,
+        query: NvFp4ProjectionOperation,
+        key: NvFp4ProjectionOperation,
+        value: NvFp4ProjectionOperation,
     },
     Cholesky {
         input: usize,

@@ -242,18 +242,12 @@ fn apply_layer(
     let input_norm = nml(graph.parameter_value(&layer.input_layernorm.weight))?;
     let mut hidden =
         nml(graph.rms_norm(hidden_input, Some(input_norm), 2, config.rms_norm_epsilon()))?;
-    let query = nml(graph.linear(
+    let (query, key, value) = nml(graph.linear_qkv(
         hidden,
         &layer.self_attn.q_proj.weight,
         Some(&layer.self_attn.q_proj.bias),
-    ))?;
-    let key = nml(graph.linear(
-        hidden,
         &layer.self_attn.k_proj.weight,
         Some(&layer.self_attn.k_proj.bias),
-    ))?;
-    let value = nml(graph.linear(
-        hidden,
         &layer.self_attn.v_proj.weight,
         Some(&layer.self_attn.v_proj.bias),
     ))?;

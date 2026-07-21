@@ -2,10 +2,10 @@ use nml_kernel_triton::{
     ArgumentKind, AttentionGeometry, AttentionLaunch, Builder, Comparison, DType, Error,
     GatedActivation, GroupedProjectionConfig, Kernel, KernelLaunch, KernelSpec,
     NvFp4EmbeddingConfig,
-    NvFp4GroupedProjectionConfig, NvFp4GroupedRole, NvFp4LinearConfig, OutputAlias,
+    NvFp4GroupedProjectionConfig, NvFp4GroupedRole, NvFp4LinearConfig, NvFp4QkvConfig, OutputAlias,
     PagedAttention2dConfig, PagedAttention3dConfig, Reduction, ScaleDotElement,
     SegmentReductionConfig, TensorSpec, build_grouped_projection, build_nvfp4_embedding,
-    build_nvfp4_grouped_projection, build_nvfp4_linear, build_paged_attention_2d,
+    build_nvfp4_grouped_projection, build_nvfp4_linear, build_nvfp4_qkv, build_paged_attention_2d,
     build_paged_attention_3d, build_segment_reduction, select_attention_launch,
 };
 use nml_mlir::{Block, Context, Region};
@@ -136,6 +136,48 @@ fn nvfp4_decode_linear_uses_compact_gemv_without_dead_matrix_rows() {
         ttir.rfind("arith.mulf").unwrap() > ttir.find("tt.reduce").unwrap(),
         "the tensor-wide scale must be applied after the K reduction: {ttir}"
     );
+}
+
+#[test]
+fn nvfp4_decode_qkv_combines_three_projection_tails_in_one_grid() {
+    let production = NvFp4QkvConfig {
+        dtype: DType::Bf16,
+        inputs: 2_880,
+        query_outputs: 4_096,
+        key_outputs: 512,
+        value_outputs: 512,
+        block_n: 8,
+        block_k: 256,
+        has_bias: true,
+    };
+    assert_eq!(production.launch_grid().unwrap(), [640, 1, 1]);
+
+    let ttir = build_nvfp4_qkv(NvFp4QkvConfig {
+        dtype: DType::Bf16,
+        inputs: 80,
+        query_outputs: 32,
+        key_outputs: 8,
+        value_outputs: 8,
+        block_n: 8,
+        block_k: 32,
+        has_bias: true,
+    })
+    .unwrap();
+    let ttir = ttir.text();
+    assert!(ttir.contains("@nvfp4_qkv_gemv"), "{ttir}");
+    assert_eq!(ttir.matches("scf.if ").count(), 3, "{ttir}");
+    assert_eq!(ttir.matches("scf.for ").count(), 3, "{ttir}");
+    assert_eq!(ttir.matches(" = \"tt.reduce\"").count(), 3, "{ttir}");
+    assert_eq!(ttir.matches("tt.store").count(), 3, "{ttir}");
+    assert!(!ttir.contains("tt.dot"), "{ttir}");
+    assert!(!ttir.contains("math.exp2"), "{ttir}");
+    let signature = ttir
+        .lines()
+        .find(|line| line.contains("tt.func public @nvfp4_qkv_gemv"))
+        .unwrap();
+    assert_eq!(signature.matches("!tt.ptr<bf16>").count(), 7, "{signature}");
+    assert_eq!(signature.matches("!tt.ptr<i8>").count(), 6, "{signature}");
+    assert_eq!(signature.matches("!tt.ptr<f32>").count(), 3, "{signature}");
 }
 
 #[test]

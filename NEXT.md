@@ -1,23 +1,63 @@
 # GPT-OSS 20B NVFP4 A40 performance analysis
 
+## 2026-07-21 measured decoder result
+
+Commit `29036b7` implemented the first recommended SM8x decoder tranche without
+changing recipe v2, launch geometry, or the public NVFP4 representation. The
+exact image
+`sha256:f4fd5d8506070e5d582078c9ea87e0bc2aba9e01c2e9512bf284a5422222b671`
+completed the same 320-token A40 workload under GDB and Nsight Systems at
+121.694 steady-device TPS and 117.384 decode-loop TPS
+([report](./references/runpod/reports/20260721T200016Z-33llh2wpqva86j-f4fd5d850607-diagnostic/performance.json)).
+
+Against the fastest recent warm control on the prior image, steady-device TPS
+improved from 107.624 to 121.694 (+13.1%) and decode-loop TPS improved from
+103.130 to 117.384 (+13.8%). Against the retained official baseline, the gains
+are +21.0% and +28.7%, respectively. The kernel evidence, rather than the more
+variable token-download time, establishes the actual result:
+
+| Decode projection | Prior warm control | `29036b7` | Change | Registers |
+|---|---:|---:|---:|---:|
+| Gate/up | 122.519 us | 94.316 us | -23.0% | 72 -> 56 |
+| Down | 64.035 us | 53.737 us | -16.1% | 48 -> 40 |
+| Q | 31.928 us | 25.737 us | -19.4% | 56 -> 40 |
+| K or V | 12.970 us | 14.236 us | **+9.8%** | 56 -> 40 |
+| O | 28.699 us | 22.261 us | -22.4% | 48 -> 39 |
+| Vocabulary head | 1018.680 us | 809.833 us | -20.5% | 128 -> 128 |
+
+Total decode NVFP4 kernel time fell from 7.579 to 6.203 ms/token (-18.2%).
+The unchanged trace contains exactly 179,350 kernel launches; total GPU kernel
+time fell from 3.080 to 2.622 seconds. This proves that applying the tensor-wide
+scale after the complete F32 K reduction and simplifying exact E2M1/E4M3FN
+construction produced real kernel alpha rather than a host-side measurement
+artifact.
+
+This particular algebraic tranche is substantially harvested. More decoder
+headroom may exist in a purpose-built SM86 CUDA/PTX implementation, vectorized
+packed conversion, or a counter-guided E4M3 subnormal path, but those are
+different and higher-risk implementations. Repeating generic expression
+rewrites now has lower expected value than addressing the only regressing,
+severely under-occupied projection family: K/V.
+
 ## Bottom line
 
 150+ TPS on an A40 is plausible, but the branch evidence says it will not come from another artifact-layout rewrite or a global GEMV tile change.
 
-The strongest path is:
+The strongest path, updated after the measured decoder gain, is:
 
 1. Keep recipe v2 and its output-major, K-contiguous representation.
 2. Keep the restored decode geometry: `block_n=8`, `block_k=256`, 4 warps, 1 stage; retain `block_n=32` for the vocabulary head.
-3. Optimize the software E2M1/E4M3 decode instruction path without changing the public format.
-4. Fuse or overlap Q/K/V, especially the severely under-occupied K/V projections.
+3. Keep the successful decoder simplification from `29036b7` as the new control.
+4. Fuse Q/K/V decode into one launch so Q's 512 CTAs absorb the two under-filled 64-CTA K/V tails.
 5. Reduce graph parameter patching and inter-component gaps while retaining bounded layer-pair graphs.
-6. Pipeline the synchronous host token observation, which currently costs about 1 ms/token.
+6. Pipeline the synchronous host token observation.
+7. Return to a purpose-built SM86 decoder only after the fused-QKV and orchestration gains are measured.
 
-The latest trace is 100.566 steady device TPS but only 91.236 end-to-end decode-loop TPS ([current performance](./references/runpod/reports/20260720T200639Z-tca1p7gmof152c-9628b6916dcc-diagnostic/performance.json)). Reaching 150 therefore requires:
+The latest trace is 121.694 steady-device TPS and 117.384 end-to-end decode-loop TPS. Reaching 150 now requires:
 
-- 1.49× on steady device execution.
-- 1.64× on the actual decode loop.
-- A reduction from roughly 10.96 ms to 6.67 ms per delivered token.
+- 1.23x on steady-device execution.
+- 1.28x on the actual decode loop.
+- A reduction from roughly 8.22 ms to 6.67 ms per steady device token.
 
 Two times performance—around 200 TPS—looks possible only with a substantially better SM8x software decoder and orchestration, probably a purpose-built CUDA/PTX path rather than Triton scheduling tweaks alone.
 
@@ -46,6 +86,7 @@ A limitation is important: these are Nsight Systems reports, not Nsight Compute 
 | Layer-pair restoration | 102.930 steady | 58.248 overall | Good steady state, poisoned by a 2.19-second cold graph instantiation |
 | Wider tiles/two stages | 66.963 | 63.314 | Confirmed regression |
 | Current restored geometry | 100.566 | 91.236 | Correct baseline |
+| Simplified exact decoder and post-reduction global scale (`29036b7`) | **121.694** | **117.384** | Successful: NVFP4 decode kernels -18.2% |
 
 The durable history in [TASKS.md](./TASKS.md) correctly separates functional acceptance from throughput promotion.
 
@@ -107,21 +148,32 @@ Approximate active compact-weight traffic is 2.03 GB/token. With A40’s reporte
 
 That makes 150 physically reasonable.
 
-### Projection decomposition
+### Projection decomposition after `29036b7`
 
-| Current kernel work | Time per token | Estimated effective bandwidth |
+| Current kernel work | Time per token | Conclusion |
 |---|---:|---:|
-| 24 gate/up projections | 2.921 ms | 307 GB/s |
-| 24 down projections | 1.534 ms | 292 GB/s |
-| 24 Q projections | 0.760 ms | 210 GB/s |
-| 24 K and 24 V projections | 0.619 ms | only ~64 GB/s each |
-| 24 O projections | 0.681 ms | 234 GB/s |
-| Vocabulary head | 1.020 ms | 319 GB/s |
-| **NVFP4 total** | **7.535 ms** | — |
+| 24 gate/up projections | 2.264 ms | Decoder simplification worked |
+| 24 down projections | 1.290 ms | Decoder simplification worked |
+| 24 Q projections | 0.618 ms | Decoder simplification worked |
+| 24 K and 24 V projections | 0.683 ms | Only regression; two 64-CTA tails per layer |
+| 24 O projections | 0.534 ms | Decoder simplification worked |
+| Vocabulary head | 0.812 ms | Decoder simplification worked despite 128 registers |
+| **NVFP4 total** | **6.203 ms** | **1.376 ms/token saved** |
 
-Repeated non-NVFP4 kernels add approximately 0.82 ms/token. The steady device result is roughly 9.94 ms/token, leaving about 1.59 ms/token in recurring graph/submission gaps.
+The first plus steady decode executions now total 2.631 seconds. After removing
+prefill from the Nsight kernel sum, decode kernels occupy approximately 2.288
+seconds, leaving roughly 0.34 seconds, or 1.07 ms/token, in recurring
+device-execution gaps. The prior warm trace exposed about 0.75 ms/token of such
+gaps. The new run used a different A40 host and an older 570 driver, so the
+increase cannot yet be assigned entirely to code, but faster kernels also make
+fixed launch and graph costs a larger fraction of the budget.
 
-The clearest kernel-level finding is K/V under-occupancy: each launches only 64 CTAs on an 84-SM A40. Those tiny projections achieve roughly one-fifth the effective throughput of gate/up and the head.
+The clearest kernel-level finding remains K/V under-occupancy: each launches
+only 64 CTAs on an 84-SM A40, and K/V was the only projection family to regress
+after the decoder change. Q launches 512 otherwise-identical CTAs. A single
+640-CTA QKV grid can turn three separately scheduled tails into approximately
+eight full-device waves while retaining recipe-v2 bytes and the proven
+`N=8,K=256` CTA body.
 
 ### The graph finding
 
@@ -129,8 +181,8 @@ Current layer-pair execution produced:
 
 - 4,172 `cuGraphLaunch` calls, about 13 per token.
 - 122,865 `cuGraphExecKernelNodeSetParams_v2` calls, about 385 per token.
-- 451 ms total host API time in graph launch.
-- 448 ms total in graph-node parameter patching.
+- 449 ms total host API time in graph launch.
+- 237 ms total in graph-node parameter patching.
 
 The single full-model graph reduced graph launches to 344, but steady device time grew from about 3.16 seconds to 4.68 seconds for the run. Dominant NVFP4 kernel time was virtually unchanged. The giant XLA graph therefore reduced launch count but made GPU scheduling much less continuous.
 
@@ -140,7 +192,11 @@ Conclusion: do not repeat the 24-layer StableHLO monolith. The useful target is 
 
 The current loop waits for and downloads each selected token before proceeding ([execution.rs](./products/serve/src/gpt_oss/execution.rs)). The token itself is already fed device-to-device into the next embedding; it is not uploaded again.
 
-Nsight records negligible actual device-copy work, while the application charges 320.286 ms—about 1 ms/token—to `decode_download`. This is readiness/host-observation latency, not PCIe bandwidth.
+Nsight records negligible actual device-copy work. The new run charges 86.853
+ms, or 0.27 ms/token, to `decode_download`, versus 0.39 ms/token in the fastest
+recent warm control and 1.00 ms/token in the retained official baseline. This
+is readiness/host-observation latency, not PCIe bandwidth, and it is variable
+enough that promotion must be supported by kernel and steady-device evidence.
 
 ## What the external benchmark proves—and does not prove
 
@@ -176,9 +232,12 @@ Keep:
 
 The former content of `NEXT.md` is contradicted by measurement: fewer CTAs and deeper pipelines did not improve occupancy. Its predicted 35% gain became a 33% regression.
 
-### 2. Build an SM8x-specific software FP4 decoder
+### 2. Preserve the successful SM8x decoder and defer the lower-level rewrite
 
-This is the likely centerpiece.
+The generic-IR decoder tranche is now measured and accepted. Keep its exact
+bit construction and post-reduction global scaling. Do not combine further
+decoder work with QKV launch fusion: separate images and reports are required
+to preserve attribution.
 
 The current kernels perform nibble extraction, E2M1 decode, E4M3FN decode, scale expansion, global scaling, activation multiplication, and F32 reduction in generic Triton IR. NCU must determine whether instruction issue is the principal limiter, but the llama.cpp evidence strongly suggests it.
 
@@ -195,11 +254,22 @@ Candidate implementation:
 
 A backend-specific kernel is not a custom user format. Users still consume canonical NVFP4; only code generation is device-specific.
 
-### 3. Fuse or overlap Q/K/V
+### 3. Fuse Q/K/V decode as the next isolated experiment
 
 This is the most obvious shape-specific win.
 
-K and V each launch only 64 CTAs and achieve about 64 GB/s. Options:
+K and V each launch only 64 CTAs and achieve about 64 GB/s. First implementation:
+
+- Author one semantic compact QKV operation for three NVFP4 projections that
+  share the same activation.
+- Lower only `M=1` SM8x execution to one Triton kernel and one custom call.
+- Retain three independent payload/scale/global/bias operands and three output
+  buffers; do not concatenate or rewrite checkpoint tensors.
+- Use one combined 640-CTA launch for GPT-OSS widths 4096/512/512 with the
+  proven `block_n=8`, `block_k=256`, four-warps, one-stage body.
+- Keep prefill, CPU, and Turing paths as three existing projections.
+
+Fallback options only if the fused launch does not promote:
 
 - One fused NVFP4 QKV kernel with a combined output domain and three output buffers.
 - Three concurrent stream launches, as llama.cpp uses.
@@ -208,7 +278,9 @@ K and V each launch only 64 CTAs and achieve about 64 GB/s. Options:
 
 Do not apply split-K to gate/up, down, or the vocabulary head: those already have ample CTAs, and recipe v3 proved that partial buffers/finalizers can erase the benefit.
 
-A reasonable QKV target is saving 0.5–0.7 ms/token.
+A reasonable QKV target is saving 0.35–0.55 ms/token. Promotion requires a
+fresh Nsight trace showing one 640-CTA QKV kernel per layer, no numerical or
+device-contract regression, and a decode-loop improvement outside run variance.
 
 ### 4. Reduce graph patches without creating another monolith
 
@@ -222,7 +294,7 @@ Keep the two-layer executable as the known-good unit, then test bounded changes:
 - Experiment with four-layer segments—six submissions/token—but stop if recurrent kernel gaps grow.
 - If the runtime permits it, capture an outer CUDA Graph that launches the already-optimized bounded components instead of recompiling the whole transformer as one StableHLO program.
 
-The target should be reducing the approximately 1.59 ms/token recurrent gap to around 0.5 ms.
+The target should be reducing the approximately 1.07 ms/token recurrent gap to around 0.5 ms.
 
 ### 5. Pipeline token observation
 
@@ -230,7 +302,8 @@ Queue the selected-token D2H copy on a separate stream and immediately begin one
 
 The host then observes the previous token while the GPU works. If the previous token is a stop token, discard the speculative result; the request-local cache is ending anyway.
 
-This can hide most of the current ~1 ms/token host boundary without changing model semantics or uploading the token again.
+This can hide most of the remaining 0.27-0.39 ms/token host boundary without
+changing model semantics or uploading the token again.
 
 ### 6. Fuse only measured lightweight boundaries
 
@@ -242,30 +315,37 @@ After projection work:
 - Sampling reductions/sorts.
 - KV update bookkeeping.
 
-These repeated non-NVFP4 kernels total only about 0.82 ms/token, so they cannot produce 1.5× alone. A realistic target is 0.2–0.3 ms/token.
+These repeated non-NVFP4 kernels total about 0.97 ms/token in the new trace, so
+they cannot produce the remaining speedup alone. A realistic saving is
+0.2-0.3 ms/token.
 
 ## A credible 150 TPS budget
 
 | Component | Current | Required target |
 |---|---:|---:|
-| NVFP4 projections | 7.54 ms | ~5.20 ms |
-| Other repeated GPU kernels | 0.82 ms | ~0.55 ms |
-| Graph/submission gaps | 1.59 ms | ~0.55 ms |
-| Host token observation | ~1.00 ms | ~0.30 ms |
-| **Decode loop** | **~10.95 ms / 91 TPS** | **~6.60 ms / 152 TPS** |
+| NVFP4 projections | 6.20 ms | ~5.25 ms |
+| Other repeated GPU kernels | ~0.97 ms | ~0.75 ms |
+| Device graph/submission gaps | ~1.07 ms | ~0.55 ms |
+| Host token observation beyond device execution | ~0.30 ms | ~0.10 ms |
+| **Decode loop** | **~8.52 ms / 117 TPS** | **~6.65 ms / 150 TPS** |
 
 This asks for approximately:
 
-- 31% faster projection kernels, including QKV overlap.
-- About 1 ms less graph/runtime gap.
-- Most token-download latency hidden.
+- 15% less projection time, starting with QKV tail elimination.
+- About 0.5 ms less graph/runtime gap.
+- Most remaining token-observation latency hidden.
 - A smaller contribution from conventional fusion.
 
 That is aggressive but consistent with the trace. In contrast, 200 TPS requires a 5 ms complete loop; that likely needs the optimized SM8x decoder to approach 400–450 GB/s on the large gate/down/head workloads.
 
-## Required next profiling gate
+## Required promotion profiling gate
 
-Before implementation decisions, obtain Nsight Compute reports for these exact decode shapes:
+The fused-QKV implementation is justified directly by the Nsight Systems launch
+geometry and does not need NCU to begin. Before promoting it, run the exact
+image on A40 and require one `nvfp4_qkv_gemv` launch with grid 640 per layer.
+If it fails to improve outside run variance, obtain Nsight Compute reports for
+these exact decode shapes before choosing split-K, narrower tiles, or another
+decoder rewrite:
 
 - Gate/up: active top-four experts.
 - Down: active top-four experts.

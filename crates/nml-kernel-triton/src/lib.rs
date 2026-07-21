@@ -23,7 +23,8 @@ mod unified_attention;
 pub use moe::{build_grouped_projection, GatedActivation, GroupedProjectionConfig};
 pub use nvfp4::{
     build_nvfp4_embedding, build_nvfp4_grouped_projection, build_nvfp4_linear,
-    NvFp4EmbeddingConfig, NvFp4GroupedProjectionConfig, NvFp4GroupedRole, NvFp4LinearConfig,
+    build_nvfp4_qkv, NvFp4EmbeddingConfig, NvFp4GroupedProjectionConfig, NvFp4GroupedRole,
+    NvFp4LinearConfig, NvFp4QkvConfig,
 };
 pub use paged_attention::{select_attention_launch, AttentionGeometry, AttentionLaunch};
 pub use specification::{KernelLaunch, KernelSpec, OutputAlias, TensorSpec};

@@ -100,6 +100,98 @@ fn nvfp4_linear_is_one_semantic_operation_with_three_physical_components() {
 }
 
 #[test]
+fn nvfp4_decode_qkv_is_one_sm8x_launch_without_changing_portable_semantics() {
+    fn projection(name: &str, outputs: i64) -> (Parameter, Parameter) {
+        (
+            Parameter::nvfp4(
+                format!("{name}.weight"),
+                format!("model.{name}.weight"),
+                Shape::new(DType::Bf16, &[outputs, 16]).unwrap(),
+            )
+            .unwrap(),
+            parameter(
+                &format!("{name}.bias"),
+                Shape::new(DType::Bf16, &[outputs]).unwrap(),
+            ),
+        )
+    }
+
+    fn program(rows: i64) -> nml_ir::Program {
+        let (query_weight, query_bias) = projection("query", 32);
+        let (key_weight, key_bias) = projection("key", 8);
+        let (value_weight, value_bias) = projection("value", 8);
+        let mut builder = ProgramBuilder::new();
+        let input = builder.input(
+            "hidden",
+            Shape::new(DType::Bf16, &[1, rows, 16]).unwrap(),
+        );
+        let (query, key, value) = builder
+            .linear_qkv(
+                input,
+                &query_weight,
+                Some(&query_bias),
+                &key_weight,
+                Some(&key_bias),
+                &value_weight,
+                Some(&value_bias),
+            )
+            .unwrap();
+        builder.finish(&[query, key, value]).unwrap()
+    }
+
+    let decode = program(1);
+    let context = Context::new();
+    let sm86 = decode
+        .module_with_sharding_cuda(
+            &context,
+            &nml_sharding::Sharding::single(),
+            84,
+            8,
+            6,
+        )
+        .unwrap();
+    sm86.verify().unwrap();
+    let sm86 = sm86.text();
+    assert_eq!(sm86.matches("__gpu$xla.gpu.triton").count(), 1, "{sm86}");
+    assert!(sm86.contains("nvfp4_qkv_gemv"), "{sm86}");
+    assert!(!sm86.contains("nvfp4_linear_gemv"), "{sm86}");
+
+    let context = Context::new();
+    let sm75 = decode
+        .module_with_sharding_cuda(
+            &context,
+            &nml_sharding::Sharding::single(),
+            40,
+            7,
+            5,
+        )
+        .unwrap();
+    sm75.verify().unwrap();
+    let sm75 = sm75.text();
+    assert_eq!(sm75.matches("nml.nvfp4.turing.linear").count(), 3, "{sm75}");
+    assert!(!sm75.contains("nvfp4_qkv_gemv"), "{sm75}");
+
+    let portable = decode.stablehlo().unwrap();
+    assert_eq!(portable.matches("nml.nvfp4.linear").count(), 3, "{portable}");
+    assert!(!portable.contains("nvfp4_qkv_gemv"), "{portable}");
+
+    let context = Context::new();
+    let prefill = program(2)
+        .module_with_sharding_cuda(
+            &context,
+            &nml_sharding::Sharding::single(),
+            84,
+            8,
+            6,
+        )
+        .unwrap();
+    prefill.verify().unwrap();
+    let prefill = prefill.text();
+    assert_eq!(prefill.matches("__gpu$xla.gpu.triton").count(), 3, "{prefill}");
+    assert!(!prefill.contains("nvfp4_qkv_gemv"), "{prefill}");
+}
+
+#[test]
 fn nvfp4_linear_validates_optional_bias_before_authoring_the_compact_operation() {
     let dtype = DType::F16;
     let weight = Parameter::nvfp4(

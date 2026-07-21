@@ -21,6 +21,18 @@ pub struct NvFp4LinearConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NvFp4QkvConfig {
+    pub dtype: DType,
+    pub inputs: i64,
+    pub query_outputs: i64,
+    pub key_outputs: i64,
+    pub value_outputs: i64,
+    pub block_n: i64,
+    pub block_k: i64,
+    pub has_bias: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NvFp4GroupedRole {
     GateUpActivated,
     Down,
@@ -162,12 +174,164 @@ impl NvFp4LinearConfig {
     }
 }
 
+impl NvFp4QkvConfig {
+    pub fn launch_grid(self) -> Result<[i32; 3], Error> {
+        self.validate()?;
+        let programs = [
+            self.query_outputs,
+            self.key_outputs,
+            self.value_outputs,
+        ]
+        .into_iter()
+        .try_fold(0_i64, |programs, outputs| {
+            programs.checked_add(ceil_div(outputs, self.block_n))
+        })
+        .ok_or(Error::InvalidKernelSpec("NVFP4 QKV launch grid overflows"))?;
+        Ok([
+            i32::try_from(programs)
+                .map_err(|_| Error::InvalidKernelSpec("NVFP4 QKV launch grid exceeds I32"))?,
+            1,
+            1,
+        ])
+    }
+
+    fn validate(self) -> Result<(), Error> {
+        if !matches!(self.dtype, DType::F16 | DType::Bf16)
+            || [
+                self.inputs,
+                self.query_outputs,
+                self.key_outputs,
+                self.value_outputs,
+            ]
+            .into_iter()
+            .any(|value| value <= 0)
+            || [self.block_n, self.block_k]
+                .into_iter()
+                .any(|value| value <= 0 || !(value as u64).is_power_of_two())
+            || self.block_k % REPRESENTATION_BLOCK != 0
+        {
+            return Err(Error::InvalidKernelSpec(
+                "NVFP4 QKV requires F16/BF16, positive geometry, power-of-two tiles, and a K tile divisible by sixteen",
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub fn build_nvfp4_linear(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
     config.validate()?;
     if config.rows == 1 {
         return build_nvfp4_linear_gemv(config);
     }
     build_nvfp4_linear_matrix(config)
+}
+
+/// Builds one autoregressive compact QKV launch over three independent source
+/// tensors. The representation remains unchanged; only the scheduling domain
+/// is combined so the two 64-CTA K/V tails share waves with Q on SM8x.
+pub fn build_nvfp4_qkv(config: NvFp4QkvConfig) -> Result<Kernel, Error> {
+    config.validate()?;
+    let mut builder = Builder::new("nvfp4_qkv_gemv")?;
+    let input = pointer(&mut builder, "input", config.dtype)?;
+    let query_payload = pointer(&mut builder, "query_payload", DType::U8)?;
+    let query_block_scales = pointer(&mut builder, "query_block_scales", DType::U8)?;
+    let query_global_scale = pointer(&mut builder, "query_global_scale", DType::F32)?;
+    let query_bias = config
+        .has_bias
+        .then(|| pointer(&mut builder, "query_bias", config.dtype))
+        .transpose()?;
+    let key_payload = pointer(&mut builder, "key_payload", DType::U8)?;
+    let key_block_scales = pointer(&mut builder, "key_block_scales", DType::U8)?;
+    let key_global_scale = pointer(&mut builder, "key_global_scale", DType::F32)?;
+    let key_bias = config
+        .has_bias
+        .then(|| pointer(&mut builder, "key_bias", config.dtype))
+        .transpose()?;
+    let value_payload = pointer(&mut builder, "value_payload", DType::U8)?;
+    let value_block_scales = pointer(&mut builder, "value_block_scales", DType::U8)?;
+    let value_global_scale = pointer(&mut builder, "value_global_scale", DType::F32)?;
+    let value_bias = config
+        .has_bias
+        .then(|| pointer(&mut builder, "value_bias", config.dtype))
+        .transpose()?;
+    let query_output = pointer(&mut builder, "query_output", config.dtype)?;
+    let key_output = pointer(&mut builder, "key_output", config.dtype)?;
+    let value_output = pointer(&mut builder, "value_output", config.dtype)?;
+
+    let program = builder.program_id(0)?;
+    let query_programs = ceil_div(config.query_outputs, config.block_n);
+    let key_programs = ceil_div(config.key_outputs, config.block_n);
+    let query_limit = builder.integer(query_programs, DType::I32)?;
+    let key_limit = builder.integer(
+        query_programs
+            .checked_add(key_programs)
+            .ok_or(Error::InvalidKernelSpec("NVFP4 QKV program range overflows"))?,
+        DType::I32,
+    )?;
+
+    let query_program = builder.compare(Comparison::Less, &program, &query_limit)?;
+    builder.if_only(&query_program, |body| {
+        build_nvfp4_gemv_projection(
+            body,
+            qkv_projection(config, config.query_outputs),
+            &program,
+            &input,
+            &query_payload,
+            &query_block_scales,
+            &query_global_scale,
+            query_bias.as_ref(),
+            &query_output,
+        )
+    })?;
+
+    let after_query = builder.compare(Comparison::GreaterEqual, &program, &query_limit)?;
+    let before_value = builder.compare(Comparison::Less, &program, &key_limit)?;
+    let key_program = builder.bit_and(&after_query, &before_value)?;
+    builder.if_only(&key_program, |body| {
+        let local_program = body.subtract(&program, &query_limit)?;
+        build_nvfp4_gemv_projection(
+            body,
+            qkv_projection(config, config.key_outputs),
+            &local_program,
+            &input,
+            &key_payload,
+            &key_block_scales,
+            &key_global_scale,
+            key_bias.as_ref(),
+            &key_output,
+        )
+    })?;
+
+    let value_program = builder.compare(Comparison::GreaterEqual, &program, &key_limit)?;
+    builder.if_only(&value_program, |body| {
+        let local_program = body.subtract(&program, &key_limit)?;
+        build_nvfp4_gemv_projection(
+            body,
+            qkv_projection(config, config.value_outputs),
+            &local_program,
+            &input,
+            &value_payload,
+            &value_block_scales,
+            &value_global_scale,
+            value_bias.as_ref(),
+            &value_output,
+        )
+    })?;
+    builder.return_void()?;
+    builder.finish()
+}
+
+const fn qkv_projection(config: NvFp4QkvConfig, outputs: i64) -> NvFp4LinearConfig {
+    NvFp4LinearConfig {
+        dtype: config.dtype,
+        rows: 1,
+        outputs,
+        inputs: config.inputs,
+        block_m: 1,
+        block_n: config.block_n,
+        block_k: config.block_k,
+        has_bias: config.has_bias,
+    }
 }
 
 fn build_nvfp4_linear_matrix(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
@@ -320,17 +484,6 @@ fn build_nvfp4_linear_matrix(config: NvFp4LinearConfig) -> Result<Kernel, Error>
 /// decoded block scale for all eight packed bytes that it governs, and reduces
 /// directly into F32 output accumulators.
 fn build_nvfp4_linear_gemv(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
-    let block_n = i32::try_from(config.block_n)
-        .map_err(|_| Error::InvalidKernelSpec("NVFP4 N tile exceeds I32"))?;
-    let packed_k = config.block_k / 2;
-    let packed_k_i32 = i32::try_from(packed_k)
-        .map_err(|_| Error::InvalidKernelSpec("NVFP4 packed K tile exceeds I32"))?;
-    let scale_k = config.block_k / REPRESENTATION_BLOCK;
-    let scale_k_i32 = i32::try_from(scale_k)
-        .map_err(|_| Error::InvalidKernelSpec("NVFP4 scale K tile exceeds I32"))?;
-    let packed_width = ceil_div(config.inputs, 2);
-    let scale_width = ceil_div(config.inputs, REPRESENTATION_BLOCK);
-
     let mut builder = Builder::new("nvfp4_linear_gemv")?;
     let input = pointer(&mut builder, "input", config.dtype)?;
     let payload = pointer(&mut builder, "payload", DType::U8)?;
@@ -343,8 +496,46 @@ fn build_nvfp4_linear_gemv(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
     let output = pointer(&mut builder, "output", config.dtype)?;
 
     let output_program = builder.program_id(0)?;
+    build_nvfp4_gemv_projection(
+        &mut builder,
+        config,
+        &output_program,
+        &input,
+        &payload,
+        &block_scales,
+        &global_scale,
+        bias.as_ref(),
+        &output,
+    )?;
+    builder.return_void()?;
+    builder.finish()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_nvfp4_gemv_projection(
+    builder: &mut Builder,
+    config: NvFp4LinearConfig,
+    output_program: &Value,
+    input: &Value,
+    payload: &Value,
+    block_scales: &Value,
+    global_scale: &Value,
+    bias: Option<&Value>,
+    output: &Value,
+) -> Result<(), Error> {
+    let block_n = i32::try_from(config.block_n)
+        .map_err(|_| Error::InvalidKernelSpec("NVFP4 N tile exceeds I32"))?;
+    let packed_k = config.block_k / 2;
+    let packed_k_i32 = i32::try_from(packed_k)
+        .map_err(|_| Error::InvalidKernelSpec("NVFP4 packed K tile exceeds I32"))?;
+    let scale_k = config.block_k / REPRESENTATION_BLOCK;
+    let scale_k_i32 = i32::try_from(scale_k)
+        .map_err(|_| Error::InvalidKernelSpec("NVFP4 scale K tile exceeds I32"))?;
+    let packed_width = ceil_div(config.inputs, 2);
+    let scale_width = ceil_div(config.inputs, REPRESENTATION_BLOCK);
+
     let block_n_value = builder.integer(config.block_n, DType::I32)?;
-    let output_base = builder.multiply(&output_program, &block_n_value)?;
+    let output_base = builder.multiply(output_program, &block_n_value)?;
     let output_lanes = builder.range(0, block_n)?;
     let outputs = builder.add(&output_base, &output_lanes)?;
     let output_limit = builder.integer(config.outputs, DType::I32)?;
@@ -353,7 +544,7 @@ fn build_nvfp4_linear_gemv(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
     let lower = builder.integer(0, DType::I32)?;
     let upper = builder.integer(config.inputs, DType::I32)?;
     let step = builder.integer(config.block_k, DType::I32)?;
-    let global = builder.load(&global_scale)?;
+    let global = builder.load(global_scale)?;
     let accumulator = builder.full_float(&[config.block_n], 0.0, DType::F32)?;
     let result = builder.for_loop(
         &lower,
@@ -372,8 +563,8 @@ fn build_nvfp4_linear_gemv(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
             let valid_odd = body.compare(Comparison::Less, &odd_k, &input_limit)?;
 
             let input_zero = body.full_float(&[packed_k], 0.0, config.dtype)?;
-            let even_addresses = body.add_pointer(&input, &even_k)?;
-            let odd_addresses = body.add_pointer(&input, &odd_k)?;
+            let even_addresses = body.add_pointer(input, &even_k)?;
+            let odd_addresses = body.add_pointer(input, &odd_k)?;
             let even = body.load_masked(&even_addresses, &valid_even, &input_zero)?;
             let odd = body.load_masked(&odd_addresses, &valid_odd, &input_zero)?;
             let even = body.cast(&even, DType::F32)?;
@@ -388,7 +579,7 @@ fn build_nvfp4_linear_gemv(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
             // Weight rows own contiguous K. Keeping K as the final TTIR
             // dimension lets lanes in one warp issue adjacent byte loads.
             let payload_offsets = matrix_offsets(body, &payload_rows, &packed_columns)?;
-            let payload_addresses = body.add_pointer(&payload, &payload_offsets)?;
+            let payload_addresses = body.add_pointer(payload, &payload_offsets)?;
             let payload_mask = body.mask_2d(&valid_outputs, &valid_even)?;
             let payload_zero = body.full_integer(&[config.block_n, packed_k], 0, DType::U8)?;
             let packed =
@@ -409,7 +600,7 @@ fn build_nvfp4_linear_gemv(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
             let scale_width_value = body.integer(scale_width, DType::I32)?;
             let scale_rows = body.multiply(&outputs, &scale_width_value)?;
             let scale_offsets = matrix_offsets(body, &scale_rows, &scale_columns)?;
-            let scale_addresses = body.add_pointer(&block_scales, &scale_offsets)?;
+            let scale_addresses = body.add_pointer(block_scales, &scale_offsets)?;
             let scale_mask = body.mask_2d(&valid_outputs, &valid_scales)?;
             let scale_zero = body.full_integer(&[config.block_n, scale_k], 0, DType::U8)?;
             let scales = body.load_masked_streaming(&scale_addresses, &scale_mask, &scale_zero)?;
@@ -433,7 +624,7 @@ fn build_nvfp4_linear_gemv(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
     let result = builder.multiply(&result, &global)?;
 
     let result = if let Some(bias) = bias {
-        let bias_addresses = builder.add_pointer(&bias, &outputs)?;
+        let bias_addresses = builder.add_pointer(bias, &outputs)?;
         let bias_zero = builder.full_float(&[config.block_n], 0.0, config.dtype)?;
         let bias = builder.load_masked(&bias_addresses, &valid_outputs, &bias_zero)?;
         let bias = builder.cast(&bias, DType::F32)?;
@@ -442,10 +633,9 @@ fn build_nvfp4_linear_gemv(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
         result
     };
     let result = builder.cast(&result, config.dtype)?;
-    let output_addresses = builder.add_pointer(&output, &outputs)?;
+    let output_addresses = builder.add_pointer(output, &outputs)?;
     builder.store_masked(&output_addresses, &result, &valid_outputs)?;
-    builder.return_void()?;
-    builder.finish()
+    Ok(())
 }
 
 pub fn build_nvfp4_embedding(config: NvFp4EmbeddingConfig) -> Result<Kernel, Error> {

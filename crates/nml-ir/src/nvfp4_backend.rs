@@ -8,8 +8,9 @@
 use crate::{device_capabilities::CudaCapabilities, Error};
 use nml_kernel_triton::{
     build_nvfp4_embedding, build_nvfp4_grouped_projection, build_nvfp4_linear,
-    DType as KernelDType, KernelLaunch, KernelSpec, NvFp4EmbeddingConfig,
-    NvFp4GroupedProjectionConfig, NvFp4GroupedRole, NvFp4LinearConfig, TensorSpec,
+    build_nvfp4_qkv, DType as KernelDType, KernelLaunch, KernelSpec, NvFp4EmbeddingConfig,
+    NvFp4GroupedProjectionConfig, NvFp4GroupedRole, NvFp4LinearConfig, NvFp4QkvConfig,
+    TensorSpec,
 };
 use nml_mlir::{Block, Context, Region, Type, Value};
 use nml_types::{DType, Partition, Shape};
@@ -27,6 +28,28 @@ pub(crate) struct LinearInputs<'context> {
     pub bias_shape: Option<Shape>,
     pub result_shape: Shape,
     pub result_type: Type<'context>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct QkvProjectionInputs<'context> {
+    pub payload: Value<'context>,
+    pub block_scales: Value<'context>,
+    pub global_scale: Value<'context>,
+    pub bias: Option<Value<'context>>,
+    pub payload_shape: Shape,
+    pub block_scales_shape: Shape,
+    pub global_scale_shape: Shape,
+    pub bias_shape: Option<Shape>,
+    pub result_shape: Shape,
+    pub result_type: Type<'context>,
+}
+
+pub(crate) struct QkvInputs<'context> {
+    pub activation: Value<'context>,
+    pub activation_shape: Shape,
+    pub query: QkvProjectionInputs<'context>,
+    pub key: QkvProjectionInputs<'context>,
+    pub value: QkvProjectionInputs<'context>,
 }
 
 pub(crate) struct ExpertInputs<'context> {
@@ -153,6 +176,194 @@ pub(crate) fn lower_linear<'context>(
     let result = reshape.result(0)?;
     block.append_operation(reshape)?;
     Ok(result)
+}
+
+pub(crate) fn lower_qkv<'context>(
+    context: &'context Context,
+    block: &mut Block<'context>,
+    inputs: QkvInputs<'context>,
+    capabilities: CudaCapabilities,
+) -> Result<[Value<'context>; 3], Error> {
+    let projections = [inputs.query, inputs.key, inputs.value];
+    if capabilities.supports_nvfp4_turing_custom_call() {
+        let mut results = Vec::with_capacity(3);
+        for projection in projections {
+            results.push(lower_linear(
+                context,
+                block,
+                linear_inputs(inputs.activation, inputs.activation_shape, projection),
+                capabilities,
+            )?);
+        }
+        return results
+            .try_into()
+            .map_err(|_| Error::InvalidLinearAlgebra("NVFP4 QKV result arity changed"));
+    }
+    let plans = projections
+        .iter()
+        .map(|projection| {
+            LinearPlan::new(
+                inputs.activation_shape,
+                projection.result_shape,
+                projection.bias.is_some(),
+                capabilities,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let first = plans[0];
+    let fused_decode = first.config.rows == 1
+        && plans.iter().all(|plan| {
+            plan.config.rows == 1
+                && plan.config.dtype == first.config.dtype
+                && plan.config.inputs == first.config.inputs
+                && plan.config.block_n == first.config.block_n
+                && plan.config.block_k == first.config.block_k
+                && plan.config.has_bias == first.config.has_bias
+                && plan.warps == first.warps
+                && plan.stages == first.stages
+        });
+    if !fused_decode {
+        let mut results = Vec::with_capacity(3);
+        for projection in projections {
+            results.push(lower_linear(
+                context,
+                block,
+                linear_inputs(inputs.activation, inputs.activation_shape, projection),
+                capabilities,
+            )?);
+        }
+        return results
+            .try_into()
+            .map_err(|_| Error::InvalidLinearAlgebra("NVFP4 QKV result arity changed"));
+    }
+
+    for projection in projections {
+        require_unsharded(&linear_inputs(
+            inputs.activation,
+            inputs.activation_shape,
+            projection,
+        ))?;
+    }
+    let config = NvFp4QkvConfig {
+        dtype: first.config.dtype,
+        inputs: first.config.inputs,
+        query_outputs: plans[0].config.outputs,
+        key_outputs: plans[1].config.outputs,
+        value_outputs: plans[2].config.outputs,
+        block_n: first.config.block_n,
+        block_k: first.config.block_k,
+        has_bias: first.config.has_bias,
+    };
+    let mut argument_specs = vec![tensor(
+        config.dtype,
+        inputs.activation_shape.dimensions(),
+    )?];
+    for projection in projections {
+        argument_specs.extend([
+            tensor(KernelDType::U8, projection.payload_shape.dimensions())?,
+            tensor(
+                KernelDType::U8,
+                projection.block_scales_shape.dimensions(),
+            )?,
+            tensor(
+                KernelDType::F32,
+                projection.global_scale_shape.dimensions(),
+            )?,
+        ]);
+        if let Some(shape) = projection.bias_shape {
+            argument_specs.push(tensor(config.dtype, shape.dimensions())?);
+        }
+    }
+    let output_shapes = [
+        [1, config.query_outputs],
+        [1, config.key_outputs],
+        [1, config.value_outputs],
+    ];
+    let specification = KernelSpec::new(
+        build_nvfp4_qkv(config).map_err(kernel_error)?,
+        argument_specs,
+        output_shapes
+            .iter()
+            .map(|shape| tensor(config.dtype, shape))
+            .collect::<Result<Vec<_>, _>>()?,
+        vec![],
+    )
+    .map_err(kernel_error)?;
+    let names = ["query", "key", "value"];
+    let mut arguments = vec![("input".to_owned(), inputs.activation)];
+    for (name, projection) in names.into_iter().zip(projections) {
+        arguments.extend([
+            (projection_name(name, "payload"), projection.payload),
+            (
+                projection_name(name, "block_scales"),
+                projection.block_scales,
+            ),
+            (
+                projection_name(name, "global_scale"),
+                projection.global_scale,
+            ),
+        ]);
+        if let Some(bias) = projection.bias {
+            arguments.push((projection_name(name, "bias"), bias));
+        }
+    }
+    let borrowed_arguments = arguments
+        .iter()
+        .map(|(name, value)| (name.as_str(), *value))
+        .collect::<Vec<_>>();
+    let call = specification
+        .lower(
+            context,
+            &borrowed_arguments,
+            KernelLaunch {
+                grid: config.launch_grid().map_err(kernel_error)?,
+                warps: first.warps,
+                stages: first.stages,
+            },
+        )
+        .map_err(kernel_error)?;
+    let flat = [call.result(0)?, call.result(1)?, call.result(2)?];
+    block.append_operation(call)?;
+
+    let mut results = Vec::with_capacity(3);
+    for (flat, projection) in flat.into_iter().zip(projections) {
+        if flat.type_().text() == projection.result_type.text() {
+            results.push(flat);
+        } else {
+            let reshape = context.reshape(flat, projection.result_type)?;
+            let result = reshape.result(0)?;
+            block.append_operation(reshape)?;
+            results.push(result);
+        }
+    }
+    results
+        .try_into()
+        .map_err(|_| Error::InvalidLinearAlgebra("NVFP4 QKV result arity changed"))
+}
+
+fn linear_inputs<'context>(
+    activation: Value<'context>,
+    activation_shape: Shape,
+    projection: QkvProjectionInputs<'context>,
+) -> LinearInputs<'context> {
+    LinearInputs {
+        activation,
+        payload: projection.payload,
+        block_scales: projection.block_scales,
+        global_scale: projection.global_scale,
+        bias: projection.bias,
+        activation_shape,
+        payload_shape: projection.payload_shape,
+        block_scales_shape: projection.block_scales_shape,
+        global_scale_shape: projection.global_scale_shape,
+        bias_shape: projection.bias_shape,
+        result_shape: projection.result_shape,
+        result_type: projection.result_type,
+    }
+}
+
+fn projection_name(projection: &str, component: &str) -> String {
+    format!("{projection}_{component}")
 }
 
 pub(crate) fn lower_routed_swiglu<'context>(
