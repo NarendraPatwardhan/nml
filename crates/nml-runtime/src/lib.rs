@@ -890,6 +890,17 @@ struct BufferStorage {
     shards: Vec<nml_pjrt::Buffer>,
 }
 
+/// In-flight download of one replicated logical buffer.
+pub struct BufferDownload<'transfer> {
+    transfer: nml_pjrt::HostDownload<'transfer>,
+}
+
+impl BufferDownload<'_> {
+    pub fn wait(self) -> Result<(), Error> {
+        self.transfer.wait().map_err(Error::Pjrt)
+    }
+}
+
 impl Buffer {
     pub const fn shape(&self) -> Shape {
         self.shape
@@ -980,6 +991,22 @@ impl Buffer {
             destination.copy_from(&source)?;
         }
         Ok(result)
+    }
+
+    /// Starts a nonblocking download of a replicated logical buffer.
+    /// Sharded downloads require host-side placement assembly and therefore
+    /// retain the synchronous `to_slice` path.
+    pub fn download_to<'transfer>(
+        &'transfer self,
+        destination: &'transfer mut Slice<'_>,
+    ) -> Result<BufferDownload<'transfer>, Error> {
+        if !self.sharding.is_replicated() {
+            return Err(Error::AsyncDownloadRequiresReplicatedSharding);
+        }
+        let transfer = self.storage.shards[0]
+            .to_slice_async(destination)
+            .map_err(Error::Pjrt)?;
+        Ok(BufferDownload { transfer })
     }
 
     pub fn delete(self) -> Result<(), Error> {
@@ -1521,6 +1548,7 @@ pub enum Error {
     DonationRequiresUniqueOwnership(String),
     ParameterDonation(String),
     DeletionRequiresUniqueOwnership,
+    AsyncDownloadRequiresReplicatedSharding,
     ResultCount {
         expected: usize,
         actual: usize,
@@ -1616,6 +1644,9 @@ impl fmt::Display for Error {
             }
             Self::DeletionRequiresUniqueOwnership => {
                 f.write_str("shared buffer storage cannot be explicitly deleted")
+            }
+            Self::AsyncDownloadRequiresReplicatedSharding => {
+                f.write_str("asynchronous downloads require replicated buffer placement")
             }
             Self::ResultCount { expected, actual } => write!(
                 f,

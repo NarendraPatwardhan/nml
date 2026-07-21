@@ -63,6 +63,14 @@ fn packaged_cpu_plugin_creates_a_real_cpu_client() {
         .to_slice_alloc()
         .expect("CPU device-to-host transfer must complete");
     assert_eq!(returned.contiguous_bytes().unwrap(), host_bytes);
+    let mut asynchronous = Slice::alloc(shape).unwrap();
+    let download = buffer
+        .to_slice_async(&mut asynchronous)
+        .expect("CPU device-to-host transfer must start asynchronously");
+    download
+        .wait()
+        .expect("CPU asynchronous device-to-host transfer must complete");
+    assert_eq!(asynchronous.contiguous_bytes().unwrap(), host_bytes);
 
     for (shape, bytes) in [
         (

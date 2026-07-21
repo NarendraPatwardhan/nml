@@ -79,6 +79,23 @@ fn persistent_linear_parameters_execute_repeatedly_from_real_checkpoints() {
     truncated_checkpoint_releases_in_flight_transfers(&platform);
     activation_donation_aliases_the_output(&platform);
     reusable_parameter_slots_chain_without_host_synchronization(&platform);
+    replicated_buffer_download_starts_before_host_wait(&platform);
+}
+
+fn replicated_buffer_download_starts_before_host_wait(platform: &nml::Platform) {
+    let shape = Shape::new(DType::I32, &[1, 1]).unwrap();
+    let expected = [17_i32];
+    let buffer = platform
+        .upload(
+            &nml::Slice::from_typed(shape, &expected).unwrap(),
+            nml::Sharding::replicated(),
+            nml::Memory::Default,
+        )
+        .unwrap();
+    let mut destination = nml::Slice::alloc(shape).unwrap();
+    let download = buffer.download_to(&mut destination).unwrap();
+    download.wait().unwrap();
+    assert_eq!(destination.items::<i32>().unwrap(), expected);
 }
 
 fn reusable_parameter_slots_chain_without_host_synchronization(platform: &nml::Platform) {

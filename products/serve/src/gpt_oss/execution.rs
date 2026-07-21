@@ -530,6 +530,7 @@ impl ResidentModel<'_> {
         let mut decode_download = Duration::ZERO;
         let mut first_decode_submission = SubmissionTimings::default();
         let mut steady_decode_submission = SubmissionTimings::default();
+        let mut token_download = Slice::alloc(token_buffer.shape()).map_err(boxed)?;
         let (first_decode_pair, remaining_decode_pairs) = decode_pairs
             .split_first_mut()
             .ok_or_else(|| message("GPT-OSS decode schedule contains no layer pair"))?;
@@ -608,11 +609,16 @@ impl ResidentModel<'_> {
             }
             decode_submission.head = submission_started.elapsed();
 
-            // The head outputs carry readiness dependencies, so the next token
-            // can enter embedding and the first bounded layer pair before the
-            // host observes it. This queues enough useful work to cover both
-            // the head-to-embedding and embedding-to-first-pair bubbles while
-            // limiting terminal speculation to two request-local layer caches.
+            // Start host observation before the device token gains another
+            // consumer. PJRT can now order the tiny D2H transfer directly
+            // after the head while embedding and the first bounded layer pair
+            // execute from the same dependency-carrying token buffer. Starting
+            // this transfer after that speculative consumer would serialize
+            // readback behind the pair and starve the remaining layer pairs.
+            let pending_token = token_buffer
+                .download_to(&mut token_download)
+                .map_err(boxed)?;
+
             // Keep one token of budget beyond the speculative input: otherwise
             // the lookahead would compute a token the caller never requested.
             if should_enqueue_lookahead(generated_index, request.max_new_tokens) {
@@ -635,7 +641,8 @@ impl ResidentModel<'_> {
                 add_submission(&mut steady_decode_submission, decode_submission);
             }
             let download_started = Instant::now();
-            next_token = download_token(&token_buffer)?;
+            pending_token.wait().map_err(boxed)?;
+            next_token = token_from_slice(&token_download)?;
             decode_download += download_started.elapsed();
         }
 
@@ -1110,6 +1117,10 @@ fn upload_f32_scalar(platform: &Platform, value: f32, placement: &Sharding) -> R
 
 fn download_token(buffer: &Buffer) -> Result<u32> {
     let slice = buffer.to_slice().map_err(boxed)?;
+    token_from_slice(&slice)
+}
+
+fn token_from_slice(slice: &Slice<'_>) -> Result<u32> {
     let values = slice.items::<i32>().map_err(boxed)?;
     let [token] = values else {
         return Err(message("GPT-OSS token output is not scalar-shaped"));

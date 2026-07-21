@@ -1782,6 +1782,33 @@ impl Drop for HostTransfer<'_> {
     }
 }
 
+/// In-flight device-to-host transfer. Both the source buffer and destination
+/// storage remain borrowed until PJRT reports completion.
+pub struct HostDownload<'transfer> {
+    done: Option<Event>,
+    _borrows: PhantomData<&'transfer mut ()>,
+}
+
+impl HostDownload<'_> {
+    pub fn wait(mut self) -> Result<(), Error> {
+        self.done
+            .take()
+            .expect("host download completion event")
+            .wait()
+    }
+}
+
+impl Drop for HostDownload<'_> {
+    fn drop(&mut self) {
+        // PJRT may still be writing caller-owned storage. Awaiting here keeps
+        // both borrows live until the plugin has released the destination,
+        // including every failure and early-return path.
+        if let Some(done) = self.done.take() {
+            let _ = done.wait();
+        }
+    }
+}
+
 /// One client-registered staging allocation. The source borrow prevents the
 /// allocation from moving or being released until PJRT has been unmapped.
 pub struct DmaMapping<'data> {
@@ -2126,6 +2153,16 @@ impl Buffer {
     }
 
     pub fn to_slice(&self, destination: &mut Slice<'_>) -> Result<(), Error> {
+        self.to_slice_async(destination)?.wait()
+    }
+
+    /// Starts a device-to-host transfer without synchronizing the caller.
+    /// The returned guard borrows both this buffer and `destination`; dropping
+    /// or waiting on it proves that PJRT has finished writing host storage.
+    pub fn to_slice_async<'transfer>(
+        &'transfer self,
+        destination: &'transfer mut Slice<'_>,
+    ) -> Result<HostDownload<'transfer>, Error> {
         let shape = self.shape()?;
         if destination.shape() != shape {
             return Err(Error::InvalidHostBuffer {
@@ -2151,8 +2188,10 @@ impl Buffer {
         self.client.state.plugin.into_result(error)?;
         let event =
             NonNull::new(args.event).ok_or(Error::NullResult("PJRT_Buffer_ToHostBuffer event"))?;
-        Event::from_raw(&self.client.state.plugin, event).wait()?;
-        Ok(())
+        Ok(HostDownload {
+            done: Some(Event::from_raw(&self.client.state.plugin, event)),
+            _borrows: PhantomData,
+        })
     }
 
     pub fn delete(&self) -> Result<(), Error> {
