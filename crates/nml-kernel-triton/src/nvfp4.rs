@@ -419,8 +419,6 @@ fn build_nvfp4_linear_gemv(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
             let scales = body.reshape(&scales, &[config.block_n, packed_k])?;
             let low = body.multiply(&low, &scales)?;
             let high = body.multiply(&high, &scales)?;
-            let low = body.multiply(&low, &global)?;
-            let high = body.multiply(&high, &global)?;
             let low = body.multiply(&low, &even)?;
             let high = body.multiply(&high, &odd)?;
             let products = body.add(&low, &high)?;
@@ -429,6 +427,10 @@ fn build_nvfp4_linear_gemv(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
         },
     )?[0]
         .clone();
+    // The tensor-wide scale is invariant across K. Apply it once after the
+    // complete F32 reduction instead of to both decoded halves of every
+    // packed weight.
+    let result = builder.multiply(&result, &global)?;
 
     let result = if let Some(bias) = bias {
         let bias_addresses = builder.add_pointer(&bias, &outputs)?;
@@ -1185,7 +1187,6 @@ fn build_grouped_gate_up_gemv(config: NvFp4GroupedProjectionConfig) -> Result<Ke
     let accumulators = builder.if_then_else(
         &schedule.execute,
         |body| {
-            let global = body.load(&global_scale)?;
             let gate_accumulator = body.full_float(&[config.block_n], 0.0, DType::F32)?;
             let up_accumulator = body.full_float(&[config.block_n], 0.0, DType::F32)?;
             let lower = body.integer(0, DType::I32)?;
@@ -1323,8 +1324,6 @@ fn build_grouped_gate_up_gemv(config: NvFp4GroupedProjectionConfig) -> Result<Ke
                     let up_products = loop_body.add(&up_even, &up_odd)?;
                     let gate = loop_body.reduce(Reduction::Sum, &gate_products, 1)?;
                     let up = loop_body.reduce(Reduction::Sum, &up_products, 1)?;
-                    let gate = loop_body.multiply(&gate, &global)?;
-                    let up = loop_body.multiply(&up, &global)?;
                     let gate = loop_body.add(&carried[0], &gate)?;
                     let up = loop_body.add(&carried[1], &up)?;
                     Ok(vec![gate, up])
@@ -1338,8 +1337,9 @@ fn build_grouped_gate_up_gemv(config: NvFp4GroupedProjectionConfig) -> Result<Ke
             ])
         },
     )?;
-    let mut gate = accumulators[0].clone();
-    let mut up = accumulators[1].clone();
+    let global = builder.load(&global_scale)?;
+    let mut gate = builder.multiply(&accumulators[0], &global)?;
+    let mut up = builder.multiply(&accumulators[1], &global)?;
 
     let expert_i64 = builder.cast(&schedule.address_expert, DType::I64)?;
     let bias_stride = builder.integer(logical_rows, DType::I64)?;
@@ -1428,7 +1428,6 @@ fn build_grouped_down_gemv(config: NvFp4GroupedProjectionConfig) -> Result<Kerne
     let accumulators = builder.if_then_else(
         &schedule.execute,
         |body| {
-            let global = body.load(&global_scale)?;
             let accumulator = body.full_float(&[config.block_n], 0.0, DType::F32)?;
             let lower = body.integer(0, DType::I32)?;
             let upper = body.integer(config.input_size, DType::I32)?;
@@ -1523,7 +1522,6 @@ fn build_grouped_down_gemv(config: NvFp4GroupedProjectionConfig) -> Result<Kerne
                     let odd_products = loop_body.multiply(&high, &odd)?;
                     let products = loop_body.add(&even_products, &odd_products)?;
                     let partial = loop_body.reduce(Reduction::Sum, &products, 1)?;
-                    let partial = loop_body.multiply(&partial, &global)?;
                     let result = loop_body.add(&carried[0], &partial)?;
                     Ok(vec![result])
                 },
@@ -1531,7 +1529,8 @@ fn build_grouped_down_gemv(config: NvFp4GroupedProjectionConfig) -> Result<Kerne
         },
         |body| Ok(vec![body.full_float(&[config.block_n], 0.0, DType::F32)?]),
     )?;
-    let mut result = accumulators[0].clone();
+    let global = builder.load(&global_scale)?;
+    let mut result = builder.multiply(&accumulators[0], &global)?;
     let columns_i64 = builder.cast(&columns, DType::I64)?;
     let output_width = builder.integer(config.output_size, DType::I64)?;
     let bias_base = builder.multiply(&expert_i64, &output_width)?;
@@ -1605,25 +1604,15 @@ fn decode_e2m1(builder: &mut Builder, code: &super::Value) -> Result<super::Valu
     let magnitude_mask = builder.full_integer(&shape, 0x07, DType::U8)?;
     let magnitude = builder.bit_and(code, &magnitude_mask)?;
 
-    // E2M1's eight magnitudes map directly onto IEEE F32 fields. Magnitudes
-    // two through seven have exponent `(magnitude >> 1) + 126` and use the low
-    // code bit as the F32 0.5 mantissa. Zero and 0.5 are the only exceptions.
-    // Constructing bits is both exact and substantially cheaper than deriving
-    // a dynamic exponent through `math.exp2` for every logical weight.
-    let one_u8 = builder.full_integer(&shape, 1, DType::U8)?;
-    let mantissa = builder.bit_and(&magnitude, &one_u8)?;
-    let group = builder.shift_right_logical(&magnitude, &one_u8)?;
-    let group = builder.cast(&group, DType::I32)?;
-    let exponent_bias = builder.full_integer(&shape, 126, DType::I32)?;
-    let exponent = builder.add(&group, &exponent_bias)?;
-    let exponent_place = builder.full_integer(&shape, 1 << 23, DType::I32)?;
-    let normal_bits = builder.multiply(&exponent, &exponent_place)?;
-    let mantissa = builder.cast(&mantissa, DType::I32)?;
-    let mantissa_place = builder.full_integer(&shape, 1 << 22, DType::I32)?;
-    let mantissa_bits = builder.multiply(&mantissa, &mantissa_place)?;
-    let normal_bits = builder.add(&normal_bits, &mantissa_bits)?;
-
+    // For magnitudes two through seven, the exact IEEE F32 bit pattern is
+    // `(magnitude + 252) << 22`. Zero and 0.5 are the only exceptions and are
+    // exactly `magnitude * bits(0.5)`. This affine construction removes the
+    // separate dynamic exponent and mantissa paths from every decoded lane.
     let magnitude_i32 = builder.cast(&magnitude, DType::I32)?;
+    let normal_bias = builder.full_integer(&shape, 252, DType::I32)?;
+    let normal_bits = builder.add(&magnitude_i32, &normal_bias)?;
+    let normal_place = builder.full_integer(&shape, 1 << 22, DType::I32)?;
+    let normal_bits = builder.multiply(&normal_bits, &normal_place)?;
     let half_bits = builder.full_integer(&shape, 0x3f00_0000, DType::I32)?;
     let small_bits = builder.multiply(&magnitude_i32, &half_bits)?;
     let two = builder.full_integer(&shape, 2, DType::U8)?;
@@ -1643,75 +1632,39 @@ fn decode_e2m1(builder: &mut Builder, code: &super::Value) -> Result<super::Valu
 
 fn decode_e4m3fn(builder: &mut Builder, bits: &super::Value) -> Result<super::Value, Error> {
     let shape = code_shape(bits)?;
+    let payload_mask = builder.full_integer(&shape, 0x7f, DType::U8)?;
+    let payload = builder.bit_and(bits, &payload_mask)?;
     let three = builder.full_integer(&shape, 3, DType::U8)?;
-    let exponent = builder.shift_right_logical(bits, &three)?;
-    let exponent_mask = builder.full_integer(&shape, 0x0f, DType::U8)?;
-    let exponent = builder.bit_and(&exponent, &exponent_mask)?;
+    let exponent = builder.shift_right_logical(&payload, &three)?;
     let fraction_mask = builder.full_integer(&shape, 0x07, DType::U8)?;
-    let fraction = builder.bit_and(bits, &fraction_mask)?;
+    let fraction = builder.bit_and(&payload, &fraction_mask)?;
 
-    // Normal E4M3FN values become F32 by rebiasing the exponent from seven to
-    // 127 and placing the three mantissa bits at the top of F32's mantissa.
-    // NVFP4 block scales are validated as non-negative before upload, so the
-    // source sign bit is not part of the accepted execution domain.
-    let exponent_i32 = builder.cast(&exponent, DType::I32)?;
-    let f32_bias_delta = builder.full_integer(&shape, 120, DType::I32)?;
-    let f32_exponent = builder.add(&exponent_i32, &f32_bias_delta)?;
-    let exponent_place = builder.full_integer(&shape, 1 << 23, DType::I32)?;
-    let normal_bits = builder.multiply(&f32_exponent, &exponent_place)?;
-    let fraction_i32 = builder.cast(&fraction, DType::I32)?;
-    let fraction_place = builder.full_integer(&shape, 1 << 20, DType::I32)?;
-    let fraction_bits = builder.multiply(&fraction_i32, &fraction_place)?;
-    let normal_bits = builder.add(&normal_bits, &fraction_bits)?;
-
-    // Exponent zero has only eight cases. These three exact integer pieces
-    // cover 0, 2^-9, the 2^-8 pair, and the four 2^-7 values without a table
-    // load, division, or transcendental operation.
-    let zero_u8 = builder.full_integer(&shape, 0, DType::U8)?;
-    let one_u8 = builder.full_integer(&shape, 1, DType::U8)?;
-    let two_u8 = builder.full_integer(&shape, 2, DType::U8)?;
-    let four_u8 = builder.full_integer(&shape, 4, DType::U8)?;
-    let two_i32 = builder.cast(&two_u8, DType::I32)?;
-    let fraction_minus_two = builder.subtract(&fraction_i32, &two_i32)?;
-    let mid_step = builder.full_integer(&shape, 1 << 22, DType::I32)?;
-    let mid_bits = builder.multiply(&fraction_minus_two, &mid_step)?;
-    let mid_base = builder.full_integer(&shape, 0x3b80_0000, DType::I32)?;
-    let mid_bits = builder.add(&mid_base, &mid_bits)?;
-    let four_i32 = builder.cast(&four_u8, DType::I32)?;
-    let fraction_minus_four = builder.subtract(&fraction_i32, &four_i32)?;
-    let high_step = builder.full_integer(&shape, 1 << 21, DType::I32)?;
-    let high_bits = builder.multiply(&fraction_minus_four, &high_step)?;
-    let high_base = builder.full_integer(&shape, 0x3c00_0000, DType::I32)?;
-    let high_bits = builder.add(&high_base, &high_bits)?;
-    let is_below_four = builder.compare(Comparison::Less, &fraction, &four_u8)?;
-    let subnormal_bits = builder.select(&is_below_four, &mid_bits, &high_bits)?;
-    let one_bits = builder.full_integer(&shape, 0x3b00_0000, DType::I32)?;
-    let is_one = builder.compare(Comparison::Equal, &fraction, &one_u8)?;
-    let subnormal_bits = builder.select(&is_one, &one_bits, &subnormal_bits)?;
-    let zero_bits = builder.full_integer(&shape, 0, DType::I32)?;
-    let is_zero_fraction = builder.compare(Comparison::Equal, &fraction, &zero_u8)?;
-    let subnormal_bits = builder.select(&is_zero_fraction, &zero_bits, &subnormal_bits)?;
-
+    // A normal non-negative E4M3FN value becomes F32 by shifting its complete
+    // seven-bit exponent/fraction payload into place and adding the bias
+    // delta. Subnormals are exactly `fraction * 2^-9`; U8-to-F32 conversion is
+    // exact for all eight cases and avoids a multi-branch bit construction.
+    let payload_i32 = builder.cast(&payload, DType::I32)?;
+    let payload_place = builder.full_integer(&shape, 1 << 20, DType::I32)?;
+    let normal_bits = builder.multiply(&payload_i32, &payload_place)?;
+    let bias_delta = builder.full_integer(&shape, 0x3c00_0000, DType::I32)?;
+    let normal_bits = builder.add(&normal_bits, &bias_delta)?;
+    let normal = builder.bitcast(&normal_bits, DType::F32)?;
+    let fraction = builder.cast(&fraction, DType::F32)?;
+    let subnormal_step = builder.full_float(&shape, 2.0_f64.powi(-9), DType::F32)?;
+    let subnormal = builder.multiply(&fraction, &subnormal_step)?;
     let zero = builder.full_integer(&shape, 0, DType::U8)?;
     let is_zero_exponent = builder.compare(Comparison::Equal, &exponent, &zero)?;
-    let value_bits = builder.select(&is_zero_exponent, &subnormal_bits, &normal_bits)?;
+    let value = builder.select(&is_zero_exponent, &subnormal, &normal)?;
 
     // The scalar representation rejects negative scales and E4M3FN NaN. A
     // malformed component cannot report an error from inside a custom call,
     // so poison those unreachable encodings with a canonical F32 NaN instead
     // of silently interpreting them as a valid positive scale.
-    let sign_boundary = builder.full_integer(&shape, 0x80, DType::U8)?;
-    let has_sign = builder.compare(Comparison::GreaterEqual, bits, &sign_boundary)?;
-    let fifteen = builder.full_integer(&shape, 15, DType::U8)?;
-    let seven = builder.full_integer(&shape, 7, DType::U8)?;
-    let exponent_is_fifteen = builder.compare(Comparison::Equal, &exponent, &fifteen)?;
-    let fraction_is_seven = builder.compare(Comparison::Equal, &fraction, &seven)?;
-    let is_nan = builder.bit_and(&exponent_is_fifteen, &fraction_is_seven)?;
-    let true_value = builder.full_integer(&shape, 1, DType::I1)?;
-    let invalid = builder.select(&has_sign, &true_value, &is_nan)?;
+    let invalid_boundary = builder.full_integer(&shape, 0x7f, DType::U8)?;
+    let invalid = builder.compare(Comparison::GreaterEqual, bits, &invalid_boundary)?;
     let nan_bits = builder.full_integer(&shape, 0x7fc0_0000, DType::I32)?;
-    let value_bits = builder.select(&invalid, &nan_bits, &value_bits)?;
-    builder.bitcast(&value_bits, DType::F32)
+    let nan = builder.bitcast(&nan_bits, DType::F32)?;
+    builder.select(&invalid, &nan, &value)
 }
 
 fn code_shape(value: &super::Value) -> Result<Vec<i64>, Error> {

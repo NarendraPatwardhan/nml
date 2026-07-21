@@ -132,6 +132,10 @@ fn nvfp4_decode_linear_uses_compact_gemv_without_dead_matrix_rows() {
     assert!(ttir.contains("tt.reshape"), "{ttir}");
     assert!(!ttir.contains("tt.dot"), "{ttir}");
     assert!(!ttir.contains("math.exp2"), "{ttir}");
+    assert!(
+        ttir.rfind("arith.mulf").unwrap() > ttir.find("tt.reduce").unwrap(),
+        "the tensor-wide scale must be applied after the K reduction: {ttir}"
+    );
 }
 
 #[test]
@@ -243,6 +247,10 @@ fn nvfp4_decode_experts_use_selected_expert_gemv_kernels() {
         assert_eq!(gate_up.matches(" = \"tt.reduce\"").count(), 2, "{gate_up}");
         assert_eq!(gate_up.matches("math.exp2").count(), 1, "{gate_up}");
         assert!(!gate_up.contains("tt.dot"), "{gate_up}");
+        assert!(
+            gate_up.rfind("arith.mulf").unwrap() > gate_up.rfind("tt.reduce").unwrap(),
+            "the tensor-wide scale must be applied after the K reduction: {gate_up}"
+        );
 
         let down = build_nvfp4_grouped_projection(NvFp4GroupedProjectionConfig {
             dtype,
@@ -263,6 +271,10 @@ fn nvfp4_decode_experts_use_selected_expert_gemv_kernels() {
         assert_eq!(down.matches(" = \"tt.reduce\"").count(), 1, "{down}");
         assert!(!down.contains("math.exp2"), "{down}");
         assert!(!down.contains("tt.dot"), "{down}");
+        assert!(
+            down.rfind("arith.mulf").unwrap() > down.find("tt.reduce").unwrap(),
+            "the tensor-wide scale must be applied after the K reduction: {down}"
+        );
     }
 }
 
