@@ -181,9 +181,41 @@ bitcast inside each serving graph. Deterministic position readback is removed;
 token plus two U64 RNG words are bitcast into one 20-byte-per-row result. The
 hot serving step therefore moves from 14 H2D plus 3 D2H transfers to exactly
 1 H2D plus 1 D2H transfer at the product ABI. CPU and CUDA BuildBuddy contracts
-pass. The next A40 run must measure actual host registration, graph parameter
-updates, H2D/D2H calls, B1, and concurrency-8 deltas before this repair is
-called accepted.
+pass.
+
+The correlated A40 follow-up reached 117.113-118.553 end-to-end output
+tokens/s for the 106+320 workload, or roughly 132-136 decode tokens/s after
+TTFT. Nsight showed that compact NVFP4 compute did not regress: useful kernels
+took 6.615-6.645 ms/token versus 6.722 ms/token in the accepted single-request
+trace. The remaining loss was a 0.522-0.621 ms/token GPU hole at the exact
+boundary between the five serving-lookahead pairs and the following seven
+pairs. The synchronous serving transaction returned through output decoding,
+page accounting, event delivery, scheduler requeue/replan, batch reconstruction,
+and a fresh slab upload before submitting that suffix.
+
+The data plane is now refactored around an uncontended device-resident B1 lane:
+
+- batched prefill and generic changing-membership batches retain the compact
+  one-H2D/one-D2H serving ABI;
+- an idle B1 sequence imports its current token/RNG once, then retains token,
+  RNG, position, executable arguments, page table, and the accepted five-pair
+  prefix as device dependencies;
+- steady B1 performs zero H2D transfers and one four-byte token D2H; its page
+  table is uploaded only when physical-page membership changes;
+- the engine keeps the row in `InFlightDecode` and continues directly while
+  the command queue is empty, checking cancellation, deadline, output
+  backpressure, shutdown, and new commands after every visible token;
+- a membership-changing command retires the lane at a token boundary, reads
+  RNG once, discards the bounded prefix, and resumes generic batching over the
+  same process-wide paged K/V arena; and
+- the duplicate serving-only lookahead embedding/pair executable and its
+  sequence/position/token identity bridge are removed.
+
+BuildBuddy and A40 evidence for this refactor are separate gates. The legacy
+diagnostic route remains only as the immutable performance control until this
+new server lane reaches at least 150 decode-loop tokens/s; after that proof,
+the diagnostic adapter must drive the serving lane and the old request-local
+prefill/execution route must be deleted.
 
 ## 4. External reference facts and what they do not prove
 
@@ -742,34 +774,40 @@ request's slot as permanent identity.
 ### 9.5 Preserve the single-stream fast path
 
 When there is exactly one active decode request and no useful queued/prefill
-work, use the accepted batch-1 graph and its bounded five-layer-pair lookahead.
-Terminal speculative work remains within that request's private tail and is
-discarded on completion. This prevents the server abstraction from giving
-back the already accepted 151.324 decode-loop tokens/s.
+work, retain that request in a device-resident decode lane with the accepted
+bounded five-layer-pair lookahead. Terminal speculative work remains within
+that request's private tail and is discarded on completion. This prevents the
+server abstraction from giving back the accepted 151.324 decode-loop tokens/s.
 
 When other work exists, the scheduler fills the observed host boundary with
 another request/batch instead of blindly looking ahead for one sequence.
 
 Implemented batch-1 serving pipeline:
 
-- the head still returns one compact 20-byte-per-row device result and performs
-  no extra host transfer;
-- a batch-1-only embedding consumes the sampled token directly from that device
-  result while its D2H is in flight;
-- one batch-1-only pair executable reads the current serving slab with position
-  and exact attention length advanced by one, and submits the accepted first
-  five pairs against an already reserved cache tail;
-- the following step consumes the prefix only when sequence, position, and
-  sampled token all match, otherwise it falls back to the complete graph;
-- cancellation/release drops the retained hidden prefix, and cache-buffer
-  dependencies serialize any already submitted private-tail writes before a
-  physical page can be reused; and
-- the engine permits new lookahead work only when its current plan has no
-  prefill submission, so useful competing work takes precedence.
+- the first entry imports the token/RNG returned by batched prefill into the
+  ordinary device decode state;
+- token, RNG, position, executable arguments, and the five-pair prefix remain
+  device-resident across steady tokens, producing zero steady H2D and one
+  four-byte D2H;
+- the global physical page table is installed once and refreshed only when a
+  new page is allocated;
+- the engine retains the request locally in `InFlightDecode`, bypassing
+  remove/requeue/replan while no command or competing work exists;
+- command arrival, cancellation, deadline, shutdown, or output backpressure
+  ends the lane at the next visible-token boundary;
+- B1-to-batch transition downloads the current RNG once, drops the bounded
+  hidden prefix, and lets the generic batch overwrite its tentative cache
+  position through the same dependency-ordered global K/V buffers; and
+- a later B1 re-entry reconstructs the device position from
+  `prompt_tokens + visible_generated_tokens - 1`, so membership changes never
+  rewind or overwrite committed K/V; and
+- the superseded serving-only lookahead graph family is deleted rather than
+  retained as a second implementation.
 
-BuildBuddy CPU and CUDA contracts pass. The remaining promotion gate is the
-real A40 single-stream measurement; do not call this recovered until that run
-shows at least 150 steady decode-loop tokens/s.
+The remaining promotion gate is the real A40 single-stream measurement; do
+not call this recovered until that run shows at least 150 steady decode-loop
+tokens/s. Once it does, route the diagnostic adapter through this lane and
+delete the old request-local execution path.
 
 ### 9.6 Continuous-batching acceptance
 

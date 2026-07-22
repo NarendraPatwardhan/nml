@@ -2,7 +2,7 @@
 
 Status: authoritative system document
 
-Last architectural review: 2026-07-18
+Last architectural review: 2026-07-22
 
 NML is a Rust acceleration substrate for CPU and NVIDIA CUDA. It lets a product
 describe tensor programs and persistent state in Rust, lowers those programs
@@ -474,12 +474,22 @@ representation, component roles, physical storage, platform, and placement.
 Execution enqueues embedding, the 24 prefill layer invocations or 12 decode
 pair invocations, and the head through PJRT readiness dependencies,
 synchronizing the host only when the selected token is needed. Hidden state and
-every per-layer K/V pair use explicit output aliasing; one request-owned I32
-page table describes all layer caches. Prefill and cache capacities use finite
-power-of-two/page buckets so compiled families are reusable across requests
-without making XLA compile a monolithic 24-layer module. This lifecycle does
-not claim continuous batching or cross-request cache sharing; those require the
-separate server-owned arena and scheduler.
+every per-layer K/V pair use explicit output aliasing. The server owns one
+process-wide physical cache arena; each scheduled family supplies arbitrary
+per-row I32 page tables over that arena. Prefill and cache capacities use
+finite power-of-two/page buckets so compiled families are reusable across
+requests without making XLA compile a monolithic 24-layer module.
+
+Changing-membership prefill/decode uses a compact batched ABI with one typed U8
+control slab upload and one token/RNG result download per scheduled batch. An
+uncontended B1 decode is a distinct scheduling policy over the same parameters,
+executables, and physical cache: it imports token/RNG once, retains token, RNG,
+position, page table, and bounded hidden prefix as device dependencies, and
+performs zero steady H2D plus one token D2H. The row remains scheduler-owned as
+`InFlightDecode`, but the engine does not remove, requeue, or replan it between
+tokens while membership is unchanged. Commands and terminal conditions are
+observed after every visible token; a membership change retires device RNG once
+and returns to the generic batch ABI at that token boundary.
 
 Loaded executables resolve immutable result arity once at compilation. A hot
 enqueue must not reacquire an executable metadata handle merely to rediscover
@@ -1111,6 +1121,7 @@ table is a compact compatibility index, not a migration checklist.
 | D-063 | Every grouped expert backend exposes gate/up plus one activation as `[assignments, intermediate]`; down never receives interleaved gate/up channels or recomputes their activation. |
 | D-064 | Compact CUDA decode uses dedicated `M = 1` GEMV with exact register-local E2M1/E4M3FN decoding and block-scale reuse; tensor-core matrix tiles remain the distinct prefill family. |
 | D-065 | Every paid RunPod product run is one combined Nsight-Systems-over-GDB execution; acceptance requires debugger, product, and profiler artifacts before Pod termination. |
+| D-066 | Stable B1 decode is a device-resident continuation lane over the same global paged K/V arena: host scheduling remains authoritative, but it cannot be a per-token GPU dependency while membership is unchanged. Generic changing-membership batches retain one compact H2D/D2H ABI. |
 
 ## 16. Provenance and reference relationships
 

@@ -15,8 +15,6 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-const SINGLE_SEQUENCE_LOOKAHEAD_PAIRS: usize = 5;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SchedulerConfig {
     pub(crate) batch_buckets: Vec<usize>,
@@ -135,7 +133,10 @@ pub(crate) struct BatchPlan {
     /// Prefill is a separate submission, so a long prompt cannot sit in front
     /// of the decode rows selected in the same scheduler iteration.
     pub(crate) prefill: Option<BatchSubmission>,
-    pub(crate) single_sequence_lookahead_pairs: usize,
+    /// The selected decode is the only runnable sequence, so the engine may
+    /// retain it in the device-resident continuation lane until membership
+    /// changes.
+    pub(crate) single_sequence_decode: bool,
 }
 
 impl BatchPlan {
@@ -391,23 +392,18 @@ impl Scheduler {
                 items: prefill_items,
             })
         };
-        let lookahead = if decode
+        let single_sequence_decode = decode
             .as_ref()
             .is_some_and(|submission| submission.items.len() == 1)
             && prefill.is_none()
             && self.waiting.is_empty()
             && self.prefill.is_empty()
             && self.decode.is_empty()
-            && self.active == 1
-        {
-            SINGLE_SEQUENCE_LOOKAHEAD_PAIRS
-        } else {
-            0
-        };
+            && self.active == 1;
         Ok(BatchPlan {
             decode,
             prefill,
-            single_sequence_lookahead_pairs: lookahead,
+            single_sequence_decode,
         })
     }
 
@@ -676,7 +672,7 @@ mod tests {
             .plan(now + Duration::from_millis(11))
             .unwrap();
         assert_eq!(plan.active_tokens(), 4);
-        assert_eq!(plan.single_sequence_lookahead_pairs, 0);
+        assert!(!plan.single_sequence_decode);
         let decode = plan.decode.unwrap();
         let prefill = plan.prefill.unwrap();
         assert_eq!(decode.phase, ScheduledPhase::Decode);
@@ -720,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn lookahead_is_exactly_the_idle_batch_one_fast_path() {
+    fn device_lane_is_exactly_the_idle_batch_one_fast_path() {
         let now = Instant::now();
         let mut scheduler = Scheduler::new(config()).unwrap();
         let mut pages = PageManager::new(8).unwrap();
@@ -732,12 +728,12 @@ mod tests {
             .unwrap();
         let decode = scheduler.plan(now).unwrap();
         assert_eq!(decode.decode.as_ref().unwrap().family_capacity, 1);
-        assert_eq!(decode.single_sequence_lookahead_pairs, 5);
+        assert!(decode.single_sequence_decode);
         scheduler.complete_decode(id(1), false).unwrap();
 
         scheduler.enqueue(id(2), 1, 8, now).unwrap();
         let with_waiter = scheduler.plan(now).unwrap();
-        assert_eq!(with_waiter.single_sequence_lookahead_pairs, 0);
+        assert!(!with_waiter.single_sequence_decode);
     }
 
     #[test]

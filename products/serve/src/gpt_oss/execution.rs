@@ -6,10 +6,9 @@ use super::checkpoint::{
 };
 use super::config::{AttentionKind, Config};
 use super::graph::{
-    build_decode_layer_pair, build_embedding, build_head, build_layer,
-    build_serving_decode_lookahead_embedding, build_serving_decode_lookahead_layer_pair,
-    cache_shape, page_table_shape, Phase, ShapeFamily, BATCH_RESULT_BYTES_PER_ROW,
-    CACHE_PAGE_SIZE, ServingSlabLayout, MAXIMUM_TOP_K,
+    build_decode_layer_pair, build_embedding, build_head, build_layer, cache_shape,
+    page_table_shape, Phase, ShapeFamily, BATCH_RESULT_BYTES_PER_ROW, CACHE_PAGE_SIZE,
+    ServingSlabLayout, MAXIMUM_TOP_K,
 };
 use crate::{CompilationProfile, SamplingOptions, SubmissionTimings};
 use nml::exe::{Arguments, Results};
@@ -140,8 +139,12 @@ impl ExecutionProfile {
     }
 
     fn supports(self, request: &PreparedRequest) -> bool {
-        self.prefill.sequence() >= request.tokens.len()
-            && self.decode.cache_capacity() >= request.required_cache_capacity
+        self.supports_lengths(request.tokens.len(), request.required_cache_capacity)
+    }
+
+    fn supports_lengths(self, prompt_tokens: usize, required_cache_capacity: usize) -> bool {
+        self.prefill.sequence() >= prompt_tokens
+            && self.decode.cache_capacity() >= required_cache_capacity
     }
 }
 
@@ -199,14 +202,6 @@ pub(super) struct BatchInputs {
     pub(super) temperature: Vec<f32>,
     pub(super) top_p: Vec<f32>,
     pub(super) min_p: Vec<f32>,
-    pub(super) lookahead: Option<BatchLookahead>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct BatchLookahead {
-    pub(super) sequence: u64,
-    pub(super) position: i32,
-    pub(super) enqueue_next: bool,
 }
 
 pub(super) struct BatchOutputs {
@@ -330,7 +325,6 @@ impl<'platform> CompiledDefinition<'platform> {
             startup,
             bound_families,
             caches,
-            serving_decode_prefix: None,
             cache_allocation,
             cache_storage_bytes,
         })
@@ -461,7 +455,6 @@ pub(super) struct ResidentModel<'platform> {
     startup: StartupMetrics,
     bound_families: BTreeMap<ShapeFamily, BoundComponentFamily>,
     caches: Vec<LayerCache>,
-    serving_decode_prefix: Option<ServingDecodePrefix>,
     cache_allocation: Duration,
     cache_storage_bytes: usize,
 }
@@ -473,6 +466,195 @@ impl ResidentModel<'_> {
 
     pub(super) const fn startup(&self) -> StartupMetrics {
         self.startup
+    }
+
+    pub(super) fn prepare_single_sequence_decode(
+        &self,
+        prompt_tokens: usize,
+        max_new_tokens: usize,
+        generated_tokens: &[u32],
+        sampling: SamplingOptions,
+    ) -> Result<SingleSequenceDecodeLane> {
+        let first_token = *generated_tokens
+            .last()
+            .ok_or_else(|| message("single-sequence decode has no visible input token"))?;
+        if prompt_tokens == 0
+            || generated_tokens.len() >= max_new_tokens
+            || super::protocol::is_stop_token(first_token)
+        {
+            return Err(message(
+                "only an unfinished single sequence can enter the device decode lane",
+            ));
+        }
+        let lifecycle = RequestLifecycle::resume(max_new_tokens, generated_tokens)?;
+        let decode_position = lifecycle.decode_position(prompt_tokens)?;
+        let required_cache_capacity = prompt_tokens
+            .checked_add(max_new_tokens)
+            .ok_or_else(|| message("single-sequence decode capacity overflows usize"))?;
+        let profile = self
+            .plan
+            .profiles
+            .iter()
+            .copied()
+            .filter(|profile| {
+                profile.supports_lengths(prompt_tokens, required_cache_capacity)
+            })
+            .min_by_key(|profile| {
+                (profile.decode.cache_capacity(), profile.prefill.sequence())
+            })
+            .ok_or_else(|| {
+                message("single-sequence decode is not covered by a compiled profile")
+            })?;
+        let family = self
+            .plan
+            .families
+            .get(&profile.decode)
+            .ok_or_else(|| message("single-sequence decode family was not retained"))?;
+        let mut embedding = family.embedding.args();
+        bind_embedding(&mut embedding, &self.checkpoint, &self.parameters)?;
+        let pairs = bind_decode_pairs(family, &self.checkpoint, &self.parameters, &self.config)?;
+        let mut head = family.head.args();
+        bind_head(&mut head, &self.parameters)?;
+
+        let platform = self.plan.platform;
+        let placement = &self.plan.placement;
+        let active_rows = upload_bool(
+            platform,
+            Shape::new(nml::DataType::Bool, &[1]).map_err(boxed)?,
+            &[true],
+            placement,
+        )?;
+        head.set(
+            "top_k",
+            upload_i32(
+                platform,
+                Shape::new(nml::DataType::I32, &[1]).map_err(boxed)?,
+                &[i32::try_from(sampling.top_k)
+                    .map_err(|_| message("GPT-OSS top-k exceeds I32"))?],
+                placement,
+            )?,
+        )
+        .map_err(boxed)?;
+        head.set(
+            "temperature",
+            upload_f32_vector(platform, &[sampling.temperature], placement)?,
+        )
+        .map_err(boxed)?;
+        head.set(
+            "top_p",
+            upload_f32_vector(platform, &[sampling.top_p], placement)?,
+        )
+        .map_err(boxed)?;
+        head.set(
+            "min_p",
+            upload_f32_vector(platform, &[sampling.min_p], placement)?,
+        )
+        .map_err(boxed)?;
+        head.set("active_rows", active_rows.clone()).map_err(boxed)?;
+
+        let state_started = Instant::now();
+        let token_buffer = upload_i32(
+            platform,
+            Shape::new(nml::DataType::I32, &[1]).map_err(boxed)?,
+            &[i32::try_from(first_token).map_err(|_| message("GPT-OSS token exceeds I32"))?],
+            placement,
+        )?;
+        let sampling_state = upload_u64(
+            platform,
+            Shape::new(nml::DataType::U64, &[1, 2]).map_err(boxed)?,
+            &sampling.seed,
+            placement,
+        )?;
+        let position = upload_i32(
+            platform,
+            Shape::new(nml::DataType::I32, &[1]).map_err(boxed)?,
+            &[i32::try_from(decode_position)
+                .map_err(|_| message("GPT-OSS decode position exceeds I32"))?],
+            placement,
+        )?;
+        let query_lengths = upload_i32(
+            platform,
+            Shape::new(nml::DataType::I32, &[1]).map_err(boxed)?,
+            &[1],
+            placement,
+        )?;
+        let last_index = upload_i32(
+            platform,
+            Shape::new(nml::DataType::I32, &[1, 1]).map_err(boxed)?,
+            &[0],
+            placement,
+        )?;
+        let token_download = Slice::alloc(token_buffer.shape()).map_err(boxed)?;
+        let cache_metadata_bytes = page_table_shape(profile.decode)?.byte_count().map_err(boxed)?;
+        Ok(SingleSequenceDecodeLane {
+            execution: RequestExecution {
+                lifecycle,
+                profile,
+                prompt_token_count: prompt_tokens,
+                cache_capacity: profile.decode.cache_capacity(),
+                cache_storage_bytes: self.cache_storage_bytes,
+                cache_metadata_bytes,
+                metrics: RunMetrics {
+                    cache_allocation: self.cache_allocation,
+                    decode_state_initialization: state_started.elapsed(),
+                    ..RunMetrics::default()
+                },
+                page_table: None,
+                prefill: None,
+                decode: Some(DecodeState {
+                    embedding,
+                    pairs,
+                    head,
+                    token_buffer,
+                    sampling_state: Some(sampling_state),
+                    position: Some(position),
+                    query_lengths,
+                    active_rows,
+                    last_index,
+                    token_download,
+                    lookahead: None,
+                }),
+            },
+        })
+    }
+
+    pub(super) fn single_sequence_page_table_width(
+        &self,
+        lane: &SingleSequenceDecodeLane,
+    ) -> usize {
+        lane.execution.page_table_width()
+    }
+
+    pub(super) fn single_sequence_lookahead_tokens(
+        &self,
+        lane: &SingleSequenceDecodeLane,
+    ) -> Result<usize> {
+        lane.execution.decode_cache_lookahead_tokens()
+    }
+
+    pub(super) fn install_single_sequence_page_table(
+        &self,
+        lane: &mut SingleSequenceDecodeLane,
+        pages: &[i32],
+    ) -> Result<()> {
+        self.install_page_table(&mut lane.execution, pages)
+    }
+
+    pub(super) fn decode_single_sequence_step(
+        &mut self,
+        lane: &mut SingleSequenceDecodeLane,
+    ) -> Result<RawToken> {
+        lane.execution
+            .decode_step(&mut self.caches)?
+            .ok_or_else(|| message("single-sequence decode lane omitted its token"))
+    }
+
+    pub(super) fn retire_single_sequence_decode(
+        &self,
+        mut lane: SingleSequenceDecodeLane,
+    ) -> Result<[u64; 2]> {
+        lane.execution.discard_decode_lookahead();
+        lane.execution.current_sampling_state()
     }
 
     pub(super) fn prefill_step(
@@ -498,21 +680,6 @@ impl ResidentModel<'_> {
     ) -> Result<BatchOutputs> {
         let family = self.batch_family(phase, batch_capacity, query_capacity)?;
         validate_batch_inputs(family, &input)?;
-        let lookahead = input.lookahead;
-        let prefix_hidden = if phase == Phase::Decode {
-            match (lookahead, self.serving_decode_prefix.take()) {
-                (Some(key), Some(prefix))
-                    if prefix.sequence == key.sequence
-                        && prefix.position == key.position
-                        && prefix.token == input.tokens[0] =>
-                {
-                    Some(prefix.hidden)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
         let platform = self.plan.platform;
         let placement = &self.plan.placement;
         let slab_layout = ServingSlabLayout::for_family(family)?;
@@ -528,17 +695,11 @@ impl ResidentModel<'_> {
             .bound_families
             .get_mut(&family)
             .expect("selected bound family exists");
-        let consumed_prefix = prefix_hidden.is_some();
-        let mut hidden = match prefix_hidden {
-            Some(hidden) => hidden,
-            None => {
-                bound
-                    .embedding
-                    .set("batch_slab", batch_slab.clone())
-                    .map_err(boxed)?;
-                one(bound.embedding.enqueue().map_err(boxed)?)?
-            }
-        };
+        bound
+            .embedding
+            .set("batch_slab", batch_slab.clone())
+            .map_err(boxed)?;
+        let mut hidden = one(bound.embedding.enqueue().map_err(boxed)?)?;
         match &mut bound.layers {
             BoundLayerExecutables::Prefill { layers, kinds } => {
                 for ((arguments, kind), cache) in
@@ -555,14 +716,9 @@ impl ResidentModel<'_> {
                 }
             }
             BoundLayerExecutables::Decode { pairs } => {
-                let pair_offset = if consumed_prefix {
-                    DECODE_LOOKAHEAD_PAIRS
-                } else {
-                    0
-                };
-                for (arguments, caches) in pairs[pair_offset..]
+                for (arguments, caches) in pairs
                     .iter_mut()
-                    .zip(self.caches[pair_offset * 2..].chunks_exact_mut(2))
+                    .zip(self.caches.chunks_exact_mut(2))
                 {
                     let (next, _) = execute_serving_layer_pair(
                         arguments,
@@ -593,68 +749,11 @@ impl ResidentModel<'_> {
         }
         let mut result_slice = Slice::alloc(result.shape()).map_err(boxed)?;
         let download = result.download_to(&mut result_slice).map_err(boxed)?;
-
-        // Preserve the proven single-stream overlap: while the compact result
-        // is returning to the host, submit the next token's embedding and
-        // first five layer pairs against the same device result and slab.
-        let next_hidden = match lookahead.filter(|key| key.enqueue_next) {
-            Some(_) => {
-                let speculative = bound.serving_lookahead.as_mut().ok_or_else(|| {
-                    message("batch-1 decode lookahead executable was not compiled")
-                })?;
-                if speculative.pairs.len() != DECODE_LOOKAHEAD_PAIRS {
-                    return Err(message("batch-1 decode lookahead schedule is invalid"));
-                }
-                speculative
-                    .embedding
-                    .set("batch_result", result.clone())
-                    .map_err(boxed)?;
-                let mut hidden = one(speculative.embedding.enqueue().map_err(boxed)?)?;
-                for (arguments, caches) in speculative
-                    .pairs
-                    .iter_mut()
-                    .zip(self.caches[..DECODE_LOOKAHEAD_PAIRS * 2].chunks_exact_mut(2))
-                {
-                    let (next, _) = execute_serving_layer_pair(
-                        arguments,
-                        hidden,
-                        batch_slab.clone(),
-                        caches,
-                    )?;
-                    hidden = next;
-                }
-                Some(hidden)
-            }
-            None => None,
-        };
-
         download.wait().map_err(boxed)?;
-        let outputs = decode_batch_output_bytes(
+        decode_batch_output_bytes(
             result_slice.items::<u8>().map_err(boxed)?,
             family.batch(),
-        )?;
-        if let (Some(key), Some(hidden)) = (lookahead, next_hidden) {
-            self.serving_decode_prefix = Some(ServingDecodePrefix {
-                sequence: key.sequence,
-                position: key
-                    .position
-                    .checked_add(1)
-                    .ok_or_else(|| message("batch-1 decode lookahead position overflows I32"))?,
-                token: outputs.tokens[0],
-                hidden,
-            });
-        }
-        Ok(outputs)
-    }
-
-    pub(super) fn discard_serving_decode_prefix(&mut self, sequence: u64) {
-        if self
-            .serving_decode_prefix
-            .as_ref()
-            .is_some_and(|prefix| prefix.sequence == sequence)
-        {
-            self.serving_decode_prefix = None;
-        }
+        )
     }
 
     pub(super) fn batch_page_table_width(
@@ -951,6 +1050,26 @@ impl RequestLifecycle {
         }
     }
 
+    fn resume(max_new_tokens: usize, generated_tokens: &[u32]) -> Result<Self> {
+        if generated_tokens.is_empty() || generated_tokens.len() >= max_new_tokens {
+            return Err(message(
+                "single-sequence decode requires an unfinished visible token history",
+            ));
+        }
+        if generated_tokens
+            .last()
+            .is_some_and(|token| super::protocol::is_stop_token(*token))
+        {
+            return Err(message("a stopped sequence cannot resume device decode"));
+        }
+        Ok(Self {
+            phase: RequestPhase::DecodeReady,
+            max_new_tokens,
+            generated_tokens: generated_tokens.to_vec(),
+            stopped: false,
+        })
+    }
+
     fn record_prefill(&mut self, token: u32, is_stop: bool) -> Result<RawToken> {
         if self.phase != RequestPhase::PrefillPending {
             return Err(message("GPT-OSS prefill step is not pending"));
@@ -989,6 +1108,12 @@ impl RequestLifecycle {
             .ok_or_else(|| message("GPT-OSS decode has no visible input token"))
     }
 
+    fn decode_position(&self, prompt_tokens: usize) -> Result<usize> {
+        prompt_tokens
+            .checked_add(self.decode_generated_index()?)
+            .ok_or_else(|| message("GPT-OSS decode position overflows usize"))
+    }
+
     fn fail(&mut self) {
         if self.phase != RequestPhase::Complete {
             self.phase = RequestPhase::Failed;
@@ -1017,6 +1142,14 @@ pub(super) struct RequestExecution {
     page_table: Option<Buffer>,
     prefill: Option<PrefillState>,
     decode: Option<DecodeState>,
+}
+
+/// Device-resident decode state for the uncontended serving lane. It shares
+/// the process-wide paged K/V buffers with generic batches, but keeps token,
+/// RNG, position, executable arguments, and the bounded decode prefix on the
+/// device until request membership changes.
+pub(super) struct SingleSequenceDecodeLane {
+    execution: RequestExecution,
 }
 
 struct PrefillState {
@@ -1100,6 +1233,28 @@ impl RequestExecution {
 
     pub(super) const fn stopped(&self) -> bool {
         self.lifecycle.stopped
+    }
+
+    fn discard_decode_lookahead(&mut self) {
+        if let Some(decode) = &mut self.decode {
+            decode.lookahead.take();
+        }
+    }
+
+    fn current_sampling_state(&self) -> Result<[u64; 2]> {
+        let state = self
+            .decode
+            .as_ref()
+            .and_then(|decode| decode.sampling_state.as_ref())
+            .ok_or_else(|| message("single-sequence decode has no sampling state"))?;
+        let slice = state.to_slice().map_err(boxed)?;
+        let values = slice.items::<u64>().map_err(boxed)?;
+        let [first, second] = values else {
+            return Err(message(
+                "single-sequence decode returned an invalid sampling state",
+            ));
+        };
+        Ok([*first, *second])
     }
 
     /// Executes the selected bounded prefill family once. Chunked prefill will
@@ -1411,12 +1566,6 @@ struct ComponentFamily {
     embedding: Exe,
     layers: LayerExecutables,
     head: Exe,
-    serving_lookahead: Option<ServingLookaheadExecutables>,
-}
-
-struct ServingLookaheadExecutables {
-    embedding: Exe,
-    pair: Exe,
 }
 
 enum LayerExecutables {
@@ -1461,30 +1610,10 @@ impl ComponentFamily {
         let head = compile(platform, placement, |graph| {
             build_head(graph, checkpoint, config, family)
         })?;
-        let serving_lookahead = if family.is_serving()
-            && family.phase() == Phase::Decode
-            && family.batch() == 1
-        {
-            Some(ServingLookaheadExecutables {
-                embedding: compile(platform, placement, |graph| {
-                    build_serving_decode_lookahead_embedding(
-                        graph, checkpoint, config, family,
-                    )
-                })?,
-                pair: compile(platform, placement, |graph| {
-                    build_serving_decode_lookahead_layer_pair(
-                        graph, sliding, full, config, family,
-                    )
-                })?,
-            })
-        } else {
-            None
-        };
         Ok(Self {
             embedding,
             layers,
             head,
-            serving_lookahead,
         })
     }
 
@@ -1514,12 +1643,6 @@ struct BoundComponentFamily {
     embedding: Arguments,
     layers: BoundLayerExecutables,
     head: Arguments,
-    serving_lookahead: Option<BoundServingLookahead>,
-}
-
-struct BoundServingLookahead {
-    embedding: Arguments,
-    pairs: Vec<Arguments>,
 }
 
 enum BoundLayerExecutables {
@@ -1552,27 +1675,10 @@ impl BoundComponentFamily {
                 pairs: bind_decode_pairs(family, checkpoint, parameters, config)?,
             },
         };
-        let serving_lookahead = family
-            .serving_lookahead
-            .as_ref()
-            .map(|lookahead| {
-                let mut embedding = lookahead.embedding.args();
-                bind_embedding(&mut embedding, checkpoint, parameters)?;
-                let pairs = bind_decode_pairs_to(
-                    &lookahead.pair,
-                    checkpoint,
-                    parameters,
-                    config,
-                    Some(DECODE_LOOKAHEAD_PAIRS),
-                )?;
-                Ok::<_, BoxError>(BoundServingLookahead { embedding, pairs })
-            })
-            .transpose()?;
         Ok(Self {
             embedding,
             layers,
             head,
-            serving_lookahead,
         })
     }
 }
@@ -1585,13 +1691,6 @@ struct LayerCache {
 struct DecodePrefix {
     hidden: Buffer,
     submission: SubmissionTimings,
-}
-
-struct ServingDecodePrefix {
-    sequence: u64,
-    position: i32,
-    token: i32,
-    hidden: Buffer,
 }
 
 // Five layer pairs cover the pair-four host-submission bubble observed on A40
@@ -1698,22 +1797,7 @@ fn bind_decode_pairs(
     parameters: &LoadedCheckpoint,
     config: &Config,
 ) -> Result<Vec<Arguments>> {
-    bind_decode_pairs_to(
-        family.decode_pair()?,
-        checkpoint,
-        parameters,
-        config,
-        None,
-    )
-}
-
-fn bind_decode_pairs_to(
-    executable: &Exe,
-    checkpoint: &Checkpoint,
-    parameters: &LoadedCheckpoint,
-    config: &Config,
-    pair_limit: Option<usize>,
-) -> Result<Vec<Arguments>> {
+    let executable = family.decode_pair()?;
     if checkpoint.model.layers.len() != parameters.model.layers.len()
         || checkpoint.model.layers.len() != config.layer_types().len()
         || !checkpoint.model.layers.len().is_multiple_of(2)
@@ -1729,7 +1813,6 @@ fn bind_decode_pairs_to(
         .model
         .layers
         .chunks_exact(2)
-        .take(pair_limit.unwrap_or(usize::MAX))
         .enumerate()
         .map(|(pair, loaded)| {
             let first = pair * 2;
@@ -2133,20 +2216,6 @@ fn validate_batch_inputs(family: ShapeFamily, input: &BatchInputs) -> Result<()>
     {
         return Err(message("batch input vectors do not match the compiled family"));
     }
-    if let Some(lookahead) = input.lookahead {
-        if !family.is_serving()
-            || family.phase() != Phase::Decode
-            || family.batch() != 1
-            || !input.active_rows[0]
-            || !input.sample_rows[0]
-            || input.positions[0] != lookahead.position
-            || input.sequence_lengths[0] != lookahead.position.saturating_add(1)
-        {
-            return Err(message(
-                "batch lookahead requires one exact active decode row",
-            ));
-        }
-    }
     for row in 0..batch {
         if input.sample_rows[row] && !input.active_rows[row] {
             return Err(message("only an active batch row may sample"));
@@ -2440,6 +2509,19 @@ mod tests {
     }
 
     #[test]
+    fn resumed_single_sequence_lifecycle_preserves_the_visible_budget() {
+        let mut resumed = RequestLifecycle::resume(4, &[11, 12]).unwrap();
+        assert_eq!(resumed.phase, RequestPhase::DecodeReady);
+        assert_eq!(resumed.decode_generated_index().unwrap(), 1);
+        assert_eq!(resumed.decode_position(106).unwrap(), 107);
+        resumed.record_decode(13, false).unwrap();
+        assert_eq!(resumed.phase, RequestPhase::DecodeReady);
+        resumed.record_decode(14, false).unwrap();
+        assert_eq!(resumed.phase, RequestPhase::Complete);
+        assert!(RequestLifecycle::resume(2, &[11, 12]).is_err());
+    }
+
+    #[test]
     fn decode_lookahead_never_crosses_the_visible_token_budget() {
         assert_eq!(DECODE_LOOKAHEAD_PAIRS, 5);
         assert!(!should_enqueue_lookahead(0, 0));
@@ -2469,7 +2551,6 @@ mod tests {
             temperature: vec![0.7, 1.0],
             top_p: vec![0.8, 1.0],
             min_p: vec![0.05, 0.0],
-            lookahead: None,
         };
         validate_batch_inputs(family, &input).unwrap();
         let layout = ServingSlabLayout::for_family(family).unwrap();

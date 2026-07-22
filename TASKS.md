@@ -99,8 +99,9 @@ global page sharing yet.
   loop.
 - [x] Keep model definition -> compilation -> parameter residency ordering and
   make every step select only precompiled executables.
-- [x] Retain a blocking `Generator::generate` compatibility/diagnostic adapter
-  implemented by driving the new steps; do not maintain two graph paths.
+- [x] Retain a blocking `Generator::generate` diagnostic adapter as the pinned
+  151-TPS migration control; it is temporary until the serving B1 lane proves
+  parity and is then deleted by the Milestone 3 convergence task.
 - [x] Preserve the batch-1 five-pair lookahead and its “never past visible
   budget”/terminal-discard invariants in the step driver.
 - [ ] Add fixed-seed equivalence tests for normal return, tool call, early stop,
@@ -321,12 +322,25 @@ control.
   iteration; do not block all decode behind one long prompt.
 - [x] Repack surviving/new sequences into the smallest next batch family after
   every result; request identity must not equal batch slot.
-- [x] Use the accepted five-pair lookahead only for batch 1 with no useful
-  competing work. The compact device result now feeds a dedicated lookahead
-  embedding, the next position/length are advanced inside the lookahead pair
-  graph, and the first five pairs run while the one compact D2H is in flight.
-  Prefix identity is sequence/position/token checked, cancellation discards it,
-  and a planned prefill suppresses new speculative work.
+- [x] Replace per-token B1 reconstruction with one device-resident continuation
+  lane. Import token/RNG once after batched prefill; retain token, RNG,
+  position, page table, executable arguments, and the accepted five-pair
+  prefix; perform zero steady H2D plus one four-byte D2H; and remain
+  `InFlightDecode` until a command, cancellation, deadline, shutdown, or
+  backpressure changes membership.
+- [x] Make B1-to-batch transition explicit: retire device RNG once, discard the
+  bounded prefix, preserve the same global paged K/V buffers, and resume the
+  generic compact batch family at a visible-token boundary. On later B1
+  re-entry, derive position from prompt length plus the complete visible-token
+  history rather than rewinding to the first decode position.
+- [x] Delete the superseded serving-only lookahead embedding/pair executable
+  and its sequence/position/token identity bridge.
+- [ ] Publish the refactored server image and prove at least 150 decode-loop
+  tokens/s on the exact 106+320 A40 control before removing the diagnostic
+  performance route.
+- [ ] After A40 parity, drive `generate` through the serving B1 lane and delete
+  `ProductSession`/request-local prefill plus the remaining non-serving route;
+  retain specialized B1 graph shapes as serving policy, not a second engine.
 
 ### 3.5 Deterministic and load acceptance
 

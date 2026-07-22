@@ -315,57 +315,6 @@ pub(super) fn build_embedding(
     Ok(vec![("hidden".to_owned(), hidden)])
 }
 
-/// Embeds the token sampled by a batch-1 serving head without waiting for its
-/// compact result to cross the host boundary. The compact result remains the
-/// single D2H contract; this graph consumes the same device buffer directly.
-pub(super) fn build_serving_decode_lookahead_embedding(
-    graph: &mut Graph,
-    checkpoint: &Checkpoint,
-    config: &Config,
-    family: ShapeFamily,
-) -> Result<Vec<(String, Tensor)>> {
-    if !family.is_serving() || family.phase() != Phase::Decode || family.batch() != 1 {
-        return Err(message(
-            "GPT-OSS serving lookahead embedding requires batch-1 decode",
-        ));
-    }
-    let batch = dimension(family.batch())?;
-    let result = graph.input(
-        "batch_result",
-        shape(
-            DataType::U8,
-            &[batch, dimension(BATCH_RESULT_BYTES_PER_ROW)?],
-        )?,
-    );
-    let token_bytes = nml(graph.slice(
-        result,
-        &[0, 0],
-        &[batch, dimension(std::mem::size_of::<i32>())?],
-        &[1, 1],
-    ))?;
-    let token_bytes = nml(graph.reshape(
-        token_bytes,
-        shape(
-            DataType::U8,
-            &[batch, 1, dimension(std::mem::size_of::<i32>())?],
-        )?,
-    ))?;
-    let token = nml(graph.bitcast(token_bytes, DataType::I32))?;
-    let token = nml(graph.reshape(token, shape(DataType::I32, &[batch])?))?;
-    let hidden = nml(graph.token_embedding(
-        &checkpoint.model.embed_tokens.weight,
-        token,
-    ))?;
-    let hidden = nml(graph.reshape(
-        hidden,
-        shape(
-            DataType::Bf16,
-            &[batch, 1, dimension(config.hidden_size())?],
-        )?,
-    ))?;
-    Ok(vec![("hidden".to_owned(), hidden)])
-}
-
 pub(super) fn build_layer(
     graph: &mut Graph,
     layer: &DecoderLayer,
@@ -377,7 +326,7 @@ pub(super) fn build_layer(
     let cache_shape = cache_shape(config, family)?;
     let hidden_input = graph.input("hidden", hidden_shape);
     let (position, sequence_lengths, query_lengths, active_rows, page_table) =
-        layer_inputs(graph, family, 0)?;
+        layer_inputs(graph, family)?;
     let key_input = graph.input("cache.key", cache_shape);
     let value_input = graph.input("cache.value", cache_shape);
     let (hidden, key_cache, value_cache) = apply_layer(
@@ -418,35 +367,6 @@ pub(super) fn build_decode_layer_pair(
     config: &Config,
     family: ShapeFamily,
 ) -> Result<Vec<(String, Tensor)>> {
-    build_decode_layer_pair_with_offset(graph, sliding, full, config, family, 0)
-}
-
-/// Builds the batch-1 prefix that runs after the current head and before its
-/// result reaches the host. It reads the current serving slab but addresses
-/// the just-sampled token's next cache position and attention length.
-pub(super) fn build_serving_decode_lookahead_layer_pair(
-    graph: &mut Graph,
-    sliding: &DecoderLayer,
-    full: &DecoderLayer,
-    config: &Config,
-    family: ShapeFamily,
-) -> Result<Vec<(String, Tensor)>> {
-    if !family.is_serving() || family.phase() != Phase::Decode || family.batch() != 1 {
-        return Err(message(
-            "GPT-OSS serving lookahead layer pair requires batch-1 decode",
-        ));
-    }
-    build_decode_layer_pair_with_offset(graph, sliding, full, config, family, 1)
-}
-
-fn build_decode_layer_pair_with_offset(
-    graph: &mut Graph,
-    sliding: &DecoderLayer,
-    full: &DecoderLayer,
-    config: &Config,
-    family: ShapeFamily,
-    position_offset: i32,
-) -> Result<Vec<(String, Tensor)>> {
     if family.phase() != Phase::Decode {
         return Err(message("GPT-OSS layer pairs are decode-only"));
     }
@@ -454,7 +374,7 @@ fn build_decode_layer_pair_with_offset(
     let cache_shape = cache_shape(config, family)?;
     let hidden_input = graph.input("hidden", hidden_shape);
     let (position, sequence_lengths, query_lengths, active_rows, page_table) =
-        layer_inputs(graph, family, position_offset)?;
+        layer_inputs(graph, family)?;
     let sliding_key_input = graph.input("sliding.cache.key", cache_shape);
     let sliding_value_input = graph.input("sliding.cache.value", cache_shape);
     let full_key_input = graph.input("full.cache.key", cache_shape);
@@ -731,15 +651,9 @@ pub(super) fn build_head(
 fn layer_inputs(
     graph: &mut Graph,
     family: ShapeFamily,
-    position_offset: i32,
 ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
     let batch = dimension(family.batch())?;
     if !family.is_serving() {
-        if position_offset != 0 {
-            return Err(message(
-                "only serving decode layers support an input position offset",
-            ));
-        }
         let position = graph.input("position", shape(DataType::I32, &[batch])?);
         let sequence_lengths = sequence_lengths(graph, family, position)?;
         let query_lengths = graph.input("query_lengths", shape(DataType::I32, &[batch])?);
@@ -765,13 +679,8 @@ fn layer_inputs(
         width_usize,
         DataType::I32,
     )?;
-    let mut position = control_vector(graph, control, 0, batch, DataType::I32)?;
-    let mut sequence_lengths = control_vector(graph, control, 1, batch, DataType::I32)?;
-    if position_offset != 0 {
-        let offset = nml(graph.scalar(position_offset))?;
-        position = nml(graph.add(position, offset))?;
-        sequence_lengths = nml(graph.add(sequence_lengths, offset))?;
-    }
+    let position = control_vector(graph, control, 0, batch, DataType::I32)?;
+    let sequence_lengths = control_vector(graph, control, 1, batch, DataType::I32)?;
     let query_lengths = control_vector(graph, control, 2, batch, DataType::I32)?;
     let active_i32 = control_vector(graph, control, 3, batch, DataType::I32)?;
     let zero = nml(graph.scalar(0_i32))?;
@@ -1135,42 +1044,6 @@ mod tests {
             &[4, BATCH_RESULT_BYTES_PER_ROW as i64],
         );
 
-        let batch_one = ShapeFamily::serving_decode(1, 512, 32, 1).unwrap();
-        let lookahead_embedding = finish!(|graph| {
-            build_serving_decode_lookahead_embedding(
-                graph,
-                &checkpoint,
-                &config,
-                batch_one,
-            )
-        });
-        assert_contract!(lookahead_embedding, 1, 3, 1, &[None]);
-        assert!(lookahead_embedding
-            .input_names()
-            .any(|name| name == "batch_result"));
-        assert_eq!(
-            lookahead_embedding.outputs().next().unwrap().1.dimensions(),
-            &[1, 1, config.hidden_size() as i64],
-        );
-        let lookahead_pair = finish!(|graph| {
-            build_serving_decode_lookahead_layer_pair(
-                graph,
-                sliding,
-                full,
-                &config,
-                batch_one,
-            )
-        });
-        assert_contract!(
-            lookahead_pair,
-            6,
-            58,
-            5,
-            &[Some(0), Some(2), Some(3), Some(4), Some(5)],
-        );
-        assert!(lookahead_pair
-            .input_names()
-            .any(|name| name == "batch_slab"));
     }
 
     fn selected_config() -> Config {
