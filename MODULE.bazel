@@ -251,6 +251,7 @@ crate.spec(
     version = "=1.52.3",
 )
 crate.spec(package = "tokio-util", features = ["rt"], version = "=0.7.18")
+crate.spec(package = "tokio-stream", version = "=0.1.18")
 crate.spec(
     package = "tower",
     features = ["limit", "load-shed", "timeout", "util"],

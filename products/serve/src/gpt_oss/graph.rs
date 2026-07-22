@@ -25,22 +25,72 @@ pub(super) enum Phase {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) struct ShapeFamily {
     phase: Phase,
+    batch: usize,
     sequence: usize,
     cache_capacity: usize,
+    physical_pages: usize,
+    tensor_parallel: usize,
 }
 
 impl ShapeFamily {
-    pub(super) fn prefill(sequence: usize, cache_capacity: usize) -> Result<Self> {
-        Self::new(Phase::Prefill, sequence, cache_capacity)
+    pub(super) fn prefill(
+        sequence: usize,
+        cache_capacity: usize,
+        physical_pages: usize,
+    ) -> Result<Self> {
+        Self::serving_prefill(1, sequence, cache_capacity, physical_pages, 1)
     }
 
-    pub(super) fn decode(cache_capacity: usize) -> Result<Self> {
-        Self::new(Phase::Decode, 1, cache_capacity)
+    pub(super) fn decode(cache_capacity: usize, physical_pages: usize) -> Result<Self> {
+        Self::serving_decode(1, cache_capacity, physical_pages, 1)
     }
 
-    fn new(phase: Phase, sequence: usize, cache_capacity: usize) -> Result<Self> {
-        if sequence == 0 || cache_capacity == 0 {
+    pub(super) fn serving_prefill(
+        batch: usize,
+        query: usize,
+        cache_capacity: usize,
+        physical_pages: usize,
+        tensor_parallel: usize,
+    ) -> Result<Self> {
+        Self::new(
+            Phase::Prefill,
+            batch,
+            query,
+            cache_capacity,
+            physical_pages,
+            tensor_parallel,
+        )
+    }
+
+    pub(super) fn serving_decode(
+        batch: usize,
+        cache_capacity: usize,
+        physical_pages: usize,
+        tensor_parallel: usize,
+    ) -> Result<Self> {
+        Self::new(
+            Phase::Decode,
+            batch,
+            1,
+            cache_capacity,
+            physical_pages,
+            tensor_parallel,
+        )
+    }
+
+    fn new(
+        phase: Phase,
+        batch: usize,
+        sequence: usize,
+        cache_capacity: usize,
+        physical_pages: usize,
+        tensor_parallel: usize,
+    ) -> Result<Self> {
+        if batch == 0 || sequence == 0 || cache_capacity == 0 || physical_pages == 0 {
             return Err(message("GPT-OSS execution dimensions must be nonzero"));
+        }
+        if !matches!(tensor_parallel, 1 | 2 | 4) {
+            return Err(message("GPT-OSS tensor parallel degree must be 1, 2, or 4"));
         }
         if sequence > cache_capacity {
             return Err(message("GPT-OSS prefill bucket exceeds cache capacity"));
@@ -50,6 +100,11 @@ impl ShapeFamily {
                 "GPT-OSS cache capacity exceeds the I32 index domain",
             ));
         }
+        if physical_pages > i32::MAX as usize {
+            return Err(message(
+                "GPT-OSS physical cache page count exceeds the I32 index domain",
+            ));
+        }
         if !cache_capacity.is_multiple_of(CACHE_PAGE_SIZE) {
             return Err(message(
                 "GPT-OSS cache capacity must contain complete pages",
@@ -57,8 +112,11 @@ impl ShapeFamily {
         }
         Ok(Self {
             phase,
+            batch,
             sequence,
             cache_capacity,
+            physical_pages,
+            tensor_parallel,
         })
     }
 
@@ -70,6 +128,10 @@ impl ShapeFamily {
         self.sequence
     }
 
+    pub(super) const fn batch(self) -> usize {
+        self.batch
+    }
+
     pub(super) const fn cache_capacity(self) -> usize {
         self.cache_capacity
     }
@@ -77,6 +139,11 @@ impl ShapeFamily {
     pub(super) const fn page_count(self) -> usize {
         self.cache_capacity / CACHE_PAGE_SIZE
     }
+
+    pub(super) const fn physical_pages(self) -> usize {
+        self.physical_pages
+    }
+
 }
 
 pub(super) fn build_embedding(
@@ -85,16 +152,29 @@ pub(super) fn build_embedding(
     config: &Config,
     family: ShapeFamily,
 ) -> Result<Vec<(String, Tensor)>> {
-    let tokens = graph.input(
-        "tokens",
-        shape(DataType::I32, &[1, dimension(family.sequence())?])?,
-    );
+    let batch = dimension(family.batch())?;
+    let sequence = dimension(family.sequence())?;
+    let token_shape = match family.phase() {
+        Phase::Prefill => shape(DataType::I32, &[batch, sequence])?,
+        Phase::Decode => shape(DataType::I32, &[batch])?,
+    };
+    let tokens = graph.input("tokens", token_shape);
     let hidden = nml(graph.token_embedding(&checkpoint.model.embed_tokens.weight, tokens))?;
+    let hidden = match family.phase() {
+        Phase::Prefill => hidden,
+        Phase::Decode => nml(graph.reshape(
+            hidden,
+            shape(
+                DataType::Bf16,
+                &[batch, 1, dimension(config.hidden_size())?],
+            )?,
+        ))?,
+    };
     require_shape(
         hidden,
         DataType::Bf16,
         &[
-            1,
+            dimension(family.batch())?,
             dimension(family.sequence())?,
             dimension(config.hidden_size())?,
         ],
@@ -112,8 +192,19 @@ pub(super) fn build_layer(
     let hidden_shape = hidden_shape(config, family)?;
     let cache_shape = cache_shape(config, family)?;
     let hidden_input = graph.input("hidden", hidden_shape);
-    let position = graph.input("position", shape(DataType::I32, &[])?);
+    let position = graph.input(
+        "position",
+        shape(DataType::I32, &[dimension(family.batch())?])?,
+    );
     let sequence_lengths = sequence_lengths(graph, family, position)?;
+    let query_lengths = graph.input(
+        "query_lengths",
+        shape(DataType::I32, &[dimension(family.batch())?])?,
+    );
+    let active_rows = graph.input(
+        "active_rows",
+        shape(DataType::Bool, &[dimension(family.batch())?])?,
+    );
     let page_table = graph.input("page_table", page_table_shape(family)?);
     let key_input = graph.input("cache.key", cache_shape);
     let value_input = graph.input("cache.value", cache_shape);
@@ -126,6 +217,8 @@ pub(super) fn build_layer(
         hidden_input,
         position,
         sequence_lengths,
+        query_lengths,
+        active_rows,
         page_table,
         key_input,
         value_input,
@@ -161,8 +254,19 @@ pub(super) fn build_decode_layer_pair(
     let hidden_shape = hidden_shape(config, family)?;
     let cache_shape = cache_shape(config, family)?;
     let hidden_input = graph.input("hidden", hidden_shape);
-    let position = graph.input("position", shape(DataType::I32, &[])?);
+    let position = graph.input(
+        "position",
+        shape(DataType::I32, &[dimension(family.batch())?])?,
+    );
     let sequence_lengths = sequence_lengths(graph, family, position)?;
+    let query_lengths = graph.input(
+        "query_lengths",
+        shape(DataType::I32, &[dimension(family.batch())?])?,
+    );
+    let active_rows = graph.input(
+        "active_rows",
+        shape(DataType::Bool, &[dimension(family.batch())?])?,
+    );
     let page_table = graph.input("page_table", page_table_shape(family)?);
     let sliding_key_input = graph.input("sliding.cache.key", cache_shape);
     let sliding_value_input = graph.input("sliding.cache.value", cache_shape);
@@ -178,6 +282,8 @@ pub(super) fn build_decode_layer_pair(
         hidden_input,
         position,
         sequence_lengths,
+        query_lengths,
+        active_rows,
         page_table,
         sliding_key_input,
         sliding_value_input,
@@ -191,6 +297,8 @@ pub(super) fn build_decode_layer_pair(
         hidden,
         position,
         sequence_lengths,
+        query_lengths,
+        active_rows,
         page_table,
         full_key_input,
         full_value_input,
@@ -215,27 +323,23 @@ fn apply_layer(
     hidden_input: Tensor,
     position: Tensor,
     sequence_lengths: Tensor,
+    query_lengths: Tensor,
+    active_rows: Tensor,
     page_table: Tensor,
     key_input: Tensor,
     value_input: Tensor,
 ) -> Result<(Tensor, Tensor, Tensor)> {
+    let batch = dimension(family.batch())?;
     let sequence = dimension(family.sequence())?;
     let hidden_size = dimension(config.hidden_size())?;
     let query_heads = dimension(config.query_heads())?;
     let key_value_heads = dimension(config.key_value_heads())?;
     let head_dim = dimension(config.head_dim())?;
-    let page_count = dimension(family.page_count())?;
-    let page_size = dimension(CACHE_PAGE_SIZE)?;
     let hidden_shape = hidden_shape(config, family)?;
-    let cache_shape = shape(
-        DataType::Bf16,
-        &[page_count, page_size, key_value_heads, head_dim],
-    )?;
-    let zero = nml(graph.scalar(0_i32))?;
 
-    let token_shape = shape(DataType::I32, &[1, sequence])?;
+    let token_shape = shape(DataType::I32, &[batch, sequence])?;
     let offsets = nml(graph.iota(token_shape, 1))?;
-    let position_vector = nml(graph.broadcast_in_dim(position, token_shape, &[]))?;
+    let position_vector = nml(graph.broadcast_in_dim(position, token_shape, &[0]))?;
     let positions = nml(graph.add(offsets, position_vector))?;
 
     let residual = hidden_input;
@@ -253,15 +357,15 @@ fn apply_layer(
     ))?;
     let query = nml(graph.reshape(
         query,
-        shape(DataType::Bf16, &[1, sequence, query_heads, head_dim])?,
+        shape(DataType::Bf16, &[batch, sequence, query_heads, head_dim])?,
     ))?;
     let key = nml(graph.reshape(
         key,
-        shape(DataType::Bf16, &[1, sequence, key_value_heads, head_dim])?,
+        shape(DataType::Bf16, &[batch, sequence, key_value_heads, head_dim])?,
     ))?;
     let value = nml(graph.reshape(
         value,
-        shape(DataType::Bf16, &[1, sequence, key_value_heads, head_dim])?,
+        shape(DataType::Bf16, &[batch, sequence, key_value_heads, head_dim])?,
     ))?;
     let rope = nml::attention::RopeOptions {
         base: config.rope_theta(),
@@ -279,22 +383,33 @@ fn apply_layer(
     let query = nml(graph.rope(query, positions, rope))?;
     let key = nml(graph.rope(key, positions, rope))?;
 
-    let dense_cache_shape = shape(
-        DataType::Bf16,
-        &[
-            1,
-            dimension(family.cache_capacity())?,
-            key_value_heads,
-            head_dim,
-        ],
-    )?;
-    let dense_key = nml(graph.reshape(key_input, dense_cache_shape))?;
-    let dense_value = nml(graph.reshape(value_input, dense_cache_shape))?;
-    let dense_key = nml(graph.dynamic_update_slice(dense_key, key, &[zero, position, zero, zero]))?;
-    let dense_value =
-        nml(graph.dynamic_update_slice(dense_value, value, &[zero, position, zero, zero]))?;
-    let key_cache = nml(graph.reshape(dense_key, cache_shape))?;
-    let value_cache = nml(graph.reshape(dense_value, cache_shape))?;
+    let query_lengths_vector = query_lengths;
+    let query_lengths = nml(graph.broadcast_in_dim(query_lengths_vector, token_shape, &[0]))?;
+    let valid_queries = nml(graph.less(offsets, query_lengths))?;
+    let active_queries = nml(graph.broadcast_in_dim(
+        active_rows,
+        shape(DataType::Bool, &[batch, sequence])?,
+        &[0],
+    ))?;
+    let write_mask = nml(graph.logical_and(valid_queries, active_queries))?;
+    let key_cache = nml(graph.paged_cache_update(
+        key_input,
+        key,
+        page_table,
+        position,
+        query_lengths_vector,
+        active_rows,
+        write_mask,
+    ))?;
+    let value_cache = nml(graph.paged_cache_update(
+        value_input,
+        value,
+        page_table,
+        position,
+        query_lengths_vector,
+        active_rows,
+        write_mask,
+    ))?;
     let key_cache = nml(graph.reuse_buffer(key_cache, key_input))?;
     let value_cache = nml(graph.reuse_buffer(value_cache, value_input))?;
 
@@ -321,7 +436,7 @@ fn apply_layer(
         attention,
         shape(
             DataType::Bf16,
-            &[1, sequence, dimension(config.query_width())?],
+            &[batch, sequence, dimension(config.query_width())?],
         )?,
     ))?;
     let attention = nml(graph.linear(
@@ -334,7 +449,13 @@ fn apply_layer(
     let residual = hidden;
     let post_norm = nml(graph.parameter_value(&layer.post_attention_layernorm.weight))?;
     hidden = nml(graph.rms_norm(hidden, Some(post_norm), 2, config.rms_norm_epsilon()))?;
-    let routed = nml(graph.reshape(hidden, shape(DataType::Bf16, &[sequence, hidden_size])?))?;
+    let routed_tokens = batch
+        .checked_mul(sequence)
+        .ok_or_else(|| message("GPT-OSS routed token dimension overflows I64"))?;
+    let routed = nml(graph.reshape(
+        hidden,
+        shape(DataType::Bf16, &[routed_tokens, hidden_size])?,
+    ))?;
     let router_logits = nml(graph.linear(
         routed,
         &layer.mlp.router.weight,
@@ -351,6 +472,12 @@ fn apply_layer(
     ))?;
     let routed = nml(graph.reshape(routed, hidden_shape))?;
     hidden = nml(graph.add(residual, routed))?;
+    let active_hidden = nml(graph.broadcast_in_dim(
+        write_mask,
+        hidden_shape.with_dtype(DataType::Bool),
+        &[0, 1],
+    ))?;
+    hidden = nml(graph.select(active_hidden, hidden, hidden_input))?;
     Ok((hidden, key_cache, value_cache))
 }
 
@@ -360,46 +487,49 @@ pub(super) fn build_head(
     config: &Config,
     family: ShapeFamily,
 ) -> Result<Vec<(String, Tensor)>> {
+    let batch = dimension(family.batch())?;
     let sequence = dimension(family.sequence())?;
     let hidden_size = dimension(config.hidden_size())?;
     let hidden = graph.input(
         "hidden",
-        shape(DataType::Bf16, &[1, sequence, hidden_size])?,
+        shape(DataType::Bf16, &[batch, sequence, hidden_size])?,
     );
-    let last_index = graph.input("last_index", shape(DataType::I32, &[])?);
-    let sampling_state_input = graph.input("sampling_state", shape(DataType::U64, &[2])?);
-    let top_k = graph.input("top_k", shape(DataType::I32, &[])?);
-    let temperature = graph.input("temperature", shape(DataType::F32, &[])?);
-    let top_p = graph.input("top_p", shape(DataType::F32, &[])?);
-    let min_p = graph.input("min_p", shape(DataType::F32, &[])?);
-    let zero = nml(graph.scalar(0_i32))?;
-    let last = nml(graph.dynamic_slice(hidden, &[zero, last_index, zero], &[1, 1, hidden_size]))?;
+    let last_index = graph.input("last_index", shape(DataType::I32, &[batch, 1])?);
+    let sampling_state_input =
+        graph.input("sampling_state", shape(DataType::U64, &[batch, 2])?);
+    let top_k = graph.input("top_k", shape(DataType::I32, &[batch])?);
+    let temperature = graph.input("temperature", shape(DataType::F32, &[batch])?);
+    let top_p = graph.input("top_p", shape(DataType::F32, &[batch])?);
+    let min_p = graph.input("min_p", shape(DataType::F32, &[batch])?);
+    let active_rows = graph.input("active_rows", shape(DataType::Bool, &[batch])?);
+    let last = nml(graph.gather_batched_nd(hidden, last_index, 1, &[1]))?;
     let final_norm = nml(graph.parameter_value(&checkpoint.model.norm.weight))?;
-    let last = nml(graph.rms_norm(last, Some(final_norm), 2, config.rms_norm_epsilon()))?;
-    let last = nml(graph.reshape(last, shape(DataType::Bf16, &[1, hidden_size])?))?;
+    let last = nml(graph.rms_norm(last, Some(final_norm), 1, config.rms_norm_epsilon()))?;
     let logits = nml(graph.linear(last, &checkpoint.lm_head.weight, None))?;
-    let sampling_state = nml(graph.random_state(sampling_state_input))?;
-    let (sampling_state, token) = nml(graph.sample_tokens_dynamic(
+    let (sampling_state, token) = nml(graph.sample_tokens_batched_dynamic(
         logits,
-        sampling_state,
-        1,
+        sampling_state_input,
         top_k,
         temperature,
         top_p,
         min_p,
+        active_rows,
         MAXIMUM_TOP_K,
     ))?;
     let sampling_state =
-        nml(graph.reuse_buffer(sampling_state.into_tensor(), sampling_state_input))?;
-    let token = nml(graph.reshape(token, shape(DataType::I32, &[1, 1])?))?;
+        nml(graph.reuse_buffer(sampling_state, sampling_state_input))?;
     let mut outputs = vec![
         ("token".to_owned(), token),
         ("sampling_state".to_owned(), sampling_state),
     ];
     if family.phase() == Phase::Decode {
-        let position = graph.input("position", shape(DataType::I32, &[])?);
+        let position = graph.input("position", shape(DataType::I32, &[batch])?);
         let one = nml(graph.scalar(1_i32))?;
-        outputs.push(("position".to_owned(), nml(graph.add(position, one))?));
+        let advanced = nml(graph.add(position, one))?;
+        outputs.push((
+            "position".to_owned(),
+            nml(graph.select(active_rows, advanced, position))?,
+        ));
     }
     Ok(outputs)
 }
@@ -408,7 +538,7 @@ pub(super) fn cache_shape(config: &Config, family: ShapeFamily) -> Result<Shape>
     shape(
         DataType::Bf16,
         &[
-            dimension(family.page_count())?,
+            dimension(family.physical_pages())?,
             dimension(CACHE_PAGE_SIZE)?,
             dimension(config.key_value_heads())?,
             dimension(config.head_dim())?,
@@ -420,7 +550,7 @@ fn hidden_shape(config: &Config, family: ShapeFamily) -> Result<Shape> {
     shape(
         DataType::Bf16,
         &[
-            1,
+            dimension(family.batch())?,
             dimension(family.sequence())?,
             dimension(config.hidden_size())?,
         ],
@@ -429,17 +559,22 @@ fn hidden_shape(config: &Config, family: ShapeFamily) -> Result<Shape> {
 
 fn sequence_lengths(graph: &mut Graph, family: ShapeFamily, position: Tensor) -> Result<Tensor> {
     match family.phase() {
-        Phase::Prefill => Ok(graph.input("sequence_lengths", shape(DataType::I32, &[1])?)),
+        Phase::Prefill => Ok(graph.input(
+            "sequence_lengths",
+            shape(DataType::I32, &[dimension(family.batch())?])?,
+        )),
         Phase::Decode => {
             let one = nml(graph.scalar(1_i32))?;
-            let length = nml(graph.add(position, one))?;
-            nml(graph.reshape(length, shape(DataType::I32, &[1])?))
+            nml(graph.add(position, one))
         }
     }
 }
 
 pub(super) fn page_table_shape(family: ShapeFamily) -> Result<Shape> {
-    shape(DataType::I32, &[1, dimension(family.page_count())?])
+    shape(
+        DataType::I32,
+        &[dimension(family.batch())?, dimension(family.page_count())?],
+    )
 }
 
 fn require_shape(tensor: Tensor, dtype: DataType, dimensions: &[i64]) -> Result<()> {
@@ -518,8 +653,8 @@ mod tests {
     fn component_programs_keep_model_depth_out_of_the_compiler_abi() {
         let config = selected_config();
         let checkpoint = synthetic_checkpoint(&config);
-        let prefill = ShapeFamily::prefill(32, 512).unwrap();
-        let decode = ShapeFamily::decode(512).unwrap();
+        let prefill = ShapeFamily::prefill(32, 512, 32).unwrap();
+        let decode = ShapeFamily::decode(512, 32).unwrap();
 
         let embedding = finish!(|graph| build_embedding(graph, &checkpoint, &config, prefill));
         assert_contract!(embedding, 1, 3, 1, &[None]);
@@ -535,7 +670,7 @@ mod tests {
                 AttentionKind::SlidingAttention,
             )
         });
-        assert_contract!(prefill_layer, 6, 29, 3, &[Some(0), Some(4), Some(5)],);
+        assert_contract!(prefill_layer, 8, 29, 3, &[Some(0), Some(6), Some(7)],);
         assert!(prefill_layer
             .input_names()
             .any(|name| name == "sequence_lengths"));
@@ -547,10 +682,10 @@ mod tests {
             finish!(|graph| { build_decode_layer_pair(graph, sliding, full, &config, decode) });
         assert_contract!(
             decode_layer,
-            7,
+            9,
             58,
             5,
-            &[Some(0), Some(3), Some(4), Some(5), Some(6)],
+            &[Some(0), Some(5), Some(6), Some(7), Some(8)],
         );
         assert!(!decode_layer
             .input_names()
@@ -573,9 +708,22 @@ mod tests {
             .any(|name| name.starts_with("model.layers.1.")));
 
         let prefill_head = finish!(|graph| build_head(graph, &checkpoint, &config, prefill));
-        assert_contract!(prefill_head, 7, 4, 2, &[None, Some(2)]);
+        assert_contract!(prefill_head, 8, 4, 2, &[None, Some(2)]);
         let decode_head = finish!(|graph| build_head(graph, &checkpoint, &config, decode));
-        assert_contract!(decode_head, 8, 4, 3, &[None, Some(2), None]);
+        assert_contract!(decode_head, 9, 4, 3, &[None, Some(2), None]);
+
+        let batched = ShapeFamily::serving_decode(4, 512, 32, 1).unwrap();
+        let batched_embedding =
+            finish!(|graph| build_embedding(graph, &checkpoint, &config, batched));
+        assert_eq!(
+            batched_embedding.outputs().next().unwrap().1.dimensions(),
+            &[4, 1, config.hidden_size() as i64]
+        );
+        let batched_head = finish!(|graph| build_head(graph, &checkpoint, &config, batched));
+        let outputs = batched_head.outputs().collect::<Vec<_>>();
+        assert_eq!(outputs[0].1.dimensions(), &[4]);
+        assert_eq!(outputs[1].1.dimensions(), &[4, 2]);
+        assert_eq!(outputs[2].1.dimensions(), &[4]);
     }
 
     fn selected_config() -> Config {

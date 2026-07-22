@@ -647,7 +647,7 @@ fn parameter(name: &str, shape: Shape) -> nml::Parameter {
 
 fn set_generated_parameter(
     platform: &nml::Platform,
-    arguments: &mut nml::exe::Arguments<'_>,
+    arguments: &mut nml::exe::Arguments,
     parameter: &nml::Parameter,
     multiplier: usize,
     modulus: usize,

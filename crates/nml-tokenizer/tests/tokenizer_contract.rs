@@ -51,3 +51,70 @@ fn malformed_json_is_diagnostic() {
     };
     assert!(error.contains("IREE tokenizer status"), "{error}");
 }
+
+#[test]
+fn decoder_keeps_the_shared_tokenizer_owner_alive() {
+    fn require_static<T: 'static>() {}
+    require_static::<nml_tokenizer::Decoder>();
+
+    let mut decoder = {
+        let tokenizer = Tokenizer::from_bytes(WORDPIECE.as_bytes()).unwrap();
+        let last_visible_clone = tokenizer.clone();
+        let decoder = last_visible_clone.decoder().unwrap();
+        drop(last_visible_clone);
+        drop(tokenizer);
+        decoder
+    };
+
+    let mut bytes = decoder.push(1).unwrap();
+    bytes.extend(decoder.push(2).unwrap());
+    bytes.extend(decoder.finish().unwrap());
+    assert_eq!(String::from_utf8(bytes).unwrap(), "hello world");
+}
+
+#[test]
+fn independent_sessions_are_serialized_across_threads() {
+    fn require_send_sync<T: Send + Sync>() {}
+    fn require_send<T: Send>() {}
+    require_send_sync::<Tokenizer>();
+    require_send::<nml_tokenizer::Decoder>();
+
+    let tokenizer = Tokenizer::from_bytes(WORDPIECE.as_bytes()).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(33));
+    std::thread::scope(|scope| {
+        let mut threads = Vec::new();
+        for index in 0..32 {
+            let tokenizer = tokenizer.clone();
+            let barrier = barrier.clone();
+            threads.push(scope.spawn(move || {
+                let expected = if index % 2 == 0 { 1 } else { 2 };
+                let text = if index % 2 == 0 { "hello" } else { "world" };
+                barrier.wait();
+                assert_eq!(tokenizer.encode(text).unwrap(), [expected]);
+                let mut decoder = tokenizer.decoder().unwrap();
+                let mut bytes = decoder.push(expected).unwrap();
+                bytes.extend(decoder.finish().unwrap());
+                assert_eq!(String::from_utf8(bytes).unwrap(), text);
+            }));
+        }
+        barrier.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+    });
+}
+
+#[test]
+fn decoder_owner_can_move_between_threads() {
+    let tokenizer = Tokenizer::from_bytes(WORDPIECE.as_bytes()).unwrap();
+    let mut decoder = tokenizer.decoder().unwrap();
+    let bytes = std::thread::spawn(move || {
+        let mut bytes = decoder.push(1).unwrap();
+        bytes.extend(decoder.push(2).unwrap());
+        bytes.extend(decoder.finish().unwrap());
+        bytes
+    })
+    .join()
+    .unwrap();
+    assert_eq!(String::from_utf8(bytes).unwrap(), "hello world");
+}

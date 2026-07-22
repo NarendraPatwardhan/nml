@@ -6,17 +6,52 @@ use nml_tokenizer_sys as ffi;
 use std::error::Error as StdError;
 use std::ffi::CStr;
 use std::fmt;
-use std::marker::PhantomData;
 use std::path::Path;
 use std::ptr::NonNull;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 const RESOURCE_EXHAUSTED: i32 = 8;
 const MIN_TOKEN_CAPACITY: usize = 32;
 const DECODE_CHUNK_BYTES: usize = 2048;
 
 /// One immutable tokenizer parsed from a Hugging Face `tokenizer.json` file.
+///
+/// Clones retain the same allocation. Calls through clones and their decoder
+/// sessions are serialized because upstream IREE does not publish a shared
+/// tokenizer concurrency contract.
+#[derive(Clone)]
 pub struct Tokenizer {
+    inner: Arc<TokenizerInner>,
+}
+
+struct TokenizerInner {
+    // IREE does not publish a concurrency contract for a tokenizer shared by
+    // independent encode/decode states. Keep the opaque allocation behind one
+    // narrow gate instead of inferring thread safety from const-qualified C
+    // parameters. Per-session state remains independently owned, but every
+    // bridge operation that can observe the shared tokenizer is serialized.
+    allocation: Mutex<TokenizerAllocation>,
+}
+
+struct TokenizerAllocation {
     raw: NonNull<ffi::nml_iree_tokenizer_t>,
+}
+
+// SAFETY: this value is only an owning handle. Moving it does not dereference
+// the allocation, all dereferences are made while its containing `Mutex` is
+// locked, and the bridge created the allocation with IREE's system allocator.
+// No `Sync` claim is made for either the handle or the IREE allocation.
+unsafe impl Send for TokenizerAllocation {}
+
+impl TokenizerInner {
+    fn lock(&self) -> MutexGuard<'_, TokenizerAllocation> {
+        // A Rust panic cannot mutate the shared tokenizer: bridge calls do not
+        // unwind and all mutable encoder/decoder state lives outside it. It is
+        // therefore safe to recover the serialization gate after poisoning.
+        self.allocation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 impl Tokenizer {
@@ -34,16 +69,21 @@ impl Tokenizer {
         };
         check(code)?;
         let raw = NonNull::new(raw).ok_or(Error::NullResult("tokenizer"))?;
-        Ok(Self { raw })
+        Ok(Self {
+            inner: Arc::new(TokenizerInner {
+                allocation: Mutex::new(TokenizerAllocation { raw }),
+            }),
+        })
     }
 
     pub fn token_id(&self, token: &str) -> Option<u32> {
+        let allocation = self.inner.lock();
         let mut token_id = 0;
         // SAFETY: the tokenizer is alive, the UTF-8 string is readable for its
         // declared length, and the output points to initialized writable data.
         let found = unsafe {
             ffi::nml_iree_tokenizer_lookup(
-                self.raw.as_ptr(),
+                allocation.raw.as_ptr(),
                 token.as_ptr(),
                 token.len(),
                 &mut token_id,
@@ -71,11 +111,14 @@ impl Tokenizer {
         text: &str,
         match_special_tokens: bool,
     ) -> Result<Vec<u32>, Error> {
+        // The guard intentionally covers creation, all feed/finalize calls,
+        // and `Encoder::drop`; the encoder may retain tokenizer references.
+        let allocation = self.inner.lock();
         let mut raw = std::ptr::null_mut();
         // SAFETY: the tokenizer outlives the encoder and `raw` is writable.
         let code = unsafe {
             ffi::nml_iree_encoder_create(
-                self.raw.as_ptr(),
+                allocation.raw.as_ptr(),
                 text.len(),
                 match_special_tokens,
                 &mut raw,
@@ -87,17 +130,18 @@ impl Tokenizer {
         encoder.encode(text.as_bytes())
     }
 
-    pub fn decoder(&self) -> Result<Decoder<'_>, Error> {
+    pub fn decoder(&self) -> Result<Decoder, Error> {
+        let allocation = self.inner.lock();
         let mut raw = std::ptr::null_mut();
-        // SAFETY: the tokenizer outlives the returned decoder through the Rust
-        // borrow, and `raw` is a valid out-pointer.
-        let code = unsafe { ffi::nml_iree_decoder_create(self.raw.as_ptr(), &mut raw) };
+        // SAFETY: the returned decoder retains a shared tokenizer owner and
+        // `raw` is a valid out-pointer.
+        let code = unsafe { ffi::nml_iree_decoder_create(allocation.raw.as_ptr(), &mut raw) };
         check(code)?;
         let raw = NonNull::new(raw).ok_or(Error::NullResult("decoder"))?;
         Ok(Decoder {
             raw,
             finished: false,
-            tokenizer: PhantomData,
+            _tokenizer: Arc::clone(&self.inner),
         })
     }
 
@@ -109,7 +153,7 @@ impl Tokenizer {
     }
 }
 
-impl Drop for Tokenizer {
+impl Drop for TokenizerAllocation {
     fn drop(&mut self) {
         // SAFETY: this pointer is uniquely owned and freed exactly once.
         unsafe { ffi::nml_iree_tokenizer_free(self.raw.as_ptr()) };
@@ -208,14 +252,29 @@ impl Drop for Encoder {
     }
 }
 
-/// Stateful detokenization for token-at-a-time generation.
-pub struct Decoder<'tokenizer> {
+/// Owned stateful detokenization for token-at-a-time generation.
+///
+/// A decoder retains the tokenizer allocation that created it, so it can
+/// safely outlive every public [`Tokenizer`] handle. Decoder operations join
+/// the same narrow serialization gate as encoding and vocabulary lookup.
+pub struct Decoder {
     raw: NonNull<ffi::nml_iree_decoder_t>,
     finished: bool,
-    tokenizer: PhantomData<&'tokenizer Tokenizer>,
+    // Retains the immutable tokenizer allocation referenced by IREE's decoder
+    // state. Field drop follows `Decoder::drop`, so the raw decoder is freed
+    // before this final shared owner can release the tokenizer.
+    _tokenizer: Arc<TokenizerInner>,
 }
 
-impl Decoder<'_> {
+// SAFETY: the bridge decoder is a uniquely owned heap allocation containing
+// only system-allocated storage plus a pointer to the retained immutable
+// tokenizer. It has no creator-thread affinity, bridge diagnostics are
+// `_Thread_local`, every operation requires `&mut self`, and each bridge call
+// is additionally serialized by the retained tokenizer's mutex. Moving the
+// unique owner between threads cannot introduce concurrent decoder access.
+unsafe impl Send for Decoder {}
+
+impl Decoder {
     /// Feeds one token and returns all bytes now safe to stream. A fragment is
     /// not required to be valid UTF-8 until the complete stream is assembled.
     pub fn push(&mut self, token_id: u32) -> Result<Vec<u8>, Error> {
@@ -223,6 +282,7 @@ impl Decoder<'_> {
     }
 
     pub fn reset(&mut self) -> Result<(), Error> {
+        let _allocation = self._tokenizer.lock();
         // SAFETY: `raw` points to a live decoder and reset preserves storage.
         check(unsafe { ffi::nml_iree_decoder_reset(self.raw.as_ptr()) })?;
         self.finished = false;
@@ -233,6 +293,7 @@ impl Decoder<'_> {
         if self.finished {
             return Err(Error::DecoderFinished);
         }
+        let _allocation = self._tokenizer.lock();
         let mut output = Vec::new();
         let mut chunk_bytes = 32usize;
         loop {
@@ -270,6 +331,7 @@ impl Decoder<'_> {
         if self.finished {
             return Err(Error::DecoderFinished);
         }
+        let _allocation = self._tokenizer.lock();
         let initial_capacity = token_ids
             .len()
             .max(1)
@@ -330,10 +392,11 @@ fn grow_zeroed(output: &mut Vec<u8>, additional: usize) -> Result<usize, Error> 
     Ok(start)
 }
 
-impl Drop for Decoder<'_> {
+impl Drop for Decoder {
     fn drop(&mut self) {
+        let _allocation = self._tokenizer.lock();
         // SAFETY: this pointer is uniquely owned and freed exactly once before
-        // the borrowed tokenizer can be destroyed.
+        // the retained tokenizer owner can be destroyed.
         unsafe { ffi::nml_iree_decoder_free(self.raw.as_ptr()) };
     }
 }

@@ -1095,7 +1095,12 @@ pub trait ParameterTree {
 pub type Loaded<T> = <T as ParameterTree>::Loaded;
 
 /// A compiled executable with named, reusable argument bindings.
+#[derive(Clone)]
 pub struct Exe {
+    inner: Arc<ExeInner>,
+}
+
+struct ExeInner {
     backend: Backend,
     platform_id: usize,
     loaded: LoadedExecutable,
@@ -1158,26 +1163,35 @@ impl Exe {
             .collect::<Vec<_>>()
             .into();
         Ok(Self {
-            backend,
-            platform_id,
-            loaded,
-            device_count,
-            sharding,
-            inputs,
-            input_indices,
-            outputs,
-            output_names,
+            inner: Arc::new(ExeInner {
+                backend,
+                platform_id,
+                loaded,
+                device_count,
+                sharding,
+                inputs,
+                input_indices,
+                outputs,
+                output_names,
+            }),
         })
     }
 
-    pub fn args(&self) -> exe::Arguments<'_> {
+    /// Creates an independently owned argument set.
+    ///
+    /// The returned bindings keep the loaded executable alive. This is
+    /// intentional: long-lived inference sessions can retain baked arguments
+    /// without borrowing the model object that originally compiled them.
+    pub fn args(&self) -> exe::Arguments {
         exe::Arguments {
-            executable: self,
-            slots: vec![None; self.inputs.len()],
-            baked: vec![false; self.inputs.len()],
+            executable: Arc::clone(&self.inner),
+            slots: vec![None; self.inner.inputs.len()],
+            baked: vec![false; self.inner.inputs.len()],
         }
     }
+}
 
+impl ExeInner {
     fn results(
         &self,
         buffers: Vec<Buffer>,
@@ -1198,15 +1212,20 @@ impl Exe {
 }
 
 pub mod exe {
-    use super::{Arc, Buffer, Error, Exe, LoadedParameter, Parameter};
+    use super::{Arc, Buffer, Error, ExeInner, LoadedParameter, Parameter};
 
-    pub struct Arguments<'exe> {
-        pub(super) executable: &'exe Exe,
+    /// Reusable executable bindings that own the executable they target.
+    ///
+    /// Arguments are deliberately not tied to an `Exe` borrow. The loaded
+    /// executable is reference-counted together with its immutable binding
+    /// manifest, while every argument set owns its mutable buffer slots.
+    pub struct Arguments {
+        pub(super) executable: Arc<ExeInner>,
         pub(super) slots: Vec<Option<Buffer>>,
         pub(super) baked: Vec<bool>,
     }
 
-    impl Arguments<'_> {
+    impl Arguments {
         pub fn set(&mut self, name: &str, buffer: Buffer) -> Result<&mut Self, Error> {
             let index = self
                 .executable

@@ -113,7 +113,7 @@ pub(super) fn representative_layer<'checkpoint>(
 /// a reusable executable. Checkpoint names are deliberately not executable
 /// identities: representation and storage contracts remain the authority.
 pub(super) fn bind_tree<T: ParameterTree>(
-    arguments: &mut Arguments<'_>,
+    arguments: &mut Arguments,
     slots: &T,
     loaded: &Loaded<T>,
 ) -> Result<()> {
@@ -128,7 +128,7 @@ pub(super) fn bind_tree<T: ParameterTree>(
 /// executables use this for each structural subtree, then call `bake` exactly
 /// once after every parameter component has been installed.
 pub(super) fn bind_tree_components<T: ParameterTree>(
-    arguments: &mut Arguments<'_>,
+    arguments: &mut Arguments,
     slots: &T,
     loaded: &Loaded<T>,
 ) -> Result<()> {

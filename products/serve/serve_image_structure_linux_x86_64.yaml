@@ -15,7 +15,8 @@ metadataTest:
       value: NML GPT-OSS 20B NVFP4 inference over the CPU and CUDA acceleration substrate
   entrypoint:
     - /usr/local/bin/nml-serve
-  cmd: []
+  cmd:
+    - serve
   workdir: /usr/local/bin/nml-serve.runfiles/_main
 
 fileExistenceTests:

@@ -18,14 +18,29 @@ nml_rust_library(
         "src/gpt_oss/execution.rs",
         "src/gpt_oss/graph.rs",
         "src/gpt_oss/protocol.rs",
+        "src/server.rs",
+        "src/server/api.rs",
+        "src/server/cache.rs",
+        "src/server/contracts.rs",
+        "src/server/engine.rs",
+        "src/server/http.rs",
+        "src/server/metrics.rs",
+        "src/server/scheduler.rs",
         "src/lib.rs",
     ],
     crate_root = "src/lib.rs",
     deps = [
         "//crates/nml:nml",
+        "@rust_crates//axum",
+        "@rust_crates//prometheus-client",
         "@rust_crates//serde",
         "@rust_crates//serde_json",
         "@rust_crates//sha2",
+        "@rust_crates//tokio",
+        "@rust_crates//tokio-stream",
+        "@rust_crates//tokio-util",
+        "@rust_crates//tower",
+        "@rust_crates//tracing",
     ],
     visibility = [":__pkg__"],
 )
@@ -46,6 +61,8 @@ nml_rust_binary(
     deps = [
         ":nml_serve",
         "//crates/nml:nml",
+        "@rust_crates//tokio",
+        "@rust_crates//tracing-subscriber",
     ],
     env = select({
         "//platforms:cuda.enabled": {
@@ -54,6 +71,19 @@ nml_rust_binary(
         "//conditions:default": {},
     }),
     visibility = ["//:__pkg__"],
+)
+
+nml_rust_test(
+    name = "serve_cli_contract_test",
+    size = "small",
+    srcs = ["src/main.rs"],
+    crate_root = "src/main.rs",
+    deps = [
+        ":nml_serve",
+        "//crates/nml:nml",
+        "@rust_crates//tokio",
+        "@rust_crates//tracing-subscriber",
+    ],
 )
 
 # Keep the slowly changing PJRT/CUDA/model-engine runfiles separate from the
@@ -96,7 +126,7 @@ image_from_binary(
     name = "serve_image",
     base = "@distroless_cc_debian12",
     binary = ":serve_image_entrypoint",
-    cmd = [],
+    cmd = ["serve"],
     env = {
         "LD_LIBRARY_PATH": "/usr/local/lib/nml",
     },
@@ -173,18 +203,34 @@ nml_rust_test(
         "src/gpt_oss/execution.rs",
         "src/gpt_oss/graph.rs",
         "src/gpt_oss/protocol.rs",
+        "src/server.rs",
+        "src/server/api.rs",
+        "src/server/cache.rs",
+        "src/server/contracts.rs",
+        "src/server/engine.rs",
+        "src/server/http.rs",
+        "src/server/metrics.rs",
+        "src/server/scheduler.rs",
         "src/lib.rs",
     ],
     crate_root = "src/lib.rs",
     data = [
         "//artifacts/gpt-oss-20b-nvfp4:manifest",
+        "profiles/a40-single-stream-control-v1.json",
         "@gpt_oss_harmony_tokenizer//file",
     ],
     deps = [
         "//crates/nml:nml",
+        "@rust_crates//axum",
+        "@rust_crates//prometheus-client",
         "@rust_crates//serde",
         "@rust_crates//serde_json",
         "@rust_crates//sha2",
+        "@rust_crates//tokio",
+        "@rust_crates//tokio-stream",
+        "@rust_crates//tokio-util",
+        "@rust_crates//tower",
+        "@rust_crates//tracing",
     ],
     env = {
         "NML_GPT_OSS_TOKENIZER_RLOCATION": "$(rlocationpath @gpt_oss_harmony_tokenizer//file)",

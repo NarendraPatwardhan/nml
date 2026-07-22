@@ -1345,6 +1345,42 @@ fn token_sampling_composes_static_and_runtime_controls_with_one_state_chain() {
 }
 
 #[test]
+fn batched_sampling_has_one_independent_state_chain_per_row_and_masks_padding() {
+    let mut builder = ProgramBuilder::new();
+    let logits = builder.input("logits", Shape::new(DType::F32, &[3, 8]).unwrap());
+    let state_input = builder.input("states", Shape::new(DType::U64, &[3, 2]).unwrap());
+    let top_k = builder.input("top_k", Shape::new(DType::I32, &[3]).unwrap());
+    let temperature = builder.input("temperature", Shape::new(DType::F32, &[3]).unwrap());
+    let top_p = builder.input("top_p", Shape::new(DType::F32, &[3]).unwrap());
+    let min_p = builder.input("min_p", Shape::new(DType::F32, &[3]).unwrap());
+    let active = builder.input("active", Shape::new(DType::Bool, &[3]).unwrap());
+    let (states, tokens) = builder
+        .sample_tokens_batched_dynamic(
+            logits,
+            state_input,
+            top_k,
+            temperature,
+            top_p,
+            min_p,
+            active,
+            8,
+        )
+        .unwrap();
+    assert_eq!(states.shape().dimensions(), &[3, 2]);
+    assert_eq!(tokens.shape().dimensions(), &[3]);
+    let states = builder.reuse_buffer(states, state_input).unwrap();
+    let text = builder
+        .finish(&[tokens, states])
+        .unwrap()
+        .stablehlo()
+        .unwrap();
+    assert_eq!(text.matches("stablehlo.rng_bit_generator").count(), 3, "{text}");
+    assert!(text.matches("stablehlo.select").count() >= 6, "{text}");
+    assert!(text.contains("tf.aliasing_output"), "{text}");
+    Context::new().parse_module(&text).unwrap().verify().unwrap();
+}
+
+#[test]
 fn ordering_and_random_generation_reject_invalid_contracts_early() {
     let mut builder = ProgramBuilder::new();
     let values = builder.input("values", Shape::new(DType::F32, &[2, 5]).unwrap());
@@ -1566,6 +1602,107 @@ fn rope_and_ordinary_attention_are_verified_compositions() {
         .unwrap()
         .verify()
         .unwrap();
+}
+
+#[test]
+fn paged_cache_update_is_one_masked_in_place_scatter() {
+    let mut builder = ProgramBuilder::new();
+    let cache = builder.input(
+        "cache",
+        Shape::new(DType::F32, &[5, 4, 2, 3]).unwrap(),
+    );
+    let updates = builder.input(
+        "updates",
+        Shape::new(DType::F32, &[2, 3, 2, 3]).unwrap(),
+    );
+    let block_tables = builder.input(
+        "block_tables",
+        Shape::new(DType::I32, &[2, 3]).unwrap(),
+    );
+    let start_positions =
+        builder.input("start_positions", Shape::new(DType::I32, &[2]).unwrap());
+    let query_lengths =
+        builder.input("query_lengths", Shape::new(DType::I32, &[2]).unwrap());
+    let active_rows = builder.input("active_rows", Shape::new(DType::Bool, &[2]).unwrap());
+    let write_mask = builder.input(
+        "write_mask",
+        Shape::new(DType::Bool, &[2, 3]).unwrap(),
+    );
+    let updated = builder
+        .paged_cache_update(
+            cache,
+            updates,
+            block_tables,
+            start_positions,
+            query_lengths,
+            active_rows,
+            write_mask,
+        )
+        .unwrap();
+    let updated = builder.reuse_buffer(updated, cache).unwrap();
+    let text = builder.finish(&[updated]).unwrap().stablehlo().unwrap();
+
+    assert_eq!(text.matches("\"stablehlo.scatter\"").count(), 1, "{text}");
+    assert_eq!(text.matches("\"stablehlo.gather\"").count(), 1, "{text}");
+    assert!(text.contains("stablehlo.select"), "{text}");
+    assert!(text.contains("tf.aliasing_output"), "{text}");
+    assert!(!text.contains("dynamic_update_slice"), "{text}");
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
+}
+
+#[test]
+fn paged_cache_update_rejects_incompatible_metadata_before_mlir() {
+    let mut builder = ProgramBuilder::new();
+    let cache = builder.input(
+        "cache",
+        Shape::new(DType::F32, &[5, 4, 2, 3]).unwrap(),
+    );
+    let updates = builder.input(
+        "updates",
+        Shape::new(DType::F32, &[2, 3, 2, 3]).unwrap(),
+    );
+    let block_tables = builder.input(
+        "block_tables",
+        Shape::new(DType::I32, &[2, 3]).unwrap(),
+    );
+    let starts = builder.input("starts", Shape::new(DType::I32, &[2]).unwrap());
+    let lengths = builder.input("lengths", Shape::new(DType::I32, &[2]).unwrap());
+    let active = builder.input("active", Shape::new(DType::Bool, &[2]).unwrap());
+    let wrong_mask = builder.input("wrong_mask", Shape::new(DType::Bool, &[2, 2]).unwrap());
+    assert!(matches!(
+        builder.paged_cache_update(
+            cache,
+            updates,
+            block_tables,
+            starts,
+            lengths,
+            active,
+            wrong_mask,
+        ),
+        Err(Error::InvalidIndexing(_))
+    ));
+
+    let wrong_table = builder.input(
+        "wrong_table",
+        Shape::new(DType::I64, &[2, 3]).unwrap(),
+    );
+    let mask = builder.input("mask", Shape::new(DType::Bool, &[2, 3]).unwrap());
+    assert!(matches!(
+        builder.paged_cache_update(
+            cache,
+            updates,
+            wrong_table,
+            starts,
+            lengths,
+            active,
+            mask,
+        ),
+        Err(Error::UnsupportedDType { .. })
+    ));
 }
 
 #[test]

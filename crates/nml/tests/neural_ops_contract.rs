@@ -21,6 +21,7 @@ fn model_enabling_operations_execute_on_the_product_backends() {
     execute_structural_contract(&platform);
     execute_nd_indexing_contract(&platform);
     execute_ordering_random_and_sampling_contract(&platform);
+    execute_batched_sampling_independence_contract(&platform);
     execute_single_device_collective_contract(&platform);
     if platform.name() == "cpu" {
         execute_expert_parallel_moe_contract(&platform);
@@ -1269,6 +1270,159 @@ fn execute_ordering_random_and_sampling_contract(platform: &nml::Platform) {
     );
 }
 
+fn execute_batched_sampling_independence_contract(platform: &nml::Platform) {
+    const VOCABULARY: i64 = 6;
+    let compile = |batch: i64| {
+        let mut builder = ProgramBuilder::new();
+        let logits = builder.input(
+            "logits",
+            Shape::new(DType::F32, &[batch, VOCABULARY]).unwrap(),
+        );
+        let states = builder.input("states", Shape::new(DType::U64, &[batch, 2]).unwrap());
+        let top_k = builder.input("top_k", Shape::new(DType::I32, &[batch]).unwrap());
+        let temperature =
+            builder.input("temperature", Shape::new(DType::F32, &[batch]).unwrap());
+        let top_p = builder.input("top_p", Shape::new(DType::F32, &[batch]).unwrap());
+        let min_p = builder.input("min_p", Shape::new(DType::F32, &[batch]).unwrap());
+        let active = builder.input("active", Shape::new(DType::Bool, &[batch]).unwrap());
+        let (next_states, tokens) = builder
+            .sample_tokens_batched_dynamic(
+                logits,
+                states,
+                top_k,
+                temperature,
+                top_p,
+                min_p,
+                active,
+                4,
+            )
+            .unwrap();
+        let next_states = builder.reuse_buffer(next_states, states).unwrap();
+        let program = builder
+            .finish_named(&[
+                ("tokens".to_owned(), tokens),
+                ("states".to_owned(), next_states),
+            ])
+            .unwrap();
+        platform.compile(&program, nml::Sharding::single()).unwrap()
+    };
+    let single = compile(1);
+    let batch = compile(3);
+    let row_logits = [1.2f32, 0.6, 0.0, -0.6, -1.2, -1.8];
+    let row_seed = [0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210];
+
+    let execute_single = || {
+        let mut arguments = single.args();
+        set_float(
+            platform,
+            &mut arguments,
+            "logits",
+            Shape::new(DType::F32, &[1, VOCABULARY]).unwrap(),
+            &row_logits,
+        );
+        set_u64(
+            platform,
+            &mut arguments,
+            "states",
+            Shape::new(DType::U64, &[1, 2]).unwrap(),
+            &row_seed,
+        );
+        set_i32(
+            platform,
+            &mut arguments,
+            "top_k",
+            Shape::new(DType::I32, &[1]).unwrap(),
+            &[4],
+        );
+        for (name, value) in [("temperature", 0.8), ("top_p", 0.95), ("min_p", 0.0)] {
+            set_float(
+                platform,
+                &mut arguments,
+                name,
+                Shape::new(DType::F32, &[1]).unwrap(),
+                &[value],
+            );
+        }
+        set_bool(
+            platform,
+            &mut arguments,
+            "active",
+            Shape::new(DType::Bool, &[1]).unwrap(),
+            &[true],
+        );
+        arguments.call().unwrap()
+    };
+    let execute_batch = || {
+        let mut arguments = batch.args();
+        let logits = row_logits
+            .into_iter()
+            .chain([99.0, -99.0, 3.0, 2.0, 1.0, 0.0])
+            .chain([-1.8, -1.2, -0.6, 0.0, 0.6, 1.2])
+            .collect::<Vec<_>>();
+        let inactive_seed = [11_u64, 22];
+        let third_seed = [33_u64, 44];
+        let states = row_seed
+            .into_iter()
+            .chain(inactive_seed)
+            .chain(third_seed)
+            .collect::<Vec<_>>();
+        set_float(
+            platform,
+            &mut arguments,
+            "logits",
+            Shape::new(DType::F32, &[3, VOCABULARY]).unwrap(),
+            &logits,
+        );
+        set_u64(
+            platform,
+            &mut arguments,
+            "states",
+            Shape::new(DType::U64, &[3, 2]).unwrap(),
+            &states,
+        );
+        set_i32(
+            platform,
+            &mut arguments,
+            "top_k",
+            Shape::new(DType::I32, &[3]).unwrap(),
+            &[4, 1, 2],
+        );
+        for (name, values) in [
+            ("temperature", [0.8, 0.1, 1.1]),
+            ("top_p", [0.95, 1.0, 0.8]),
+            ("min_p", [0.0, 0.9, 0.05]),
+        ] {
+            set_float(
+                platform,
+                &mut arguments,
+                name,
+                Shape::new(DType::F32, &[3]).unwrap(),
+                &values,
+            );
+        }
+        set_bool(
+            platform,
+            &mut arguments,
+            "active",
+            Shape::new(DType::Bool, &[3]).unwrap(),
+            &[true, false, true],
+        );
+        arguments.call().unwrap()
+    };
+
+    let single = execute_single();
+    let batch = execute_batch();
+    let single_tokens = decode_i32(&single, "tokens");
+    let batch_tokens = decode_i32(&batch, "tokens");
+    let single_states = decode_u64(&single, "states");
+    let batch_states = decode_u64(&batch, "states");
+    assert_eq!(batch_tokens[0], single_tokens[0]);
+    assert_eq!(&batch_states[..2], single_states.as_slice());
+    assert_eq!(batch_tokens[1], -1);
+    assert_eq!(&batch_states[2..4], &[11, 22]);
+    assert!((0..VOCABULARY as i32).contains(&batch_tokens[2]));
+}
+
 fn execute_single_device_collective_contract(platform: &nml::Platform) {
     let shape = Shape::new(DType::F32, &[4]).unwrap();
     let mut builder = ProgramBuilder::new();
@@ -1723,7 +1877,7 @@ fn scalar(builder: &mut ProgramBuilder, dtype: DType, value: f32) -> nml::Tensor
 
 fn set_float(
     platform: &nml::Platform,
-    arguments: &mut nml::exe::Arguments<'_>,
+    arguments: &mut nml::exe::Arguments,
     name: &str,
     shape: Shape,
     values: &[f32],
@@ -1738,7 +1892,7 @@ fn set_float(
 
 fn set_parameter_float(
     platform: &nml::Platform,
-    arguments: &mut nml::exe::Arguments<'_>,
+    arguments: &mut nml::exe::Arguments,
     parameter: &nml::Parameter,
     values: &[f32],
     sharding: nml::Sharding,
@@ -1755,7 +1909,7 @@ fn set_parameter_float(
 
 fn set_i32(
     platform: &nml::Platform,
-    arguments: &mut nml::exe::Arguments<'_>,
+    arguments: &mut nml::exe::Arguments,
     name: &str,
     shape: Shape,
     values: &[i32],
@@ -1769,10 +1923,24 @@ fn set_i32(
 
 fn set_u64(
     platform: &nml::Platform,
-    arguments: &mut nml::exe::Arguments<'_>,
+    arguments: &mut nml::exe::Arguments,
     name: &str,
     shape: Shape,
     values: &[u64],
+) {
+    let host = nml::Slice::from_typed(shape, values).unwrap();
+    let buffer = platform
+        .upload(&host, nml::Sharding::single(), nml::Memory::Default)
+        .unwrap();
+    arguments.set(name, buffer).unwrap();
+}
+
+fn set_bool(
+    platform: &nml::Platform,
+    arguments: &mut nml::exe::Arguments,
+    name: &str,
+    shape: Shape,
+    values: &[bool],
 ) {
     let host = nml::Slice::from_typed(shape, values).unwrap();
     let buffer = platform

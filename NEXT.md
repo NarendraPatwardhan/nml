@@ -1,465 +1,1413 @@
-# GPT-OSS 20B NVFP4 A40 performance analysis
-
-## 2026-07-22 expert-kernel result and next selected tranche
-
-Commit `bc7b830` combined exact K=2880 tail handling, E2M1/E4M3FN decode
-codebooks, eight decode gate/up warps, and four decode down warps. Image
-`sha256:6b7b883efa28b2931986ee04012e5f1aab9eded60898ed3aeea3d7aa2dd03fdb`
-reached 155.203 steady-device TPS, 154.713 device-decode TPS, and 138.269
-decode-loop TPS on A40
-([report](./references/runpod/reports/20260722T013718Z-y6n806pc8gtemu-6b7b883efa28-diagnostic/performance.json)).
-The direct `d4ad426` control measured 150.113, 149.606, and 136.742 TPS,
-respectively.
-
-The improvement is real but uneven. Down fell from 55.538 to 49.304 us
-(-11.2%), while gate/up fell from 96.401 to 93.043 us (-3.5%). Unchanged
-repeated kernels were approximately 2.18% faster on the new pod, leaving about
-9.3% attributable improvement for down but only about 1.3% for gate/up. The
-exact final 64-wide K tail is the strongest explanation for the down result;
-the codebook and gate/up warp effects remain bundled and are not independently
-proven.
-
-The chronological Nsight trace shows that the kernel gain exposed a host
-submission boundary. Clean GPU busy time fell from 6.822 to 6.522 ms/token,
-but clean non-kernel gaps rose from 0.481 to 0.643 ms/token. The recurring gap
-is immediately before layer pair four: 433.8 us median and approximately
-443.5 us clean average, versus roughly 4.8 us at ordinary graph boundaries.
-Layer-pair starts are approximately 459 us apart. A five-pair lookahead models
-to about 10 us residual at this boundary and 148.5-148.8 clean decode-loop TPS;
-a small kernel or host improvement should then clear 150.
-
-The selected next tranche is therefore:
-
-1. Increase bounded decode lookahead from three to five layer pairs.
-2. Restore decode gate/up to four warps while retaining the exact-tail and
-   codebook paths; keep down at four warps unchanged.
-3. Avoid the redundant token-buffer await when readiness can be established
-   without blocking. The host-download event remains the correctness
-   synchronization, while the readiness fast path preserves the existing
-   device-execution and download timing boundary.
-
-### Future tranche: bounded four-layer graph composition
-
-If five-pair lookahead plus the isolated gate/wait corrections do not sustain
-150+ decode-loop TPS, combine two adjacent layer-pair executables into one
-bounded four-layer component. Keep embedding, head, and the remaining schedule
-separate; do not repeat the failed 24-layer monolith.
-
-The current trace records approximately 13 graph launches/token at about
-1.405 ms/token of host API time and roughly 336 graph-node parameter patches at
-about 0.893 ms/token. Six four-layer components would remove six graph launches
-per token, with an upper-bound launch saving near 0.65 ms/token; parameter
-patching will remain unless stable arguments are also retained. Prove the
-schedule first with one isolated four-layer boundary, checking GPU continuity,
-then expand to all six only if it promotes end-to-end decode-loop TPS.
-
-The periodic 5-15 ms trace stalls must not drive this design: they align with
-16 CUPTI buffer flushes totaling 24.616 ms and are profiler overhead. The
-deterministic pair-four boundary is the real orchestration target.
-
-## 2026-07-22 measured fused-QKV result
-
-Commit `12ce228` fused the three M=1 Q/K/V projections into one semantic NVFP4
-operation without changing recipe v2, checkpoint tensors, prefill, CPU, or the
-public NVFP4 representation. The exact image
-`sha256:b0d387f67cdcca02c5dcd36a5ea8c336de8793770f354eb21b8985c7142aeb65`
-completed the same 320-token A40 workload under GDB and Nsight Systems at
-136.250 steady-device TPS and 132.249 decode-loop TPS
-([report](./references/runpod/reports/20260721T221141Z-v0pgn2uihkknxw-b0d387f67cdc-diagnostic/performance.json)).
-The source commit embedded in the report is exactly `12ce228`; GDB exited
-normally, and the paid pod was terminated after collection.
-
-The direct control is `29036b7`, which already contained the accepted SM8x
-decoder simplification. The fused result is therefore isolated:
-
-| Metric | `29036b7` control | Fused QKV `12ce228` | Change |
-|---|---:|---:|---:|
-| Steady-device TPS | 121.694 | **136.250** | **+12.0%** |
-| Device-decode TPS | 121.260 | **136.028** | **+12.2%** |
-| Decode-loop TPS | 117.384 | **132.249** | **+12.7%** |
-| Steady decode execution | 2613.121 ms | **2333.945 ms** | **-10.7%** |
-| Complete decode loop | 2717.565 ms | **2412.119 ms** | **-11.2%** |
-| GPU kernel calls | 179,350 | **164,038** | **-15,312** |
-| Total GPU kernel time | 2622.156 ms | **2435.431 ms** | **-7.1%** |
-
-Nsight confirms the intended mechanism. The old per-layer Q + K + V sequence
-cost `25.737 + 14.236 + 14.236 = 54.209` us and launched grids
-`512 + 64 + 64`. The new `nvfp4_qkv_gemv` costs 27.908 us, launches one
-640-CTA grid, and remains at 40 registers/thread with no local memory. Across
-the run, QKV GPU time fell from 415.030 to 213.667 ms (-48.5%), and the launch
-count fell from 22,968 to 7,656. Non-QKV kernel time changed by only +0.7%, so
-the gain cannot be explained by host or cross-machine variance.
-
-The two successful tranches are now harvested as the control: exact software
-decode from `29036b7`, then QKV tail elimination from `12ce228`. Repeating QKV
-tiling, split-K, layout, or generic decoder-expression experiments has lower
-expected value than attacking the newly exposed recurring execution bubbles.
-
-## Bottom line
-
-150+ TPS on an A40 is plausible, but the branch evidence says it will not come from another artifact-layout rewrite or a global GEMV tile change.
-
-The strongest path, updated after the measured QKV gain, is:
-
-1. Keep recipe v2 and its output-major, K-contiguous representation.
-2. Keep the restored decode geometry: `block_n=8`, `block_k=256`, 4 warps, 1 stage; retain `block_n=32` for the vocabulary head.
-3. Keep the successful decoder simplification from `29036b7` and fused QKV from `12ce228` as the new control.
-4. Pipeline one bounded speculative unit: enqueue the next embedding and first layer pair before observing the previous token on the host.
-5. If a boundary remains, fuse decode embedding with the first layer pair rather than enlarging all layer segments.
-6. Reduce stable graph parameter patching only after the bounded pipeline is measured.
-7. Return to a purpose-built SM86 decoder only after orchestration gains and NCU counters justify it.
-
-The latest trace is 136.250 steady-device TPS and 132.249 end-to-end decode-loop
-TPS. Reaching 150 now requires:
-
-- 1.10x on steady-device execution.
-- 1.13x on the actual decode loop.
-- A reduction from 7.56 to 6.67 ms per decode-loop token, about 0.90 ms.
-
-Two times performance—around 200 TPS—looks possible only with a substantially better SM8x software decoder and orchestration, probably a purpose-built CUDA/PTX path rather than Triton scheduling tweaks alone.
-
-## What was analyzed
-
-The original analysis inspected all 25 commits from `master` at `3d3ee0d`
-through `987e4f7`, the recipe and execution contracts, the retained successful
-and failed reports, and the Nsight Systems SQLite/CSV exports. This update also
-analyzes the documentation commit `ee29dff`, decoder commit `29036b7`, fused-QKV
-commit `12ce228`, and their exact A40 reports.
-
-A limitation is important: these are Nsight Systems reports, not Nsight Compute reports. They provide exact launch counts, timing, grids, registers, streams, graph activity, and memory-copy timing, but not the counters needed to prove whether the decoder is limited by DRAM, instruction issue, MIO/LG throttling, scoreboarding, or occupancy. `ncu` is not installed locally.
-
-## Performance progression
-
-| Architecture | Steady device TPS | Decode-loop TPS | Conclusion |
-|---|---:|---:|---|
-| Initial executable path | 7.700 | 7.626 | Correct vertical, catastrophically inefficient decode |
-| Dirty pre-`22f3541` | 9.065 | 8.996 | Small improvement only |
-| `22f3541` architecture | 59.611 unprofiled / 55.475 profiled | 58.488 / 52.191 | First major success |
-| `355863c` direct/composed experiment | 5.601 | 5.583 | Severe regression |
-| `6f8dd0b` restored architecture | 57.248 | 54.504 | Restoration confirmed |
-| Recipe v2 | 100.083 | 92.660 | Largest later improvement |
-| Recipe v3 initial | 64.654 | 62.975 | Functional, much slower |
-| Recipe v3 best | 81.461 | 75.129 | Improved but still 19% below v2 |
-| Recipe v2 restored | 105.246 | 100.441 | Best retained run; likely normal run variance |
-| Whole-model monolith | 67.915 | 65.905 | Kernel work unchanged; orchestration collapsed |
-| Layer-pair restoration | 102.930 steady | 58.248 overall | Good steady state, poisoned by a 2.19-second cold graph instantiation |
-| Wider tiles/two stages | 66.963 | 63.314 | Confirmed regression |
-| Current restored geometry | 100.566 | 91.236 | Correct baseline |
-| Simplified exact decoder and post-reduction global scale (`29036b7`) | **121.694** | **117.384** | Successful: NVFP4 decode kernels -18.2% |
-| Fused M=1 QKV scheduling (`12ce228`) | **136.250** | **132.249** | Successful: QKV time -48.5%, 15,312 launches removed |
-
-The durable history in [TASKS.md](./TASKS.md) correctly separates functional acceptance from throughput promotion.
-
-## Every commit
-
-| Commit | Analysis and verdict |
-|---|---|
-| `feceae4` | Established the complete CPU/CUDA NVFP4 vertical and original artifact. Necessary foundation, but the eventual exact-image A40 result was only 7.7 TPS. |
-| `59277b9` | Componentized the GPT-OSS product, protocol, checkpoint, execution, and generation path. Primarily architecture and E2E ownership; no independent throughput claim. |
-| `5cd5c96` | Moved compilation before parameter residency. Architecturally sound, but its three A40 attempts produced two runfiles failures and an LLVM/XLA compilation segmentation fault. No performance conclusion can be assigned to this commit. |
-| `3a7ea04` | Added custom-call ABI integrity. This enabled trustworthy execution, but its exact image was still 7.7 TPS. Infrastructure success, not a speedup. |
-| `22f3541` | The largest successful kernel change: dedicated M=1 GEMV, exact packed-bit decode, sparse expert execution, fused gate/up SwiGLU, reused metadata, and tighter PJRT ownership. It moved the system to roughly 55–60 TPS—about 6.6×. |
-| `c8ba0d6` | License-only. No performance effect. |
-| `355863c` | Tried direct expert kernels, larger composed segments, and streaming head work. Result: 5.601 TPS. Direct down consumed 73.4% of GPU kernel time and gate/up 18.7%; together they were 92.1%. This architecture is conclusively rejected. |
-| `6f8dd0b` | Restored the accepted `22f` design. Fresh profiled result: 57.248 TPS, confirming the regression came from `355`, not the machine or harness. |
-| `f9ab291` | Recorded the restored baseline. Evidence-only. |
-| `f652a30` | Introduced recipe v2: `[N,K/2]`, output-major, contiguous K, no prepared copy, and rowwise decode GEMVs. The later 100.083 TPS run validates the tranche, although layout, kernels, baked arguments, and two-layer execution changed together, so the 1.75× improvement cannot honestly be attributed to layout alone. |
-| `feaf370` | Fixed recipe-v2 artifact byte accounting and unblocked the immutable run. The associated run reached 100.083 TPS ([report](./references/runpod/reports/20260720T074402Z-ylcav28r6vy6kf-d4da39627c61-diagnostic/performance.json)). |
-| `644aad9` | Recorded recipe-v2 evidence. No runtime change. |
-| `623e96c` | Added operation-shaped recipe v3, split-K and finalizers, but its first A40 attempts failed in `ptxas`: incompatible cache and eviction hints. No successful performance result. |
-| `85e5e89` | Correctly repaired pre-Blackwell cache-policy legality. Recipe v3 then ran at 64.654 TPS ([report](./references/runpod/reports/20260720T105545Z-1nty175dxjdf8b-881acf6a63dd-diagnostic/performance.json)). The PTX fix worked; the v3 performance design did not. |
-| `b5600ae` | Recorded recipe-v3 runtime acceptance while explicitly admitting that 64.654 failed the 143.12 TPS promotion threshold. Good evidence discipline; no speed change. |
-| `9a466a2` | Attempted to restore M=1 occupancy and pipeline depth, but ordinary M=1 projections accidentally took the padded matrix path. Result: 47.454 TPS. |
-| `19f5eca` | Forced M=1 back through GEMV with recipe-v2-like tiles. Recovered to 68.068 TPS, but split-K finalizers and recipe-v3 costs remained. |
-| `5a7fabd` | Increased grouped expert tiles to `N=32,K=256`. Improved v3 to 81.461 TPS ([report](./references/runpod/reports/20260720T142341Z-heby6o0z2ndxl2-cbebd86932bd-diagnostic/performance.json)), its best result, but still materially below recipe v2. |
-| `e0fe7be` | Reverted recipe v3. This was the correct architectural decision. The first restored run was blocked by the stale artifact-byte expectation. |
-| `484707d` | Corrected the byte count and produced a 105.246 TPS recipe-v2 run. Most other source changes are formatting churn, but it also accidentally tracks `tools/runpod/__pycache__/api.cpython-314.pyc`, making the commit noisier than its purpose. |
-| `d0fc6e2` | Compiled all 24 layers, embedding, and head into one StableHLO program. Steady performance fell to 67.915 TPS ([report](./references/runpod/reports/20260720T160400Z-q3z96lg19ubvuf-760026cf60b9-diagnostic/performance.json)). The dominant kernel work remained essentially unchanged; the GPU developed large gaps inside the giant graph. |
-| `ab6b24a` | Warning suppression only. |
-| `c20e001` | Reverted the monolith and restored 102.930 steady TPS. Its overall rate was only 60.230 because one first-use `cuGraphInstantiateWithFlags` call took 2.1936 seconds ([report](./references/runpod/reports/20260720T161829Z-2h28yb5uhkn7zw-290dbca720e7-diagnostic/performance.json)). This is a cold-start measurement failure, not a steady regression. |
-| `72ed331` | Bundled wider tiles, `K=128`, two warps, two stages, streaming `.cg` loads, and scale hoisting. It regressed to 66.963 TPS ([report](./references/runpod/reports/20260720T195042Z-i70qee04j2zzk0-39cb278614ea-diagnostic/performance.json)). The tile/pipeline geometry failed. |
-| `987e4f7` | Reverted only the tile/warp/stage schedule and restored 100.566 TPS. The streaming loads survived, proving that `.cg` was not the cause of the 67 TPS result. Current geometry is documented in [nvfp4_backend.rs](./crates/nml-ir/src/nvfp4_backend.rs), while the retained streaming loads are visible in [nvfp4.rs](./crates/nml-kernel-triton/src/nvfp4.rs). |
-| `ee29dff` | Replaced the speculative roadmap with the commit-by-commit and Nsight-backed analysis in this file. Evidence-only. |
-| `29036b7` | Applied the tensor-wide scale after the complete F32 K reduction and simplified exact E2M1/E4M3FN construction. The exact A40 image reached 121.694 steady-device and 117.384 decode-loop TPS; decode NVFP4 kernels fell 18.2%. Accepted. |
-| `12ce228` | Added one semantic M=1 QKV operation and one 640-CTA SM8x kernel while preserving three physical parameter sets and outputs. The exact A40 image reached 136.250 steady-device and 132.249 decode-loop TPS. QKV GPU time fell 48.5% and 15,312 launches disappeared. Accepted. |
-
-## What recipe v3 got wrong
-
-Recipe v3 borrowed superficially appropriate ideas—output-contiguous slices, split-K, finalization, larger tiles—but changed the representation and execution cost model together.
-
-Its best run had:
-
-- Gate/up around 125 µs plus a finalizer, using 233 registers and only `4 × 90` CTAs.
-- Down around 65 µs plus a finalizer, using 96 registers and `4 × 90` CTAs.
-- Extra partial-result storage, finalization launches, and reductions on every projection.
-- Lower grid concurrency than recipe v2.
-
-Recipe v2’s accepted decoder now uses 56 registers for gate/up and 40 for down,
-with the same `4 × 360` CTA geometry. Recipe v3 traded away occupancy and added
-intermediate traffic before demonstrating that split-K was necessary.
-
-This is exactly why the reference ledger warns that reference scheduling ideas must survive NML’s representation and epilogue contracts rather than being copied wholesale ([KERNEL_REFERENCES.md](./references/KERNEL_REFERENCES.md)).
-
-## What the current Nsight trace says
-
-The model uses four of 32 experts per token, 24 layers, hidden/intermediate width 2,880, Q width 4,096, K/V width 512, and a 201,088-token vocabulary ([config](./artifacts/gpt-oss-20b-nvfp4/config.json)). Recipe v2 quantizes attention, experts, embedding, and output projection ([recipe](./artifacts/gpt-oss-20b-nvfp4/recipe.json)).
-
-Approximate active compact-weight traffic is 2.03 GB/token. With A40’s reported 696 GB/s:
-
-- Ideal weight-only floor: 2.92 ms/token.
-- Current 136.250 steady-device TPS corresponds to about 277 GB/s aggregate effective bandwidth, 40% of peak.
-- 150 TPS requires about 305 GB/s, 44% of peak.
-- 200 TPS requires about 406 GB/s, 58% of peak.
-
-That makes 150 physically reasonable.
-
-### Projection decomposition after `12ce228`
-
-| Current kernel work | Time per token | Conclusion |
-|---|---:|---:|
-| 24 gate/up projections | 2.267 ms | Largest remaining NVFP4 family |
-| 24 down projections | 1.293 ms | Second-largest NVFP4 family |
-| 24 fused QKV projections | 0.670 ms | Down from 1.301 ms; fusion worked |
-| 24 O projections | 0.536 ms | Stable against control |
-| Vocabulary head | 0.812 ms | Stable despite 128 registers |
-| **NVFP4 total** | **5.579 ms** | **0.624 ms/token saved by QKV fusion** |
-
-Across the 318 complete embedding-to-embedding intervals in the new trace, the
-average token interval is 7.607 ms: 6.594 ms of GPU kernels and 1.013 ms with no
-kernel executing. The direct control averaged 8.579 ms: 7.199 ms busy and
-1.380 ms non-kernel. The busy-time reduction is the fused QKV kernel; the
-non-kernel reduction is consistent with removing 48 kernel nodes per token.
-
-The remaining raw-kernel target is no longer QKV. Gate/up plus down consume
-3.559 ms/token, 64% of NVFP4 time and 47% of the full traced token interval.
-Those expert kernels are the only family large enough to provide another major
-kernel tranche, but changing them without NCU counters would be guesswork. The
-trace exposes a lower-risk orchestration opportunity first.
-
-### The graph finding
-
-Current layer-pair execution produces:
-
-- 4,172 `cuGraphLaunch` calls, about 13 per token.
-- 107,557 `cuGraphExecKernelNodeSetParams_v2` calls, about 337 per token.
-- 322 ms total host API time in graph launch.
-- 297 ms total in graph-node parameter patching.
-
-QKV fusion left executable-level graph launches unchanged but removed 15,308
-kernel-node patches, essentially the expected two nodes per layer per decode
-step. This proves bounded semantic fusion can remove real graph bookkeeping;
-the absolute API durations are host-sensitive and should not be compared across
-pods as if they were kernel timings.
-
-The single full-model graph reduced graph launches to 344, but steady device time grew from about 3.16 seconds to 4.68 seconds for the run. Dominant NVFP4 kernel time was virtually unchanged. The giant XLA graph therefore reduced launch count but made GPU scheduling much less continuous.
-
-Conclusion: do not repeat the 24-layer StableHLO monolith. The useful target is persistent/bounded graph composition and fewer parameter patches, not maximum source-level fusion.
-
-### The next alpha: two deterministic boundaries
-
-The chronological trace localizes 87% of non-kernel time to two boundaries that
-occur exactly once per steady token:
-
-| Boundary | Calls | Average gap | Total |
-|---|---:|---:|---:|
-| Final head position update -> next embedding | 318 | 420.732 us | 133.793 ms |
-| Embedding -> first layer-pair kernel | 318 | 461.569 us | 146.779 ms |
-| **Combined** | | **882.301 us/token** | **280.572 ms** |
-
-The first boundary contains completion observation, the 67.015 ms aggregate
-`decode_download`, token emission/stop handling, and next submission. The
-second is the cost of preparing the first bounded layer-pair graph after a
-two-microsecond embedding kernel. All other non-kernel time is only about
-0.13 ms/token.
-
-The current loop waits for and downloads each selected token before proceeding
-([execution.rs](./products/serve/src/gpt_oss/execution.rs)). Yet `enqueue`
-already returns dependency-carrying device buffers that may be passed directly
-to another enqueue without a host synchronization
-([runtime](./crates/nml-runtime/src/lib.rs)). The token is already fed
-device-to-device into embedding; it is never uploaded again. This makes bounded
-lookahead an implementation opportunity, not a new runtime or format project.
-
-## What the external benchmark proves—and does not prove
-
-The linked article is directionally useful, but its quantization labeling is imprecise. It describes the 3090 result as generic Q4/Q4_K_M, while the primary llama.cpp benchmark uses `gpt-oss-20b-mxfp4.gguf` and reports approximately 161.8 TPS on an RTX 3090. [Article](https://runaihome.com/blog/gpt-oss-20b-local-ai-hardware-guide-2026/), [primary benchmark](https://github.com/ggml-org/llama.cpp/discussions/15396).
-
-It is also not an apples-to-apples format comparison. OpenAI’s published model retains only MoE weights in MXFP4; non-MoE tensors are BF16. NML recipe v2 quantizes attention and the very large vocabulary head as well. [OpenAI GPT-OSS repository](https://github.com/openai/gpt-oss).
-
-That means:
-
-- The llama.cpp result proves that software MXFP4 decode can be fast on Ampere.
-- It does not directly prove 161 TPS on an A40.
-- NML’s estimated active weight traffic is substantially lower, so 150 TPS does not require matching the 3090’s raw bandwidth.
-
-More recent llama.cpp work is especially relevant: combined GEMV fusion, top-k/MoE work, fused normalization, and concurrent Q/K/V streams moved a reported 4090 GPT-OSS result from 232.05 to 271.99 TPS—about 17%. [llama.cpp optimization discussion](https://github.com/ggml-org/llama.cpp/discussions/17621).
-
-Another llama.cpp investigation found that on non-native-FP4 GPUs the fallback can be instruction-bound, with much higher instruction counts and MIO/LG throttling; simple alignment repacking reportedly provided only 1–2%. [Software fallback/layout discussion](https://github.com/ggml-org/llama.cpp/discussions/18427). That matches NML’s evidence: another representation rewrite is unlikely to supply 1.5×.
-
-## Recommended solution set
-
-### 1. Freeze recipe v2 as the control
-
-Do not introduce recipe v4 or another public quantization format.
-
-Keep:
-
-- `[N,K/2]` output-major, K-contiguous payload.
-- One E4M3FN scale per 16 E2M1 values.
-- No persistent BF16 expansion.
-- Fused gate/up activation.
-- Sparse top-four expert execution.
-- Current M=1 tile family.
-- Current `.cg` weight loads until an isolated `.ca`/`.cg` comparison says otherwise.
-
-The former content of `NEXT.md` is contradicted by measurement: fewer CTAs and deeper pipelines did not improve occupancy. Its predicted 35% gain became a 33% regression.
-
-### 2. Preserve both accepted SM8x kernel tranches
-
-Keep the exact decoder construction and post-reduction global scaling from
-`29036b7`. Keep the semantic QKV operation, independent parameter buffers,
-640-CTA grid, and 40-register kernel from `12ce228`. QKV beat its stated
-0.35-0.55 ms/token target by saving 0.631 ms/token at the kernel level.
-
-Do not retile QKV or revive selective split-K. The fused kernel is now only
-0.670 ms/token, while gate/up and down together are 3.559 ms/token. Further QKV
-work cannot close the remaining gap.
-
-### 3. Pipeline one layer pair ahead as the next isolated experiment
-
-This is the highest-confidence remaining alpha and requires no NCU prerequisite.
-Restructure decode as a bounded one-pair lookahead state machine:
-
-1. Enqueue the current head and retain its dependency-carrying device outputs:
-   token, sampling state, and position.
-2. Before `token_buffer.wait()` or `download_token`, bind that device token to
-   the next embedding and enqueue embedding plus the first two-layer executable.
-3. While the GPU executes that bounded unit, wait for and download the previous
-   token, emit it, and evaluate the stop condition on the host.
-4. If generation continues, submit the remaining 11 layer pairs and head. If
-   the previous token is terminal, discard the speculative buffers; its cache
-   is request-local and the request is ending.
-5. Never speculate past `max_new_tokens`, and keep the visible token stream and
-   sampling-state sequence identical to the current implementation.
-
-Submitting only embedding plus one pair bounds terminal waste while providing
-roughly one layer-pair execution window for host observation. It should attack
-both measured bubbles: it queues the first pair before the two-microsecond
-embedding can outrun host submission, and overlaps previous-token observation
-with useful GPU work.
-
-The theoretical exposed opportunity is 0.882 ms/token. Removing all of it
-would move the measured 7.56 ms decode loop to about 6.68 ms, approximately
-149.7 TPS. A realistic first-run target is a 0.65-0.80 ms reduction, or roughly
-145-148 TPS; a small bounded fusion or conventional-kernel gain may still be
-needed to clear 150 reliably.
-
-### 4. Fuse only the remaining bounded boundary if lookahead leaves it exposed
-
-If Nsight still shows a material embedding-to-first-pair gap, build a dedicated
-decode entry component containing embedding plus the first sliding/full layer
-pair. Keep the other 11 two-layer executables unchanged. This removes one
-executable boundary per token without repeating the failed 24-layer StableHLO
-monolith or changing the reusable layer-pair schedule globally.
-
-Only after that experiment should broader graph work resume:
-
-- Make KV cache addresses stable and update contents in place.
-- Use fixed hidden-state ping-pong buffers.
-- Patch only truly request-varying nodes rather than stable parameter nodes.
-- Capture an outer CUDA Graph around accepted bounded components if PJRT/XLA
-  exposes a safe ownership boundary.
-
-Four-layer or whole-model StableHLO segments are not the next experiment. The
-monolith already proved that fewer source-level submissions can increase GPU
-gaps even when dominant kernel time is unchanged.
-
-### 5. Use NCU before another decoder or expert-kernel rewrite
-
-The current kernels still perform packed E2M1/E4M3FN software decode in generic
-Triton IR. Gate/up and down are large enough that a 20% improvement would save
-about 0.71 ms/token, but Nsight Systems cannot determine whether their next
-limit is DRAM, instruction issue, MIO/LG throttling, scoreboarding, or occupancy.
-
-If orchestration does not promote, profile gate/up, down, and the vocabulary
-head with NCU before changing their implementation. A purpose-built SM80/SM86
-CUDA/PTX backend remains valid behind the same `NvFp4` representation; it is a
-device-specific decoder, not a custom user format.
-
-### 6. Fuse only measured lightweight boundaries
-
-After projection work:
-
-- QKV reshape/RoPE where legal.
-- Residual plus RMSNorm.
-- Router logits plus top-k preparation.
-- Sampling reductions/sorts.
-- KV update bookkeeping.
-
-These repeated non-NVFP4 kernels total about 1.01 ms/token in the new trace, so
-they cannot produce the remaining speedup alone. They are useful for the final
-0.05-0.15 ms after orchestration, not as a substitute for removing the two
-measured bubbles.
-
-## A credible 150 TPS budget
-
-| Component | Current | Required target |
-|---|---:|---:|
-| NVFP4 projections | 5.58 ms | ~5.50 ms |
-| Other repeated GPU kernels | ~1.01 ms | ~0.98 ms |
-| Head -> embedding bubble | 0.42 ms | ~0.04 ms |
-| Embedding -> first-pair bubble | 0.46 ms | ~0.04 ms |
-| Other recurring gaps | ~0.13 ms | ~0.10 ms |
-| **Traced token interval** | **~7.61 ms** | **~6.66 ms / 150 TPS** |
-
-This asks for approximately:
-
-- Most of the 0.882 ms in the two deterministic boundaries overlapped.
-- Only about 0.1 ms of additional kernel or residual-gap improvement.
-- No new artifact layout, quantization format, or global tile schedule.
-
-That is aggressive but consistent with the trace. In contrast, 200 TPS requires a 5 ms complete loop; that likely needs the optimized SM8x decoder to approach 400–450 GB/s on the large gate/down/head workloads.
-
-## Required promotion profiling gate
-
-Fused QKV is accepted: the exact image produced one 640-CTA
-`nvfp4_qkv_gemv` per layer, retained 40 registers/thread, passed the full GDB
-workload, and improved both kernel and end-to-end rates. The next promotion gate
-is the bounded lookahead pipeline. Require:
-
-- Identical visible tokens for fixed-seed non-stop, early-stop, and
-  max-token-bound requests.
-- No speculation beyond the requested token budget.
-- The accepted QKV kernel geometry and timing to remain intact.
-- Head-to-embedding and embedding-to-first-pair gaps reported separately; the
-  target is below 0.10 ms combined on a warm A40 trace.
-- Terminal speculative work and cache mutation to remain request-local and be
-  discarded before any externally visible state is reused.
-- Decode-loop improvement outside run variance; steady-device TPS alone is not
-  sufficient.
-
-If bounded orchestration does not promote, obtain Nsight Compute reports for
-these exact decode shapes before another kernel rewrite:
-
-- Gate/up: active top-four experts.
-- Down: active top-four experts.
-- Q: `2880 → 4096`.
-- K/V: `2880 → 512`.
-- O: `4096 → 2880`.
-- Head: `2880 → 201088`.
-
-Collect:
-
-- DRAM bytes and percent of sustained peak.
-- L1/L2 sectors, hit rates, and replay.
-- Executed instruction count.
-- Issue-active percentage.
-- LG, MIO, long-scoreboard, not-selected, and dependency stalls.
-- Achieved occupancy and active warps.
-- Registers, spills, and local-memory traffic.
-
-Every experiment should use the same A40, locked clocks, driver, artifact revision, prompt, and 320-token workload; report median and spread across at least five warm runs. Cold graph instantiation and warm steady performance must be separate. Promotion should require 150+ **decode-loop** TPS, not only steady-device TPS.
-
-There is also a small evidence-hygiene issue: the monolith report’s metadata does not cleanly identify `d0fc6e2`, although its workload behavior is unambiguously the single-graph implementation. Future reports should embed the exact source SHA, dirty-tree state, kernel schedule identity, compiler revision, PTX hash, artifact revision, and image digest.
-
-Finally, the checked-in artifact metadata is inconsistent: [published.json](./artifacts/gpt-oss-20b-nvfp4/published.json) records `11,805,934,204` bytes, while [README.md](./artifacts/gpt-oss-20b-nvfp4/README.md) still says `11,805,938,322`. It does not affect current throughput, but it illustrates why benchmark provenance needs to be byte-exact.
+# NML inference server implementation plan
+
+Status: implementation-grade roadmap for converting `products/serve` from one
+blocking generation call into a production-shaped GPT-OSS inference server.
+
+This document replaces the completed A40 kernel-optimization investigation.
+The accepted single-request implementation is the performance control for the
+server work; it is not discarded. [`SYSTEM.md`](./SYSTEM.md) remains the
+governing architecture and [`TASKS.md`](./TASKS.md) is the executable checklist.
+
+## 1. Objective and definition of done
+
+Build one long-running Rust inference server around the selected GPT-OSS 20B
+NVFP4 product with:
+
+- Tokio/Axum/Tower request handling and OpenAI-compatible chat streaming;
+- continuous batching with chunked prefill and decode-first scheduling;
+- one process-wide paged KV arena instead of one cache allocation per request;
+- automatic prefix caching over immutable full KV pages;
+- real Shardy/XLA tensor parallelism across homogeneous NVIDIA GPUs;
+- complete GPT-OSS Harmony tool-call input/output behavior without executing
+  user tools inside NML; and
+- lossless speculative decoding with the pinned
+  [`z-lab/gpt-oss-20b-DFlash`](https://huggingface.co/z-lab/gpt-oss-20b-DFlash)
+  drafter.
+
+The server is complete only when all of the following are true:
+
+1. Multiple clients can submit, stream, cancel, and complete requests through
+   the HTTP boundary while one dedicated engine owner retains every PJRT/XLA
+   object.
+2. Every engine iteration may advance a different set of active requests; a
+   finished or cancelled request leaves the next iteration without rebuilding
+   or recompiling the model.
+3. KV memory is allocated once, divided into 16-token physical pages, assigned
+   through arbitrary per-sequence block tables, and reclaimed without copying
+   unaffected K/V data.
+4. Prefix hits skip target-model prefill for every complete matching page and
+   never permit one namespace to observe another namespace's cached content.
+5. Tensor-parallel execution loads physical parameter shards, runs one SPMD
+   executable over the declared mesh, performs the required collectives, and
+   produces the same model result as the one-device path. Replicating the full
+   model on every GPU is not tensor parallelism.
+6. OpenAI chat requests can declare function tools, generated tool calls are
+   returned with a `tool_calls` finish reason, and subsequent tool results can
+   be rendered back into the exact Harmony history. NML never invokes the tool.
+7. DFlash drafts seven tokens in parallel, the target verifies an eight-token
+   block, only the accepted prefix is committed, and the visible distribution
+   and sampling-state progression match ordinary target decoding.
+8. The immutable A40 single-stream control remains at least 150 decode-loop
+   tokens/s, or any regression is isolated, explained by a named server cost,
+   and repaired before promotion.
+9. Concurrency, cache reuse, tensor parallelism, and speculation are each
+   accepted by permanent contracts in a venue that really executes the
+   claimed hardware path. Compilation alone is never reported as execution.
+
+## 2. Governing constraints
+
+These are architecture constraints, not optional implementation preferences.
+
+- `products/serve` owns admission, scheduling, batching, global page leases,
+  transport, cancellation, protocol adaptation, and serving metrics.
+- GPT-OSS owns its exact artifact, Harmony token semantics, checkpoint schema,
+  graph families, target hidden-state taps, and model-specific sharding.
+- Framework crates gain only reusable mechanisms such as batched sampling,
+  page-aware cache update, or safe tokenizer ownership. They must not learn
+  request IDs, HTTP schemas, GPT-OSS layer numbers, DFlash artifact names, or
+  scheduling policy.
+- Tokio owns sockets, timers, signals, cancellation, and bounded channels.
+  XLA compilation and PJRT execution never run on Tokio worker threads.
+- One dedicated OS thread constructs and destroys `Platform`, loaded
+  parameters, executables, cache buffers, and the scheduler. The async side
+  holds only a bounded command sender and per-request event receivers.
+- All executable families are compiled before target or draft parameters
+  become resident. A request never invokes XLA compilation.
+- Static shapes remain finite and explicit. Runtime batching selects the
+  smallest precompiled batch/query family and masks inactive rows; it does not
+  create an unbounded family cross-product.
+- The current recipe-v2 NVFP4 representation, fused QKV, expert kernels,
+  five-pair single-stream lookahead, and compact model artifact remain the
+  control. Serving work does not reopen the quantization format.
+- Page allocation policy cannot change attention semantics or CUDA tile width.
+  GPT-OSS pages remain 16 tokens; attention compute tiles remain independently
+  bounded.
+- Prefix caching shares only complete immutable pages. A partial tail page is
+  private to one sequence and can be overwritten after rollback.
+- Tool calling means protocol rendering, parsing, and transport. It does not
+  authorize arbitrary server-side tool execution.
+- DFlash custom Python is a readable reference, not a runtime dependency.
+  NML pins the artifact and reimplements its exact inference graph in Rust/NML.
+- No local compile, test, benchmark, format, image build, or model execution is
+  part of this plan. Routine gates use `bb` with `--config=buildbuddy` and the
+  truthful CPU/CUDA configuration; real CUDA evidence consumes a published
+  immutable image on the appropriate GPU venue.
+
+## 3. Baseline that must survive
+
+The server starts from commit `fb415a8dadd51a0053b9be314faa836e2b274721`
+and image digest
+`sha256:3c81704ea85512df7ff76de83ea21f403ef592dc50c23c5ae20e8d70c1e7f3ff`.
+The exact A40 report is
+[`performance.json`](./references/runpod/reports/20260722T021821Z-uwqx38f0an0isb-3c81704ea855-diagnostic/performance.json).
+
+| Control metric | Accepted value |
+| --- | ---: |
+| Prompt tokens | 106 |
+| Generated tokens | 320 |
+| Steady-device throughput | 156.062 tokens/s |
+| Device-decode throughput | 155.644 tokens/s |
+| Complete decode-loop throughput | **151.324 tokens/s** |
+| Decode device time | 2,049.544 ms |
+| Token download time | 58.517 ms |
+| Complete decode loop | 2,108.061 ms |
+
+The current implementation already provides:
+
+- compile-before-residency and reusable embedding/layer/head executables;
+- finite prefill and cache profiles;
+- 16-token paged-attention reads through an I32 page table;
+- persistent donated K/V buffers with cache truncate/rollback/replay
+  primitives in the runtime;
+- asynchronous PJRT enqueue/dependency chaining;
+- exact explicit-state top-k/temperature/top-p/min-p sampling;
+- Shardy mesh, physical shard loading, and CPU multi-device evidence;
+- package-private Harmony conversation rendering and strict incremental output
+  parsing, including tool calls and tool results; and
+- A40-accepted Triton fused QKV and compact expert decode kernels.
+
+The current implementation does **not** yet provide:
+
+- an HTTP server or Tokio runtime;
+- a step-wise multi-request engine;
+- a global cache arena;
+- arbitrary physical-page writes;
+- batched GPT-OSS graph shapes or per-row sampling controls;
+- prefix ownership/refcounts/eviction;
+- model-specific GPT-OSS tensor partitions on CUDA;
+- public chat/tool schemas; or
+- a DFlash artifact, graph, cache, verifier, or scheduler.
+
+One correctness trap must be fixed before claiming paged serving: current
+attention reads honor the page table, but `apply_layer` reshapes cache storage
+as one dense logical sequence and writes at `position`. That is correct only
+for the current identity mapping. A non-identity server page table would read
+from one physical page and write to another. The global arena milestone must
+therefore introduce a page-aware update indexed by `(physical_page,
+page_offset)` before continuous batching or prefix sharing can execute.
+
+## 4. External reference facts and what they do not prove
+
+The DFlash artifact is pinned for planning at Hugging Face revision
+`d53f6551543204c859e8bbaaddbd15d11b447af9`. Its current model card and custom
+code establish this exact contract:
+
+- 784,767,104 BF16 parameters, approximately 1.57 GB of payload;
+- eight Qwen3-style full-attention draft layers;
+- hidden size 2,880, intermediate size 7,680, 64 query heads, eight KV heads,
+  and head dimension 64;
+- target feature taps after GPT-OSS target layers `[1, 6, 11, 16, 21]`;
+- concatenation of the five target features followed by a learned
+  `5*2880 -> 2880` projection and RMS normalization;
+- mask token ID `200000`;
+- block size eight: one already-authoritative token plus seven drafted tokens;
+- non-causal draft attention over cached target-context features and the
+  current mask/noise block; and
+- reuse of the target token embedding and target LM head.
+
+The authors report mean accepted lengths of 4.2-5.1 and 1.7-2.2x end-to-end
+speedups from concurrency 1 through 32, but those results used BF16 target
+execution on one H200. They justify implementation and an A40 experiment; they
+do not prove an A40 NVFP4 speedup. NML promotion uses its own target artifact,
+sampler, batching policy, and A40 measurements.
+
+Relevant primary references:
+
+- [DFlash GPT-OSS model card](https://huggingface.co/z-lab/gpt-oss-20b-DFlash)
+- [DFlash paper](https://arxiv.org/abs/2602.06036)
+- [DFlash reference implementation](https://github.com/z-lab/dflash)
+- [vLLM chunked-prefill and parallelism documentation](https://docs.vllm.ai/en/stable/configuration/optimization/)
+- [vLLM prefix-cache design](https://docs.vllm.ai/en/stable/design/prefix_caching/)
+
+Ideas taken from these references are re-expressed through NML's ownership,
+artifact, tokenizer, XLA, PJRT, and permanent-test contracts. Their API or
+runtime architecture is not copied wholesale.
+
+## 5. End-state architecture
+
+```text
+HTTP client
+    |
+    v
+Axum route -> request validation -> Harmony render/tokenize
+    |                                  |
+    | bounded EngineCommand::Submit    | owned incremental parser
+    v                                  v
+Tokio control plane <----------- bounded token/event stream
+    |
+    | bounded command queue + cancellation tokens
+    v
+dedicated engine OS thread
+    |
+    +-- admission queue and request state machine
+    +-- continuous-batch scheduler
+    +-- global target KV page arena
+    +-- optional DFlash KV page arena
+    +-- prefix hash/refcount/LRU index
+    +-- resident target and draft executables/parameters
+    +-- one PJRT client spanning the selected TP mesh
+    |
+    v
+batched prefill / decode / verify / draft executable submissions
+    |
+    v
+one compact token-result download per scheduled batch
+```
+
+### 5.1 Ownership table
+
+| Owner | Long-lived state | Forbidden state |
+| --- | --- | --- |
+| Axum handler | validated request, request ID, response assembler/SSE writer, cancellation guard | PJRT buffers, executable handles, scheduler/page state |
+| Protocol preparation | structured Harmony conversation, exact token IDs, owned response parser | model buffers, HTTP socket ownership |
+| Tokio server state | bounded command sender, readiness state, metrics handles, shutdown token | direct XLA/PJRT calls |
+| Engine thread | platform, target/draft model, executables, scheduler, request token state, page arenas, prefix index | socket writes or unbounded waits on clients |
+| GPT-OSS executor | model-specific batched graphs, parameter binding, feature taps, stop-token semantics, TP partition plan | HTTP status codes or queue policy |
+| Framework crates | tensors, page-aware update semantics, batched sampling, sharding, buffers, executable calls | GPT-OSS/DFlash names or request scheduling |
+
+### 5.2 Bounded communication
+
+Use Tokio bounded channels only:
+
+```rust
+enum EngineCommand {
+    Submit {
+        request: PreparedInferenceRequest,
+        events: mpsc::Sender<EngineEvent>,
+        cancellation: CancellationToken,
+        admitted: oneshot::Sender<Result<RequestId, AdmissionError>>,
+    },
+    Cancel { request_id: RequestId, reason: CancelReason },
+    Snapshot { reply: oneshot::Sender<EngineSnapshot> },
+    Shutdown { deadline: Instant },
+}
+
+enum EngineEvent {
+    Token { token_id: u32, index: usize, timing: TokenTiming },
+    Finished { reason: FinishReason, usage: Usage },
+    Failed { code: EngineErrorCode, message: String },
+}
+```
+
+Starting capacities are explicit configuration, not hidden constants:
+
+- engine command queue: 1,024;
+- per-request event queue: 64;
+- admitted/queued requests: 1,024;
+- maximum active sequences: 32 for the first A40 profile;
+- maximum batched tokens per scheduler iteration: 4,096;
+- maximum prefill chunk: 256 tokens per request per iteration.
+
+These are initial acceptance values. A benchmark may change them only together
+with a checked-in profile and before/after evidence. Queue saturation returns
+HTTP 429; it never grows an unbounded allocation.
+
+The engine uses `try_send` for response events. A full per-request stream queue
+marks the request `client_backpressure`, cancels it, and releases its pages;
+the GPU owner never blocks behind a slow or disconnected socket.
+
+### 5.3 Startup and shutdown
+
+1. Parse and validate all server/model/parallel/cache profiles.
+2. Spawn the engine thread.
+3. On that thread, construct the platform and topology, validate both artifact
+   manifests, declare all target/draft parameters, freeze the configured
+   physical-page count from the explicit cache budget and declared memory
+   accounting, compile every selected family with that count, load parameters
+   once, validate remaining memory, allocate cache arenas, and warm one
+   execution of each hot family. Cache sizing never triggers a post-residency
+   recompile.
+4. Send a startup result through a one-shot channel.
+5. Bind the public socket only after startup succeeds, or bind but keep
+   `/readyz` false and reject inference until the result arrives. Pick one
+   behavior and test it; the preferred behavior is bind early, readiness false.
+6. On SIGTERM/SIGINT, stop admission, fail queued requests, let active requests
+   run until the configured grace deadline, then cancel the remainder.
+7. Join the engine thread so PJRT buffers, executables, parameters, platform,
+   and plugin state are destroyed in their valid order.
+
+## 6. Request and scheduler data model
+
+### 6.1 Identifiers and immutable request input
+
+- `RequestId`: monotonic process-unique 128-bit/display-safe ID.
+- `SequenceId`: engine-private ID; one request initially owns one sequence.
+- `PreparedInferenceRequest`:
+  - exact rendered token IDs;
+  - maximum new tokens;
+  - per-request explicit sampling parameters and seed;
+  - stop-token set fixed by GPT-OSS Harmony;
+  - optional deadline;
+  - optional prefix-cache salt;
+  - speculation policy (`auto`, `disabled`, later `required` only for tests);
+  - prompt byte/token accounting and API metadata that does not enter graphs.
+
+Sampling state is part of the sequence, not global engine state. Batching must
+not change one request's random stream when another request arrives, leaves,
+or changes batch slot.
+
+### 6.2 Request state machine
+
+```text
+Received
+  -> Queued
+  -> Admitted
+  -> PrefixMatched
+  -> Prefilling <-> QueuedForPrefill
+  -> Decoding <-> QueuedForDecode
+  -> ToolCall | Completed | LengthLimited
+
+Any nonterminal state
+  -> Cancelled | DeadlineExceeded | Failed
+```
+
+`RequestState` retains:
+
+- prompt tokens and prefill cursor;
+- generated token IDs and remaining visible budget;
+- logical sequence length and independently tracked tentative length;
+- sampling state;
+- target block table and private tail-page state;
+- optional DFlash block table, pending authoritative token, accepted-feature
+  buffers, and rolling acceptance statistics;
+- admission reservation credits;
+- arrival, admission, first-scheduled, first-token, and last-token timestamps;
+- cancellation token and response event sender.
+
+Terminal transition is idempotent and centralized. It must:
+
+1. emit at most one terminal event;
+2. release target and draft page references exactly once;
+3. return unused reservation credits;
+4. remove the request from every scheduler queue/slot; and
+5. update counters before dropping the event sender.
+
+### 6.3 Batch plan
+
+The scheduler produces an immutable host plan before touching device state:
+
+```rust
+struct BatchPlan {
+    phase: BatchPhase,
+    family: BatchFamily,
+    slots: Vec<ScheduledSequence>,
+    token_count: usize,
+    page_allocations: Vec<PageMutation>,
+    rollback_points: Vec<CacheCheckpoint>,
+}
+
+enum BatchPhase {
+    Decode,
+    Prefill,
+    Draft,
+    Verify,
+}
+```
+
+The plan validates all pages, lengths, positions, token budgets, and output
+capacity before any mutation. Applying it is transactional at the host metadata
+level: if device submission fails, affected requests fail and all uncommitted
+leases are returned from their checkpoints.
+
+### 6.4 Scheduling policy
+
+One engine iteration:
+
+1. Drain at most a bounded number of commands so request floods cannot starve
+   already-running generations.
+2. Observe cancellation/deadline flags and finalize those requests.
+3. Evict zero-reference cached pages if admission needs reservation credits.
+4. Admit queued requests in FIFO order when their prompt plus worst-case output
+   page reservation can finish without mid-generation OOM.
+5. Schedule every eligible ordinary decode request first, up to
+   `max_num_sequences` and the per-iteration token budget.
+6. Schedule DFlash draft/verify work according to its separate cost and
+   acceptance policy; do not mix a draft graph with a target decode graph.
+7. Spend the remaining token budget on oldest prefills. Chunk any prefill that
+   does not fit; do not defer the whole request.
+8. If the oldest prefill has waited beyond `max_prefill_wait`, reserve at least
+   one prefill chunk even under sustained decode load.
+9. Select the smallest compiled family whose batch/query capacities cover the
+   plan, pad unused rows/tokens, and mark them inactive.
+10. Execute decode before prefill for latency. Prefill and decode may occur in
+    the same scheduler iteration as separate executable submissions; they do
+    not need to be one mixed-shape graph to qualify as continuous batching.
+11. Download one compact result buffer for the batch, scatter token/state
+    results to requests, parse stop conditions, and commit/release metadata.
+12. Immediately form the next iteration; no request owns the engine loop.
+
+Decode-first must not mean prefill starvation. Permanent scheduler simulation
+tests cover sustained decode arrivals, an aged long prefill, cancellations,
+and page pressure with deterministic virtual time.
+
+## 7. Phase A: step-wise engine and Tokio serving shell
+
+This phase changes ownership without yet claiming continuous batching.
+
+### 7.1 Refactor generation into steps
+
+Replace `ResidentModel::generate` as the engine primitive with:
+
+- `prepare`: select an existing profile and initialize request state;
+- `prefill_step`: consume one bounded prompt chunk and return the first token
+  only when the full prompt is complete;
+- `decode_step`: consume the prior device token and advance one visible token;
+- `finish`: truncate/finalize protocol state and release cache leases.
+
+Retain a blocking single-request adapter for permanent equivalence tests, but
+implement it by driving the same step API. There must not be a second model
+execution path.
+
+### 7.2 Make Harmony sessions independently owned
+
+The current `HarmonyParser<'tokenizer>` borrows its tokenizer, which prevents
+many live parsers from being stored or moved independently. Refactor the
+generic tokenizer owner so a decoder retains shared ownership of the immutable
+tokenizer allocation. Then:
+
+- `Tokenizer` is cheaply cloneable through one audited shared inner owner;
+- `Decoder` owns that shared handle rather than a borrow;
+- the underlying tokenizer is freed after the final encoder/decoder;
+- concurrent encoder/decoder use is enabled only if the IREE bridge contract
+  and a permanent concurrency test prove it safe; otherwise calls are
+  serialized behind the narrow tokenizer owner; and
+- `HarmonyParser` becomes an owned request object with no self-reference or
+  leaked lifetime.
+
+Render/tokenize on a bounded CPU preparation path before engine admission.
+Response tasks own the parser and translate raw token events into HTTP events.
+The engine remains token/protocol-ID aware only where GPT-OSS stop semantics
+require it.
+
+### 7.3 Introduce the async server
+
+Replace the one-shot default binary with a `serve` command. Keep a clearly
+named diagnostic `generate` command only if the existing RunPod acceptance
+harness still needs it; both commands must use the same executor.
+
+Initial routes:
+
+- `GET /healthz`: process is alive; no GPU claim.
+- `GET /readyz`: target model, configured executables, cache arena, and optional
+  drafter are resident and the engine accepts commands.
+- `GET /metrics`: Prometheus text format.
+- `GET /v1/models`: selected served model identity and capabilities.
+- `POST /v1/chat/completions`: streaming and non-streaming chat completion.
+- `POST /v1/completions`: text-prompt compatibility after chat is stable.
+
+Use Tower body-size, concurrency, timeout, and load-shed layers. Request body
+and admission timeout are bounded; generation duration is governed by request
+deadline/cancellation rather than an HTTP middleware that can orphan device
+work.
+
+SSE requirements:
+
+- exact `text/event-stream` framing;
+- one stable completion ID and created timestamp;
+- first role delta, content/reasoning/tool deltas, one finish delta, usage when
+  requested, and terminal `[DONE]`;
+- disconnect drops a guard that cancels the engine request;
+- a non-stream response is assembled from the same internal events; and
+- no prompt, generated content, tool arguments, or cache salt enters logs by
+  default.
+
+Phase exit: two simultaneous HTTP clients can queue, stream, cancel, and
+complete through the dedicated engine owner, even if execution is temporarily
+serialized one request at a time. The old CLI and new HTTP path produce the
+same fixed-seed tokens/events.
+
+## 8. Phase B: global paged KV arena
+
+Continuous batching and prefix caching depend on this phase.
+
+### 8.1 Physical layout
+
+Allocate one target K buffer and one target V buffer per GPT-OSS layer:
+
+```text
+[physical_pages, 16, local_kv_heads, 64] BF16
+```
+
+All 24 layers use the same physical page ID namespace. Logical page `j` for a
+request maps to physical page `block_table[j]` in every layer's K/V arena.
+One host `PageDescriptor` therefore owns the corresponding page across all 48
+target buffers.
+
+Target KV bytes per token at TP=1 are exact:
+
+```text
+24 layers * 2 (K,V) * 8 KV heads * 64 * 2 BF16 bytes = 49,152 bytes/token
+49,152 * 16 = 786,432 bytes/physical page
+```
+
+At tensor parallel degree `P`, KV heads are sharded and target cache bytes per
+device are divided by `P`. Page metadata and block tables are replicated.
+
+At startup:
+
+1. Require an explicit cache byte budget, or derive a conservative budget from
+   the platform's pre-compile memory report, declared target/draft resident
+   bytes, and an explicit compiler/temporary safety margin.
+2. Convert that budget into a whole physical-page count **before graph
+   compilation** and freeze the count into every serving family.
+3. Compile all families while parameters and cache buffers are absent, then
+   load parameters once.
+4. Recheck actual remaining memory against the already frozen cache budget and
+   safety margin. If it does not fit, fail readiness; do not shrink the arena
+   and compile another family after residency.
+5. Require enough pages for at least one maximum configured prefill chunk plus
+   one output page; otherwise fail readiness with exact accounting.
+6. Allocate every per-layer arena buffer once. Requests allocate metadata and
+   page leases, never K/V tensors.
+
+### 8.2 Page-aware write operation
+
+Add a model-independent page update operation with semantics:
+
+```text
+cache[page_table[b, position[b] / page_size],
+      position[b] % page_size,
+      :, :] = update[b, :, :]
+```
+
+The batched form accepts:
+
+- physical cache `[P, S, Hkv, D]`;
+- updates `[B, Q, Hkv, D]`;
+- block table `[B, L]`;
+- starting positions `[B]`;
+- valid query lengths `[B]`;
+- active rows `[B]`; and
+- an optional per-query write mask for query-only replay of an already cached
+  final prompt token.
+
+It validates every used page ID before launch, skips padded/inactive tokens,
+supports a query chunk crossing page boundaries, donates and aliases cache
+storage, and has a portable StableHLO implementation. Optimized Triton update
+is added only if profiling shows the portable scatter is material.
+
+Replace the dense `reshape + dynamic_update_slice` in GPT-OSS with this
+operation. Keep paged-attention reads unchanged. Permanent tests use
+permuted/non-contiguous page tables so the old identity-only behavior cannot
+pass accidentally.
+
+### 8.3 Host page manager
+
+Preallocate one descriptor per physical page:
+
+```rust
+struct PageDescriptor {
+    physical_id: u32,
+    ref_count: u32,
+    state: PageState,
+    valid_tokens: u8,
+    block_hash: Option<BlockHash>,
+    token_ids: [u32; 16],
+    lru_links: LruLinks,
+}
+
+enum PageState {
+    Free,
+    Private { sequence: SequenceId },
+    Sealed,
+}
+```
+
+Invariants:
+
+- a free page has refcount zero and no request block-table reference;
+- a private page has exactly one owning sequence and may be partial;
+- only a complete page can become sealed/shareable;
+- a sealed page is immutable; appending allocates the next page;
+- `ref_count` equals live block-table references, not cache-index membership;
+- a sealed zero-reference page remains cacheable and evictable;
+- allocation may evict only sealed zero-reference pages;
+- rollback never changes bytes in an earlier sealed page;
+- cancellation releases pages in reverse logical order and cannot double-free;
+- host logical/tentative lengths, not stale device bytes, define visibility.
+
+### 8.4 Admission reservations
+
+Do not fail a request halfway through its declared output because another
+request consumed the last page. The first implementation reserves page credits
+for:
+
+- prompt pages not satisfied by prefix hits; plus
+- the request's worst-case remaining output pages, accounting for its current
+  partial private tail.
+
+Credits guarantee finish but physical pages are assigned lazily. Zero-reference
+cached pages count as evictable capacity. Requests that cannot reserve wait in
+the admission queue. Later preemption/recompute may improve utilization, but
+it is not a prerequisite for a correct first server and must not be faked by
+allowing mid-request OOM.
+
+### 8.5 Device metadata
+
+For each batch, construct:
+
+- compact tokens;
+- positions and sequence lengths;
+- active/query-length masks; and
+- a block-table matrix padded with `-1` only after the last used logical page.
+
+Upload metadata once per batch, replicated over a TP mesh. Select the smallest
+batch family and retain one configured logical-page capacity rather than
+compiling every possible current length. Measure metadata upload bytes/time.
+If it exceeds 2% of steady decode time, retain stable device block-table rows
+per request and update only changed entries through a small scatter executable.
+
+Phase exit: multiple request block tables use deliberately permuted physical
+pages through every layer, produce the dense-cache oracle result, survive
+truncate/replay/cancel, and return all pages to the initial accounting state.
+
+## 9. Phase C: continuous batching
+
+### 9.1 Static batch families
+
+Extend `ShapeFamily` into a serving family containing:
+
+- phase (`prefill`, `decode`, later `verify`/`draft`);
+- batch capacity;
+- query capacity;
+- configured logical-page capacity;
+- process-wide physical-page count; and
+- tensor-parallel configuration.
+
+First A40 family set:
+
+- batch capacities: `1, 2, 4, 8, 16, 32`;
+- decode query capacity: `1`;
+- prefill query capacities: `16, 64, 256`;
+- one operator-selected maximum model length/page-table width; and
+- one exact physical-page count derived at startup.
+
+The family count is therefore bounded, auditable, and logged. Do not compile a
+batch x every prompt bucket x every sequence-length bucket cross-product.
+
+### 9.2 Batched model shapes
+
+Refactor every target component:
+
+- tokens: `[B, Q]`;
+- hidden: `[B, Q, 2880]`;
+- positions: `[B]` start plus an internal query iota;
+- query lengths: `[B]`;
+- logical sequence lengths: `[B]`;
+- active rows: `[B]`;
+- page tables: `[B, logical_pages]`;
+- sampling states: `[B, 2]`;
+- per-row top-k, temperature, top-p, and min-p: `[B]`; and
+- output tokens/states: `[B]` / `[B, 2]`.
+
+Flatten only where the semantic operation requires `[B*Q, ...]`, and restore
+batch/query axes afterward. Inactive rows must not route experts, mutate KV,
+advance RNG, or emit tokens.
+
+Extend generic sampling so each row has independent dynamic controls and RNG.
+The selected token for request A must be invariant when request B is inserted,
+removed, cancelled, or assigned another slot.
+
+### 9.3 Batched compact kernels
+
+Correct portable execution comes first, but CUDA promotion requires retained
+compact weights throughout:
+
+- batch 1 continues to use the accepted M=1 fused-QKV/GEMV/expert path;
+- small `M=B*Q` batches use a Triton family that shares weight loads across
+  rows where profitable instead of launching B independent one-row kernels;
+- routed MoE flattens active tokens, builds one assignment schedule, and
+  launches only selected expert blocks;
+- padded rows produce no assignments and no weight traffic;
+- head projection computes only active rows and preserves the global top-64
+  sampling contract; and
+- kernel selection is based on exact M/geometry/capability, never a silent
+  dense BF16 expansion.
+
+Benchmark each retained B family. A family that is slower than issuing its
+active requests separately must not be selected until corrected.
+
+### 9.4 Dynamic membership and fairness
+
+After every batch result:
+
+- remove terminal/cancelled rows;
+- keep nonterminal request state independent of its prior slot;
+- admit and insert new requests immediately;
+- select the next smallest family for the new cardinality; and
+- preserve FIFO within equal phase/priority plus aging across phases.
+
+No CUDA graph, executable arguments object, or cache table may capture a
+request's slot as permanent identity.
+
+### 9.5 Preserve the single-stream fast path
+
+When there is exactly one active decode request and no useful queued/prefill
+work, use the accepted batch-1 graph and its bounded five-layer-pair lookahead.
+Terminal speculative work remains within that request's private tail and is
+discarded on completion. This prevents the server abstraction from giving
+back the already accepted 151.324 decode-loop tokens/s.
+
+When other work exists, the scheduler fills the observed host boundary with
+another request/batch instead of blindly looking ahead for one sequence.
+
+### 9.6 Continuous-batching acceptance
+
+Permanent deterministic contracts:
+
+- batched outputs equal independent single-request outputs for greedy and
+  seeded stochastic sampling;
+- batch membership changes every step without changing surviving sequences;
+- chunked and unchunked prefill produce the same first-token distribution;
+- inactive slots never change cache/RNG/accounting;
+- cancellation before prefill, during prefill, during decode, and while an
+  event queue is full releases all state;
+- one long prefill cannot starve active decode, and sustained decode cannot
+  starve an aged prefill;
+- page reservations prevent mid-request OOM; and
+- no request invokes compilation.
+
+Real A40 promotion workload, five warm repetitions per point:
+
+- prompt/output mixes: `128/128`, `1K/128`, and `4K/256`;
+- concurrency: `1, 2, 4, 8, 16, 32`;
+- report request throughput, prompt tokens/s, output tokens/s, TTFT, TPOT,
+  end-to-end latency, batch-size histogram, GPU busy time, queue time, and page
+  utilization;
+- concurrency-8 aggregate output throughput must be at least 1.5x the same
+  image's concurrency-1 rate without correctness loss;
+- p95 TPOT at concurrency 8 must remain below 2.5x concurrency-1 TPOT; and
+- the exact single-stream control must remain at least 150 decode-loop tokens/s.
+
+## 10. Phase D: OpenAI chat and tool calling
+
+### 10.1 Public request schema
+
+Implement strict Serde types rather than passing arbitrary JSON into Harmony.
+Initial supported fields:
+
+- `model` (must select the resident GPT-OSS identity/alias);
+- `messages` with `system`, `developer`, `user`, `assistant`, and `tool` roles;
+- text content only; multimodal content is rejected explicitly;
+- `max_tokens` / `max_completion_tokens` with one normalized internal field;
+- `temperature`, `top_p`, NML's bounded `top_k` and `min_p` extension;
+- `seed`, `stream`, and `stream_options.include_usage`;
+- function `tools` with name, optional description, and JSON Schema parameters;
+- `tool_choice` initially `none` and `auto`;
+- optional request deadline and prefix `cache_salt` extension; and
+- `speculative` extension (`auto` or `disabled`).
+
+Reject unsupported fields whose semantics would otherwise be silently wrong:
+parallel choices (`n > 1`), logprobs until implemented, multimodal parts,
+response-format grammars, and forced/named tool choice until a real constrained
+tool decoder exists.
+
+### 10.2 Harmony mapping
+
+- OpenAI system/developer messages map to exact `SystemContent` and
+  `DeveloperContent`.
+- Function schemas pass through the existing audited JSON-Schema-to-TypeScript
+  renderer.
+- `tool_choice=none` omits tool definitions; `auto` includes them.
+- Assistant text/history maps to the correct Harmony channel records.
+- An assistant `tool_calls` entry maps to `Message::ToolCall`.
+- A subsequent `role=tool` message must reference a prior call ID and maps to
+  `Message::ToolResult` with the matching function name.
+- Malformed call IDs, duplicate results, result-before-call, invalid names,
+  non-JSON arguments, and unsupported parallel calls fail before tokenization.
+
+GPT-OSS currently terminates one completion at one `<|call|>`, so expose one
+tool call per choice. Generate a stable server call ID such as
+`call_<request-id>_0`; preserve the function name/recipient separately.
+
+### 10.3 Output behavior
+
+- Final-channel text becomes ordinary assistant `content`.
+- Analysis may be exposed through a documented `reasoning` extension; it must
+  never be merged silently into final content.
+- A complete parsed tool call becomes `message.tool_calls[0]` with type
+  `function`, name, and exact raw JSON arguments.
+- Because the Harmony parser deliberately withholds incomplete tool JSON, an
+  SSE response emits the tool arguments as one complete delta when `<|call|>`
+  closes it. Partial invalid JSON is never exposed.
+- Finish reasons map to `stop`, `length`, `tool_calls`, `cancelled`, or an
+  OpenAI-shaped error before stream completion.
+- NML returns the call and stops. No registry, subprocess, HTTP callback, or
+  in-process function execution is added.
+
+Tool acceptance includes official Harmony byte fixtures, OpenAI JSON/SSE
+fixtures, multi-turn call/result history, prefix hits over identical tool
+schemas, early disconnect, malformed model output, and complete absence of a
+tool execution side effect.
+
+## 11. Phase E: automatic prefix caching
+
+Prefix caching begins only after the global page manager is correct.
+
+### 11.1 Cache key
+
+Compute a chained SHA-256 for each complete 16-token block:
+
+```text
+block_hash = SHA256(
+    version ||
+    parent_block_hash ||
+    exact_16_u32_token_ids ||
+    cache_namespace_digest ||
+    request_cache_salt
+)
+```
+
+The namespace digest includes:
+
+- exact target artifact manifest and recipe identity;
+- tokenizer file identity and `openai-harmony-gpt-oss-v1`;
+- model/attention/RoPE/cache semantic version;
+- KV dtype and page size;
+- target model/cache semantic fingerprint, explicitly excluding batch slot,
+  batch-capacity padding, and other scheduler-only choices; and
+- when applicable, exact DFlash artifact/graph identity.
+
+Sampling parameters are not part of target prompt KV identity. Exact rendered
+token IDs already include system instructions, tool schemas, assistant/tool
+history, dates, and caller content.
+
+Keep the exact block token IDs and parent hash in the descriptor and compare
+them after digest lookup. A hash collision is an error/second candidate, never
+permission to reuse unrelated KV.
+
+### 11.2 Lookup and allocation
+
+At request preparation:
+
+1. Hash complete prompt blocks from the root.
+2. Walk the longest contiguous chain present in the prefix index.
+3. Increment each matched page refcount and remove it from the evictable free
+   queue while in use.
+4. Set the prefill cursor to matched_tokens.
+5. Allocate a private page for the unmatched suffix/tail only when scheduled.
+6. If the entire prompt is matched, replay only the final prompt token through
+   the target with its cache-write mask disabled. Its existing cached K/V
+   remains visible to attention, the query reconstructs the final hidden/logits,
+   and no duplicate KV entry is appended. If query-only replay is unavailable,
+   cap the reusable prefix so at least one prompt token is computed normally;
+   never claim a full hit without a valid first-token logit.
+
+When a private page becomes full and all of its tokens are committed, seal it,
+assign its chained hash, and insert it into the index. Generated-history pages
+may also be sealed because a later chat turn can contain the exact assistant
+prefix. Partial pages are never indexed or shared.
+
+### 11.3 Refcounts and LRU eviction
+
+- Index membership does not pin a page.
+- Releasing the final live reference appends a sealed page to the LRU tail.
+- Allocation first consumes truly free pages, then evicts the LRU head among
+  sealed zero-reference pages.
+- Eviction removes the hash mapping and clears the descriptor before reuse.
+- Reverse logical release order makes late, highly specific blocks older
+  eviction candidates before widely shared early blocks.
+- Duplicate hashes may temporarily name more than one physical page if both
+  were produced concurrently; retain one canonical candidate after requests
+  release rather than rewriting an in-flight append-only block table.
+
+### 11.4 Isolation
+
+`cache_salt` participates in the root hash. Requests with different salts
+cannot share pages or infer hits through timing. Server configuration may:
+
+- require a salt in multi-tenant mode;
+- derive a salt from an authenticated tenant identity when auth is later
+  introduced; or
+- use one documented global namespace for trusted single-tenant deployment.
+
+Never log salts or block token contents. Metrics expose counts only.
+
+### 11.5 Prefix acceptance
+
+- Second execution of an identical prompt reports exact full-page hit tokens
+  and executes only its residual tail/first-token work.
+- Prompts differing in one block share only the common parent chain.
+- Same tokens under a different model/protocol/salt miss completely.
+- Prefix reuse produces the same output as clean prefill for greedy and seeded
+  stochastic requests.
+- Cancellation/refcount races cannot evict a page still referenced by another
+  request.
+- Under forced pressure, LRU eviction returns exact page accounting and never
+  changes a live request.
+- A 4K-token repeated-prefix A40 workload must reduce second-request prefill
+  model tokens by at least 99% of complete-page tokens and materially improve
+  TTFT; report the exact speedup rather than assigning a guessed threshold.
+
+## 12. Phase F: tensor-parallel GPT-OSS sharding
+
+### 12.1 Supported topology
+
+Start with one homogeneous single-node tensor mesh axis and TP degrees
+`1, 2, 4`. GPT-OSS has 64 query heads and eight KV heads, so these degrees
+partition attention evenly. TP=8 is deferred until NVFP4 row-shard padding is
+explicitly implemented: the 2,880-wide expert intermediate would produce a
+360-element K shard, which is not aligned to the recipe's 16-value scale
+blocks.
+
+All selected devices must report compatible backend, compute capability, and
+memory. One PJRT client/executable spans the mesh. Do not spawn one independent
+model server per GPU and call it tensor parallelism.
+
+### 12.2 Partition plan
+
+Use one product-owned `TP_AXIS` and attach partitions to logical parameter and
+activation shapes before lowering:
+
+| Component | Tensor-parallel placement |
+| --- | --- |
+| RMSNorm, positions, page tables, routing logits/IDs | replicated |
+| Token embedding vocabulary rows | vocabulary-sharded local lookup, then hidden all-reduce |
+| Q/K/V weights and biases | column-sharded over query/KV heads |
+| Q/K/V activations and KV cache | local head shards |
+| Attention output projection | row-sharded input, hidden all-reduce |
+| Router projection | replicated |
+| Expert gate/up | column-sharded over intermediate channels |
+| Expert activation | local intermediate shard |
+| Expert down | row-sharded intermediate input, hidden all-reduce |
+| LM head | vocabulary-row sharded |
+| Sampling | local top-64 candidates, all-gather candidates, global top-k/filter/sample, replicated token/state |
+
+All 32 experts remain present as tensor-sharded experts in this milestone.
+Expert parallelism/all-to-all is a different feature and is not substituted for
+the requested tensor parallelism.
+
+GPT-OSS stores gate and up as two contiguous intermediate halves. Treat the
+logical output as `[gate_or_up=2, intermediate]` and shard the intermediate
+axis, so every device receives matching gate/up channels. A naive contiguous
+split of the flattened `2*intermediate` axis would place gate on some devices
+and up on others and is invalid.
+
+### 12.3 NVFP4 physical sharding
+
+For every structured parameter component:
+
+- payload, local E4M3 scale, global scale, bias, and logical shape use one
+  consistent shard contract;
+- checkpoint byte spans are read directly into the owning device shard;
+- no full packed tensor is uploaded to every device and sliced afterward;
+- N/output-axis shards preserve output-major row boundaries;
+- K/input-axis shards begin/end on 16-value scale-block boundaries;
+- a gate/up shard reads the two corresponding non-contiguous output-row spans
+  from the checkpoint and presents one local `[2*intermediate_local, K]`
+  component without constructing a full-device copy;
+- TP=2 and TP=4 expert down shards are respectively 1,440 and 720 values and
+  therefore aligned;
+- any required padding is declared, zero-filled, excluded from logical output,
+  and included in exact resident-byte accounting; and
+- custom-call ABI validation uses local component shapes while semantic output
+  retains global Shardy placement.
+
+### 12.4 Collectives and sampling
+
+Let Shardy/XLA insert collectives from explicit placement where it can prove
+the correct result. Add an explicit model-independent collective only if the
+semantic graph cannot express the needed global top-k candidate exchange.
+
+Global top-k correctness does not require gathering the full 201,088 logits:
+the global top 64 is contained in the union of each shard's local top 64.
+Gather candidate `(logit, global_token_id)` pairs, perform stable global
+ordering/filtering, sample once from the request's replicated RNG state, and
+broadcast the selected token/state. Tie behavior must be deterministic and
+match TP=1.
+
+### 12.5 Cache and scheduler interaction
+
+- The scheduler and page manager remain one host owner, not one copy per GPU.
+- One logical page ID identifies corresponding local-head pages on every
+  device.
+- Page tables, sequence lengths, sampling controls, and active masks are
+  replicated.
+- KV physical storage is sharded over KV heads, reducing per-device cache
+  bytes approximately by TP degree.
+- Batch membership and prefix hash identity are common across the mesh.
+- A collective/device failure fails the whole batch and all affected requests;
+  partial shard progress is never exposed.
+
+### 12.6 Tensor-parallel acceptance
+
+On real 2x and 4x homogeneous CUDA hosts:
+
+- exact topology and device assignment are reported;
+- physical parameter inventory proves shards rather than replicas;
+- per-device resident parameter and KV bytes agree with declared partitions;
+- TP=1/2/4 greedy token streams match exactly on fixed fixtures;
+- stochastic distributions/logits satisfy the declared numerical contract and
+  fixed seeds are reproducible;
+- paged allocation, prefix hits, cancellation, streaming, and tools work under
+  TP;
+- Nsight/XLA evidence shows required collectives execute;
+- throughput, TTFT, TPOT, collective time, link topology, and memory headroom
+  are reported separately; and
+- no speedup is promised on PCIe-only topology merely because memory sharding
+  is correct.
+
+## 13. Phase G: DFlash speculative decoding
+
+This phase starts only after ordinary continuous batching, global pages,
+prefix caching, and TP=1 are stable. It extends those owners; it does not add a
+second server loop.
+
+### 13.1 Artifact and checkpoint
+
+Create a separate immutable artifact contract pinned to revision
+`d53f6551543204c859e8bbaaddbd15d11b447af9`:
+
+- authenticate `config.json`, `model.safetensors`, license/model card, exact
+  tensor inventory, sizes, hashes, and repository revision;
+- materialize outside the OCI image and issue the same read-only filesystem
+  identity receipt as the target artifact;
+- validate exact architecture values listed in section 4;
+- declare the eight draft layers, final norm, target-feature projection and
+  hidden norm;
+- prove whether the checkpoint intentionally omits token embedding and LM head
+  and bind those operations to the resident target weights;
+- retain BF16 drafter weights as BF16 initially; do not invent a draft
+  quantization project; and
+- reject `trust_remote_code`; `dflash.py` and `utils.py` remain provenance
+  references for the Rust/NML implementation.
+
+Compilation still precedes both target and draft parameter residency. Startup
+memory accounting reports target parameters, draft parameters, target KV,
+draft KV, temporary verification buffers, and safety margin separately.
+
+### 13.2 Exact algorithm state
+
+Each speculative sequence owns:
+
+- one `pending_token` sampled authoritatively by the target but not yet written
+  to target KV or emitted;
+- target committed and tentative lengths;
+- target page table;
+- eight-layer draft context KV page table/length;
+- projected target context features for only the current verification result;
+- target and draft cache checkpoints;
+- proposed/accepted counters and rolling acceptance EMA; and
+- the same target sampling state used by ordinary decoding.
+
+The pending-token formulation matches the reference:
+
+1. Target prefill samples the first pending token while target KV contains the
+   prompt only.
+2. The draft input block is `[pending, MASK x 7]`.
+3. DFlash predicts positions 1-7 in one non-causal forward pass.
+4. Target verifies `[pending, draft_1, ..., draft_7]` causally in one
+   eight-token forward pass.
+5. Target sampling yields posterior tokens for every verifier position.
+6. Let `L` be the longest prefix where `draft_i == posterior_{i-1}`.
+7. Emit/commit `pending` plus `L` accepted drafts.
+8. Retain `posterior_L` as the next pending authoritative token.
+9. Roll target KV back from eight tentative writes to `L+1` committed writes.
+
+If all seven drafts match, commit eight tokens and retain the posterior after
+the eighth as the next pending token. A pending stop token terminates before a
+draft launch.
+
+### 13.3 Target feature taps
+
+DFlash needs target hidden states after zero-based GPT-OSS layers
+`1, 6, 11, 16, 21`.
+
+Add DFlash-specific target component variants that return those taps without
+changing ordinary output:
+
+- taps after the second layer of a pair are ordinary pair-boundary outputs;
+- taps after the first layer of a pair (`6` and `16`) are retained as explicit
+  auxiliary outputs before the second layer overwrites/donates hidden state;
+- prefill/verify operate in bounded chunks so at most five
+  `[B,Q,2880]` tap buffers are live;
+- one projector concatenates the five taps, applies the learned
+  `14400 -> 2880` weight and hidden RMS norm, then releases taps; and
+- no full-prompt five-layer hidden history is retained.
+
+During chunked target prefill, immediately convert projected features into
+draft context K/V for all eight draft layers. The DFlash layer computes K/V for
+target context directly from the projected target feature; context tokens do
+not need to traverse the draft attention/MLP as queries.
+
+### 13.4 Draft graph
+
+For each of eight draft layers:
+
+1. RMS-normalize the current eight noise/mask hidden states.
+2. Compute queries from noise hidden.
+3. Compute K/V for newly accepted target context features and for the current
+   noise block.
+4. Append new context and noise K/V tentatively to that layer's paged cache.
+5. Apply YaRN RoPE at the exact context/noise positions.
+6. Run non-causal GQA over previous context, newly appended context, and all
+   eight current noise positions.
+7. Apply output projection, residual, post-attention norm, Qwen3 SiLU MLP, and
+   residual.
+8. After all layers, apply final norm and the target vocabulary head to the
+   last seven positions.
+9. Select greedy draft candidates; target sampling remains authoritative.
+10. Crop draft logical cache length to retain context K/V and discard noise
+    K/V. Stale bytes remain invisible and are overwritten next iteration.
+
+An optimized hybrid paged-plus-ephemeral attention may avoid physically
+writing the noise K/V later, but only after the exact paged implementation is
+accepted and profiling proves the writes matter.
+
+### 13.5 Verification graph and lossless sampling
+
+Add `Phase::Verify` with query width eight and the ordinary causal target math,
+including feature taps. The verifier returns enough data to:
+
+- sample one target posterior per position with the request's exact top-k,
+  temperature, top-p, and min-p controls;
+- retain the successor RNG state after each position;
+- select the state after exactly the committed `L+1` visible tokens; and
+- keep later speculative draws from advancing externally visible state.
+
+The verifier may compute all eight posterior samples in parallel/sequential
+graph logic, but state selection must make it equivalent to `L+1` ordinary
+target samples. The target distribution—not the greedy draft distribution—is
+authoritative.
+
+Do not speculate past the visible budget. When fewer than eight visible tokens
+remain, emit the pending token and switch to ordinary decode for the tail
+rather than launching a full block beyond `max_tokens`.
+
+If a Harmony return/call token appears inside the accepted block:
+
+- expose tokens only through the first terminal token;
+- rollback target logical length after that token;
+- discard later accepted/tentative features and sampling states; and
+- finish/release the request before any suffix can enter prefix caching.
+
+### 13.6 DFlash page and prefix ownership
+
+Draft context KV uses the same 16-token logical token blocks but eight draft
+layers. Track it as a separate physical arena and account exact bytes:
+
+```text
+8 layers * 2 * 8 KV heads * 64 * 2 BF16 bytes = 16,384 bytes/token at TP=1
+```
+
+A DFlash prefix hit is valid only when a block bundle contains both target KV
+and matching draft context KV under the DFlash namespace digest. A target-only
+cached page cannot initialize DFlash because the selected target hidden
+features are absent. For an `auto` speculative request:
+
+- use a complete target+draft bundle hit when present;
+- otherwise prefill the suffix while populating both arenas; or
+- deliberately run ordinary target decoding when memory/policy disables draft
+  cache, without labeling a target-only hit as DFlash-ready.
+
+Target and draft pages have tied logical ownership but separate physical IDs
+and memory budgets. Bundle refcounts and rollback are transactional.
+
+### 13.7 DFlash batching and auto policy
+
+Compile draft/verify batch capacities `1, 2, 4, 8, 16, 32` only where startup
+compile/memory budgets allow. Draft batches contain requests ready to propose;
+verify batches contain requests with complete proposals. Ordinary decode and
+speculative phases share fairness/admission but use separate executables.
+
+Start with a static enabled policy for correctness. Then `auto` may disable
+speculation when:
+
+- the request has fewer than eight visible tokens remaining;
+- draft cache reservation cannot finish safely;
+- active target decode batching is already more efficient than draft+verify;
+- rolling accepted length falls below a measured break-even threshold; or
+- a configured model/request feature is incompatible.
+
+Every auto decision increments a reason-labeled metric. Never silently fall
+back because a draft execution failed; execution failure fails affected
+requests.
+
+### 13.8 DFlash acceptance and promotion
+
+Correctness gates:
+
+- greedy fixed prompts produce exactly the ordinary target tokens;
+- stochastic fixed-seed runs preserve target sampling-state progression and
+  visible tokens across mismatch positions;
+- forced accept lengths 0-7 exercise every commit/rollback path;
+- terminal tokens at pending and every accepted position expose no suffix;
+- max-token tails, cancellation during draft, cancellation during verify,
+  prefix hit/miss, page pressure, and TP=1 all return exact accounting;
+- target/draft cache pages never become visible before commit; and
+- official DFlash reference fixtures agree on projected features, draft hidden
+  output, proposals, and acceptance for bounded BF16 tensors.
+
+A40 performance gate, compared on the same image with speculation off/on:
+
+- workloads: Math500, GSM8K, HumanEval, and MT-Bench prompts using the same
+  reasoning effort as the model card where possible;
+- concurrency: `1, 4, 8, 16, 32`;
+- report mean acceptance length, proposed/accepted/rejected tokens, draft time,
+  verify time, rollback time, target calls/token, TTFT, TPOT, aggregate TPS,
+  cache bytes, and auto-disable reasons;
+- initial promotion requires mean committed tokens per target verify at least
+  3.5 and at least 1.25x end-to-end speedup at concurrency 1 without degrading
+  correctness;
+- if functional DFlash misses the performance threshold, keep it opt-in and
+  record the measured bottleneck; do not enable it by default based on H200
+  claims; and
+- repeat TP=2/4 only after TP=1 promotes, with complete memory/collective
+  accounting.
+
+## 14. Observability and operational behavior
+
+### 14.1 Metrics
+
+Prometheus families, all bounded-label:
+
+- requests received/admitted/completed/cancelled/failed/rejected;
+- request/engine-event queue depth and saturation;
+- active/queued/prefilling/decoding/speculating sequences;
+- TTFT, TPOT, end-to-end latency, queue and tokenization histograms;
+- scheduler iterations, scheduled tokens, batch size/query size/phase;
+- prefill/decode/draft/verify execution and submission time;
+- target/draft physical pages free/private/sealed/referenced/evicted;
+- reservation credits and admission waits;
+- prefix lookup blocks/tokens/hits/misses/duplicates/evictions;
+- speculative proposed/accepted/rejected tokens and accepted-length histogram;
+- per-family compile/warmup time and selected-family counts;
+- per-device parameter/cache/temporary bytes and TP degree; and
+- terminal reason/error code counts.
+
+Do not use request IDs, model text, function names, token IDs, salts, or user
+identities as metric labels.
+
+### 14.2 Structured tracing
+
+Trace request ID, phase, batch family, slot count, page mutations, queue delay,
+and engine error codes. Content logging is off by construction. A diagnostic
+operator flag may log token IDs only in an explicitly non-production mode.
+
+### 14.3 Errors
+
+Define stable internal error categories and OpenAI-shaped HTTP mappings:
+
+- invalid request/model/tool history -> 400;
+- unsupported request feature -> 400 with explicit field;
+- queue/admission overload -> 429 with retry guidance;
+- deadline/cancel -> client-visible terminal/cancel where transport allows;
+- engine unavailable/not ready -> 503;
+- artifact/compile/startup failure -> readiness false and process failure;
+- device execution/cache invariant failure -> affected requests fail, engine
+  becomes unhealthy if state integrity cannot be proven.
+
+Never catch an optimized-lowering/device error and retry a different semantic
+path inside a live request.
+
+## 15. Proposed source layout
+
+Use the smallest modules that preserve ownership boundaries:
+
+```text
+products/serve/src/
+  main.rs                       CLI, Tokio startup, signals
+  lib.rs                        server-facing public configuration/error
+  api.rs                        Axum router, shared state, errors
+  api/openai.rs                 strict request/response/SSE schemas
+  server.rs                     EngineHandle and lifecycle
+  server/engine.rs              dedicated thread loop and commands/events
+  server/scheduler.rs           request state machine and batch planning
+  server/cache.rs               target/draft page pools and reservations
+  server/prefix.rs              chained hashes, index, refcounts, LRU
+  server/metrics.rs             Prometheus registry and snapshots
+  gpt_oss.rs                    product assembly
+  gpt_oss/execution.rs          resident target executor and bindings
+  gpt_oss/graph.rs              batched target graph families
+  gpt_oss/parallel.rs           TP partition plan
+  gpt_oss/protocol.rs           Harmony renderer/parser
+  gpt_oss/dflash.rs             DFlash product owner
+  gpt_oss/dflash/config.rs      exact pinned config validation
+  gpt_oss/dflash/checkpoint.rs  draft parameter declarations
+  gpt_oss/dflash/graph.rs       feature/project/draft/verify graphs
+  gpt_oss/dflash/execution.rs   pending-token and cache transitions
+```
+
+Do not create all files before their milestone. Split an existing file only
+when the new owner exists and the permanent target lists the new source.
+
+Likely reusable framework changes:
+
+- `crates/nml-tokenizer`: shared tokenizer/owned decoder lifecycle;
+- `crates/nml-ir`: page-aware cache update and per-row batched sampling;
+- `crates/nml-runtime`: only buffer/cache metadata primitives genuinely shared
+  by other products; server LRU/admission remains under `products/serve`;
+- `crates/nml-sharding`: no GPT-OSS policy, only any missing generic placement
+  validation; and
+- Triton crate: small-M batched compact kernels only after semantic shapes and
+  portable contracts exist.
+
+## 16. Verification matrix
+
+### 16.1 BuildBuddy gates after each coherent milestone
+
+- CPU contracts:
+  `bb test //products/serve:serve_contract_test --config=buildbuddy --config=cpu`
+- affected framework contracts with the same BuildBuddy/CPU configuration;
+- CUDA compilation/contracts:
+  `bb test <affected targets> --config=buildbuddy --config=cuda`
+- server image:
+  `bb build //products/serve:serve_image --config=buildbuddy --config=cuda`
+- image structure contract through its existing BuildBuddy target.
+
+Exact target lists are recorded in `TASKS.md` as modules land. No local
+substitute is treated as evidence.
+
+### 16.2 Real hardware gates
+
+- single A40: batch-1 regression, continuous batching, prefix, tools, DFlash;
+- 2x and 4x homogeneous CUDA host: TP correctness, shards, collectives,
+  memory, and throughput;
+- suitable SM90 later: portability/performance comparison, not a prerequisite
+  for the A40-serving milestone;
+- CPU multi-device remains the compile/placement oracle but cannot prove CUDA
+  collectives.
+
+Every paid GPU report pins source SHA, dirty-tree state, model/draft artifact
+revisions, image digest, compiler/runtime versions, topology, server profile,
+request corpus, and warmup/repetition policy. Cold compile/graph setup is
+reported separately from warm serving.
+
+### 16.3 Load and failure testing
+
+Add a hermetic protocol/load client target that can drive:
+
+- fixed concurrency and arrival-rate modes;
+- streaming and non-streaming requests;
+- disconnects at deterministic token indices;
+- slow readers to saturate event queues;
+- repeated/shared/divergent prefixes;
+- mixed prompt/output lengths and sampling settings;
+- tool-call round trips; and
+- speculation on/off with exact seed comparison.
+
+Failure injection is host-level and deterministic: page-pool exhaustion,
+queue saturation, cancellation at each state transition, malformed protocol
+output, and engine shutdown. Do not fake GPU execution, but do unit-test the
+pure scheduler/page state machine without a device.
+
+## 17. Ordered milestone exits
+
+The implementation order is strict:
+
+1. **Contracts and step API**: owned protocol sessions, step-wise executor,
+   immutable single-request equivalence and A40 baseline retained.
+2. **Tokio serving shell**: bounded control plane, dedicated engine thread,
+   health/readiness/metrics/chat streaming/cancellation.
+3. **Global paged arena**: arbitrary page-aware writes, process-wide storage,
+   reservations, rollback and exact reclamation.
+4. **Continuous batching**: batched shapes/sampling/kernels, chunked prefill,
+   dynamic membership, fairness, concurrency evidence.
+5. **Complete OpenAI tool surface**: structured chat histories, auto/none tool
+   choice, SSE tool calls, tool-result round trips, no execution.
+6. **Prefix caching**: chained full-page hashes, salt isolation, refcounts/LRU,
+   TTFT evidence.
+7. **Tensor parallelism**: TP=2/4 parameter/activation/cache sharding, global
+   sampling, CUDA collective and memory proof.
+8. **DFlash**: pinned artifact, feature taps, draft/verify, lossless rollback,
+   target+draft prefix bundles, A40 promotion.
+9. **Production hardening**: overload/shutdown/load tests, SLO/profile tuning,
+   final docs and deployment examples.
+
+No later milestone can be used to hide an earlier missing invariant. In
+particular:
+
+- continuous batching cannot precede page-aware cache writes;
+- prefix caching cannot precede sealed-page ownership/refcounts;
+- DFlash cannot precede target rollback and global page transactions;
+- DFlash prefix reuse cannot use target-only pages;
+- TP support cannot be inferred from CPU compilation; and
+- HTTP concurrency cannot be claimed while one blocking generation call owns
+  the engine until completion.
+
+## 18. Explicit non-goals and rejected shortcuts
+
+- No new quantization recipe or persistent BF16 expansion.
+- No whole-transformer StableHLO monolith; the measured monolith regressed.
+- No one-Tokio-task-per-request PJRT execution.
+- No unbounded command, response, or admission queue.
+- No page table that affects reads but not writes.
+- No per-request K/V arena after the global arena milestone.
+- No prefix caching of partial pages.
+- No cache key based only on text strings, request JSON, or an unsafe fast hash
+  in multi-tenant mode.
+- No server-side arbitrary tool execution.
+- No Python `trust_remote_code` in the product image.
+- No DFlash speed claim copied from H200 results.
+- No speculative suffix made visible before target verification/commit.
+- No full-model replication labeled tensor parallelism.
+- No TP=8 until 16-value NVFP4 shard alignment/padding is explicit.
+- No runtime compilation when a new batch cardinality arrives.
+- No benchmark promotion from one cold run, steady-device time alone, or an
+  unpinned image/model/report.
+
+This plan deliberately builds the serving control plane around the model and
+kernel path that already achieved the A40 objective. The largest new gains
+should come from useful concurrent work, prefix elimination, multi-GPU memory
+headroom, and fewer target passes through DFlash—not from reopening the proven
+NVFP4 representation.

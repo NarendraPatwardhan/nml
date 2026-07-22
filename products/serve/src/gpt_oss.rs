@@ -14,9 +14,17 @@ mod graph;
 pub(crate) mod protocol;
 
 use crate::{CompilationProfile, SamplingOptions, SubmissionTimings};
+use crate::server::cache::{
+    CacheStats, FrozenCachePlan, PageManager, TargetCacheGeometry, TARGET_PAGE_SIZE,
+};
+use crate::server::contracts::{SequenceId, ServerProfile};
 use checkpoint::{BoxError, Result};
 use config::Config;
-use execution::{ModelDefinition, PreparedRequest, ResidentModel, RunMetrics, StartupMetrics};
+pub(crate) use execution::RawToken;
+use execution::{
+    BatchInputs, ModelDefinition, PreparedRequest, RequestExecution, ResidentModel, RunMetrics,
+    ServingCompileConfig, StartupMetrics,
+};
 use nml::io::ParameterSet;
 use nml::safetensors::TensorRegistry;
 use protocol::{Conversation, HarmonyProtocol, Message, SystemContent};
@@ -56,6 +64,8 @@ const CONVERTER_REQUIREMENTS_SHA256: &str =
 pub(crate) struct Generator<'platform> {
     protocol: HarmonyProtocol,
     model: ResidentModel<'platform>,
+    pages: PageManager,
+    next_sequence: u64,
 }
 
 pub(crate) struct ProductReport {
@@ -69,7 +79,57 @@ pub(crate) struct ProductReport {
     pub(crate) parameter_peak_staging_bytes: usize,
     pub(crate) cache_storage_bytes: usize,
     pub(crate) cache_metadata_bytes: usize,
+    pub(crate) cache_metadata_upload_bytes: usize,
     pub(crate) timings: ProductTimings,
+}
+
+pub(crate) struct ServerSession {
+    sequence: SequenceId,
+    prompt: Vec<u32>,
+    prompt_cursor: usize,
+    generated: Vec<u32>,
+    max_new_tokens: usize,
+    sampling: SamplingOptions,
+    stopped: bool,
+    released: bool,
+}
+
+impl ServerSession {
+    pub(crate) const fn sequence(&self) -> SequenceId {
+        self.sequence
+    }
+
+    pub(crate) fn prompt_remaining(&self) -> usize {
+        self.prompt.len() - self.prompt_cursor
+    }
+
+    pub(crate) fn prefill_complete(&self) -> bool {
+        self.prompt_cursor == self.prompt.len()
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        self.max_new_tokens == 0
+            || self.stopped
+            || self.generated.len() >= self.max_new_tokens
+    }
+
+    pub(crate) fn prompt_tokens(&self) -> usize {
+        self.prompt.len()
+    }
+
+    pub(crate) fn completion_tokens(&self) -> usize {
+        self.generated.len()
+    }
+
+    pub(crate) const fn stopped(&self) -> bool {
+        self.stopped
+    }
+}
+
+impl Generator<'_> {
+    pub(crate) fn cache_stats(&self) -> CacheStats {
+        self.pages.stats()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -80,6 +140,7 @@ pub(crate) struct ProductTimings {
     pub(crate) decode_compilation: Duration,
     pub(crate) parameter_upload: Duration,
     pub(crate) cache_allocation: Duration,
+    pub(crate) cache_metadata_upload: Duration,
     pub(crate) prompt_upload: Duration,
     pub(crate) prefill_execution: Duration,
     pub(crate) prefill_download: Duration,
@@ -98,6 +159,35 @@ impl<'platform> Generator<'platform> {
         model_directory: &Path,
         profiles: &[CompilationProfile],
     ) -> Result<Self> {
+        Self::load_sized(platform, model_directory, profiles, None, None)
+    }
+
+    pub(crate) fn load_server(
+        platform: &'platform nml::Platform,
+        model_directory: &Path,
+        profile: &ServerProfile,
+    ) -> Result<Self> {
+        Self::load_sized(
+            platform,
+            model_directory,
+            &profile.compilation_families,
+            Some((profile.cache_budget_bytes, profile.cache_safety_bytes)),
+            Some(ServingCompileConfig {
+                batch_buckets: profile.batch_buckets.clone(),
+                prefill_query_buckets: profile.prefill_query_buckets.clone(),
+                logical_cache_capacity: profile.max_model_length,
+                tensor_parallel: profile.tensor_parallel,
+            }),
+        )
+    }
+
+    fn load_sized(
+        platform: &'platform nml::Platform,
+        model_directory: &Path,
+        profiles: &[CompilationProfile],
+        cache_budget: Option<(usize, usize)>,
+        serving: Option<ServingCompileConfig>,
+    ) -> Result<Self> {
         let validation_started = Instant::now();
         validate_artifact(model_directory).map_err(boxed)?;
         let artifact_validation = validation_started.elapsed();
@@ -105,30 +195,136 @@ impl<'platform> Generator<'platform> {
         let protocol = HarmonyProtocol::load(model_directory).map_err(boxed)?;
         let registry =
             TensorRegistry::from_path(model_directory.join(CHECKPOINT_INDEX)).map_err(boxed)?;
+        let physical_pages = match cache_budget {
+            Some((budget, safety)) => FrozenCachePlan::freeze(
+                TargetCacheGeometry {
+                    layers: config.layers(),
+                    page_size: TARGET_PAGE_SIZE,
+                    local_kv_heads: config.key_value_heads(),
+                    head_dimension: config.head_dim(),
+                    element_bytes: 2, // GPT-OSS target K/V is BF16.
+                },
+                budget,
+                safety,
+            )
+            .map_err(boxed)?
+            .physical_pages(),
+            None => profiles
+                .iter()
+                .map(|profile| {
+                    profile
+                        .max_sequence_tokens
+                        .div_ceil(graph::CACHE_PAGE_SIZE)
+                        .max(1)
+                        .checked_next_power_of_two()
+                        .ok_or_else(|| {
+                            checkpoint::message("GPT-OSS cache profile overflows usize")
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .max()
+                .ok_or_else(|| checkpoint::message("GPT-OSS requires a compilation profile"))?,
+        };
         let definition =
             ModelDefinition::declare(config, ParameterSet::new(registry), artifact_validation)?;
-        let model = definition.compile(platform, profiles)?.make_resident()?;
-        Ok(Self { protocol, model })
+        let model = definition
+            .compile(platform, profiles, physical_pages, serving.as_ref())?
+            .make_resident()?;
+        let startup = model.startup();
+        tracing::info!(
+            compiled_families = startup.compiled_families,
+            prefill_compilation_seconds = startup.prefill_compilation.as_secs_f64(),
+            decode_compilation_seconds = startup.decode_compilation.as_secs_f64(),
+            "compiled finite GPT-OSS serving families before parameter residency"
+        );
+        Ok(Self {
+            protocol,
+            model,
+            pages: PageManager::new(physical_pages).map_err(boxed)?,
+            next_sequence: 1,
+        })
     }
 
     pub(crate) fn generate(
-        &self,
+        &mut self,
         prompt: String,
         max_new_tokens: usize,
         cache_capacity: Option<usize>,
         sampling: SamplingOptions,
         mut emit: impl FnMut(protocol::Event) -> Result<()>,
     ) -> Result<ProductReport> {
-        let tokenization_started = Instant::now();
         let conversation = Conversation::new([
             Message::System(SystemContent::default()),
             Message::user(prompt),
         ]);
+        // This compatibility/diagnostic adapter, rather than the device
+        // session, owns Harmony translation. Server response tasks can drive
+        // the same step API with their own independent parser.
+        let tokenization_started = Instant::now();
         let tokens = self
             .protocol
             .render_for_completion(&conversation)
             .map_err(boxed)?;
         let tokenization = tokenization_started.elapsed();
+        let mut parser = self.protocol.parser();
+        let mut session = self.prepare_tokens(
+            tokens,
+            max_new_tokens,
+            cache_capacity,
+            sampling,
+            tokenization,
+        )?;
+        let generation = (|| {
+            if let Some(raw) = self.prefill_step(&mut session)? {
+                emit_raw_token(&mut parser, raw, &mut emit)?;
+            }
+            while !session.is_complete() {
+                let raw = self.decode_step(&mut session)?.ok_or_else(|| {
+                    checkpoint::message("GPT-OSS decode step omitted its raw token")
+                })?;
+                emit_raw_token(&mut parser, raw, &mut emit)?;
+            }
+            let stopped = session.stopped();
+            let events = if stopped {
+                parser.finish().map_err(boxed)?;
+                Vec::new()
+            } else {
+                parser.truncate().map_err(boxed)?
+            };
+            Ok::<_, BoxError>(events)
+        })();
+        let events = match generation {
+            Ok(events) => events,
+            Err(error) => {
+                self.cancel(&mut session)?;
+                return Err(error);
+            }
+        };
+        let report = self.finalize(session)?;
+        for event in events {
+            emit(event)?;
+        }
+        Ok(report)
+    }
+
+    /// Returns a cheaply cloned protocol owner for bounded CPU preparation and
+    /// response-side parsing outside the dedicated model/PJRT thread.
+    #[allow(dead_code)] // Consumed by the Tokio preparation path in Milestone 1.
+    pub(crate) fn protocol(&self) -> HarmonyProtocol {
+        self.protocol.clone()
+    }
+
+    /// Prepares an already rendered/tokenized request for engine execution.
+    /// Family selection is limited to the startup plan and never compiles.
+    pub(crate) fn prepare_tokens(
+        &mut self,
+        tokens: Vec<u32>,
+        max_new_tokens: usize,
+        cache_capacity: Option<usize>,
+        sampling: SamplingOptions,
+        tokenization: Duration,
+    ) -> Result<ProductSession> {
         let request = PreparedRequest::new(
             tokens,
             max_new_tokens,
@@ -138,23 +334,501 @@ impl<'platform> Generator<'platform> {
             tokenization,
         )?;
         let prompt_tokens = request.tokens.len();
-        let mut parser = self.protocol.parser();
-        let run = self.model.generate(&request, |token, _is_stop| {
-            for event in parser.process(token).map_err(boxed)? {
-                emit(event)?;
-            }
-            Ok(())
-        })?;
-        if run.stopped {
-            parser.finish().map_err(boxed)?;
+        let tokenization = request.tokenization;
+        let mut execution = self.model.prepare(request)?;
+        let sequence = if max_new_tokens == 0 {
+            None
         } else {
-            for event in parser.truncate().map_err(boxed)? {
-                emit(event)?;
+            let sequence = SequenceId::new(self.next_sequence);
+            self.next_sequence = self
+                .next_sequence
+                .checked_add(1)
+                .ok_or_else(|| checkpoint::message("GPT-OSS sequence ID space is exhausted"))?;
+            self.pages
+                .reserve_tokens(
+                    sequence,
+                    prompt_tokens.checked_add(max_new_tokens).ok_or_else(|| {
+                        checkpoint::message("GPT-OSS cache reservation overflows usize")
+                    })?,
+                )
+                .map_err(boxed)?;
+            let mut installed_page_table = Vec::new();
+            let installed = (|| {
+                self.pages
+                    .append_tentative(sequence, prompt_tokens)
+                    .map_err(boxed)?;
+                self.install_page_table(
+                    sequence,
+                    &mut execution,
+                    &mut installed_page_table,
+                )
+            })();
+            if let Err(error) = installed {
+                self.pages.release_sequence(sequence).map_err(boxed)?;
+                return Err(error);
+            }
+            Some((sequence, installed_page_table))
+        };
+        let (sequence, installed_page_table) = match sequence {
+            Some((sequence, installed_page_table)) => {
+                (Some(sequence), installed_page_table)
+            }
+            None => (None, Vec::new()),
+        };
+        Ok(ProductSession {
+            execution,
+            sequence,
+            installed_page_table,
+            prompt_tokens,
+            tokenization,
+            startup: self.model.startup(),
+        })
+    }
+
+    pub(crate) fn prepare_server_tokens(
+        &mut self,
+        tokens: Vec<u32>,
+        max_new_tokens: usize,
+        sampling: SamplingOptions,
+    ) -> Result<ServerSession> {
+        if tokens.is_empty() {
+            return Err(checkpoint::message("GPT-OSS server prompt is empty"));
+        }
+        let maximum = tokens
+            .len()
+            .checked_add(max_new_tokens)
+            .ok_or_else(|| checkpoint::message("GPT-OSS server token budget overflows usize"))?;
+        if maximum > self.model.config().context_limit() {
+            return Err(checkpoint::message("GPT-OSS server request exceeds context"));
+        }
+        let sequence = SequenceId::new(self.next_sequence);
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| checkpoint::message("GPT-OSS sequence ID space is exhausted"))?;
+        self.pages
+            .reserve_tokens(sequence, maximum)
+            .map_err(boxed)?;
+        Ok(ServerSession {
+            sequence,
+            prompt: tokens,
+            prompt_cursor: 0,
+            generated: Vec::with_capacity(max_new_tokens),
+            max_new_tokens,
+            sampling,
+            stopped: false,
+            released: false,
+        })
+    }
+
+    pub(crate) fn prefill_batch(
+        &mut self,
+        sessions: &mut [&mut ServerSession],
+        chunk_tokens: &[usize],
+        batch_capacity: usize,
+        query_capacity: usize,
+    ) -> Result<Vec<Option<RawToken>>> {
+        if sessions.len() != chunk_tokens.len() || sessions.len() > batch_capacity {
+            return Err(checkpoint::message("prefill batch row count is inconsistent"));
+        }
+        let table_width = self.model.batch_page_table_width(
+            graph::Phase::Prefill,
+            batch_capacity,
+            query_capacity,
+        )?;
+        let mut checkpoints = Vec::with_capacity(sessions.len());
+        for (session, chunk) in sessions.iter_mut().zip(chunk_tokens) {
+            if session.released
+                || session.prefill_complete()
+                || *chunk == 0
+                || *chunk > query_capacity
+                || *chunk > session.prompt_remaining()
+            {
+                return Err(checkpoint::message("invalid prefill batch transition"));
+            }
+            checkpoints.push(self.pages.checkpoint(session.sequence).map_err(boxed)?);
+            if let Err(error) = self
+                .pages
+                .append_tentative(session.sequence, *chunk)
+                .map_err(boxed)
+            {
+                for checkpoint in checkpoints {
+                    self.pages.rollback(checkpoint).map_err(boxed)?;
+                }
+                return Err(error);
             }
         }
-        let startup = self.model.startup();
+        let execution = (|| {
+            let rows = sessions
+                .iter()
+                .map(|session| Some(session.sequence))
+                .chain(std::iter::repeat(None))
+                .take(batch_capacity)
+                .collect::<Vec<_>>();
+            let metadata = self
+                .pages
+                .compact_metadata(&rows, table_width)
+                .map_err(boxed)?;
+            let mut input = padded_batch_inputs(batch_capacity, query_capacity, metadata.block_tables);
+            input.sequence_lengths = metadata.sequence_lengths;
+            input.active_rows = metadata.active_rows;
+            for (row, (session, chunk)) in sessions.iter().zip(chunk_tokens).enumerate() {
+                let start = session.prompt_cursor;
+                let end = start + *chunk;
+                for (destination, token) in input.tokens
+                    [row * query_capacity..row * query_capacity + *chunk]
+                    .iter_mut()
+                    .zip(&session.prompt[start..end])
+                {
+                    *destination = i32::try_from(*token)
+                        .map_err(|_| checkpoint::message("prompt token exceeds I32"))?;
+                }
+                input.positions[row] = i32::try_from(start)
+                    .map_err(|_| checkpoint::message("prefill position exceeds I32"))?;
+                input.query_lengths[row] = i32::try_from(*chunk)
+                    .map_err(|_| checkpoint::message("prefill chunk exceeds I32"))?;
+                input.last_indices[row] = input.query_lengths[row] - 1;
+                input.sample_rows[row] = end == session.prompt.len();
+                install_sampling_row(&mut input, row, session)?;
+            }
+            self.model.execute_batch(
+                graph::Phase::Prefill,
+                batch_capacity,
+                query_capacity,
+                input,
+            )
+        })();
+        let outputs = match execution {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                for checkpoint in checkpoints {
+                    self.pages.rollback(checkpoint).map_err(boxed)?;
+                }
+                return Err(error);
+            }
+        };
+        let mut raw = Vec::with_capacity(sessions.len());
+        for (row, (session, chunk)) in sessions.iter_mut().zip(chunk_tokens).enumerate() {
+            self.pages
+                .commit(session.sequence, *chunk)
+                .map_err(boxed)?;
+            session.prompt_cursor += *chunk;
+            session.sampling.seed.copy_from_slice(
+                &outputs.sampling_states[row * 2..row * 2 + 2],
+            );
+            if session.prefill_complete() {
+                let token = u32::try_from(outputs.tokens[row]).map_err(|_| {
+                    checkpoint::message("active prefill sampling returned the padding sentinel")
+                })?;
+                session.generated.push(token);
+                let is_stop = protocol::is_stop_token(token);
+                session.stopped = is_stop;
+                raw.push(Some(RawToken { token, is_stop }));
+            } else {
+                if outputs.tokens[row] != -1 {
+                    return Err(checkpoint::message(
+                        "partial prefill row unexpectedly sampled a token",
+                    ));
+                }
+                raw.push(None);
+            }
+        }
+        Ok(raw)
+    }
+
+    pub(crate) fn decode_batch(
+        &mut self,
+        sessions: &mut [&mut ServerSession],
+        batch_capacity: usize,
+    ) -> Result<Vec<RawToken>> {
+        if sessions.is_empty() || sessions.len() > batch_capacity {
+            return Err(checkpoint::message("decode batch row count is inconsistent"));
+        }
+        let query_capacity = 1;
+        let table_width = self.model.batch_page_table_width(
+            graph::Phase::Decode,
+            batch_capacity,
+            query_capacity,
+        )?;
+        let mut checkpoints = Vec::with_capacity(sessions.len());
+        for session in sessions.iter_mut() {
+            if session.released || !session.prefill_complete() || session.is_complete() {
+                return Err(checkpoint::message("invalid decode batch transition"));
+            }
+            checkpoints.push(self.pages.checkpoint(session.sequence).map_err(boxed)?);
+            if let Err(error) = self
+                .pages
+                .append_tentative(session.sequence, 1)
+                .map_err(boxed)
+            {
+                for checkpoint in checkpoints {
+                    self.pages.rollback(checkpoint).map_err(boxed)?;
+                }
+                return Err(error);
+            }
+        }
+        let execution = (|| {
+            let rows = sessions
+                .iter()
+                .map(|session| Some(session.sequence))
+                .chain(std::iter::repeat(None))
+                .take(batch_capacity)
+                .collect::<Vec<_>>();
+            let metadata = self
+                .pages
+                .compact_metadata(&rows, table_width)
+                .map_err(boxed)?;
+            let mut input = padded_batch_inputs(batch_capacity, query_capacity, metadata.block_tables);
+            input.sequence_lengths = metadata.sequence_lengths;
+            input.active_rows = metadata.active_rows;
+            input.sample_rows[..sessions.len()].fill(true);
+            for (row, session) in sessions.iter().enumerate() {
+                let token = *session
+                    .generated
+                    .last()
+                    .ok_or_else(|| checkpoint::message("decode row has no visible input token"))?;
+                input.tokens[row] = i32::try_from(token)
+                    .map_err(|_| checkpoint::message("decode token exceeds I32"))?;
+                let position = session
+                    .prompt
+                    .len()
+                    .checked_add(session.generated.len() - 1)
+                    .ok_or_else(|| checkpoint::message("decode position overflows usize"))?;
+                input.positions[row] = i32::try_from(position)
+                    .map_err(|_| checkpoint::message("decode position exceeds I32"))?;
+                input.query_lengths[row] = 1;
+                input.last_indices[row] = 0;
+                install_sampling_row(&mut input, row, session)?;
+            }
+            self.model.execute_batch(
+                graph::Phase::Decode,
+                batch_capacity,
+                query_capacity,
+                input,
+            )
+        })();
+        let outputs = match execution {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                for checkpoint in checkpoints {
+                    self.pages.rollback(checkpoint).map_err(boxed)?;
+                }
+                return Err(error);
+            }
+        };
+        let advanced_positions = outputs
+            .positions
+            .as_ref()
+            .ok_or_else(|| checkpoint::message("decode batch omitted positions"))?;
+        let mut raw = Vec::with_capacity(sessions.len());
+        for (row, session) in sessions.iter_mut().enumerate() {
+            if advanced_positions[row]
+                != i32::try_from(session.prompt.len() + session.generated.len())
+                    .map_err(|_| checkpoint::message("advanced position exceeds I32"))?
+            {
+                return Err(checkpoint::message("decode position result is inconsistent"));
+            }
+            self.pages.commit(session.sequence, 1).map_err(boxed)?;
+            session.sampling.seed.copy_from_slice(
+                &outputs.sampling_states[row * 2..row * 2 + 2],
+            );
+            let token = u32::try_from(outputs.tokens[row]).map_err(|_| {
+                checkpoint::message("active decode sampling returned the padding sentinel")
+            })?;
+            session.generated.push(token);
+            let is_stop = protocol::is_stop_token(token);
+            session.stopped = is_stop;
+            raw.push(RawToken { token, is_stop });
+        }
+        Ok(raw)
+    }
+
+    pub(crate) fn release_server_session(&mut self, session: &mut ServerSession) -> Result<bool> {
+        if session.released {
+            return Ok(false);
+        }
+        session.released = true;
+        self.pages.release_sequence(session.sequence).map_err(boxed)
+    }
+
+    pub(crate) fn prefill_step(
+        &mut self,
+        session: &mut ProductSession,
+    ) -> Result<Option<RawToken>> {
+        let result = self.model.prefill_step(&mut session.execution);
+        match result {
+            Ok(raw) => {
+                if let Some(sequence) = session.sequence {
+                    if let Err(error) = self
+                        .pages
+                        .commit(sequence, session.prompt_tokens)
+                        .map_err(boxed)
+                    {
+                        self.cancel(session)?;
+                        return Err(error);
+                    }
+                }
+                Ok(raw)
+            }
+            Err(error) => {
+                self.cancel(session)?;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn decode_step(
+        &mut self,
+        session: &mut ProductSession,
+    ) -> Result<Option<RawToken>> {
+        let Some(sequence) = session.sequence else {
+            return Err(checkpoint::message(
+                "completed GPT-OSS session has no decode cache reservation",
+            ));
+        };
+        let result = (|| {
+            let lookahead = session.execution.decode_cache_lookahead_tokens()?;
+            let (committed, tentative) =
+                self.pages.sequence_lengths(sequence).map_err(boxed)?;
+            let required = committed
+                .checked_add(lookahead)
+                .ok_or_else(|| checkpoint::message("GPT-OSS cache lookahead overflows usize"))?;
+            if tentative < required {
+                self.pages
+                    .append_tentative(sequence, required - tentative)
+                    .map_err(boxed)?;
+            }
+            self.install_page_table(
+                sequence,
+                &mut session.execution,
+                &mut session.installed_page_table,
+            )?;
+            let raw = self.model.decode_step(&mut session.execution)?;
+            self.pages.commit(sequence, 1).map_err(boxed)?;
+            Ok::<_, BoxError>(raw)
+        })();
+        match result {
+            Ok(raw) => Ok(raw),
+            Err(error) => {
+                self.cancel(session)?;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn finalize(&mut self, session: ProductSession) -> Result<ProductReport> {
+        let sequence = session.sequence;
+        let report = session.into_report();
+        if let Some(sequence) = sequence {
+            self.pages.release_sequence(sequence).map_err(boxed)?;
+        }
+        report
+    }
+
+    pub(crate) fn cancel(&mut self, session: &mut ProductSession) -> Result<()> {
+        if let Some(sequence) = session.sequence.take() {
+            self.pages.release_sequence(sequence).map_err(boxed)?;
+        }
+        Ok(())
+    }
+
+    fn install_page_table(
+        &mut self,
+        sequence: SequenceId,
+        execution: &mut RequestExecution,
+        installed: &mut Vec<i32>,
+    ) -> Result<()> {
+        let metadata = self
+            .pages
+            .compact_metadata(&[Some(sequence)], execution.page_table_width())
+            .map_err(boxed)?;
+        if *installed == metadata.block_tables {
+            return Ok(());
+        }
+        self.model
+            .install_page_table(execution, &metadata.block_tables)?;
+        *installed = metadata.block_tables;
+        Ok(())
+    }
+}
+
+fn padded_batch_inputs(
+    batch: usize,
+    query: usize,
+    page_tables: Vec<i32>,
+) -> BatchInputs {
+    BatchInputs {
+        tokens: vec![0; batch * query],
+        positions: vec![0; batch],
+        sequence_lengths: vec![0; batch],
+        query_lengths: vec![0; batch],
+        active_rows: vec![false; batch],
+        sample_rows: vec![false; batch],
+        page_tables,
+        last_indices: vec![0; batch],
+        sampling_states: vec![0; batch * 2],
+        top_k: vec![1; batch],
+        temperature: vec![1.0; batch],
+        top_p: vec![1.0; batch],
+        min_p: vec![0.0; batch],
+    }
+}
+
+fn install_sampling_row(
+    input: &mut BatchInputs,
+    row: usize,
+    session: &ServerSession,
+) -> Result<()> {
+    input.sampling_states[row * 2..row * 2 + 2].copy_from_slice(&session.sampling.seed);
+    input.top_k[row] = i32::try_from(session.sampling.top_k)
+        .map_err(|_| checkpoint::message("sampling top-k exceeds I32"))?;
+    input.temperature[row] = session.sampling.temperature;
+    input.top_p[row] = session.sampling.top_p;
+    input.min_p[row] = session.sampling.min_p;
+    Ok(())
+}
+
+fn emit_raw_token(
+    parser: &mut protocol::HarmonyParser,
+    raw: RawToken,
+    emit: &mut impl FnMut(protocol::Event) -> Result<()>,
+) -> Result<()> {
+    if raw.is_stop != protocol::is_stop_token(raw.token) {
+        return Err(checkpoint::message(
+            "GPT-OSS raw token stop classification is inconsistent",
+        ));
+    }
+    for event in parser.process(raw.token).map_err(boxed)? {
+        emit(event)?;
+    }
+    Ok(())
+}
+
+/// Parser-independent engine-facing session. It emits raw model tokens only;
+/// Harmony parsing is owned by the blocking adapter or an async response task.
+pub(crate) struct ProductSession {
+    execution: RequestExecution,
+    sequence: Option<SequenceId>,
+    installed_page_table: Vec<i32>,
+    prompt_tokens: usize,
+    tokenization: Duration,
+    startup: StartupMetrics,
+}
+
+impl ProductSession {
+    pub(crate) fn is_complete(&self) -> bool {
+        self.execution.is_complete()
+    }
+
+    pub(crate) fn stopped(&self) -> bool {
+        self.execution.stopped()
+    }
+
+    fn into_report(self) -> Result<ProductReport> {
+        let run = self.execution.finalize()?;
+        let startup = self.startup;
         Ok(ProductReport {
-            prompt_tokens,
+            prompt_tokens: self.prompt_tokens,
             generated_tokens: run.generated_tokens,
             cache_capacity: run.cache_capacity,
             physical_parameter_components: startup.physical_parameter_components,
@@ -164,7 +838,8 @@ impl<'platform> Generator<'platform> {
             parameter_peak_staging_bytes: startup.parameter_peak_staging_bytes,
             cache_storage_bytes: run.cache_storage_bytes,
             cache_metadata_bytes: run.cache_metadata_bytes,
-            timings: timings(request.tokenization, startup, run.metrics),
+            cache_metadata_upload_bytes: run.cache_metadata_upload_bytes,
+            timings: timings(self.tokenization, startup, run.metrics),
         })
     }
 }
@@ -177,6 +852,7 @@ fn timings(tokenization: Duration, startup: StartupMetrics, run: RunMetrics) -> 
         decode_compilation: startup.decode_compilation,
         parameter_upload: startup.parameter_upload,
         cache_allocation: run.cache_allocation,
+        cache_metadata_upload: run.cache_metadata_upload,
         prompt_upload: run.prompt_upload,
         prefill_execution: run.prefill_execution,
         prefill_download: run.prefill_download,

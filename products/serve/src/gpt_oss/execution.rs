@@ -18,6 +18,14 @@ use std::time::{Duration, Instant};
 
 const MIN_PREFILL_BUCKET: usize = 16;
 
+#[derive(Clone, Debug)]
+pub(super) struct ServingCompileConfig {
+    pub(super) batch_buckets: Vec<usize>,
+    pub(super) prefill_query_buckets: Vec<usize>,
+    pub(super) logical_cache_capacity: usize,
+    pub(super) tensor_parallel: usize,
+}
+
 pub(super) struct PreparedRequest {
     pub(super) tokens: Vec<u32>,
     pub(super) max_new_tokens: usize,
@@ -84,7 +92,11 @@ struct ExecutionProfile {
 }
 
 impl ExecutionProfile {
-    fn new(profile: CompilationProfile, context_limit: usize) -> Result<Self> {
+    fn new(
+        profile: CompilationProfile,
+        context_limit: usize,
+        physical_pages: usize,
+    ) -> Result<Self> {
         if profile.max_prompt_tokens == 0 || profile.max_sequence_tokens == 0 {
             return Err(message(
                 "GPT-OSS compilation profile capacities must be nonzero",
@@ -120,8 +132,8 @@ impl ExecutionProfile {
             ));
         }
         Ok(Self {
-            prefill: ShapeFamily::prefill(prefill_capacity, cache_capacity)?,
-            decode: ShapeFamily::decode(cache_capacity)?,
+            prefill: ShapeFamily::prefill(prefill_capacity, cache_capacity, physical_pages)?,
+            decode: ShapeFamily::decode(cache_capacity, physical_pages)?,
         })
     }
 
@@ -142,11 +154,14 @@ pub(super) struct StartupMetrics {
     pub(super) parameter_resident_bytes: usize,
     pub(super) parameter_prepared_bytes: usize,
     pub(super) parameter_peak_staging_bytes: usize,
+    pub(super) compiled_families: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct RunMetrics {
     pub(super) cache_allocation: Duration,
+    pub(super) cache_metadata_upload: Duration,
+    pub(super) cache_metadata_upload_bytes: usize,
     pub(super) prompt_upload: Duration,
     pub(super) prefill_execution: Duration,
     pub(super) prefill_download: Duration,
@@ -164,8 +179,30 @@ pub(super) struct RunReport {
     pub(super) cache_capacity: usize,
     pub(super) cache_storage_bytes: usize,
     pub(super) cache_metadata_bytes: usize,
-    pub(super) stopped: bool,
+    pub(super) cache_metadata_upload_bytes: usize,
     pub(super) metrics: RunMetrics,
+}
+
+pub(super) struct BatchInputs {
+    pub(super) tokens: Vec<i32>,
+    pub(super) positions: Vec<i32>,
+    pub(super) sequence_lengths: Vec<i32>,
+    pub(super) query_lengths: Vec<i32>,
+    pub(super) active_rows: Vec<bool>,
+    pub(super) sample_rows: Vec<bool>,
+    pub(super) page_tables: Vec<i32>,
+    pub(super) last_indices: Vec<i32>,
+    pub(super) sampling_states: Vec<u64>,
+    pub(super) top_k: Vec<i32>,
+    pub(super) temperature: Vec<f32>,
+    pub(super) top_p: Vec<f32>,
+    pub(super) min_p: Vec<f32>,
+}
+
+pub(super) struct BatchOutputs {
+    pub(super) tokens: Vec<i32>,
+    pub(super) sampling_states: Vec<u64>,
+    pub(super) positions: Option<Vec<i32>>,
 }
 
 /// Artifact-backed model description. Declaring this state opens checkpoint
@@ -196,8 +233,17 @@ impl ModelDefinition {
         self,
         platform: &'platform Platform,
         profiles: &[CompilationProfile],
+        physical_pages: usize,
+        serving: Option<&ServingCompileConfig>,
     ) -> Result<CompiledDefinition<'platform>> {
-        let plan = ExecutionPlan::compile(platform, &self.checkpoint, &self.config, profiles)?;
+        let plan = ExecutionPlan::compile(
+            platform,
+            &self.checkpoint,
+            &self.config,
+            profiles,
+            physical_pages,
+            serving,
+        )?;
         Ok(CompiledDefinition {
             definition: self,
             plan,
@@ -239,13 +285,44 @@ impl<'platform> CompiledDefinition<'platform> {
             plan.decode_compilation,
             parameter_upload,
             accounting,
+            plan.families.len(),
         );
+        let bound_families = plan
+            .families
+            .iter()
+            .map(|(shape, family)| {
+                BoundComponentFamily::bind(family, &checkpoint, &parameters, &config)
+                    .map(|bound| (*shape, bound))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let allocation_started = Instant::now();
+        let family = plan
+            .families
+            .keys()
+            .next()
+            .copied()
+            .ok_or_else(|| message("GPT-OSS execution plan has no cache family"))?;
+        let cache_tensor_shape = cache_shape(&config, family)?;
+        let caches = (0..config.layers())
+            .map(|_| LayerCache::allocate(plan.platform, cache_tensor_shape, &plan.placement))
+            .collect::<Result<Vec<_>>>()?;
+        let cache_allocation = allocation_started.elapsed();
+        let cache_storage_bytes = cache_tensor_shape
+            .byte_count()
+            .map_err(boxed)?
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_mul(caches.len()))
+            .ok_or_else(|| message("GPT-OSS cache storage accounting overflows usize"))?;
         Ok(ResidentModel {
             config,
             checkpoint,
             parameters,
             plan,
             startup,
+            bound_families,
+            caches,
+            cache_allocation,
+            cache_storage_bytes,
         })
     }
 }
@@ -267,12 +344,47 @@ impl<'platform> ExecutionPlan<'platform> {
         checkpoint: &Checkpoint,
         config: &Config,
         requested_profiles: &[CompilationProfile],
+        physical_pages: usize,
+        serving: Option<&ServingCompileConfig>,
     ) -> Result<Self> {
-        let profiles = normalize_profiles(requested_profiles, config.context_limit())?;
-        let families = profiles
+        let profiles = normalize_profiles(
+            requested_profiles,
+            config.context_limit(),
+            physical_pages,
+        )?;
+        let mut families = profiles
             .iter()
             .flat_map(|profile| [profile.prefill, profile.decode])
             .collect::<BTreeSet<_>>();
+        if let Some(serving) = serving {
+            let cache_capacity = serving
+                .logical_cache_capacity
+                .div_ceil(CACHE_PAGE_SIZE)
+                .checked_mul(CACHE_PAGE_SIZE)
+                .ok_or_else(|| message("serving cache capacity overflows usize"))?;
+            if cache_capacity > config.context_limit() {
+                return Err(message(
+                    "normalized serving cache capacity exceeds the model context limit",
+                ));
+            }
+            for batch in &serving.batch_buckets {
+                families.insert(ShapeFamily::serving_decode(
+                    *batch,
+                    cache_capacity,
+                    physical_pages,
+                    serving.tensor_parallel,
+                )?);
+                for query in &serving.prefill_query_buckets {
+                    families.insert(ShapeFamily::serving_prefill(
+                        *batch,
+                        *query,
+                        cache_capacity,
+                        physical_pages,
+                        serving.tensor_parallel,
+                    )?);
+                }
+            }
+        }
         let placement = Sharding::single();
         let mut compiled = BTreeMap::new();
         let mut prefill_compilation = Duration::ZERO;
@@ -305,6 +417,7 @@ impl<'platform> ExecutionPlan<'platform> {
 fn normalize_profiles(
     requested: &[CompilationProfile],
     context_limit: usize,
+    physical_pages: usize,
 ) -> Result<BTreeSet<ExecutionProfile>> {
     if requested.is_empty() {
         return Err(message("GPT-OSS requires at least one compilation profile"));
@@ -312,7 +425,7 @@ fn normalize_profiles(
     requested
         .iter()
         .copied()
-        .map(|profile| ExecutionProfile::new(profile, context_limit))
+        .map(|profile| ExecutionProfile::new(profile, context_limit, physical_pages))
         .collect()
 }
 
@@ -336,6 +449,10 @@ pub(super) struct ResidentModel<'platform> {
     parameters: LoadedCheckpoint,
     plan: ExecutionPlan<'platform>,
     startup: StartupMetrics,
+    bound_families: BTreeMap<ShapeFamily, BoundComponentFamily>,
+    caches: Vec<LayerCache>,
+    cache_allocation: Duration,
+    cache_storage_bytes: usize,
 }
 
 impl ResidentModel<'_> {
@@ -347,24 +464,250 @@ impl ResidentModel<'_> {
         self.startup
     }
 
-    pub(super) fn generate(
+    pub(super) fn prefill_step(
+        &mut self,
+        execution: &mut RequestExecution,
+    ) -> Result<Option<RawToken>> {
+        execution.prefill_step(&mut self.caches)
+    }
+
+    pub(super) fn decode_step(
+        &mut self,
+        execution: &mut RequestExecution,
+    ) -> Result<Option<RawToken>> {
+        execution.decode_step(&mut self.caches)
+    }
+
+    pub(super) fn execute_batch(
+        &mut self,
+        phase: Phase,
+        batch_capacity: usize,
+        query_capacity: usize,
+        input: BatchInputs,
+    ) -> Result<BatchOutputs> {
+        let family = self.batch_family(phase, batch_capacity, query_capacity)?;
+        validate_batch_inputs(family, &input)?;
+        let platform = self.plan.platform;
+        let placement = &self.plan.placement;
+        let batch = usize_i64(family.batch())?;
+        let query = usize_i64(family.sequence())?;
+        let table_width = usize_i64(family.page_count())?;
+        let token_shape = match phase {
+            Phase::Prefill => Shape::new(nml::DataType::I32, &[batch, query]).map_err(boxed)?,
+            Phase::Decode => Shape::new(nml::DataType::I32, &[batch]).map_err(boxed)?,
+        };
+        let vector_i32 = Shape::new(nml::DataType::I32, &[batch]).map_err(boxed)?;
+        let vector_bool = Shape::new(nml::DataType::Bool, &[batch]).map_err(boxed)?;
+        let tokens = upload_i32(platform, token_shape, &input.tokens, placement)?;
+        let positions = upload_i32(platform, vector_i32, &input.positions, placement)?;
+        let sequence_lengths = if phase == Phase::Prefill {
+            Some(upload_i32(
+                platform,
+                vector_i32,
+                &input.sequence_lengths,
+                placement,
+            )?)
+        } else {
+            None
+        };
+        let query_lengths =
+            upload_i32(platform, vector_i32, &input.query_lengths, placement)?;
+        let active_rows = upload_bool(platform, vector_bool, &input.active_rows, placement)?;
+        let sample_rows = upload_bool(platform, vector_bool, &input.sample_rows, placement)?;
+        let page_tables = upload_i32(
+            platform,
+            Shape::new(nml::DataType::I32, &[batch, table_width]).map_err(boxed)?,
+            &input.page_tables,
+            placement,
+        )?;
+        let last_indices = upload_i32(
+            platform,
+            Shape::new(nml::DataType::I32, &[batch, 1]).map_err(boxed)?,
+            &input.last_indices,
+            placement,
+        )?;
+        let sampling_states = upload_u64(
+            platform,
+            Shape::new(nml::DataType::U64, &[batch, 2]).map_err(boxed)?,
+            &input.sampling_states,
+            placement,
+        )?;
+        let top_k = upload_i32(platform, vector_i32, &input.top_k, placement)?;
+        let temperature = upload_f32_vector(platform, &input.temperature, placement)?;
+        let top_p = upload_f32_vector(platform, &input.top_p, placement)?;
+        let min_p = upload_f32_vector(platform, &input.min_p, placement)?;
+
+        let bound = self
+            .bound_families
+            .get_mut(&family)
+            .expect("selected bound family exists");
+        bound.embedding.set("tokens", tokens).map_err(boxed)?;
+        let mut hidden = one(bound.embedding.enqueue().map_err(boxed)?)?;
+        match &mut bound.layers {
+            BoundLayerExecutables::Prefill { layers, kinds } => {
+                for ((arguments, kind), cache) in
+                    layers.iter_mut().zip(kinds.iter()).zip(&mut self.caches)
+                {
+                    let (next, _) = execute_layer(
+                        arguments,
+                        hidden,
+                        positions.clone(),
+                        sequence_lengths.clone(),
+                        query_lengths.clone(),
+                        active_rows.clone(),
+                        page_tables.clone(),
+                        cache,
+                    )?;
+                    hidden = next;
+                    let _ = kind;
+                }
+            }
+            BoundLayerExecutables::Decode { pairs } => {
+                for (arguments, caches) in
+                    pairs.iter_mut().zip(self.caches.chunks_exact_mut(2))
+                {
+                    let (next, _) = execute_layer_pair(
+                        arguments,
+                        hidden,
+                        positions.clone(),
+                        query_lengths.clone(),
+                        active_rows.clone(),
+                        page_tables.clone(),
+                        caches,
+                    )?;
+                    hidden = next;
+                }
+            }
+        }
+        bound.head.set("hidden", hidden).map_err(boxed)?;
+        bound
+            .head
+            .set("last_index", last_indices)
+            .map_err(boxed)?;
+        bound
+            .head
+            .set("sampling_state", sampling_states)
+            .map_err(boxed)?;
+        bound.head.set("top_k", top_k).map_err(boxed)?;
+        bound
+            .head
+            .set("temperature", temperature)
+            .map_err(boxed)?;
+        bound.head.set("top_p", top_p).map_err(boxed)?;
+        bound.head.set("min_p", min_p).map_err(boxed)?;
+        bound
+            .head
+            .set("active_rows", sample_rows)
+            .map_err(boxed)?;
+        if phase == Phase::Decode {
+            bound.head.set("position", positions).map_err(boxed)?;
+        }
+        let mut results = bound
+            .head
+            .enqueue()
+            .map_err(boxed)?
+            .into_buffers()
+            .into_iter();
+        let tokens = results
+            .next()
+            .ok_or_else(|| message("batched head omitted tokens"))?;
+        let states = results
+            .next()
+            .ok_or_else(|| message("batched head omitted sampling states"))?;
+        let positions = if phase == Phase::Decode {
+            Some(
+                results
+                    .next()
+                    .ok_or_else(|| message("batched decode head omitted positions"))?,
+            )
+        } else {
+            None
+        };
+        if results.next().is_some() {
+            return Err(message("batched head returned extra buffers"));
+        }
+        Ok(BatchOutputs {
+            tokens: download_i32(&tokens)?,
+            sampling_states: download_u64(&states)?,
+            positions: positions.as_ref().map(download_i32).transpose()?,
+        })
+    }
+
+    pub(super) fn batch_page_table_width(
         &self,
-        request: &PreparedRequest,
-        mut emit: impl FnMut(u32, bool) -> Result<()>,
-    ) -> Result<RunReport> {
-        let profile = self.plan.select(request)?;
+        phase: Phase,
+        batch_capacity: usize,
+        query_capacity: usize,
+    ) -> Result<usize> {
+        Ok(self
+            .batch_family(phase, batch_capacity, query_capacity)?
+            .page_count())
+    }
+
+    fn batch_family(
+        &self,
+        phase: Phase,
+        batch_capacity: usize,
+        query_capacity: usize,
+    ) -> Result<ShapeFamily> {
+        self.bound_families
+            .keys()
+            .copied()
+            .filter(|family| {
+                family.phase() == phase
+                    && family.batch() == batch_capacity
+                    && family.sequence() == query_capacity
+            })
+            .min_by_key(|family| family.cache_capacity())
+            .ok_or_else(|| message("requested batch is not covered by a compiled serving family"))
+    }
+
+    pub(super) fn install_page_table(
+        &self,
+        execution: &mut RequestExecution,
+        pages: &[i32],
+    ) -> Result<()> {
+        if pages.len() != execution.page_table_width() {
+            return Err(message(
+                "GPT-OSS page table does not match the selected execution family",
+            ));
+        }
+        let started = Instant::now();
+        execution.page_table = Some(upload_i32(
+            self.plan.platform,
+            page_table_shape(execution.profile.prefill)?,
+            pages,
+            &self.plan.placement,
+        )?);
+        execution.metrics.cache_metadata_upload += started.elapsed();
+        execution.metrics.cache_metadata_upload_bytes = execution
+            .metrics
+            .cache_metadata_upload_bytes
+            .checked_add(
+                pages
+                    .len()
+                    .checked_mul(std::mem::size_of::<i32>())
+                    .ok_or_else(|| message("GPT-OSS metadata byte count overflows usize"))?,
+            )
+            .ok_or_else(|| message("GPT-OSS metadata byte count overflows usize"))?;
+        Ok(())
+    }
+
+    /// Selects one already-compiled family and creates all request-local
+    /// execution state without enqueueing a model graph. The returned request
+    /// owns its prompt, sampling, K/V, and executable argument state.
+    pub(super) fn prepare(&self, request: PreparedRequest) -> Result<RequestExecution> {
+        let profile = self.plan.select(&request)?;
         let prefill = profile.prefill;
         let decode = profile.decode;
         let cache_capacity = decode.cache_capacity();
         if request.max_new_tokens == 0 {
-            return Ok(RunReport {
-                generated_tokens: Vec::new(),
-                cache_capacity,
-                cache_storage_bytes: 0,
-                cache_metadata_bytes: 0,
-                stopped: false,
-                metrics: RunMetrics::default(),
-            });
+            return Ok(RequestExecution::completed(
+                profile,
+                request.tokens.len(),
+                self.cache_allocation,
+                self.cache_storage_bytes,
+            ));
         }
         let platform = self.plan.platform;
         let placement = &self.plan.placement;
@@ -384,31 +727,18 @@ impl ResidentModel<'_> {
 
         let mut prefill_embedding = prefill_executables.embedding.args();
         bind_embedding(&mut prefill_embedding, checkpoint, parameters)?;
-        let mut prefill_layers = bind_layers(prefill_executables, checkpoint, parameters, config)?;
+        let prefill_layers = bind_layers(prefill_executables, checkpoint, parameters, config)?;
         let mut prefill_head = prefill_executables.head.args();
         bind_head(&mut prefill_head, parameters)?;
 
         let mut decode_embedding = decode_executables.embedding.args();
         bind_embedding(&mut decode_embedding, checkpoint, parameters)?;
-        let mut decode_pairs =
+        let decode_pairs =
             bind_decode_pairs(decode_executables, checkpoint, parameters, config)?;
         let mut decode_head = decode_executables.head.args();
         bind_head(&mut decode_head, parameters)?;
 
-        let allocation_started = Instant::now();
-        let cache_tensor_shape = cache_shape(config, prefill)?;
-        let mut caches = (0..config.layers())
-            .map(|_| LayerCache::allocate(platform, cache_tensor_shape, placement))
-            .collect::<Result<Vec<_>>>()?;
-        let page_table = identity_page_table(platform, prefill, placement)?;
-        let cache_allocation = allocation_started.elapsed();
-        let cache_storage_bytes = cache_tensor_shape
-            .byte_count()
-            .map_err(boxed)?
-            .checked_mul(2)
-            .and_then(|bytes| bytes.checked_mul(caches.len()))
-            .ok_or_else(|| message("GPT-OSS cache storage accounting overflows usize"))?;
-        let cache_metadata_bytes = page_table
+        let cache_metadata_bytes = page_table_shape(prefill)?
             .byte_count()
             .map_err(boxed)?
             .checked_add(std::mem::size_of::<i32>())
@@ -426,7 +756,13 @@ impl ResidentModel<'_> {
             &padded,
             placement,
         )?;
-        let prefill_position = upload_scalar(platform, 0, placement)?;
+        let prefill_position = upload_i32(
+            platform,
+            Shape::new(nml::DataType::I32, &[1]).map_err(boxed)?,
+            &[0],
+            placement,
+        )?;
+        let metadata_started = Instant::now();
         let sequence_lengths = upload_i32(
             platform,
             Shape::new(nml::DataType::I32, &[1]).map_err(boxed)?,
@@ -434,250 +770,614 @@ impl ResidentModel<'_> {
                 .map_err(|_| message("GPT-OSS prompt length exceeds I32"))?],
             placement,
         )?;
-        let last_index = upload_scalar(
+        let sequence_metadata_upload = metadata_started.elapsed();
+        let query_lengths = sequence_lengths.clone();
+        let active_rows = upload_bool(
             platform,
-            i32::try_from(request.tokens.len() - 1)
-                .map_err(|_| message("GPT-OSS last prompt index exceeds I32"))?,
+            Shape::new(nml::DataType::Bool, &[1]).map_err(boxed)?,
+            &[true],
+            placement,
+        )?;
+        let last_index = upload_i32(
+            platform,
+            Shape::new(nml::DataType::I32, &[1, 1]).map_err(boxed)?,
+            &[i32::try_from(request.tokens.len() - 1)
+                .map_err(|_| message("GPT-OSS last prompt index exceeds I32"))?],
             placement,
         )?;
         let sampling_state = upload_u64(
             platform,
-            Shape::new(nml::DataType::U64, &[2]).map_err(boxed)?,
+            Shape::new(nml::DataType::U64, &[1, 2]).map_err(boxed)?,
             &request.sampling.seed,
             placement,
         )?;
-        let top_k = upload_scalar(
+        let top_k = upload_i32(
             platform,
-            i32::try_from(request.sampling.top_k)
-                .map_err(|_| message("GPT-OSS top-k exceeds I32"))?,
+            Shape::new(nml::DataType::I32, &[1]).map_err(boxed)?,
+            &[i32::try_from(request.sampling.top_k)
+                .map_err(|_| message("GPT-OSS top-k exceeds I32"))?],
             placement,
         )?;
-        let temperature = upload_f32_scalar(platform, request.sampling.temperature, placement)?;
-        let top_p = upload_f32_scalar(platform, request.sampling.top_p, placement)?;
-        let min_p = upload_f32_scalar(platform, request.sampling.min_p, placement)?;
+        let temperature = upload_f32_vector(platform, &[request.sampling.temperature], placement)?;
+        let top_p = upload_f32_vector(platform, &[request.sampling.top_p], placement)?;
+        let min_p = upload_f32_vector(platform, &[request.sampling.min_p], placement)?;
         for head in [&mut prefill_head, &mut decode_head] {
             head.set("top_k", top_k.clone()).map_err(boxed)?;
             head.set("temperature", temperature.clone())
                 .map_err(boxed)?;
             head.set("top_p", top_p.clone()).map_err(boxed)?;
             head.set("min_p", min_p.clone()).map_err(boxed)?;
+            head.set("active_rows", active_rows.clone()).map_err(boxed)?;
         }
         let prompt_upload = prompt_upload_started.elapsed();
 
-        let prefill_started = Instant::now();
-        let mut prefill_submission = SubmissionTimings::default();
-        let submission_started = Instant::now();
-        prefill_embedding.set("tokens", prompt).map_err(boxed)?;
-        let mut hidden = one(prefill_embedding.enqueue().map_err(boxed)?)?;
-        prefill_submission.embedding = submission_started.elapsed();
-        for ((arguments, cache), kind) in prefill_layers
-            .iter_mut()
-            .zip(&mut caches)
-            .zip(config.layer_types())
-        {
-            let (next_hidden, elapsed) = execute_layer(
-                arguments,
-                hidden,
-                prefill_position.clone(),
-                Some(sequence_lengths.clone()),
-                page_table.clone(),
-                cache,
-            )?;
-            hidden = next_hidden;
-            record_layer_submission(&mut prefill_submission, *kind, elapsed);
-        }
-        let submission_started = Instant::now();
-        prefill_head.set("hidden", hidden).map_err(boxed)?;
-        prefill_head.set("last_index", last_index).map_err(boxed)?;
-        prefill_head
-            .set("sampling_state", sampling_state)
-            .map_err(boxed)?;
-        let mut prefill_outputs = prefill_head
-            .enqueue()
-            .map_err(boxed)?
-            .into_buffers()
-            .into_iter();
-        let mut token_buffer = prefill_outputs
-            .next()
-            .ok_or_else(|| message("GPT-OSS prefill head omitted its token"))?;
-        let mut sampling_state = prefill_outputs
-            .next()
-            .ok_or_else(|| message("GPT-OSS prefill head omitted its sampling state"))?;
-        if prefill_outputs.next().is_some() {
-            return Err(message("GPT-OSS prefill head returned extra buffers"));
-        }
-        prefill_submission.head = submission_started.elapsed();
-        token_buffer.wait().map_err(boxed)?;
-        let prefill_execution = prefill_started.elapsed();
-        let download_started = Instant::now();
-        let mut next_token = download_token(&token_buffer)?;
-        let prefill_download = download_started.elapsed();
-
         let decode_state_started = Instant::now();
-        let mut position = upload_scalar(
+        let position = upload_i32(
             platform,
-            i32::try_from(request.tokens.len())
-                .map_err(|_| message("GPT-OSS decode position exceeds I32"))?,
+            Shape::new(nml::DataType::I32, &[1]).map_err(boxed)?,
+            &[i32::try_from(request.tokens.len())
+                .map_err(|_| message("GPT-OSS decode position exceeds I32"))?],
             placement,
         )?;
-        let decode_last_index = upload_scalar(platform, 0, placement)?;
+        let decode_last_index = upload_i32(
+            platform,
+            Shape::new(nml::DataType::I32, &[1, 1]).map_err(boxed)?,
+            &[0],
+            placement,
+        )?;
+        let decode_query_lengths = upload_i32(
+            platform,
+            Shape::new(nml::DataType::I32, &[1]).map_err(boxed)?,
+            &[1],
+            placement,
+        )?;
         let decode_state_initialization = decode_state_started.elapsed();
 
-        let mut generated_tokens = Vec::with_capacity(request.max_new_tokens);
-        let mut stopped = false;
-        let mut first_decode_execution = Duration::ZERO;
-        let mut steady_decode_execution = Duration::ZERO;
-        let mut decode_download = Duration::ZERO;
-        let mut first_decode_submission = SubmissionTimings::default();
-        let mut steady_decode_submission = SubmissionTimings::default();
-        let mut token_download = Slice::alloc(token_buffer.shape()).map_err(boxed)?;
         if decode_pairs.len() < DECODE_LOOKAHEAD_PAIRS {
             return Err(message(
                 "GPT-OSS decode schedule is shorter than the lookahead prefix",
             ));
         }
         let lookahead_cache_count = DECODE_LOOKAHEAD_PAIRS * 2;
-        if caches.len() < lookahead_cache_count {
+        if config.layers() < lookahead_cache_count {
             return Err(message(
                 "GPT-OSS decode cache schedule is shorter than the lookahead prefix",
             ));
         }
-        let (lookahead_decode_pairs, remaining_decode_pairs) =
-            decode_pairs.split_at_mut(DECODE_LOOKAHEAD_PAIRS);
-        let (lookahead_decode_caches, remaining_decode_caches) =
-            caches.split_at_mut(lookahead_cache_count);
-        let mut lookahead = None;
-        for generated_index in 0..request.max_new_tokens {
-            let is_stop = super::protocol::is_stop_token(next_token);
-            emit(next_token, is_stop)?;
-            generated_tokens.push(next_token);
-            if is_stop {
-                stopped = true;
-                break;
-            }
-            if generated_index + 1 == request.max_new_tokens {
-                break;
-            }
-
-            let decode_started = Instant::now();
-            let prefix = match lookahead.take() {
-                Some(prefix) => prefix,
-                None => enqueue_decode_prefix(
-                    &mut decode_embedding,
-                    lookahead_decode_pairs,
-                    token_buffer.clone(),
-                    position.clone(),
-                    page_table.clone(),
-                    lookahead_decode_caches,
-                )?,
-            };
-            let mut hidden = prefix.hidden;
-            let mut decode_submission = prefix.submission;
-            for (arguments, caches) in remaining_decode_pairs
-                .iter_mut()
-                .zip(remaining_decode_caches.chunks_exact_mut(2))
-            {
-                let (next_hidden, elapsed) = execute_layer_pair(
-                    arguments,
-                    hidden,
-                    position.clone(),
-                    page_table.clone(),
-                    caches,
-                )?;
-                hidden = next_hidden;
-                decode_submission.layer_pairs += elapsed;
-            }
-            let submission_started = Instant::now();
-            decode_head.set("hidden", hidden).map_err(boxed)?;
-            decode_head
-                .set("last_index", decode_last_index.clone())
-                .map_err(boxed)?;
-            decode_head
-                .set("sampling_state", sampling_state)
-                .map_err(boxed)?;
-            decode_head.set("position", position).map_err(boxed)?;
-            let mut outputs = decode_head
-                .enqueue()
-                .map_err(boxed)?
-                .into_buffers()
-                .into_iter();
-            token_buffer = outputs
-                .next()
-                .ok_or_else(|| message("GPT-OSS decode head omitted its token"))?;
-            sampling_state = outputs
-                .next()
-                .ok_or_else(|| message("GPT-OSS decode head omitted its sampling state"))?;
-            position = outputs
-                .next()
-                .ok_or_else(|| message("GPT-OSS decode head omitted its position"))?;
-            if outputs.next().is_some() {
-                return Err(message("GPT-OSS decode head returned extra buffers"));
-            }
-            decode_submission.head = submission_started.elapsed();
-
-            // Start host observation before the device token gains another
-            // consumer. PJRT can now order the tiny D2H transfer directly
-            // after the head while embedding and the bounded layer-pair prefix
-            // execute from the same dependency-carrying token buffer. Starting
-            // this transfer after those speculative consumers would serialize
-            // readback behind the prefix and starve the remaining layer pairs.
-            let pending_token = token_buffer
-                .download_to(&mut token_download)
-                .map_err(boxed)?;
-
-            // Keep one token of budget beyond the speculative input: otherwise
-            // the lookahead would compute a token the caller never requested.
-            if should_enqueue_lookahead(generated_index, request.max_new_tokens) {
-                lookahead = Some(enqueue_decode_prefix(
-                    &mut decode_embedding,
-                    lookahead_decode_pairs,
-                    token_buffer.clone(),
-                    position.clone(),
-                    page_table.clone(),
-                    lookahead_decode_caches,
-                )?);
-            }
-            // The five-pair prefix normally gives the head enough time to
-            // finish before host observation reaches this point. Preserve the
-            // device/download timing boundary, but avoid a second blocking
-            // await when the token is already ready; the pending download is
-            // the sole required synchronization for correctness.
-            if !token_buffer.is_ready().map_err(boxed)? {
-                token_buffer.wait().map_err(boxed)?;
-            }
-            let execution_elapsed = decode_started.elapsed();
-            if generated_index == 0 {
-                first_decode_execution = execution_elapsed;
-                first_decode_submission = decode_submission;
-            } else {
-                steady_decode_execution += execution_elapsed;
-                add_submission(&mut steady_decode_submission, decode_submission);
-            }
-            let download_started = Instant::now();
-            pending_token.wait().map_err(boxed)?;
-            next_token = token_from_slice(&token_download)?;
-            decode_download += download_started.elapsed();
-        }
-
-        Ok(RunReport {
-            generated_tokens,
+        Ok(RequestExecution {
+            lifecycle: RequestLifecycle::new(request.max_new_tokens),
+            profile,
+            prompt_token_count: request.tokens.len(),
             cache_capacity,
-            cache_storage_bytes,
+            cache_storage_bytes: self.cache_storage_bytes,
             cache_metadata_bytes,
-            stopped,
+            metrics: RunMetrics {
+                cache_allocation: self.cache_allocation,
+                cache_metadata_upload: sequence_metadata_upload,
+                cache_metadata_upload_bytes: std::mem::size_of::<i32>(),
+                prompt_upload,
+                prefill_execution: Duration::ZERO,
+                prefill_download: Duration::ZERO,
+                decode_state_initialization,
+                first_decode_execution: Duration::ZERO,
+                steady_decode_execution: Duration::ZERO,
+                decode_download: Duration::ZERO,
+                prefill_submission: SubmissionTimings::default(),
+                first_decode_submission: SubmissionTimings::default(),
+                steady_decode_submission: SubmissionTimings::default(),
+            },
+            page_table: None,
+            prefill: Some(PrefillState {
+                embedding: prefill_embedding,
+                layers: prefill_layers,
+                layer_types: config.layer_types().to_vec(),
+                head: prefill_head,
+                prompt,
+                position: prefill_position,
+                sequence_lengths,
+                query_lengths,
+                active_rows: active_rows.clone(),
+                last_index,
+                sampling_state,
+                decode: PreparedDecodeState {
+                    embedding: decode_embedding,
+                    pairs: decode_pairs,
+                    head: decode_head,
+                    position,
+                    query_lengths: decode_query_lengths,
+                    active_rows,
+                    last_index: decode_last_index,
+                },
+            }),
+            decode: None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestPhase {
+    PrefillPending,
+    DecodeReady,
+    Complete,
+    Failed,
+}
+
+/// Pure visible-token state. Keeping this separate from device buffers makes
+/// the prefill/decode/budget contract independently testable.
+#[derive(Debug)]
+struct RequestLifecycle {
+    phase: RequestPhase,
+    max_new_tokens: usize,
+    generated_tokens: Vec<u32>,
+    stopped: bool,
+}
+
+impl RequestLifecycle {
+    fn new(max_new_tokens: usize) -> Self {
+        Self {
+            phase: if max_new_tokens == 0 {
+                RequestPhase::Complete
+            } else {
+                RequestPhase::PrefillPending
+            },
+            max_new_tokens,
+            generated_tokens: Vec::with_capacity(max_new_tokens),
+            stopped: false,
+        }
+    }
+
+    fn record_prefill(&mut self, token: u32, is_stop: bool) -> Result<RawToken> {
+        if self.phase != RequestPhase::PrefillPending {
+            return Err(message("GPT-OSS prefill step is not pending"));
+        }
+        self.record(token, is_stop)
+    }
+
+    fn record_decode(&mut self, token: u32, is_stop: bool) -> Result<RawToken> {
+        if self.phase != RequestPhase::DecodeReady {
+            return Err(message("GPT-OSS decode step is not ready"));
+        }
+        self.record(token, is_stop)
+    }
+
+    fn record(&mut self, token: u32, is_stop: bool) -> Result<RawToken> {
+        if self.generated_tokens.len() >= self.max_new_tokens {
+            return Err(message("GPT-OSS visible token budget is exhausted"));
+        }
+        self.generated_tokens.push(token);
+        self.stopped = is_stop;
+        self.phase = if is_stop || self.generated_tokens.len() == self.max_new_tokens {
+            RequestPhase::Complete
+        } else {
+            RequestPhase::DecodeReady
+        };
+        Ok(RawToken { token, is_stop })
+    }
+
+    fn decode_generated_index(&self) -> Result<usize> {
+        if self.phase != RequestPhase::DecodeReady {
+            return Err(message("GPT-OSS decode step is not ready"));
+        }
+        self.generated_tokens
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| message("GPT-OSS decode has no visible input token"))
+    }
+
+    fn fail(&mut self) {
+        if self.phase != RequestPhase::Complete {
+            self.phase = RequestPhase::Failed;
+        }
+    }
+}
+
+/// One raw token sampled by the engine. Harmony translation belongs to the
+/// response/blocking adapter rather than this device execution object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RawToken {
+    pub(crate) token: u32,
+    pub(crate) is_stop: bool,
+}
+
+/// One prepared request. `prefill_step` is an explicit one-shot transition;
+/// every successful `decode_step` performs exactly one additional token step.
+pub(super) struct RequestExecution {
+    lifecycle: RequestLifecycle,
+    profile: ExecutionProfile,
+    prompt_token_count: usize,
+    cache_capacity: usize,
+    cache_storage_bytes: usize,
+    cache_metadata_bytes: usize,
+    metrics: RunMetrics,
+    page_table: Option<Buffer>,
+    prefill: Option<PrefillState>,
+    decode: Option<DecodeState>,
+}
+
+struct PrefillState {
+    embedding: Arguments,
+    layers: Vec<Arguments>,
+    layer_types: Vec<AttentionKind>,
+    head: Arguments,
+    prompt: Buffer,
+    position: Buffer,
+    sequence_lengths: Buffer,
+    query_lengths: Buffer,
+    active_rows: Buffer,
+    last_index: Buffer,
+    sampling_state: Buffer,
+    decode: PreparedDecodeState,
+}
+
+struct PreparedDecodeState {
+    embedding: Arguments,
+    pairs: Vec<Arguments>,
+    head: Arguments,
+    position: Buffer,
+    query_lengths: Buffer,
+    active_rows: Buffer,
+    last_index: Buffer,
+}
+
+struct DecodeState {
+    embedding: Arguments,
+    pairs: Vec<Arguments>,
+    head: Arguments,
+    token_buffer: Buffer,
+    sampling_state: Option<Buffer>,
+    position: Option<Buffer>,
+    query_lengths: Buffer,
+    active_rows: Buffer,
+    last_index: Buffer,
+    token_download: Slice<'static>,
+    lookahead: Option<DecodePrefix>,
+}
+
+impl RequestExecution {
+    fn completed(
+        profile: ExecutionProfile,
+        prompt_token_count: usize,
+        cache_allocation: Duration,
+        cache_storage_bytes: usize,
+    ) -> Self {
+        Self {
+            lifecycle: RequestLifecycle::new(0),
+            profile,
+            prompt_token_count,
+            cache_capacity: profile.decode.cache_capacity(),
+            cache_storage_bytes,
+            cache_metadata_bytes: 0,
             metrics: RunMetrics {
                 cache_allocation,
-                prompt_upload,
-                prefill_execution,
-                prefill_download,
-                decode_state_initialization,
-                first_decode_execution,
-                steady_decode_execution,
-                decode_download,
-                prefill_submission,
-                first_decode_submission,
-                steady_decode_submission,
+                ..RunMetrics::default()
             },
+            page_table: None,
+            prefill: None,
+            decode: None,
+        }
+    }
+
+    pub(super) fn is_complete(&self) -> bool {
+        self.lifecycle.phase == RequestPhase::Complete
+    }
+
+    pub(super) const fn page_table_width(&self) -> usize {
+        self.profile.decode.page_count()
+    }
+
+    pub(super) fn decode_cache_lookahead_tokens(&self) -> Result<usize> {
+        let generated_index = self.lifecycle.decode_generated_index()?;
+        Ok(1 + usize::from(should_enqueue_lookahead(
+            generated_index,
+            self.lifecycle.max_new_tokens,
+        )))
+    }
+
+    pub(super) const fn stopped(&self) -> bool {
+        self.lifecycle.stopped
+    }
+
+    /// Executes the selected bounded prefill family once. Chunked prefill will
+    /// replace this full-prompt step in Milestone 3; until then its one-shot
+    /// transition is explicit and cannot be repeated.
+    fn prefill_step(
+        &mut self,
+        caches: &mut [LayerCache],
+    ) -> Result<Option<RawToken>> {
+        let result = self.try_prefill_step(caches);
+        if result.is_err() {
+            self.lifecycle.fail();
+            self.prefill = None;
+            self.decode = None;
+        }
+        result
+    }
+
+    fn try_prefill_step(&mut self, caches: &mut [LayerCache]) -> Result<Option<RawToken>> {
+        if self.lifecycle.phase == RequestPhase::Complete
+            && self.lifecycle.max_new_tokens == 0
+        {
+            return Ok(None);
+        }
+        if self.lifecycle.phase != RequestPhase::PrefillPending {
+            return Err(message("GPT-OSS prefill step was already consumed"));
+        }
+        if self.prompt_token_count > self.profile.prefill.sequence() {
+            return Err(message(
+                "GPT-OSS prepared prompt exceeds its selected prefill family",
+            ));
+        }
+        let mut prefill = self
+            .prefill
+            .take()
+            .ok_or_else(|| message("GPT-OSS prefill state is not available"))?;
+        let page_table = self
+            .page_table
+            .as_ref()
+            .ok_or_else(|| message("GPT-OSS prepared request has no page table"))?
+            .clone();
+
+        let prefill_started = Instant::now();
+        let mut submission = SubmissionTimings::default();
+        let submission_started = Instant::now();
+        prefill
+            .embedding
+            .set("tokens", prefill.prompt)
+            .map_err(boxed)?;
+        let mut hidden = one(prefill.embedding.enqueue().map_err(boxed)?)?;
+        submission.embedding = submission_started.elapsed();
+        for ((arguments, cache), kind) in prefill
+            .layers
+            .iter_mut()
+            .zip(caches)
+            .zip(&prefill.layer_types)
+        {
+            let (next_hidden, elapsed) = execute_layer(
+                arguments,
+                hidden,
+                prefill.position.clone(),
+                Some(prefill.sequence_lengths.clone()),
+                prefill.query_lengths.clone(),
+                prefill.active_rows.clone(),
+                page_table.clone(),
+                cache,
+            )?;
+            hidden = next_hidden;
+            record_layer_submission(&mut submission, *kind, elapsed);
+        }
+        let submission_started = Instant::now();
+        prefill.head.set("hidden", hidden).map_err(boxed)?;
+        prefill
+            .head
+            .set("last_index", prefill.last_index)
+            .map_err(boxed)?;
+        prefill
+            .head
+            .set("sampling_state", prefill.sampling_state)
+            .map_err(boxed)?;
+        let mut outputs = prefill
+            .head
+            .enqueue()
+            .map_err(boxed)?
+            .into_buffers()
+            .into_iter();
+        let token_buffer = outputs
+            .next()
+            .ok_or_else(|| message("GPT-OSS prefill head omitted its token"))?;
+        let sampling_state = outputs
+            .next()
+            .ok_or_else(|| message("GPT-OSS prefill head omitted its sampling state"))?;
+        if outputs.next().is_some() {
+            return Err(message("GPT-OSS prefill head returned extra buffers"));
+        }
+        submission.head = submission_started.elapsed();
+        token_buffer.wait().map_err(boxed)?;
+        self.metrics.prefill_execution = prefill_started.elapsed();
+        self.metrics.prefill_submission = submission;
+
+        let download_started = Instant::now();
+        let token = download_token(&token_buffer)?;
+        self.metrics.prefill_download = download_started.elapsed();
+        let token_download = Slice::alloc(token_buffer.shape()).map_err(boxed)?;
+        self.decode = Some(DecodeState {
+            embedding: prefill.decode.embedding,
+            pairs: prefill.decode.pairs,
+            head: prefill.decode.head,
+            token_buffer,
+            sampling_state: Some(sampling_state),
+            position: Some(prefill.decode.position),
+            query_lengths: prefill.decode.query_lengths,
+            active_rows: prefill.decode.active_rows,
+            last_index: prefill.decode.last_index,
+            token_download,
+            lookahead: None,
+        });
+        let is_stop = super::protocol::is_stop_token(token);
+        self.lifecycle.record_prefill(token, is_stop).map(Some)
+    }
+
+    /// Consumes the preceding device token and returns exactly one newly
+    /// sampled raw token. A terminal or budget-ending token may have a bounded
+    /// prefix in flight; `finalize` discards it without executing the suffix.
+    fn decode_step(
+        &mut self,
+        caches: &mut [LayerCache],
+    ) -> Result<Option<RawToken>> {
+        let result = self.try_decode_step(caches);
+        if result.is_err() {
+            self.lifecycle.fail();
+            self.prefill = None;
+            self.decode = None;
+        }
+        result
+    }
+
+    fn try_decode_step(&mut self, caches: &mut [LayerCache]) -> Result<Option<RawToken>> {
+        if self.is_complete() {
+            return Ok(None);
+        }
+        let generated_index = self.lifecycle.decode_generated_index()?;
+        let state = self
+            .decode
+            .as_mut()
+            .ok_or_else(|| message("completed GPT-OSS request has no decode state"))?;
+        let position = state
+            .position
+            .as_ref()
+            .ok_or_else(|| message("GPT-OSS decode position is owned by an execution"))?
+            .clone();
+        let lookahead_cache_count = DECODE_LOOKAHEAD_PAIRS * 2;
+        let (lookahead_pairs, remaining_pairs) =
+            state.pairs.split_at_mut(DECODE_LOOKAHEAD_PAIRS);
+        let (lookahead_caches, remaining_caches) =
+            caches.split_at_mut(lookahead_cache_count);
+        let page_table = self
+            .page_table
+            .as_ref()
+            .ok_or_else(|| message("GPT-OSS prepared request has no page table"))?
+            .clone();
+
+        let decode_started = Instant::now();
+        let prefix = match state.lookahead.take() {
+            Some(prefix) => prefix,
+            None => enqueue_decode_prefix(
+                &mut state.embedding,
+                lookahead_pairs,
+                state.token_buffer.clone(),
+                position.clone(),
+                state.query_lengths.clone(),
+                state.active_rows.clone(),
+                page_table.clone(),
+                lookahead_caches,
+            )?,
+        };
+        let mut hidden = prefix.hidden;
+        let mut submission = prefix.submission;
+        for (arguments, caches) in remaining_pairs
+            .iter_mut()
+            .zip(remaining_caches.chunks_exact_mut(2))
+        {
+            let (next_hidden, elapsed) = execute_layer_pair(
+                arguments,
+                hidden,
+                position.clone(),
+                state.query_lengths.clone(),
+                state.active_rows.clone(),
+                page_table.clone(),
+                caches,
+            )?;
+            hidden = next_hidden;
+            submission.layer_pairs += elapsed;
+        }
+        let submission_started = Instant::now();
+        state.head.set("hidden", hidden).map_err(boxed)?;
+        state
+            .head
+            .set("last_index", state.last_index.clone())
+            .map_err(boxed)?;
+        state
+            .head
+            .set(
+                "sampling_state",
+                state.sampling_state.take().ok_or_else(|| {
+                    message("GPT-OSS sampling state is owned by an execution")
+                })?,
+            )
+            .map_err(boxed)?;
+        state
+            .head
+            .set(
+                "position",
+                state
+                    .position
+                    .take()
+                    .ok_or_else(|| message("GPT-OSS decode position is owned by an execution"))?,
+            )
+            .map_err(boxed)?;
+        let mut outputs = state
+            .head
+            .enqueue()
+            .map_err(boxed)?
+            .into_buffers()
+            .into_iter();
+        state.token_buffer = outputs
+            .next()
+            .ok_or_else(|| message("GPT-OSS decode head omitted its token"))?;
+        state.sampling_state = Some(
+            outputs
+                .next()
+                .ok_or_else(|| message("GPT-OSS decode head omitted its sampling state"))?,
+        );
+        state.position = Some(
+            outputs
+                .next()
+                .ok_or_else(|| message("GPT-OSS decode head omitted its position"))?,
+        );
+        if outputs.next().is_some() {
+            return Err(message("GPT-OSS decode head returned extra buffers"));
+        }
+        submission.head = submission_started.elapsed();
+
+        // Observe the token directly after the head. The bounded prefix below
+        // remains an overlapping consumer of the same device token buffer.
+        let pending_token = state
+            .token_buffer
+            .download_to(&mut state.token_download)
+            .map_err(boxed)?;
+        if should_enqueue_lookahead(generated_index, self.lifecycle.max_new_tokens) {
+            state.lookahead = Some(enqueue_decode_prefix(
+                &mut state.embedding,
+                lookahead_pairs,
+                state.token_buffer.clone(),
+                state
+                    .position
+                    .as_ref()
+                    .ok_or_else(|| message("GPT-OSS decode head omitted its position"))?
+                    .clone(),
+                state.query_lengths.clone(),
+                state.active_rows.clone(),
+                page_table,
+                lookahead_caches,
+            )?);
+        }
+        if !state.token_buffer.is_ready().map_err(boxed)? {
+            state.token_buffer.wait().map_err(boxed)?;
+        }
+        let execution_elapsed = decode_started.elapsed();
+        if generated_index == 0 {
+            self.metrics.first_decode_execution = execution_elapsed;
+            self.metrics.first_decode_submission = submission;
+        } else {
+            self.metrics.steady_decode_execution += execution_elapsed;
+            add_submission(&mut self.metrics.steady_decode_submission, submission);
+        }
+        let download_started = Instant::now();
+        pending_token.wait().map_err(boxed)?;
+        let token = token_from_slice(&state.token_download)?;
+        self.metrics.decode_download += download_started.elapsed();
+        let is_stop = super::protocol::is_stop_token(token);
+        self.lifecycle.record_decode(token, is_stop).map(Some)
+    }
+
+    pub(super) fn finalize(mut self) -> Result<RunReport> {
+        if !self.is_complete() {
+            return Err(message(
+                "GPT-OSS request cannot finalize before a terminal token or visible budget",
+            ));
+        }
+        // A stop token is observed after the bounded prefix was submitted.
+        // Discard that prefix here: it is never extended through the remaining
+        // pairs or head, preserving terminal-token semantics.
+        if let Some(decode) = &mut self.decode {
+            decode.lookahead.take();
+        }
+        Ok(RunReport {
+            generated_tokens: self.lifecycle.generated_tokens,
+            cache_capacity: self.cache_capacity,
+            cache_storage_bytes: self.cache_storage_bytes,
+            cache_metadata_bytes: self.cache_metadata_bytes,
+            cache_metadata_upload_bytes: self.metrics.cache_metadata_upload_bytes,
+            metrics: self.metrics,
         })
     }
 }
@@ -759,6 +1459,50 @@ impl ComponentFamily {
     }
 }
 
+struct BoundComponentFamily {
+    embedding: Arguments,
+    layers: BoundLayerExecutables,
+    head: Arguments,
+}
+
+enum BoundLayerExecutables {
+    Prefill {
+        layers: Vec<Arguments>,
+        kinds: Vec<AttentionKind>,
+    },
+    Decode {
+        pairs: Vec<Arguments>,
+    },
+}
+
+impl BoundComponentFamily {
+    fn bind(
+        family: &ComponentFamily,
+        checkpoint: &Checkpoint,
+        parameters: &LoadedCheckpoint,
+        config: &Config,
+    ) -> Result<Self> {
+        let mut embedding = family.embedding.args();
+        bind_embedding(&mut embedding, checkpoint, parameters)?;
+        let mut head = family.head.args();
+        bind_head(&mut head, parameters)?;
+        let layers = match &family.layers {
+            LayerExecutables::Prefill { .. } => BoundLayerExecutables::Prefill {
+                layers: bind_layers(family, checkpoint, parameters, config)?,
+                kinds: config.layer_types().to_vec(),
+            },
+            LayerExecutables::DecodePair(_) => BoundLayerExecutables::Decode {
+                pairs: bind_decode_pairs(family, checkpoint, parameters, config)?,
+            },
+        };
+        Ok(Self {
+            embedding,
+            layers,
+            head,
+        })
+    }
+}
+
 struct LayerCache {
     key: Option<Buffer>,
     value: Option<Buffer>,
@@ -820,7 +1564,7 @@ impl LayerCache {
 }
 
 fn bind_embedding(
-    arguments: &mut Arguments<'_>,
+    arguments: &mut Arguments,
     checkpoint: &Checkpoint,
     parameters: &LoadedCheckpoint,
 ) -> Result<()> {
@@ -831,7 +1575,7 @@ fn bind_embedding(
     )
 }
 
-fn bind_head(arguments: &mut Arguments<'_>, parameters: &LoadedCheckpoint) -> Result<()> {
+fn bind_head(arguments: &mut Arguments, parameters: &LoadedCheckpoint) -> Result<()> {
     arguments
         .set_parameter(&parameters.model.norm.weight)
         .map_err(boxed)?;
@@ -842,12 +1586,12 @@ fn bind_head(arguments: &mut Arguments<'_>, parameters: &LoadedCheckpoint) -> Re
     Ok(())
 }
 
-fn bind_layers<'family>(
-    family: &'family ComponentFamily,
+fn bind_layers(
+    family: &ComponentFamily,
     checkpoint: &Checkpoint,
     parameters: &LoadedCheckpoint,
     config: &Config,
-) -> Result<Vec<Arguments<'family>>> {
+) -> Result<Vec<Arguments>> {
     if checkpoint.model.layers.len() != parameters.model.layers.len()
         || checkpoint.model.layers.len() != config.layer_types().len()
     {
@@ -867,12 +1611,12 @@ fn bind_layers<'family>(
         .collect()
 }
 
-fn bind_decode_pairs<'family>(
-    family: &'family ComponentFamily,
+fn bind_decode_pairs(
+    family: &ComponentFamily,
     checkpoint: &Checkpoint,
     parameters: &LoadedCheckpoint,
     config: &Config,
-) -> Result<Vec<Arguments<'family>>> {
+) -> Result<Vec<Arguments>> {
     if checkpoint.model.layers.len() != parameters.model.layers.len()
         || checkpoint.model.layers.len() != config.layer_types().len()
         || !checkpoint.model.layers.len().is_multiple_of(2)
@@ -903,21 +1647,21 @@ fn bind_decode_pairs<'family>(
         .collect()
 }
 
-fn bind_layer<'family>(
-    executable: &'family Exe,
+fn bind_layer(
+    executable: &Exe,
     slots: &super::checkpoint::DecoderLayer,
     loaded: &LoadedDecoderLayer,
-) -> Result<Arguments<'family>> {
+) -> Result<Arguments> {
     let mut arguments = executable.args();
     bind_tree(&mut arguments, slots, loaded)?;
     Ok(arguments)
 }
 
-fn bind_layer_pair<'family>(
-    executable: &'family Exe,
+fn bind_layer_pair(
+    executable: &Exe,
     slots: &[super::checkpoint::DecoderLayer],
     loaded: &[LoadedDecoderLayer],
-) -> Result<Arguments<'family>> {
+) -> Result<Arguments> {
     let [sliding_slot, full_slot] = slots else {
         return Err(message("GPT-OSS decode pair slot count is not two"));
     };
@@ -932,10 +1676,12 @@ fn bind_layer_pair<'family>(
 }
 
 fn enqueue_decode_prefix(
-    embedding: &mut Arguments<'_>,
-    pairs: &mut [Arguments<'_>],
+    embedding: &mut Arguments,
+    pairs: &mut [Arguments],
     token: Buffer,
     position: Buffer,
+    query_lengths: Buffer,
+    active_rows: Buffer,
     page_table: Buffer,
     caches: &mut [LayerCache],
 ) -> Result<DecodePrefix> {
@@ -952,6 +1698,8 @@ fn enqueue_decode_prefix(
             pair,
             hidden,
             position.clone(),
+            query_lengths.clone(),
+            active_rows.clone(),
             page_table.clone(),
             pair_caches,
         )?;
@@ -966,10 +1714,12 @@ const fn should_enqueue_lookahead(generated_index: usize, max_new_tokens: usize)
 }
 
 fn execute_layer(
-    arguments: &mut Arguments<'_>,
+    arguments: &mut Arguments,
     hidden: Buffer,
     position: Buffer,
     sequence_lengths: Option<Buffer>,
+    query_lengths: Buffer,
+    active_rows: Buffer,
     page_table: Buffer,
     cache: &mut LayerCache,
 ) -> Result<(Buffer, Duration)> {
@@ -980,6 +1730,10 @@ fn execute_layer(
     if let Some(lengths) = sequence_lengths {
         arguments.set("sequence_lengths", lengths).map_err(boxed)?;
     }
+    arguments
+        .set("query_lengths", query_lengths)
+        .map_err(boxed)?;
+    arguments.set("active_rows", active_rows).map_err(boxed)?;
     arguments.set("page_table", page_table).map_err(boxed)?;
     arguments.set("cache.key", key).map_err(boxed)?;
     arguments.set("cache.value", value).map_err(boxed)?;
@@ -1005,9 +1759,11 @@ fn execute_layer(
 }
 
 fn execute_layer_pair(
-    arguments: &mut Arguments<'_>,
+    arguments: &mut Arguments,
     hidden: Buffer,
     position: Buffer,
+    query_lengths: Buffer,
+    active_rows: Buffer,
     page_table: Buffer,
     caches: &mut [LayerCache],
 ) -> Result<(Buffer, Duration)> {
@@ -1021,6 +1777,10 @@ fn execute_layer_pair(
     let (full_key, full_value) = full.take()?;
     arguments.set("hidden", hidden).map_err(boxed)?;
     arguments.set("position", position).map_err(boxed)?;
+    arguments
+        .set("query_lengths", query_lengths)
+        .map_err(boxed)?;
+    arguments.set("active_rows", active_rows).map_err(boxed)?;
     arguments.set("page_table", page_table).map_err(boxed)?;
     arguments
         .set("sliding.cache.key", sliding_key)
@@ -1090,26 +1850,6 @@ fn compile(
     platform.compile(&program, placement.clone()).map_err(boxed)
 }
 
-fn identity_page_table(
-    platform: &Platform,
-    family: ShapeFamily,
-    placement: &Sharding,
-) -> Result<Buffer> {
-    let pages = (0..family.page_count())
-        .map(|page| i32::try_from(page).map_err(|_| message("page index exceeds I32")))
-        .collect::<Result<Vec<_>>>()?;
-    upload_i32(platform, page_table_shape(family)?, &pages, placement)
-}
-
-fn upload_scalar(platform: &Platform, value: i32, placement: &Sharding) -> Result<Buffer> {
-    upload_i32(
-        platform,
-        Shape::new(nml::DataType::I32, &[]).map_err(boxed)?,
-        &[value],
-        placement,
-    )
-}
-
 fn upload_i32(
     platform: &Platform,
     shape: Shape,
@@ -1134,12 +1874,105 @@ fn upload_u64(
         .map_err(boxed)
 }
 
-fn upload_f32_scalar(platform: &Platform, value: f32, placement: &Sharding) -> Result<Buffer> {
-    let shape = Shape::new(nml::DataType::F32, &[]).map_err(boxed)?;
-    let values = [value];
-    let slice = Slice::from_typed(shape, &values).map_err(boxed)?;
+fn upload_f32_vector(
+    platform: &Platform,
+    values: &[f32],
+    placement: &Sharding,
+) -> Result<Buffer> {
+    let shape = Shape::new(
+        nml::DataType::F32,
+        &[i64::try_from(values.len()).map_err(|_| message("F32 upload length exceeds I64"))?],
+    )
+    .map_err(boxed)?;
+    let slice = Slice::from_typed(shape, values).map_err(boxed)?;
     platform
         .upload(&slice, placement.clone(), Memory::Default)
+        .map_err(boxed)
+}
+
+fn upload_bool(
+    platform: &Platform,
+    shape: Shape,
+    values: &[bool],
+    placement: &Sharding,
+) -> Result<Buffer> {
+    let slice = Slice::from_typed(shape, values).map_err(boxed)?;
+    platform
+        .upload(&slice, placement.clone(), Memory::Default)
+        .map_err(boxed)
+}
+
+fn validate_batch_inputs(family: ShapeFamily, input: &BatchInputs) -> Result<()> {
+    let batch = family.batch();
+    let query = family.sequence();
+    let tokens = match family.phase() {
+        Phase::Prefill => batch
+            .checked_mul(query)
+            .ok_or_else(|| message("batch token shape overflows usize"))?,
+        Phase::Decode => batch,
+    };
+    let table_entries = batch
+        .checked_mul(family.page_count())
+        .ok_or_else(|| message("batch page-table shape overflows usize"))?;
+    if input.tokens.len() != tokens
+        || input.positions.len() != batch
+        || input.sequence_lengths.len() != batch
+        || input.query_lengths.len() != batch
+        || input.active_rows.len() != batch
+        || input.sample_rows.len() != batch
+        || input.page_tables.len() != table_entries
+        || input.last_indices.len() != batch
+        || input.sampling_states.len() != batch * 2
+        || input.top_k.len() != batch
+        || input.temperature.len() != batch
+        || input.top_p.len() != batch
+        || input.min_p.len() != batch
+    {
+        return Err(message("batch input vectors do not match the compiled family"));
+    }
+    for row in 0..batch {
+        if input.sample_rows[row] && !input.active_rows[row] {
+            return Err(message("only an active batch row may sample"));
+        }
+        if input.active_rows[row] {
+            let query_length = usize::try_from(input.query_lengths[row])
+                .map_err(|_| message("active query length is negative"))?;
+            if query_length == 0 || query_length > query {
+                return Err(message("active query length exceeds its compiled family"));
+            }
+            if input.positions[row] < 0
+                || input.sequence_lengths[row]
+                    < input.positions[row].saturating_add(input.query_lengths[row])
+                || input.last_indices[row] < 0
+                || input.last_indices[row] >= input.query_lengths[row]
+            {
+                return Err(message("active batch row has inconsistent positions or lengths"));
+            }
+        } else if input.positions[row] != 0
+            || input.sequence_lengths[row] != 0
+            || input.query_lengths[row] != 0
+        {
+            return Err(message("inactive batch rows must have zero positions and lengths"));
+        }
+    }
+    Ok(())
+}
+
+fn download_i32(buffer: &Buffer) -> Result<Vec<i32>> {
+    buffer
+        .to_slice()
+        .map_err(boxed)?
+        .items::<i32>()
+        .map(|items| items.to_vec())
+        .map_err(boxed)
+}
+
+fn download_u64(buffer: &Buffer) -> Result<Vec<u64>> {
+    buffer
+        .to_slice()
+        .map_err(boxed)?
+        .items::<u64>()
+        .map(|items| items.to_vec())
         .map_err(boxed)
 }
 
@@ -1172,6 +2005,7 @@ fn startup_metrics(
     decode_compilation: Duration,
     parameter_upload: Duration,
     accounting: LoadAccounting,
+    compiled_families: usize,
 ) -> StartupMetrics {
     StartupMetrics {
         artifact_validation,
@@ -1183,6 +2017,7 @@ fn startup_metrics(
         parameter_resident_bytes: accounting.resident_bytes(),
         parameter_prepared_bytes: accounting.prepared_bytes(),
         parameter_peak_staging_bytes: accounting.peak_staging_bytes(),
+        compiled_families,
     }
 }
 
@@ -1201,8 +2036,122 @@ fn usize_i64(value: usize) -> Result<i64> {
 mod tests {
     use super::*;
 
+    fn reference_visible_tokens(samples: &[(u32, bool)], budget: usize) -> Vec<u32> {
+        samples
+            .iter()
+            .copied()
+            .take(budget)
+            .scan(false, |complete, (token, is_stop)| {
+                if *complete {
+                    return None;
+                }
+                *complete = is_stop;
+                Some(token)
+            })
+            .collect()
+    }
+
+    fn stepped_visible_tokens(samples: &[(u32, bool)], budget: usize) -> Vec<u32> {
+        let mut lifecycle = RequestLifecycle::new(budget);
+        if budget == 0 {
+            return lifecycle.generated_tokens;
+        }
+        let (token, is_stop) = samples[0];
+        lifecycle.record_prefill(token, is_stop).unwrap();
+        for &(token, is_stop) in &samples[1..] {
+            if lifecycle.phase == RequestPhase::Complete {
+                break;
+            }
+            lifecycle.record_decode(token, is_stop).unwrap();
+        }
+        lifecycle.generated_tokens
+    }
+
+    #[test]
+    fn step_lifecycle_matches_the_complete_loop_for_every_terminal_shape() {
+        for (samples, budget) in [
+            (vec![(11, false), (12, false), (13, true), (14, false)], 8),
+            (vec![(21, true), (22, false)], 8),
+            (vec![(31, false), (32, false), (33, false)], 2),
+            (vec![(41, false)], 1),
+            (vec![(51, false)], 0),
+        ] {
+            assert_eq!(
+                stepped_visible_tokens(&samples, budget),
+                reference_visible_tokens(&samples, budget),
+            );
+        }
+    }
+
+    #[test]
+    fn prefill_is_a_one_shot_transition_and_decode_requires_a_visible_input() {
+        let mut lifecycle = RequestLifecycle::new(3);
+        assert_eq!(lifecycle.phase, RequestPhase::PrefillPending);
+        assert!(lifecycle.record_decode(1, false).is_err());
+        assert_eq!(
+            lifecycle.record_prefill(7, false).unwrap(),
+            RawToken {
+                token: 7,
+                is_stop: false,
+            },
+        );
+        assert_eq!(lifecycle.phase, RequestPhase::DecodeReady);
+        assert_eq!(lifecycle.decode_generated_index().unwrap(), 0);
+        assert!(lifecycle.record_prefill(8, false).is_err());
+    }
+
+    #[test]
+    fn terminal_and_budget_tokens_make_all_later_decode_steps_ineligible() {
+        let mut terminal = RequestLifecycle::new(4);
+        terminal.record_prefill(1, false).unwrap();
+        assert!(should_enqueue_lookahead(
+            terminal.decode_generated_index().unwrap(),
+            terminal.max_new_tokens,
+        ));
+        terminal.record_decode(2, true).unwrap();
+        assert_eq!(terminal.phase, RequestPhase::Complete);
+        assert!(terminal.stopped);
+        assert!(terminal.decode_generated_index().is_err());
+        assert!(terminal.record_decode(3, false).is_err());
+
+        let mut bounded = RequestLifecycle::new(2);
+        bounded.record_prefill(1, false).unwrap();
+        assert!(!should_enqueue_lookahead(
+            bounded.decode_generated_index().unwrap(),
+            bounded.max_new_tokens,
+        ));
+        bounded.record_decode(2, false).unwrap();
+        assert_eq!(bounded.phase, RequestPhase::Complete);
+        assert!(!bounded.stopped);
+    }
+
+    #[test]
+    fn zero_token_request_is_complete_without_prefill_or_decode() {
+        let lifecycle = RequestLifecycle::new(0);
+        assert_eq!(lifecycle.phase, RequestPhase::Complete);
+        assert!(lifecycle.generated_tokens.is_empty());
+        assert!(!lifecycle.stopped);
+        assert!(lifecycle.decode_generated_index().is_err());
+    }
+
+    #[test]
+    fn execution_failure_poisoning_is_terminal_but_not_a_success() {
+        let mut lifecycle = RequestLifecycle::new(3);
+        lifecycle.record_prefill(1, false).unwrap();
+        lifecycle.fail();
+        assert_eq!(lifecycle.phase, RequestPhase::Failed);
+        assert!(lifecycle.record_decode(2, false).is_err());
+        assert!(!lifecycle.stopped);
+
+        let mut complete = RequestLifecycle::new(1);
+        complete.record_prefill(1, false).unwrap();
+        complete.fail();
+        assert_eq!(complete.phase, RequestPhase::Complete);
+    }
+
     #[test]
     fn decode_lookahead_never_crosses_the_visible_token_budget() {
+        assert_eq!(DECODE_LOOKAHEAD_PAIRS, 5);
         assert!(!should_enqueue_lookahead(0, 0));
         assert!(!should_enqueue_lookahead(0, 1));
         assert!(!should_enqueue_lookahead(0, 2));
@@ -1230,6 +2179,7 @@ mod tests {
                 max_sequence_tokens: 22,
             },
             131_072,
+            64,
         )
         .unwrap();
         let large = ExecutionProfile::new(
@@ -1238,6 +2188,7 @@ mod tests {
                 max_sequence_tokens: 300,
             },
             131_072,
+            64,
         )
         .unwrap();
         assert_eq!(small.prefill.sequence(), 32);
@@ -1265,6 +2216,7 @@ mod tests {
                 },
             ],
             131_072,
+            64,
         )
         .unwrap()
         .into_iter()
@@ -1278,7 +2230,7 @@ mod tests {
 
     #[test]
     fn requests_reject_unrepresentable_or_undersized_families() {
-        assert!(normalize_profiles(&[], 131_072).is_err());
+        assert!(normalize_profiles(&[], 131_072, 64).is_err());
         assert!(PreparedRequest::new(
             vec![],
             1,
@@ -1350,6 +2302,7 @@ mod tests {
                 max_sequence_tokens: 512,
             },
             131_072,
+            64,
         )
         .is_err());
         assert!(ExecutionProfile::new(
@@ -1358,6 +2311,7 @@ mod tests {
                 max_sequence_tokens: 131_073,
             },
             131_072,
+            64,
         )
         .is_err());
     }
@@ -1370,6 +2324,7 @@ mod tests {
                 max_sequence_tokens: 256,
             },
             131_072,
+            64,
         )
         .unwrap();
         let oversized_prompt = PreparedRequest::new(

@@ -37,6 +37,7 @@ const SPECIAL_TOKENS: [(&str, u32); 10] = [
 ];
 
 /// Exact product-owned Harmony protocol over the already selected tokenizer.
+#[derive(Clone)]
 pub struct HarmonyProtocol {
     tokenizer: Tokenizer,
 }
@@ -106,7 +107,7 @@ impl HarmonyProtocol {
         Ok(output.tokens)
     }
 
-    pub fn parser(&self) -> HarmonyParser<'_> {
+    pub fn parser(&self) -> HarmonyParser {
         HarmonyParser::new(&self.tokenizer)
     }
 }
@@ -666,14 +667,14 @@ struct ParsedHeader {
     content_type: Option<String>,
 }
 
-enum ParserState<'tokenizer> {
+enum ParserState {
     Header {
         implicit_assistant: bool,
         tokens: Vec<u32>,
     },
     Content {
         header: ParsedHeader,
-        decoder: Decoder<'tokenizer>,
+        decoder: Decoder,
         content: String,
         pending_utf8: Vec<u8>,
     },
@@ -684,19 +685,22 @@ enum ParserState<'tokenizer> {
 }
 
 /// Strict token-at-a-time parser for one assistant completion.
-pub struct HarmonyParser<'tokenizer> {
-    tokenizer: &'tokenizer Tokenizer,
-    state: ParserState<'tokenizer>,
+pub struct HarmonyParser {
+    state: ParserState,
+    // Declared after state so an active decoder is destroyed before this
+    // parser's tokenizer clone. The decoder also retains its own shared owner,
+    // making the outlives relation explicit rather than self-referential.
+    tokenizer: Tokenizer,
 }
 
-impl<'tokenizer> HarmonyParser<'tokenizer> {
-    fn new(tokenizer: &'tokenizer Tokenizer) -> Self {
+impl HarmonyParser {
+    fn new(tokenizer: &Tokenizer) -> Self {
         Self {
-            tokenizer,
             state: ParserState::Header {
                 implicit_assistant: true,
                 tokens: Vec::new(),
             },
+            tokenizer: tokenizer.clone(),
         }
     }
 
@@ -712,7 +716,7 @@ impl<'tokenizer> HarmonyParser<'tokenizer> {
                 mut tokens,
             } => {
                 if token == MESSAGE {
-                    let header = parse_header(self.tokenizer, &tokens, implicit_assistant)?;
+                    let header = parse_header(&self.tokenizer, &tokens, implicit_assistant)?;
                     ParserState::Content {
                         header,
                         decoder: self.tokenizer.decoder().map_err(Error::tokenizer)?,
@@ -881,12 +885,12 @@ impl<'tokenizer> HarmonyParser<'tokenizer> {
     }
 }
 
-fn close_message<'tokenizer>(
+fn close_message(
     delimiter: u32,
     header: ParsedHeader,
     content: String,
     events: &mut Vec<Event>,
-) -> Result<ParserState<'tokenizer>> {
+) -> Result<ParserState> {
     match delimiter {
         END => {
             if header.channel == Channel::Final {
@@ -1078,7 +1082,6 @@ fn validate_conversation(conversation: &Conversation) -> Result<()> {
             Message::Developer(content) => {
                 for function in &content.functions {
                     validate_header_atom("function name", &function.name)?;
-                    validate_nonempty("function description", &function.description)?;
                     if let Some(parameters) = &function.parameters {
                         if !parameters.is_object() {
                             return Err(Error::contract(format!(
@@ -1332,6 +1335,91 @@ mod tests {
             event,
             Event::Message(ParsedMessage { channel: Channel::Final, content })
                 if content == "2 + 2 = 4."
+        )));
+        assert_eq!(events.last(), Some(&Event::Done(StopReason::Return)));
+    }
+
+    #[test]
+    fn thirty_two_owned_parsers_keep_interleaved_decoder_state_isolated() {
+        const SESSIONS: usize = 32;
+        let protocol = protocol();
+        let expected = (0..SESSIONS)
+            .map(|index| format!("session {index}: café ∆"))
+            .collect::<Vec<_>>();
+        let streams = expected
+            .iter()
+            .map(|content| {
+                [CHANNEL]
+                    .into_iter()
+                    .chain(protocol.tokenizer.encode_ordinary("final").unwrap())
+                    .chain([MESSAGE])
+                    .chain(protocol.tokenizer.encode_ordinary(content).unwrap())
+                    .chain([RETURN])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut parsers = (0..SESSIONS)
+            .map(|_| protocol.parser())
+            .collect::<Vec<_>>();
+        let mut events = (0..SESSIONS).map(|_| Vec::new()).collect::<Vec<_>>();
+
+        for offset in 0..streams.iter().map(Vec::len).max().unwrap() {
+            for session in 0..SESSIONS {
+                if let Some(token) = streams[session].get(offset) {
+                    events[session].extend(parsers[session].process(*token).unwrap());
+                }
+            }
+        }
+
+        for (session, parser) in parsers.iter_mut().enumerate() {
+            assert_eq!(parser.finish().unwrap(), StopReason::Return);
+            assert!(events[session].iter().any(|event| matches!(
+                event,
+                Event::Message(ParsedMessage {
+                    channel: Channel::Final,
+                    content,
+                }) if content == &expected[session]
+            )));
+            assert_eq!(events[session].last(), Some(&Event::Done(StopReason::Return)));
+        }
+    }
+
+    #[test]
+    fn active_owned_parser_outlives_its_protocol_owner() {
+        fn require_static<T: 'static>() {}
+        require_static::<HarmonyParser>();
+
+        let protocol = protocol();
+        let header = [CHANNEL]
+            .into_iter()
+            .chain(protocol.tokenizer.encode_ordinary("final").unwrap())
+            .chain([MESSAGE])
+            .collect::<Vec<_>>();
+        let body = protocol
+            .tokenizer
+            .encode_ordinary("protocol already dropped: café")
+            .unwrap();
+        let mut parser = protocol.parser();
+        for token in header {
+            assert!(parser.process(token).unwrap().is_empty());
+        }
+
+        // The parser now owns an active decoder. Neither it nor the decoder
+        // borrows the protocol value that produced the session.
+        drop(protocol);
+
+        let mut events = Vec::new();
+        for token in body {
+            events.extend(parser.process(token).unwrap());
+        }
+        events.extend(parser.process(RETURN).unwrap());
+        assert_eq!(parser.finish().unwrap(), StopReason::Return);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Message(ParsedMessage {
+                channel: Channel::Final,
+                content,
+            }) if content == "protocol already dropped: café"
         )));
         assert_eq!(events.last(), Some(&Event::Done(StopReason::Return)));
     }

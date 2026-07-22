@@ -3,13 +3,45 @@
 #![forbid(unsafe_code)]
 
 mod gpt_oss;
+mod server;
+
+pub use server::contracts::{Backend, ServerConfig, ServerLimits, ServerProfile, SpeculationPolicy};
 
 use serde_json::Value;
 use std::error::Error as StdError;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 pub type Error = Box<dyn StdError + Send + Sync>;
+
+/// Stable model identifier exposed by the OpenAI-compatible server.
+pub const MODEL_NAME: &str = gpt_oss::MODEL_NAME;
+
+/// A bootstrapped long-lived inference server.
+///
+/// Call `start` before constructing a multithreaded Tokio runtime. It creates
+/// the named engine thread and waits only for process-global platform
+/// initialization; model compilation/residency continues while `run` binds
+/// and serves readiness endpoints.
+pub struct Server {
+    inner: server::http::Server,
+}
+
+impl Server {
+    pub fn start(
+        config: ServerConfig,
+        platform: impl FnOnce() -> Result<nml::Platform, Error> + Send + 'static,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            inner: server::http::Server::start(config, platform)?,
+        })
+    }
+
+    pub async fn run(self) -> Result<(), Error> {
+        self.inner.run().await
+    }
+}
 
 /// One request submitted to an already loaded GPT-OSS model.
 pub struct GenerationOptions {
@@ -73,6 +105,7 @@ pub struct Timings {
     pub decode_compilation: Duration,
     pub parameter_upload: Duration,
     pub cache_allocation: Duration,
+    pub cache_metadata_upload: Duration,
     pub prompt_upload: Duration,
     pub prefill_execution: Duration,
     pub prefill_download: Duration,
@@ -115,6 +148,7 @@ pub struct GenerationReport {
     pub parameter_peak_staging_bytes: usize,
     pub cache_storage_bytes: usize,
     pub cache_metadata_bytes: usize,
+    pub cache_metadata_upload_bytes: usize,
     pub timings: Timings,
 }
 
@@ -126,7 +160,7 @@ pub struct GenerationReport {
 /// request tokens, parser state, K/V storage, and sampling state never escape a
 /// generation call.
 pub struct Generator<'platform> {
-    inner: gpt_oss::Generator<'platform>,
+    inner: Mutex<gpt_oss::Generator<'platform>>,
 }
 
 impl<'platform> Generator<'platform> {
@@ -136,7 +170,11 @@ impl<'platform> Generator<'platform> {
         profiles: &[CompilationProfile],
     ) -> Result<Self, Error> {
         Ok(Self {
-            inner: gpt_oss::Generator::load(platform, model_directory.as_ref(), profiles)?,
+            inner: Mutex::new(gpt_oss::Generator::load(
+                platform,
+                model_directory.as_ref(),
+                profiles,
+            )?),
         })
     }
 
@@ -148,7 +186,10 @@ impl<'platform> Generator<'platform> {
     where
         E: StdError + Send + Sync + 'static,
     {
-        let report = self.inner.generate(
+        let mut generator = self.inner.lock().map_err(|_| {
+            Box::new(ProductStateError("generator lock is poisoned")) as Error
+        })?;
+        let report = generator.generate(
             options.prompt,
             options.max_new_tokens,
             options.cache_capacity,
@@ -172,10 +213,22 @@ impl<'platform> Generator<'platform> {
             parameter_peak_staging_bytes: report.parameter_peak_staging_bytes,
             cache_storage_bytes: report.cache_storage_bytes,
             cache_metadata_bytes: report.cache_metadata_bytes,
+            cache_metadata_upload_bytes: report.cache_metadata_upload_bytes,
             timings: timings(report.timings),
         })
     }
 }
+
+#[derive(Debug)]
+struct ProductStateError(&'static str);
+
+impl std::fmt::Display for ProductStateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl StdError for ProductStateError {}
 
 fn map_harmony_event(event: gpt_oss::protocol::Event) -> Option<Event> {
     use gpt_oss::protocol::{Channel, Event as HarmonyEvent, StopReason};
@@ -211,6 +264,7 @@ fn timings(value: gpt_oss::ProductTimings) -> Timings {
         decode_compilation: value.decode_compilation,
         parameter_upload: value.parameter_upload,
         cache_allocation: value.cache_allocation,
+        cache_metadata_upload: value.cache_metadata_upload,
         prompt_upload: value.prompt_upload,
         prefill_execution: value.prefill_execution,
         prefill_download: value.prefill_download,

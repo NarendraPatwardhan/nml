@@ -86,6 +86,7 @@ _COMMON_CONTRACTS = [
     "//crates/nml:execution_performance_cpu_contract_test",
     "//crates/nml:structural_contract_test",
     "//products/serve:serve_contract_test",
+    "//products/serve:serve_cli_contract_test",
     "//tools/device-contracts:device_contract_runner_contract_test",
     "//tools/artifact:materialization_contract_test",
     "//tools/runpod:runpod_contract_test",

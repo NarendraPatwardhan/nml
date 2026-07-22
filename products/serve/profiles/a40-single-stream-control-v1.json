@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "name": "a40-single-stream-control-v1",
+  "model": "GPT-OSS 20B NVFP4",
+  "source_commit": "fb415a8dadd51a0053b9be314faa836e2b274721",
+  "image_digest": "sha256:3c81704ea85512df7ff76de83ea21f403ef592dc50c23c5ae20e8d70c1e7f3ff",
+  "report": "references/runpod/reports/20260722T021821Z-uwqx38f0an0isb-3c81704ea855-diagnostic/performance.json",
+  "workload": {
+    "prompt": "Explain how a compiler and a GPU cooperate to run a transformer language model efficiently. Include graph lowering, kernel fusion, tensor memory layout, and memory bandwidth, then contrast prefill with autoregressive decode. Write a concise technical explanation for a software engineer.",
+    "expected_prompt_tokens": 106,
+    "max_new_tokens": 320,
+    "prefill_capacity": 256,
+    "cache_capacity": 512,
+    "sampling": {
+      "seed": [5642249665518785615, 6004192421796249601],
+      "temperature": 1.0,
+      "top_k": 50,
+      "top_p": 1.0,
+      "min_p": 0.0
+    }
+  },
+  "accepted_baseline": {
+    "steady_device_tokens_per_second": 156.062,
+    "device_decode_tokens_per_second": 155.644,
+    "decode_loop_tokens_per_second": 151.324,
+    "decode_device_milliseconds": 2049.544,
+    "token_download_milliseconds": 58.517,
+    "decode_loop_milliseconds": 2108.061
+  },
+  "promotion_floor": {
+    "decode_loop_tokens_per_second": 150.0
+  }
+}

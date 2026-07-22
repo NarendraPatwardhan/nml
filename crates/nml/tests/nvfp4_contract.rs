@@ -375,7 +375,7 @@ fn upload_dense(
 
 fn set_buffer(
     platform: &nml::Platform,
-    arguments: &mut nml::exe::Arguments<'_>,
+    arguments: &mut nml::exe::Arguments,
     name: &str,
     shape: Shape,
     bytes: &[u8],

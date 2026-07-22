@@ -79,7 +79,49 @@ fn persistent_linear_parameters_execute_repeatedly_from_real_checkpoints() {
     truncated_checkpoint_releases_in_flight_transfers(&platform);
     activation_donation_aliases_the_output(&platform);
     reusable_parameter_slots_chain_without_host_synchronization(&platform);
+    argument_sets_retain_their_loaded_executable(&platform);
     unsharded_buffer_download_starts_before_host_wait(&platform);
+}
+
+fn argument_sets_retain_their_loaded_executable(platform: &nml::Platform) {
+    let shape = Shape::new(DType::F32, &[4]).unwrap();
+    let placement = nml::Sharding::single();
+    let mut graph = nml::Graph::new();
+    let input = graph.input("input", shape);
+    let output = graph.negate(input).unwrap();
+    let program = graph
+        .finish_named(&[("output".to_owned(), output)])
+        .unwrap();
+    let executable = platform.compile(&program, placement.clone()).unwrap();
+    let mut arguments = executable.args();
+
+    // A serving request owns its mutable bindings, while the resident model
+    // may move or release the public executable handle independently. The
+    // argument set must keep the immutable loaded executable alive.
+    drop(executable);
+    arguments
+        .set(
+            "input",
+            platform
+                .upload(
+                    &nml::Slice::from_typed(shape, &[1.0_f32, -2.0, 3.5, -4.25]).unwrap(),
+                    placement,
+                    nml::Memory::Default,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+    let results = arguments.call().unwrap();
+    assert_eq!(
+        results
+            .get("output")
+            .unwrap()
+            .to_slice()
+            .unwrap()
+            .items::<f32>()
+            .unwrap(),
+        &[-1.0, 2.0, -3.5, 4.25],
+    );
 }
 
 fn unsharded_buffer_download_starts_before_host_wait(platform: &nml::Platform) {
@@ -566,7 +608,7 @@ fn platform() -> nml::Platform {
 }
 
 fn bind_parameters<T: nml::ParameterTree>(
-    arguments: &mut nml::exe::Arguments<'_>,
+    arguments: &mut nml::exe::Arguments,
     loaded: &nml::Loaded<T>,
 ) {
     let mut failure = None;

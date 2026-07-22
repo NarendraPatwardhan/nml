@@ -3757,6 +3757,126 @@ impl ProgramBuilder {
         Ok((state, selected))
     }
 
+    /// Samples independent rows from explicit per-row RNG states and dynamic
+    /// controls.
+    ///
+    /// The contract is intentionally rank-two: logits are `[B,V]`, states are
+    /// `[B,2]`, and each control/active mask is `[B]`. A statically bounded row
+    /// loop emits one RNG chain per row, so inserting, removing, or padding a
+    /// different row cannot perturb another row's random stream. Inactive rows
+    /// preserve their input state exactly and return `-1` as the token sentinel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_tokens_batched_dynamic(
+        &mut self,
+        logits: Tensor,
+        states: Tensor,
+        top_k: Tensor,
+        temperature: Tensor,
+        top_p: Tensor,
+        min_p: Tensor,
+        active_rows: Tensor,
+        maximum_top_k: usize,
+    ) -> Result<(Tensor, Tensor), Error> {
+        self.require_float(logits, "sample_tokens_batched_dynamic")?;
+        for tensor in [states, top_k, temperature, top_p, min_p, active_rows] {
+            self.require_local(tensor)?;
+        }
+        if logits.shape.rank() != 2 {
+            return Err(Error::InvalidSampling(
+                "batched logits must have shape [B,V]",
+            ));
+        }
+        let batch = logits.shape.dimensions()[0];
+        let vocabulary = logits.shape.dimensions()[1];
+        if batch <= 0 || vocabulary <= 0 {
+            return Err(Error::InvalidSampling(
+                "batched sampling dimensions must be positive",
+            ));
+        }
+        if states.shape.dtype() != DType::U64 || states.shape.dimensions() != [batch, 2] {
+            return Err(Error::InvalidSampling(
+                "batched random states must have shape [B,2] and dtype U64",
+            ));
+        }
+        for (tensor, dtype, message) in [
+            (top_k, DType::I32, "batched top-k must be I32[B]"),
+            (
+                active_rows,
+                DType::Bool,
+                "batched active rows must be Bool[B]",
+            ),
+        ] {
+            if tensor.shape.dtype() != dtype || tensor.shape.dimensions() != [batch] {
+                return Err(Error::InvalidSampling(message));
+            }
+        }
+        for (tensor, message) in [
+            (temperature, "batched temperature must be floating-point [B]"),
+            (top_p, "batched top-p must be floating-point [B]"),
+            (min_p, "batched min-p must be floating-point [B]"),
+        ] {
+            if tensor.shape.dtype().class() != DTypeClass::Float
+                || tensor.shape.dimensions() != [batch]
+            {
+                return Err(Error::InvalidSampling(message));
+            }
+        }
+        if maximum_top_k == 0
+            || maximum_top_k > vocabulary as usize
+            || maximum_top_k > i32::MAX as usize
+        {
+            return Err(Error::InvalidSampling(
+                "maximum top-k must be positive, fit I32, and not exceed the vocabulary",
+            ));
+        }
+
+        let scalar_i32 = Shape::new(DType::I32, &[])?;
+        let scalar_bool = Shape::new(DType::Bool, &[])?;
+        let state_shape = Shape::new(DType::U64, &[2])?;
+        let row_state_shape = Shape::new(DType::U64, &[1, 2])?;
+        let row_token_shape = Shape::new(DType::I32, &[1])?;
+        let sentinel = self.scalar(-1_i32)?;
+        let mut next_states = Vec::with_capacity(batch as usize);
+        let mut tokens = Vec::with_capacity(batch as usize);
+        for row in 0..batch {
+            let row_logits = self.slice(logits, &[row, 0], &[row + 1, vocabulary], &[1, 1])?;
+            let input_state = self.slice(states, &[row, 0], &[row + 1, 2], &[1, 1])?;
+            let input_state = self.reshape(input_state, state_shape)?;
+            let row_top_k = self.slice(top_k, &[row], &[row + 1], &[1])?;
+            let row_top_k = self.reshape(row_top_k, scalar_i32)?;
+            let row_temperature = self.slice(temperature, &[row], &[row + 1], &[1])?;
+            let row_temperature = self.reshape(
+                row_temperature,
+                Shape::new(temperature.shape.dtype(), &[])?,
+            )?;
+            let row_top_p = self.slice(top_p, &[row], &[row + 1], &[1])?;
+            let row_top_p = self.reshape(row_top_p, Shape::new(top_p.shape.dtype(), &[])?)?;
+            let row_min_p = self.slice(min_p, &[row], &[row + 1], &[1])?;
+            let row_min_p = self.reshape(row_min_p, Shape::new(min_p.shape.dtype(), &[])?)?;
+            let active = self.slice(active_rows, &[row], &[row + 1], &[1])?;
+            let active = self.reshape(active, scalar_bool)?;
+
+            let random = self.random_state(input_state)?;
+            let (next_state, token) = self.sample_tokens_dynamic(
+                row_logits,
+                random,
+                1,
+                row_top_k,
+                row_temperature,
+                row_top_p,
+                row_min_p,
+                maximum_top_k,
+            )?;
+            let next_state = self.select(active, next_state.into_tensor(), input_state)?;
+            let token = self.select(active, token, sentinel)?;
+            next_states.push(self.reshape(next_state, row_state_shape)?);
+            tokens.push(self.reshape(token, row_token_shape)?);
+        }
+        let states = self.concatenate(&next_states, 0)?;
+        let tokens = self.concatenate(&tokens, 0)?;
+        Ok((states, tokens))
+    }
+
     pub fn softmax(&mut self, input: Tensor, axis: usize) -> Result<Tensor, Error> {
         self.require_float(input, "softmax")?;
         if axis >= input.shape.rank() {
@@ -4172,6 +4292,137 @@ impl ProgramBuilder {
             },
         });
         Ok(result)
+    }
+
+    /// Writes batched query K/V rows into arbitrary physical cache pages.
+    ///
+    /// `cache` is `[physical_pages, page_size, heads, head_dim]`, `updates` is
+    /// `[batch, query, heads, head_dim]`, `block_tables` is
+    /// `[batch, logical_pages]`, and the remaining metadata is `[batch]` or
+    /// `[batch, query]` as appropriate. Masked, padded, and inactive updates
+    /// receive an out-of-bounds physical-page sentinel; StableHLO scatter
+    /// ignores those updates without reading or rewriting any cache element.
+    ///
+    /// Dynamic page IDs and logical positions must be host-validated before
+    /// execution. This operation validates their complete shape/dtype domain,
+    /// but StableHLO intentionally has no data-dependent assertion side effect.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paged_cache_update(
+        &mut self,
+        cache: Tensor,
+        updates: Tensor,
+        block_tables: Tensor,
+        start_positions: Tensor,
+        query_lengths: Tensor,
+        active_rows: Tensor,
+        write_mask: Tensor,
+    ) -> Result<Tensor, Error> {
+        self.require_local(cache)?;
+        self.require_local(updates)?;
+        self.require_rank(cache, "paged cache", 4)?;
+        self.require_rank(updates, "paged cache updates", 4)?;
+        let [physical_pages, page_size, heads, head_dimension] = cache.shape.dimensions() else {
+            unreachable!("paged cache rank was checked")
+        };
+        let [batch, query, update_heads, update_head_dimension] = updates.shape.dimensions() else {
+            unreachable!("paged update rank was checked")
+        };
+        if *physical_pages <= 0
+            || *page_size <= 0
+            || *heads <= 0
+            || *head_dimension <= 0
+            || *batch <= 0
+            || *query <= 0
+        {
+            return Err(Error::InvalidIndexing(
+                "paged cache/update dimensions must be positive",
+            ));
+        }
+        if cache.shape.dtype() != updates.shape.dtype() {
+            return Err(Error::DTypeMismatch {
+                left: cache.shape.dtype(),
+                right: updates.shape.dtype(),
+            });
+        }
+        if heads != update_heads || head_dimension != update_head_dimension {
+            return Err(Error::InvalidIndexing(
+                "paged cache and update head geometry must match",
+            ));
+        }
+        for tensor in [block_tables, start_positions, query_lengths] {
+            self.require_local(tensor)?;
+            if tensor.shape.dtype() != DType::I32 {
+                return Err(Error::UnsupportedDType {
+                    operation: "paged_cache_update metadata",
+                    dtype: tensor.shape.dtype(),
+                });
+            }
+        }
+        for tensor in [active_rows, write_mask] {
+            self.require_local(tensor)?;
+            if tensor.shape.dtype() != DType::Bool {
+                return Err(Error::UnsupportedDType {
+                    operation: "paged_cache_update mask",
+                    dtype: tensor.shape.dtype(),
+                });
+            }
+        }
+        if block_tables.shape.rank() != 2
+            || block_tables.shape.dimensions()[0] != *batch
+            || block_tables.shape.dimensions()[1] <= 0
+            || start_positions.shape.dimensions() != &[*batch]
+            || query_lengths.shape.dimensions() != &[*batch]
+            || active_rows.shape.dimensions() != &[*batch]
+            || write_mask.shape.dimensions() != &[*batch, *query]
+        {
+            return Err(Error::InvalidIndexing(
+                "paged cache metadata does not match batch/query geometry",
+            ));
+        }
+
+        let index_shape = Shape::new(DType::I32, &[*batch, *query])?;
+        let query_offsets = self.iota(index_shape, 1)?;
+        let starts = self.broadcast_in_dim(start_positions, index_shape, &[0])?;
+        let positions = self.add(starts, query_offsets)?;
+        let lengths = self.broadcast_in_dim(query_lengths, index_shape, &[0])?;
+        let within_length = self.less(query_offsets, lengths)?;
+        let active = self.broadcast_in_dim(
+            active_rows,
+            Shape::new(DType::Bool, &[*batch, *query])?,
+            &[0],
+        )?;
+        let enabled = self.logical_and(active, within_length)?;
+        let enabled = self.logical_and(enabled, write_mask)?;
+
+        let page_size = self.scalar(i32::try_from(*page_size).map_err(|_| {
+            Error::InvalidIndexing("paged cache page size exceeds the I32 domain")
+        })?)?;
+        let logical_pages = self.divide(positions, page_size)?;
+        let offsets = self.remainder(positions, page_size)?;
+        let zero = self.scalar(0_i32)?;
+        let safe_logical_pages = self.select(enabled, logical_pages, zero)?;
+        let logical_indices = self.reshape(
+            safe_logical_pages,
+            Shape::new(DType::I32, &[*batch, *query, 1])?,
+        )?;
+        let physical_pages_for_updates =
+            self.gather_batched_nd(block_tables, logical_indices, 1, &[1])?;
+        let sentinel = self.scalar(i32::try_from(*physical_pages).map_err(|_| {
+            Error::InvalidIndexing("physical page count exceeds the I32 domain")
+        })?)?;
+        let physical_pages_for_updates =
+            self.select(enabled, physical_pages_for_updates, sentinel)?;
+        let offsets = self.select(enabled, offsets, zero)?;
+        let physical_pages_for_updates = self.reshape(
+            physical_pages_for_updates,
+            Shape::new(DType::I32, &[*batch, *query, 1])?,
+        )?;
+        let offsets = self.reshape(
+            offsets,
+            Shape::new(DType::I32, &[*batch, *query, 1])?,
+        )?;
+        let indices = self.concatenate(&[physical_pages_for_updates, offsets], 2)?;
+        self.scatter_update(cache, indices, updates, &[0, 1])
     }
 
     /// Portable blockwise paged attention. K/V storage is

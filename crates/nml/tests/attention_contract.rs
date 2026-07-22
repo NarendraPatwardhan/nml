@@ -61,11 +61,138 @@ fn ordinary_and_portable_paged_attention_execute_the_same_semantics() {
     yarn_rotary_embeddings_apply_the_attention_amplitude(&platform);
     fully_masked_ordinary_attention_returns_zero(&platform);
     empty_paged_context_returns_zero(&platform);
+    masked_paged_cache_update_crosses_nonmonotonic_page_boundaries(&platform);
     cache_update_rollback_and_replay_preserve_persistent_storage(&platform);
     checkpoint_backed_attention_block_executes(&platform);
     if env!("NML_ATTENTION_BACKEND") == "cuda" {
         accelerated_cuda_attention_matches_dense_reference(&platform);
     }
+}
+
+fn masked_paged_cache_update_crosses_nonmonotonic_page_boundaries(
+    platform: &nml::Platform,
+) {
+    const PAGES: usize = 5;
+    const PAGE: usize = 4;
+    const BATCH: usize = 2;
+    const QUERY: usize = 4;
+    const DIMENSION: usize = 2;
+
+    let mut builder = ProgramBuilder::new();
+    let cache_shape = Shape::new(
+        DType::F32,
+        &[PAGES as i64, PAGE as i64, 1, DIMENSION as i64],
+    )
+    .unwrap();
+    let update_shape = Shape::new(
+        DType::F32,
+        &[BATCH as i64, QUERY as i64, 1, DIMENSION as i64],
+    )
+    .unwrap();
+    let cache = builder.input("paged_update_cache", cache_shape);
+    let updates = builder.input("paged_updates", update_shape);
+    let tables = builder.input(
+        "paged_update_tables",
+        Shape::new(DType::I32, &[BATCH as i64, 3]).unwrap(),
+    );
+    let starts = builder.input(
+        "paged_update_starts",
+        Shape::new(DType::I32, &[BATCH as i64]).unwrap(),
+    );
+    let lengths = builder.input(
+        "paged_update_lengths",
+        Shape::new(DType::I32, &[BATCH as i64]).unwrap(),
+    );
+    let active = builder.input(
+        "paged_update_active",
+        Shape::new(DType::Bool, &[BATCH as i64]).unwrap(),
+    );
+    let mask = builder.input(
+        "paged_update_mask",
+        Shape::new(DType::Bool, &[BATCH as i64, QUERY as i64]).unwrap(),
+    );
+    let output = builder
+        .paged_cache_update(cache, updates, tables, starts, lengths, active, mask)
+        .unwrap();
+    let output = builder.reuse_buffer(output, cache).unwrap();
+    let program = builder
+        .finish_named(&[("paged_update_output".to_owned(), output)])
+        .unwrap();
+    assert_eq!(program.output_aliases().collect::<Vec<_>>(), vec![Some(0)]);
+
+    let executable = platform.compile(&program, nml::Sharding::single()).unwrap();
+    let initial = (0..PAGES * PAGE * DIMENSION)
+        .map(|index| index as f32)
+        .collect::<Vec<_>>();
+    let updates = (0..BATCH * QUERY * DIMENSION)
+        .map(|index| 100.0 + index as f32)
+        .collect::<Vec<_>>();
+    let mut args = executable.args();
+    set_float(
+        platform,
+        &mut args,
+        "paged_update_cache",
+        cache_shape,
+        &initial,
+    );
+    set_float(
+        platform,
+        &mut args,
+        "paged_updates",
+        update_shape,
+        &updates,
+    );
+    set_i32(
+        platform,
+        &mut args,
+        "paged_update_tables",
+        &[BATCH as i64, 3],
+        &[3, 1, 4, 2, 0, 4],
+    );
+    set_i32(
+        platform,
+        &mut args,
+        "paged_update_starts",
+        &[BATCH as i64],
+        &[3, 0],
+    );
+    set_i32(
+        platform,
+        &mut args,
+        "paged_update_lengths",
+        &[BATCH as i64],
+        &[3, 4],
+    );
+    set_bool(
+        platform,
+        &mut args,
+        "paged_update_active",
+        &[BATCH as i64],
+        &[true, false],
+    );
+    set_bool(
+        platform,
+        &mut args,
+        "paged_update_mask",
+        &[BATCH as i64, QUERY as i64],
+        &[true, false, true, true, true, true, true, true],
+    );
+
+    let actual = decode(
+        args.call()
+            .unwrap()
+            .get("paged_update_output")
+            .unwrap()
+            .to_slice()
+            .unwrap(),
+    );
+    let mut expected = initial;
+    let first = (3 * PAGE + 3) * DIMENSION;
+    expected[first..first + DIMENSION].copy_from_slice(&updates[0..DIMENSION]);
+    let second = (PAGE + 1) * DIMENSION;
+    expected[second..second + DIMENSION]
+        .copy_from_slice(&updates[2 * DIMENSION..3 * DIMENSION]);
+    assert_eq!(actual, expected);
 }
 
 fn learned_sinks_match_across_ordinary_and_paged_attention(platform: &nml::Platform, dtype: DType) {
@@ -1504,7 +1631,7 @@ fn paged_program(dtype: DType, options: AttentionOptions) -> nml_ir::Program {
 
 fn set_float(
     platform: &nml::Platform,
-    args: &mut nml::exe::Arguments<'_>,
+    args: &mut nml::exe::Arguments,
     name: &str,
     shape: Shape,
     values: &[f32],
@@ -1543,7 +1670,7 @@ fn upload_typed<T: nml_tensor::Element>(
 
 fn set_i32(
     platform: &nml::Platform,
-    args: &mut nml::exe::Arguments<'_>,
+    args: &mut nml::exe::Arguments,
     name: &str,
     dimensions: &[i64],
     values: &[i32],
@@ -1553,6 +1680,18 @@ fn set_i32(
     let buffer = platform
         .upload(&slice, nml::Sharding::single(), nml::Memory::Default)
         .unwrap();
+    args.set(name, buffer).unwrap();
+}
+
+fn set_bool(
+    platform: &nml::Platform,
+    args: &mut nml::exe::Arguments,
+    name: &str,
+    dimensions: &[i64],
+    values: &[bool],
+) {
+    let shape = Shape::new(DType::Bool, dimensions).unwrap();
+    let buffer = upload_typed(platform, shape, values);
     args.set(name, buffer).unwrap();
 }
 
