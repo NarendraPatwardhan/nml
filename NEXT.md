@@ -1,5 +1,62 @@
 # GPT-OSS 20B NVFP4 A40 performance analysis
 
+## 2026-07-22 expert-kernel result and next selected tranche
+
+Commit `bc7b830` combined exact K=2880 tail handling, E2M1/E4M3FN decode
+codebooks, eight decode gate/up warps, and four decode down warps. Image
+`sha256:6b7b883efa28b2931986ee04012e5f1aab9eded60898ed3aeea3d7aa2dd03fdb`
+reached 155.203 steady-device TPS, 154.713 device-decode TPS, and 138.269
+decode-loop TPS on A40
+([report](./references/runpod/reports/20260722T013718Z-y6n806pc8gtemu-6b7b883efa28-diagnostic/performance.json)).
+The direct `d4ad426` control measured 150.113, 149.606, and 136.742 TPS,
+respectively.
+
+The improvement is real but uneven. Down fell from 55.538 to 49.304 us
+(-11.2%), while gate/up fell from 96.401 to 93.043 us (-3.5%). Unchanged
+repeated kernels were approximately 2.18% faster on the new pod, leaving about
+9.3% attributable improvement for down but only about 1.3% for gate/up. The
+exact final 64-wide K tail is the strongest explanation for the down result;
+the codebook and gate/up warp effects remain bundled and are not independently
+proven.
+
+The chronological Nsight trace shows that the kernel gain exposed a host
+submission boundary. Clean GPU busy time fell from 6.822 to 6.522 ms/token,
+but clean non-kernel gaps rose from 0.481 to 0.643 ms/token. The recurring gap
+is immediately before layer pair four: 433.8 us median and approximately
+443.5 us clean average, versus roughly 4.8 us at ordinary graph boundaries.
+Layer-pair starts are approximately 459 us apart. A five-pair lookahead models
+to about 10 us residual at this boundary and 148.5-148.8 clean decode-loop TPS;
+a small kernel or host improvement should then clear 150.
+
+The selected next tranche is therefore:
+
+1. Increase bounded decode lookahead from three to five layer pairs.
+2. Restore decode gate/up to four warps while retaining the exact-tail and
+   codebook paths; keep down at four warps unchanged.
+3. Avoid the redundant token-buffer await when readiness can be established
+   without blocking. The host-download event remains the correctness
+   synchronization, while the readiness fast path preserves the existing
+   device-execution and download timing boundary.
+
+### Future tranche: bounded four-layer graph composition
+
+If five-pair lookahead plus the isolated gate/wait corrections do not sustain
+150+ decode-loop TPS, combine two adjacent layer-pair executables into one
+bounded four-layer component. Keep embedding, head, and the remaining schedule
+separate; do not repeat the failed 24-layer monolith.
+
+The current trace records approximately 13 graph launches/token at about
+1.405 ms/token of host API time and roughly 336 graph-node parameter patches at
+about 0.893 ms/token. Six four-layer components would remove six graph launches
+per token, with an upper-bound launch saving near 0.65 ms/token; parameter
+patching will remain unless stable arguments are also retained. Prove the
+schedule first with one isolated four-layer boundary, checking GPU continuity,
+then expand to all six only if it promotes end-to-end decode-loop TPS.
+
+The periodic 5-15 ms trace stalls must not drive this design: they align with
+16 CUPTI buffer flushes totaling 24.616 ms and are profiler overhead. The
+deterministic pair-four boundary is the real orchestration target.
+
 ## 2026-07-22 measured fused-QKV result
 
 Commit `12ce228` fused the three M=1 Q/K/V projections into one semantic NVFP4

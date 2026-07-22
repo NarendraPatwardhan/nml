@@ -924,7 +924,7 @@ impl GroupedPlan {
             Self {
                 block_n: 8,
                 block_k: 256,
-                gate_warps: 8,
+                gate_warps: 4,
                 down_warps: 4,
                 stages: 1,
             }

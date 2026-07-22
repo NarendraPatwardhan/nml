@@ -637,7 +637,14 @@ impl ResidentModel<'_> {
                     lookahead_decode_caches,
                 )?);
             }
-            token_buffer.wait().map_err(boxed)?;
+            // The five-pair prefix normally gives the head enough time to
+            // finish before host observation reaches this point. Preserve the
+            // device/download timing boundary, but avoid a second blocking
+            // await when the token is already ready; the pending download is
+            // the sole required synchronization for correctness.
+            if !token_buffer.is_ready().map_err(boxed)? {
+                token_buffer.wait().map_err(boxed)?;
+            }
             let execution_elapsed = decode_started.elapsed();
             if generated_index == 0 {
                 first_decode_execution = execution_elapsed;
@@ -762,10 +769,9 @@ struct DecodePrefix {
     submission: SubmissionTimings,
 }
 
-// Three layer pairs provide enough independent device work to cover the
-// approximately 1.1 ms PJRT host-observation delay measured on A40, without
-// speculating an unbounded portion of the next token.
-const DECODE_LOOKAHEAD_PAIRS: usize = 3;
+// Five layer pairs cover the pair-four host-submission bubble observed on A40
+// while keeping terminal speculation bounded to ten of the model's 24 layers.
+const DECODE_LOOKAHEAD_PAIRS: usize = 5;
 
 impl LayerCache {
     fn allocate(platform: &Platform, shape: Shape, placement: &Sharding) -> Result<Self> {

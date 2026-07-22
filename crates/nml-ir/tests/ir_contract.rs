@@ -426,8 +426,8 @@ fn decode_shaped_moe_launches_only_selected_expert_blocks() {
         2,
         "gate/up and down must launch exactly one block per selected route: {text}"
     );
-    assert_eq!(text.matches("num_warps = 8 : i32").count(), 1, "{text}");
-    assert_eq!(text.matches("num_warps = 4 : i32").count(), 1, "{text}");
+    assert_eq!(text.matches("num_warps = 8 : i32").count(), 0, "{text}");
+    assert_eq!(text.matches("num_warps = 4 : i32").count(), 2, "{text}");
     assert!(text.contains("stablehlo.pad"), "{text}");
     assert_eq!(text.matches("scf.if").count(), 2, "{text}");
 }
