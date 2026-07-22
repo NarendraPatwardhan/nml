@@ -750,6 +750,27 @@ back the already accepted 151.324 decode-loop tokens/s.
 When other work exists, the scheduler fills the observed host boundary with
 another request/batch instead of blindly looking ahead for one sequence.
 
+Implemented batch-1 serving pipeline:
+
+- the head still returns one compact 20-byte-per-row device result and performs
+  no extra host transfer;
+- a batch-1-only embedding consumes the sampled token directly from that device
+  result while its D2H is in flight;
+- one batch-1-only pair executable reads the current serving slab with position
+  and exact attention length advanced by one, and submits the accepted first
+  five pairs against an already reserved cache tail;
+- the following step consumes the prefix only when sequence, position, and
+  sampled token all match, otherwise it falls back to the complete graph;
+- cancellation/release drops the retained hidden prefix, and cache-buffer
+  dependencies serialize any already submitted private-tail writes before a
+  physical page can be reused; and
+- the engine permits new lookahead work only when its current plan has no
+  prefill submission, so useful competing work takes precedence.
+
+BuildBuddy CPU and CUDA contracts pass. The remaining promotion gate is the
+real A40 single-stream measurement; do not call this recovered until that run
+shows at least 150 steady decode-loop tokens/s.
+
 ### 9.6 Continuous-batching acceptance
 
 Permanent deterministic contracts:

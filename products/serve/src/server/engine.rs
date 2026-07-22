@@ -396,6 +396,7 @@ fn run_loop(
                 &mut active,
                 &mut scheduler,
                 decode,
+                plan.prefill.is_none(),
                 &mut snapshot,
                 &metrics,
             );
@@ -694,6 +695,7 @@ fn execute_decode(
     active: &mut BTreeMap<super::contracts::SequenceId, Active>,
     scheduler: &mut Scheduler,
     submission: &BatchSubmission,
+    allow_lookahead: bool,
     snapshot: &mut EngineSnapshot,
     metrics: &Metrics,
 ) {
@@ -712,7 +714,11 @@ fn execute_decode(
             .iter_mut()
             .map(|request| &mut request.session)
             .collect::<Vec<_>>();
-        generator.decode_batch(&mut sessions, submission.family_capacity)
+        generator.decode_batch(
+            &mut sessions,
+            submission.family_capacity,
+            allow_lookahead,
+        )
     };
     metrics
         .decode_batch_seconds

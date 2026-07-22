@@ -22,8 +22,8 @@ use checkpoint::{BoxError, Result};
 use config::Config;
 pub(crate) use execution::RawToken;
 use execution::{
-    BatchInputs, ModelDefinition, PreparedRequest, RequestExecution, ResidentModel, RunMetrics,
-    ServingCompileConfig, StartupMetrics,
+    BatchInputs, BatchLookahead, ModelDefinition, PreparedRequest, RequestExecution,
+    ResidentModel, RunMetrics, ServingCompileConfig, StartupMetrics,
 };
 use nml::io::ParameterSet;
 use nml::safetensors::TensorRegistry;
@@ -540,6 +540,7 @@ impl<'platform> Generator<'platform> {
         &mut self,
         sessions: &mut [&mut ServerSession],
         batch_capacity: usize,
+        allow_lookahead: bool,
     ) -> Result<Vec<RawToken>> {
         if sessions.is_empty() || sessions.len() > batch_capacity {
             return Err(checkpoint::message("decode batch row count is inconsistent"));
@@ -551,14 +552,31 @@ impl<'platform> Generator<'platform> {
             query_capacity,
         )?;
         let mut checkpoints = Vec::with_capacity(sessions.len());
+        let batch_one = sessions.len() == 1 && batch_capacity == 1;
+        let enqueue_lookahead = batch_one && allow_lookahead;
         for session in sessions.iter_mut() {
             if session.released || !session.prefill_complete() || session.is_complete() {
                 return Err(checkpoint::message("invalid decode batch transition"));
             }
             checkpoints.push(self.pages.checkpoint(session.sequence).map_err(boxed)?);
+            let lookahead_tokens = if enqueue_lookahead
+                && session.generated.len().saturating_add(1) < session.max_new_tokens
+            {
+                2
+            } else {
+                1
+            };
+            let (committed, tentative) = self
+                .pages
+                .sequence_lengths(session.sequence)
+                .map_err(boxed)?;
+            let required = committed
+                .checked_add(lookahead_tokens)
+                .ok_or_else(|| checkpoint::message("decode lookahead length overflows usize"))?;
+            let extension = required.saturating_sub(tentative);
             if let Err(error) = self
                 .pages
-                .append_tentative(session.sequence, 1)
+                .append_tentative(session.sequence, extension)
                 .map_err(boxed)
             {
                 for checkpoint in checkpoints {
@@ -596,9 +614,26 @@ impl<'platform> Generator<'platform> {
                     .ok_or_else(|| checkpoint::message("decode position overflows usize"))?;
                 input.positions[row] = i32::try_from(position)
                     .map_err(|_| checkpoint::message("decode position exceeds I32"))?;
+                // Page allocation may extend one token beyond the visible
+                // decode so the device lookahead can cross a page boundary.
+                // The current graph must still attend through exactly its own
+                // position; the lookahead graph advances this value by one.
+                input.sequence_lengths[row] = input.positions[row]
+                    .checked_add(1)
+                    .ok_or_else(|| checkpoint::message("decode length exceeds I32"))?;
                 input.query_lengths[row] = 1;
                 input.last_indices[row] = 0;
                 install_sampling_row(&mut input, row, session)?;
+            }
+            if batch_one {
+                let session = &sessions[0];
+                input.lookahead = Some(BatchLookahead {
+                    sequence: session.sequence.as_u64(),
+                    position: input.positions[0],
+                    enqueue_next: enqueue_lookahead
+                        && session.generated.len().saturating_add(1)
+                            < session.max_new_tokens,
+                });
             }
             self.model.execute_batch(
                 graph::Phase::Decode,
@@ -638,6 +673,8 @@ impl<'platform> Generator<'platform> {
             return Ok(false);
         }
         session.released = true;
+        self.model
+            .discard_serving_decode_prefix(session.sequence.as_u64());
         self.pages.release_sequence(session.sequence).map_err(boxed)
     }
 
@@ -761,6 +798,7 @@ fn padded_batch_inputs(
         temperature: vec![1.0; batch],
         top_p: vec![1.0; batch],
         min_p: vec![0.0; batch],
+        lookahead: None,
     }
 }
 

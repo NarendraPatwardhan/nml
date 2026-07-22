@@ -6,9 +6,10 @@ use super::checkpoint::{
 };
 use super::config::{AttentionKind, Config};
 use super::graph::{
-    build_decode_layer_pair, build_embedding, build_head, build_layer, cache_shape,
-    page_table_shape, Phase, ShapeFamily, BATCH_RESULT_BYTES_PER_ROW, CACHE_PAGE_SIZE,
-    ServingSlabLayout, MAXIMUM_TOP_K,
+    build_decode_layer_pair, build_embedding, build_head, build_layer,
+    build_serving_decode_lookahead_embedding, build_serving_decode_lookahead_layer_pair,
+    cache_shape, page_table_shape, Phase, ShapeFamily, BATCH_RESULT_BYTES_PER_ROW,
+    CACHE_PAGE_SIZE, ServingSlabLayout, MAXIMUM_TOP_K,
 };
 use crate::{CompilationProfile, SamplingOptions, SubmissionTimings};
 use nml::exe::{Arguments, Results};
@@ -198,6 +199,14 @@ pub(super) struct BatchInputs {
     pub(super) temperature: Vec<f32>,
     pub(super) top_p: Vec<f32>,
     pub(super) min_p: Vec<f32>,
+    pub(super) lookahead: Option<BatchLookahead>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct BatchLookahead {
+    pub(super) sequence: u64,
+    pub(super) position: i32,
+    pub(super) enqueue_next: bool,
 }
 
 pub(super) struct BatchOutputs {
@@ -321,6 +330,7 @@ impl<'platform> CompiledDefinition<'platform> {
             startup,
             bound_families,
             caches,
+            serving_decode_prefix: None,
             cache_allocation,
             cache_storage_bytes,
         })
@@ -451,6 +461,7 @@ pub(super) struct ResidentModel<'platform> {
     startup: StartupMetrics,
     bound_families: BTreeMap<ShapeFamily, BoundComponentFamily>,
     caches: Vec<LayerCache>,
+    serving_decode_prefix: Option<ServingDecodePrefix>,
     cache_allocation: Duration,
     cache_storage_bytes: usize,
 }
@@ -487,6 +498,21 @@ impl ResidentModel<'_> {
     ) -> Result<BatchOutputs> {
         let family = self.batch_family(phase, batch_capacity, query_capacity)?;
         validate_batch_inputs(family, &input)?;
+        let lookahead = input.lookahead;
+        let prefix_hidden = if phase == Phase::Decode {
+            match (lookahead, self.serving_decode_prefix.take()) {
+                (Some(key), Some(prefix))
+                    if prefix.sequence == key.sequence
+                        && prefix.position == key.position
+                        && prefix.token == input.tokens[0] =>
+                {
+                    Some(prefix.hidden)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         let platform = self.plan.platform;
         let placement = &self.plan.placement;
         let slab_layout = ServingSlabLayout::for_family(family)?;
@@ -502,11 +528,17 @@ impl ResidentModel<'_> {
             .bound_families
             .get_mut(&family)
             .expect("selected bound family exists");
-        bound
-            .embedding
-            .set("batch_slab", batch_slab.clone())
-            .map_err(boxed)?;
-        let mut hidden = one(bound.embedding.enqueue().map_err(boxed)?)?;
+        let consumed_prefix = prefix_hidden.is_some();
+        let mut hidden = match prefix_hidden {
+            Some(hidden) => hidden,
+            None => {
+                bound
+                    .embedding
+                    .set("batch_slab", batch_slab.clone())
+                    .map_err(boxed)?;
+                one(bound.embedding.enqueue().map_err(boxed)?)?
+            }
+        };
         match &mut bound.layers {
             BoundLayerExecutables::Prefill { layers, kinds } => {
                 for ((arguments, kind), cache) in
@@ -523,8 +555,14 @@ impl ResidentModel<'_> {
                 }
             }
             BoundLayerExecutables::Decode { pairs } => {
-                for (arguments, caches) in
-                    pairs.iter_mut().zip(self.caches.chunks_exact_mut(2))
+                let pair_offset = if consumed_prefix {
+                    DECODE_LOOKAHEAD_PAIRS
+                } else {
+                    0
+                };
+                for (arguments, caches) in pairs[pair_offset..]
+                    .iter_mut()
+                    .zip(self.caches[pair_offset * 2..].chunks_exact_mut(2))
                 {
                     let (next, _) = execute_serving_layer_pair(
                         arguments,
@@ -539,7 +577,7 @@ impl ResidentModel<'_> {
         bound.head.set("hidden", hidden).map_err(boxed)?;
         bound
             .head
-            .set("batch_slab", batch_slab)
+            .set("batch_slab", batch_slab.clone())
             .map_err(boxed)?;
         let mut results = bound
             .head
@@ -553,7 +591,70 @@ impl ResidentModel<'_> {
         if results.next().is_some() {
             return Err(message("batched head returned extra buffers"));
         }
-        download_batch_outputs(&result, family.batch())
+        let mut result_slice = Slice::alloc(result.shape()).map_err(boxed)?;
+        let download = result.download_to(&mut result_slice).map_err(boxed)?;
+
+        // Preserve the proven single-stream overlap: while the compact result
+        // is returning to the host, submit the next token's embedding and
+        // first five layer pairs against the same device result and slab.
+        let next_hidden = match lookahead.filter(|key| key.enqueue_next) {
+            Some(_) => {
+                let speculative = bound.serving_lookahead.as_mut().ok_or_else(|| {
+                    message("batch-1 decode lookahead executable was not compiled")
+                })?;
+                if speculative.pairs.len() != DECODE_LOOKAHEAD_PAIRS {
+                    return Err(message("batch-1 decode lookahead schedule is invalid"));
+                }
+                speculative
+                    .embedding
+                    .set("batch_result", result.clone())
+                    .map_err(boxed)?;
+                let mut hidden = one(speculative.embedding.enqueue().map_err(boxed)?)?;
+                for (arguments, caches) in speculative
+                    .pairs
+                    .iter_mut()
+                    .zip(self.caches[..DECODE_LOOKAHEAD_PAIRS * 2].chunks_exact_mut(2))
+                {
+                    let (next, _) = execute_serving_layer_pair(
+                        arguments,
+                        hidden,
+                        batch_slab.clone(),
+                        caches,
+                    )?;
+                    hidden = next;
+                }
+                Some(hidden)
+            }
+            None => None,
+        };
+
+        download.wait().map_err(boxed)?;
+        let outputs = decode_batch_output_bytes(
+            result_slice.items::<u8>().map_err(boxed)?,
+            family.batch(),
+        )?;
+        if let (Some(key), Some(hidden)) = (lookahead, next_hidden) {
+            self.serving_decode_prefix = Some(ServingDecodePrefix {
+                sequence: key.sequence,
+                position: key
+                    .position
+                    .checked_add(1)
+                    .ok_or_else(|| message("batch-1 decode lookahead position overflows I32"))?,
+                token: outputs.tokens[0],
+                hidden,
+            });
+        }
+        Ok(outputs)
+    }
+
+    pub(super) fn discard_serving_decode_prefix(&mut self, sequence: u64) {
+        if self
+            .serving_decode_prefix
+            .as_ref()
+            .is_some_and(|prefix| prefix.sequence == sequence)
+        {
+            self.serving_decode_prefix = None;
+        }
     }
 
     pub(super) fn batch_page_table_width(
@@ -1310,6 +1411,12 @@ struct ComponentFamily {
     embedding: Exe,
     layers: LayerExecutables,
     head: Exe,
+    serving_lookahead: Option<ServingLookaheadExecutables>,
+}
+
+struct ServingLookaheadExecutables {
+    embedding: Exe,
+    pair: Exe,
 }
 
 enum LayerExecutables {
@@ -1354,10 +1461,30 @@ impl ComponentFamily {
         let head = compile(platform, placement, |graph| {
             build_head(graph, checkpoint, config, family)
         })?;
+        let serving_lookahead = if family.is_serving()
+            && family.phase() == Phase::Decode
+            && family.batch() == 1
+        {
+            Some(ServingLookaheadExecutables {
+                embedding: compile(platform, placement, |graph| {
+                    build_serving_decode_lookahead_embedding(
+                        graph, checkpoint, config, family,
+                    )
+                })?,
+                pair: compile(platform, placement, |graph| {
+                    build_serving_decode_lookahead_layer_pair(
+                        graph, sliding, full, config, family,
+                    )
+                })?,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             embedding,
             layers,
             head,
+            serving_lookahead,
         })
     }
 
@@ -1387,6 +1514,12 @@ struct BoundComponentFamily {
     embedding: Arguments,
     layers: BoundLayerExecutables,
     head: Arguments,
+    serving_lookahead: Option<BoundServingLookahead>,
+}
+
+struct BoundServingLookahead {
+    embedding: Arguments,
+    pairs: Vec<Arguments>,
 }
 
 enum BoundLayerExecutables {
@@ -1419,10 +1552,27 @@ impl BoundComponentFamily {
                 pairs: bind_decode_pairs(family, checkpoint, parameters, config)?,
             },
         };
+        let serving_lookahead = family
+            .serving_lookahead
+            .as_ref()
+            .map(|lookahead| {
+                let mut embedding = lookahead.embedding.args();
+                bind_embedding(&mut embedding, checkpoint, parameters)?;
+                let pairs = bind_decode_pairs_to(
+                    &lookahead.pair,
+                    checkpoint,
+                    parameters,
+                    config,
+                    Some(DECODE_LOOKAHEAD_PAIRS),
+                )?;
+                Ok::<_, BoxError>(BoundServingLookahead { embedding, pairs })
+            })
+            .transpose()?;
         Ok(Self {
             embedding,
             layers,
             head,
+            serving_lookahead,
         })
     }
 }
@@ -1435,6 +1585,13 @@ struct LayerCache {
 struct DecodePrefix {
     hidden: Buffer,
     submission: SubmissionTimings,
+}
+
+struct ServingDecodePrefix {
+    sequence: u64,
+    position: i32,
+    token: i32,
+    hidden: Buffer,
 }
 
 // Five layer pairs cover the pair-four host-submission bubble observed on A40
@@ -1541,6 +1698,22 @@ fn bind_decode_pairs(
     parameters: &LoadedCheckpoint,
     config: &Config,
 ) -> Result<Vec<Arguments>> {
+    bind_decode_pairs_to(
+        family.decode_pair()?,
+        checkpoint,
+        parameters,
+        config,
+        None,
+    )
+}
+
+fn bind_decode_pairs_to(
+    executable: &Exe,
+    checkpoint: &Checkpoint,
+    parameters: &LoadedCheckpoint,
+    config: &Config,
+    pair_limit: Option<usize>,
+) -> Result<Vec<Arguments>> {
     if checkpoint.model.layers.len() != parameters.model.layers.len()
         || checkpoint.model.layers.len() != config.layer_types().len()
         || !checkpoint.model.layers.len().is_multiple_of(2)
@@ -1556,6 +1729,7 @@ fn bind_decode_pairs(
         .model
         .layers
         .chunks_exact(2)
+        .take(pair_limit.unwrap_or(usize::MAX))
         .enumerate()
         .map(|(pair, loaded)| {
             let first = pair * 2;
@@ -1566,7 +1740,7 @@ fn bind_decode_pairs(
                     "GPT-OSS decode pair violates the alternating schedule",
                 ));
             }
-            bind_layer_pair(family.decode_pair()?, slots, loaded)
+            bind_layer_pair(executable, slots, loaded)
         })
         .collect()
 }
@@ -1959,6 +2133,20 @@ fn validate_batch_inputs(family: ShapeFamily, input: &BatchInputs) -> Result<()>
     {
         return Err(message("batch input vectors do not match the compiled family"));
     }
+    if let Some(lookahead) = input.lookahead {
+        if !family.is_serving()
+            || family.phase() != Phase::Decode
+            || family.batch() != 1
+            || !input.active_rows[0]
+            || !input.sample_rows[0]
+            || input.positions[0] != lookahead.position
+            || input.sequence_lengths[0] != lookahead.position.saturating_add(1)
+        {
+            return Err(message(
+                "batch lookahead requires one exact active decode row",
+            ));
+        }
+    }
     for row in 0..batch {
         if input.sample_rows[row] && !input.active_rows[row] {
             return Err(message("only an active batch row may sample"));
@@ -2047,16 +2235,6 @@ fn require_slab_offset(bytes: &[u8], expected: usize) -> Result<()> {
         return Err(message("serving batch-slab layout is inconsistent"));
     }
     Ok(())
-}
-
-fn download_batch_outputs(result: &Buffer, batch: usize) -> Result<BatchOutputs> {
-    let mut result_slice = Slice::alloc(result.shape()).map_err(boxed)?;
-    result
-        .download_to(&mut result_slice)
-        .map_err(boxed)?
-        .wait()
-        .map_err(boxed)?;
-    decode_batch_output_bytes(result_slice.items::<u8>().map_err(boxed)?, batch)
 }
 
 fn decode_batch_output_bytes(bytes: &[u8], batch: usize) -> Result<BatchOutputs> {
@@ -2291,6 +2469,7 @@ mod tests {
             temperature: vec![0.7, 1.0],
             top_p: vec![0.8, 1.0],
             min_p: vec![0.05, 0.0],
+            lookahead: None,
         };
         validate_batch_inputs(family, &input).unwrap();
         let layout = ServingSlabLayout::for_family(family).unwrap();

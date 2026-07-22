@@ -321,8 +321,12 @@ control.
   iteration; do not block all decode behind one long prompt.
 - [x] Repack surviving/new sequences into the smallest next batch family after
   every result; request identity must not equal batch slot.
-- [ ] Use the accepted five-pair lookahead only for batch 1 with no useful
-  competing work.
+- [x] Use the accepted five-pair lookahead only for batch 1 with no useful
+  competing work. The compact device result now feeds a dedicated lookahead
+  embedding, the next position/length are advanced inside the lookahead pair
+  graph, and the first five pairs run while the one compact D2H is in flight.
+  Prefix identity is sequence/position/token checked, cancellation discards it,
+  and a planned prefill suppresses new speculative work.
 
 ### 3.5 Deterministic and load acceptance
 
