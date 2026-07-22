@@ -616,18 +616,8 @@ impl<'platform> Generator<'platform> {
                 return Err(error);
             }
         };
-        let advanced_positions = outputs
-            .positions
-            .as_ref()
-            .ok_or_else(|| checkpoint::message("decode batch omitted positions"))?;
         let mut raw = Vec::with_capacity(sessions.len());
         for (row, session) in sessions.iter_mut().enumerate() {
-            if advanced_positions[row]
-                != i32::try_from(session.prompt.len() + session.generated.len())
-                    .map_err(|_| checkpoint::message("advanced position exceeds I32"))?
-            {
-                return Err(checkpoint::message("decode position result is inconsistent"));
-            }
             self.pages.commit(session.sequence, 1).map_err(boxed)?;
             session.sampling.seed.copy_from_slice(
                 &outputs.sampling_states[row * 2..row * 2 + 2],

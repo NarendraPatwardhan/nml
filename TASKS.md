@@ -232,8 +232,11 @@ cancellation, and reclamation pass exact accounting.
   complete committed page may be sealed.
 - [x] Track host committed/tentative lengths separately so stale speculative or
   rolled-back bytes remain invisible.
-- [ ] Upload one validated compact metadata set per scheduled batch. Measure
-  page-table/length upload bytes and time separately.
+- [x] Upload tokens, page tables, lengths, row masks, sampling controls, and RNG
+  state as typed contiguous sections of one validated U8 slab per scheduled
+  batch, with exactly one product-level H2D transfer.
+- [ ] Measure the compact slab's upload bytes and time separately on A40 and
+  retain the correlated profiler summary outside the source snapshot.
 
 ### 2.3 Reservations and lifecycle
 
@@ -282,7 +285,7 @@ control.
   top-k/temperature/top-p/min-p and active rows.
 - [x] Make inactive rows preserve cache, RNG, positions, and output sentinel
   exactly.
-- [ ] Return one compact token/state result buffer per batch and scatter it to
+- [x] Return one compact token/state result buffer per batch and scatter it to
   request states after one engine-thread download.
 - [x] Add fixed-seed contracts proving request A is invariant when request B is
   inserted, removed, cancelled, or assigned another padded slot.

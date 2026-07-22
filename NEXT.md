@@ -98,8 +98,9 @@ These are architecture constraints, not optional implementation preferences.
 The server starts from commit `fb415a8dadd51a0053b9be314faa836e2b274721`
 and image digest
 `sha256:3c81704ea85512df7ff76de83ea21f403ef592dc50c23c5ae20e8d70c1e7f3ff`.
-The exact A40 report is
-[`performance.json`](./references/runpod/reports/20260722T021821Z-uwqx38f0an0isb-3c81704ea855-diagnostic/performance.json).
+The exact A40 report is retained as operator evidence outside the source
+snapshot; raw profiler reports and remote-control scripts are not product
+source and are not committed under `references/`.
 
 | Control metric | Accepted value |
 | --- | ---: |
@@ -112,7 +113,7 @@ The exact A40 report is
 | Token download time | 58.517 ms |
 | Complete decode loop | 2,108.061 ms |
 
-The current implementation already provides:
+The current implementation now provides:
 
 - compile-before-residency and reusable embedding/layer/head executables;
 - finite prefill and cache profiles;
@@ -124,27 +125,65 @@ The current implementation already provides:
 - Shardy mesh, physical shard loading, and CPU multi-device evidence;
 - package-private Harmony conversation rendering and strict incremental output
   parsing, including tool calls and tool results; and
-- A40-accepted Triton fused QKV and compact expert decode kernels.
+- A40-accepted Triton fused QKV and compact expert decode kernels;
+- a Tokio/Axum OpenAI chat server with bounded admission, streaming,
+  cancellation, shutdown, readiness, and Prometheus metrics;
+- one global paged K/V arena with arbitrary page-aware reads/writes,
+  reservations, rollback, reclamation, and exact host accounting;
+- continuous decode-first batching with chunked prefill, dynamic row repacking,
+  finite `B={1,2,4,8,16,32}`/`Q={16,64,256}` families, per-row sampling, and
+  inactive-row preservation;
+- complete Harmony tool schema/history/output handling without server-side tool
+  execution; and
+- a serving-only compact control/result ABI: every token, page-table entry,
+  length, row mask, sampling scalar, and RNG word occupies a typed contiguous
+  section of one U8 input slab, and token plus RNG state return in one
+  20-byte-per-row result buffer.
 
 The current implementation does **not** yet provide:
 
-- an HTTP server or Tokio runtime;
-- a step-wise multi-request engine;
-- a global cache arena;
-- arbitrary physical-page writes;
-- batched GPT-OSS graph shapes or per-row sampling controls;
 - prefix ownership/refcounts/eviction;
 - model-specific GPT-OSS tensor partitions on CUDA;
-- public chat/tool schemas; or
 - a DFlash artifact, graph, cache, verifier, or scheduler.
 
-One correctness trap must be fixed before claiming paged serving: current
-attention reads honor the page table, but `apply_layer` reshapes cache storage
-as one dense logical sequence and writes at `position`. That is correct only
-for the current identity mapping. A non-identity server page table would read
-from one physical page and write to another. The global arena milestone must
-therefore introduce a page-aware update indexed by `(physical_page,
-page_offset)` before continuous batching or prefix sharing can execute.
+The identity-only write trap has been removed: every serving layer performs a
+page-aware update indexed by physical page and page offset. Prefix sharing must
+still wait for immutable sealed-page identity, reference ownership, and
+eviction policy; correct page indirection alone is not a prefix cache.
+
+### 3.1 First continuous-batching A40 evidence and immediate repair
+
+The first immutable server image accepted 45/45 requests, reclaimed all 2,389
+cache pages, and produced real decode families B1/B2/B4/B8. Aggregate output
+throughput scaled from 27.98 tokens/s at concurrency 1 to 72.98 tokens/s at
+concurrency 8 (2.61x), proving scheduler membership and compact-kernel dispatch
+worked. It did not satisfy the absolute performance objective.
+
+Nsight correlated the gap to the serving control path rather than NVFP4
+compute correctness:
+
+- every B1 decode layer launched the same accepted compact gate/up, down, QKV,
+  and linear GEMV kernels as the legacy path;
+- the legacy device path remained 157.21 tokens/s on the same image;
+- each server step uploaded fourteen small buffers, downloaded token/RNG/
+  position separately, and repeatedly rebound their addresses through every
+  layer-pair graph;
+- small-M B2/B4/B8 matrix kernels also remain slower than their target
+  aggregate throughput warrants; and
+- compiling the full initial family cross-product delayed readiness by roughly
+  thirteen minutes.
+
+The first repair is implemented in the serving graph ABI without changing the
+legacy single-request ABI or NVFP4 representation. Tokens, positions, lengths,
+masks, page tables, sampling scalars, and explicit RNG state are arranged as
+typed contiguous sections of one U8 host slab, uploaded once, and sliced and
+bitcast inside each serving graph. Deterministic position readback is removed;
+token plus two U64 RNG words are bitcast into one 20-byte-per-row result. The
+hot serving step therefore moves from 14 H2D plus 3 D2H transfers to exactly
+1 H2D plus 1 D2H transfer at the product ABI. CPU and CUDA BuildBuddy contracts
+pass. The next A40 run must measure actual host registration, graph parameter
+updates, H2D/D2H calls, B1, and concurrency-8 deltas before this repair is
+called accepted.
 
 ## 4. External reference facts and what they do not prove
 

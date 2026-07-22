@@ -7,7 +7,8 @@ use super::checkpoint::{
 use super::config::{AttentionKind, Config};
 use super::graph::{
     build_decode_layer_pair, build_embedding, build_head, build_layer, cache_shape,
-    page_table_shape, Phase, ShapeFamily, CACHE_PAGE_SIZE, MAXIMUM_TOP_K,
+    page_table_shape, Phase, ShapeFamily, BATCH_RESULT_BYTES_PER_ROW, CACHE_PAGE_SIZE,
+    ServingSlabLayout, MAXIMUM_TOP_K,
 };
 use crate::{CompilationProfile, SamplingOptions, SubmissionTimings};
 use nml::exe::{Arguments, Results};
@@ -202,7 +203,6 @@ pub(super) struct BatchInputs {
 pub(super) struct BatchOutputs {
     pub(super) tokens: Vec<i32>,
     pub(super) sampling_states: Vec<u64>,
-    pub(super) positions: Option<Vec<i32>>,
 }
 
 /// Artifact-backed model description. Declaring this state opens checkpoint
@@ -489,73 +489,33 @@ impl ResidentModel<'_> {
         validate_batch_inputs(family, &input)?;
         let platform = self.plan.platform;
         let placement = &self.plan.placement;
-        let batch = usize_i64(family.batch())?;
-        let query = usize_i64(family.sequence())?;
-        let table_width = usize_i64(family.page_count())?;
-        let token_shape = match phase {
-            Phase::Prefill => Shape::new(nml::DataType::I32, &[batch, query]).map_err(boxed)?,
-            Phase::Decode => Shape::new(nml::DataType::I32, &[batch]).map_err(boxed)?,
-        };
-        let vector_i32 = Shape::new(nml::DataType::I32, &[batch]).map_err(boxed)?;
-        let vector_bool = Shape::new(nml::DataType::Bool, &[batch]).map_err(boxed)?;
-        let tokens = upload_i32(platform, token_shape, &input.tokens, placement)?;
-        let positions = upload_i32(platform, vector_i32, &input.positions, placement)?;
-        let sequence_lengths = if phase == Phase::Prefill {
-            Some(upload_i32(
-                platform,
-                vector_i32,
-                &input.sequence_lengths,
-                placement,
-            )?)
-        } else {
-            None
-        };
-        let query_lengths =
-            upload_i32(platform, vector_i32, &input.query_lengths, placement)?;
-        let active_rows = upload_bool(platform, vector_bool, &input.active_rows, placement)?;
-        let sample_rows = upload_bool(platform, vector_bool, &input.sample_rows, placement)?;
-        let page_tables = upload_i32(
+        let slab_layout = ServingSlabLayout::for_family(family)?;
+        let batch_slab = upload_u8(
             platform,
-            Shape::new(nml::DataType::I32, &[batch, table_width]).map_err(boxed)?,
-            &input.page_tables,
+            Shape::new(nml::DataType::U8, &[usize_i64(slab_layout.total_bytes())?])
+                .map_err(boxed)?,
+            &pack_batch_slab(family, slab_layout, &input)?,
             placement,
         )?;
-        let last_indices = upload_i32(
-            platform,
-            Shape::new(nml::DataType::I32, &[batch, 1]).map_err(boxed)?,
-            &input.last_indices,
-            placement,
-        )?;
-        let sampling_states = upload_u64(
-            platform,
-            Shape::new(nml::DataType::U64, &[batch, 2]).map_err(boxed)?,
-            &input.sampling_states,
-            placement,
-        )?;
-        let top_k = upload_i32(platform, vector_i32, &input.top_k, placement)?;
-        let temperature = upload_f32_vector(platform, &input.temperature, placement)?;
-        let top_p = upload_f32_vector(platform, &input.top_p, placement)?;
-        let min_p = upload_f32_vector(platform, &input.min_p, placement)?;
 
         let bound = self
             .bound_families
             .get_mut(&family)
             .expect("selected bound family exists");
-        bound.embedding.set("tokens", tokens).map_err(boxed)?;
+        bound
+            .embedding
+            .set("batch_slab", batch_slab.clone())
+            .map_err(boxed)?;
         let mut hidden = one(bound.embedding.enqueue().map_err(boxed)?)?;
         match &mut bound.layers {
             BoundLayerExecutables::Prefill { layers, kinds } => {
                 for ((arguments, kind), cache) in
                     layers.iter_mut().zip(kinds.iter()).zip(&mut self.caches)
                 {
-                    let (next, _) = execute_layer(
+                    let (next, _) = execute_serving_layer(
                         arguments,
                         hidden,
-                        positions.clone(),
-                        sequence_lengths.clone(),
-                        query_lengths.clone(),
-                        active_rows.clone(),
-                        page_tables.clone(),
+                        batch_slab.clone(),
                         cache,
                     )?;
                     hidden = next;
@@ -566,13 +526,10 @@ impl ResidentModel<'_> {
                 for (arguments, caches) in
                     pairs.iter_mut().zip(self.caches.chunks_exact_mut(2))
                 {
-                    let (next, _) = execute_layer_pair(
+                    let (next, _) = execute_serving_layer_pair(
                         arguments,
                         hidden,
-                        positions.clone(),
-                        query_lengths.clone(),
-                        active_rows.clone(),
-                        page_tables.clone(),
+                        batch_slab.clone(),
                         caches,
                     )?;
                     hidden = next;
@@ -582,55 +539,21 @@ impl ResidentModel<'_> {
         bound.head.set("hidden", hidden).map_err(boxed)?;
         bound
             .head
-            .set("last_index", last_indices)
+            .set("batch_slab", batch_slab)
             .map_err(boxed)?;
-        bound
-            .head
-            .set("sampling_state", sampling_states)
-            .map_err(boxed)?;
-        bound.head.set("top_k", top_k).map_err(boxed)?;
-        bound
-            .head
-            .set("temperature", temperature)
-            .map_err(boxed)?;
-        bound.head.set("top_p", top_p).map_err(boxed)?;
-        bound.head.set("min_p", min_p).map_err(boxed)?;
-        bound
-            .head
-            .set("active_rows", sample_rows)
-            .map_err(boxed)?;
-        if phase == Phase::Decode {
-            bound.head.set("position", positions).map_err(boxed)?;
-        }
         let mut results = bound
             .head
             .enqueue()
             .map_err(boxed)?
             .into_buffers()
             .into_iter();
-        let tokens = results
+        let result = results
             .next()
-            .ok_or_else(|| message("batched head omitted tokens"))?;
-        let states = results
-            .next()
-            .ok_or_else(|| message("batched head omitted sampling states"))?;
-        let positions = if phase == Phase::Decode {
-            Some(
-                results
-                    .next()
-                    .ok_or_else(|| message("batched decode head omitted positions"))?,
-            )
-        } else {
-            None
-        };
+            .ok_or_else(|| message("batched head omitted its compact result"))?;
         if results.next().is_some() {
             return Err(message("batched head returned extra buffers"));
         }
-        Ok(BatchOutputs {
-            tokens: download_i32(&tokens)?,
-            sampling_states: download_u64(&states)?,
-            positions: positions.as_ref().map(download_i32).transpose()?,
-        })
+        download_batch_outputs(&result, family.batch())
     }
 
     pub(super) fn batch_page_table_width(
@@ -654,7 +577,8 @@ impl ResidentModel<'_> {
             .keys()
             .copied()
             .filter(|family| {
-                family.phase() == phase
+                family.is_serving()
+                    && family.phase() == phase
                     && family.batch() == batch_capacity
                     && family.sequence() == query_capacity
             })
@@ -1820,6 +1744,99 @@ fn execute_layer_pair(
     Ok((hidden, started.elapsed()))
 }
 
+fn execute_serving_layer(
+    arguments: &mut Arguments,
+    hidden: Buffer,
+    batch_slab: Buffer,
+    cache: &mut LayerCache,
+) -> Result<(Buffer, Duration)> {
+    let started = Instant::now();
+    let (key, value) = cache.take()?;
+    arguments.set("hidden", hidden).map_err(boxed)?;
+    arguments
+        .set("batch_slab", batch_slab)
+        .map_err(boxed)?;
+    arguments.set("cache.key", key).map_err(boxed)?;
+    arguments.set("cache.value", value).map_err(boxed)?;
+    let mut outputs = arguments
+        .enqueue()
+        .map_err(boxed)?
+        .into_buffers()
+        .into_iter();
+    let hidden = outputs
+        .next()
+        .ok_or_else(|| message("GPT-OSS serving layer omitted hidden state"))?;
+    let key = outputs
+        .next()
+        .ok_or_else(|| message("GPT-OSS serving layer omitted key cache"))?;
+    let value = outputs
+        .next()
+        .ok_or_else(|| message("GPT-OSS serving layer omitted value cache"))?;
+    if outputs.next().is_some() {
+        return Err(message("GPT-OSS serving layer returned extra buffers"));
+    }
+    cache.install(key, value)?;
+    Ok((hidden, started.elapsed()))
+}
+
+fn execute_serving_layer_pair(
+    arguments: &mut Arguments,
+    hidden: Buffer,
+    batch_slab: Buffer,
+    caches: &mut [LayerCache],
+) -> Result<(Buffer, Duration)> {
+    let [sliding, full] = caches else {
+        return Err(message(
+            "GPT-OSS serving decode execution requires exactly two caches",
+        ));
+    };
+    let started = Instant::now();
+    let (sliding_key, sliding_value) = sliding.take()?;
+    let (full_key, full_value) = full.take()?;
+    arguments.set("hidden", hidden).map_err(boxed)?;
+    arguments
+        .set("batch_slab", batch_slab)
+        .map_err(boxed)?;
+    arguments
+        .set("sliding.cache.key", sliding_key)
+        .map_err(boxed)?;
+    arguments
+        .set("sliding.cache.value", sliding_value)
+        .map_err(boxed)?;
+    arguments.set("full.cache.key", full_key).map_err(boxed)?;
+    arguments
+        .set("full.cache.value", full_value)
+        .map_err(boxed)?;
+    let mut outputs = arguments
+        .enqueue()
+        .map_err(boxed)?
+        .into_buffers()
+        .into_iter();
+    let hidden = outputs
+        .next()
+        .ok_or_else(|| message("GPT-OSS serving layer pair omitted hidden state"))?;
+    let sliding_key = outputs
+        .next()
+        .ok_or_else(|| message("GPT-OSS serving layer pair omitted sliding key cache"))?;
+    let sliding_value = outputs
+        .next()
+        .ok_or_else(|| message("GPT-OSS serving layer pair omitted sliding value cache"))?;
+    let full_key = outputs
+        .next()
+        .ok_or_else(|| message("GPT-OSS serving layer pair omitted full key cache"))?;
+    let full_value = outputs
+        .next()
+        .ok_or_else(|| message("GPT-OSS serving layer pair omitted full value cache"))?;
+    if outputs.next().is_some() {
+        return Err(message(
+            "GPT-OSS serving layer pair returned extra buffers",
+        ));
+    }
+    sliding.install(sliding_key, sliding_value)?;
+    full.install(full_key, full_value)?;
+    Ok((hidden, started.elapsed()))
+}
+
 fn record_layer_submission(
     timings: &mut SubmissionTimings,
     kind: AttentionKind,
@@ -1866,6 +1883,18 @@ fn upload_u64(
     platform: &Platform,
     shape: Shape,
     values: &[u64],
+    placement: &Sharding,
+) -> Result<Buffer> {
+    let slice = Slice::from_typed(shape, values).map_err(boxed)?;
+    platform
+        .upload(&slice, placement.clone(), Memory::Default)
+        .map_err(boxed)
+}
+
+fn upload_u8(
+    platform: &Platform,
+    shape: Shape,
+    values: &[u8],
     placement: &Sharding,
 ) -> Result<Buffer> {
     let slice = Slice::from_typed(shape, values).map_err(boxed)?;
@@ -1958,22 +1987,105 @@ fn validate_batch_inputs(family: ShapeFamily, input: &BatchInputs) -> Result<()>
     Ok(())
 }
 
-fn download_i32(buffer: &Buffer) -> Result<Vec<i32>> {
-    buffer
-        .to_slice()
-        .map_err(boxed)?
-        .items::<i32>()
-        .map(|items| items.to_vec())
-        .map_err(boxed)
+fn pack_batch_slab(
+    family: ShapeFamily,
+    layout: ServingSlabLayout,
+    input: &BatchInputs,
+) -> Result<Vec<u8>> {
+    let mut packed = Vec::with_capacity(layout.total_bytes());
+    require_slab_offset(&packed, layout.token_offset())?;
+    for token in &input.tokens {
+        packed.extend_from_slice(&token.to_ne_bytes());
+    }
+    require_slab_offset(&packed, layout.layer_offset())?;
+    for row in 0..family.batch() {
+        for value in [
+            input.positions[row],
+            input.sequence_lengths[row],
+            input.query_lengths[row],
+            i32::from(input.active_rows[row]),
+        ] {
+            packed.extend_from_slice(&value.to_ne_bytes());
+        }
+        let page_start = row
+            .checked_mul(family.page_count())
+            .ok_or_else(|| message("serving page-table offset overflows usize"))?;
+        for page in &input.page_tables[page_start..page_start + family.page_count()] {
+            packed.extend_from_slice(&page.to_ne_bytes());
+        }
+    }
+    require_slab_offset(&packed, layout.head_i32_offset())?;
+    for row in 0..family.batch() {
+        for value in [
+            input.last_indices[row],
+            input.top_k[row],
+            i32::from(input.sample_rows[row]),
+        ] {
+            packed.extend_from_slice(&value.to_ne_bytes());
+        }
+    }
+    require_slab_offset(&packed, layout.sampling_state_offset())?;
+    for state in &input.sampling_states {
+        packed.extend_from_slice(&state.to_ne_bytes());
+    }
+    require_slab_offset(&packed, layout.head_f32_offset())?;
+    for row in 0..family.batch() {
+        for value in [
+            input.temperature[row],
+            input.top_p[row],
+            input.min_p[row],
+        ] {
+            packed.extend_from_slice(&value.to_ne_bytes());
+        }
+    }
+    require_slab_offset(&packed, layout.total_bytes())?;
+    Ok(packed)
 }
 
-fn download_u64(buffer: &Buffer) -> Result<Vec<u64>> {
-    buffer
-        .to_slice()
+fn require_slab_offset(bytes: &[u8], expected: usize) -> Result<()> {
+    if bytes.len() != expected {
+        return Err(message("serving batch-slab layout is inconsistent"));
+    }
+    Ok(())
+}
+
+fn download_batch_outputs(result: &Buffer, batch: usize) -> Result<BatchOutputs> {
+    let mut result_slice = Slice::alloc(result.shape()).map_err(boxed)?;
+    result
+        .download_to(&mut result_slice)
         .map_err(boxed)?
-        .items::<u64>()
-        .map(|items| items.to_vec())
-        .map_err(boxed)
+        .wait()
+        .map_err(boxed)?;
+    decode_batch_output_bytes(result_slice.items::<u8>().map_err(boxed)?, batch)
+}
+
+fn decode_batch_output_bytes(bytes: &[u8], batch: usize) -> Result<BatchOutputs> {
+    if bytes.len()
+        != batch
+            .checked_mul(BATCH_RESULT_BYTES_PER_ROW)
+            .ok_or_else(|| message("serving result byte count overflows usize"))?
+    {
+        return Err(message("serving result buffer has an invalid byte count"));
+    }
+    let mut tokens = Vec::with_capacity(batch);
+    let mut sampling_states = Vec::with_capacity(batch * 2);
+    for row in bytes.chunks_exact(BATCH_RESULT_BYTES_PER_ROW) {
+        tokens.push(i32::from_ne_bytes(
+            row[..std::mem::size_of::<i32>()]
+                .try_into()
+                .expect("I32 result width is constant"),
+        ));
+        let states = &row[std::mem::size_of::<i32>()..];
+        for state in states.chunks_exact(std::mem::size_of::<u64>()) {
+            sampling_states.push(u64::from_ne_bytes(
+                state.try_into().expect("U64 result width is constant"),
+            ));
+        }
+    }
+    Ok(BatchOutputs {
+        tokens,
+        sampling_states,
+    })
 }
 
 fn download_token(buffer: &Buffer) -> Result<u32> {
@@ -2160,6 +2272,77 @@ mod tests {
         assert!(should_enqueue_lookahead(0, 4));
         assert!(should_enqueue_lookahead(1, 4));
         assert!(!should_enqueue_lookahead(2, 4));
+    }
+
+    #[test]
+    fn serving_slab_packs_every_typed_input_into_one_columnar_transfer() {
+        let family = ShapeFamily::serving_decode(2, 32, 16, 1).unwrap();
+        let input = BatchInputs {
+            tokens: vec![11, 22],
+            positions: vec![4, 0],
+            sequence_lengths: vec![5, 0],
+            query_lengths: vec![1, 0],
+            active_rows: vec![true, false],
+            sample_rows: vec![true, false],
+            page_tables: vec![7, 8, -1, -1],
+            last_indices: vec![0, 0],
+            sampling_states: vec![101, 102, 201, 202],
+            top_k: vec![17, 1],
+            temperature: vec![0.7, 1.0],
+            top_p: vec![0.8, 1.0],
+            min_p: vec![0.05, 0.0],
+        };
+        validate_batch_inputs(family, &input).unwrap();
+        let layout = ServingSlabLayout::for_family(family).unwrap();
+        let slab = pack_batch_slab(family, layout, &input).unwrap();
+        assert_eq!(slab.len(), layout.total_bytes());
+        let i32_at = |offset: usize| {
+            i32::from_ne_bytes(slab[offset..offset + 4].try_into().unwrap())
+        };
+        let u64_at = |offset: usize| {
+            u64::from_ne_bytes(slab[offset..offset + 8].try_into().unwrap())
+        };
+        let f32_at = |offset: usize| {
+            f32::from_ne_bytes(slab[offset..offset + 4].try_into().unwrap())
+        };
+        assert_eq!(i32_at(layout.token_offset()), 11);
+        assert_eq!(
+            (0..6)
+                .map(|index| i32_at(layout.layer_offset() + index * 4))
+                .collect::<Vec<_>>(),
+            [4, 5, 1, 1, 7, 8],
+        );
+        assert_eq!(
+            (0..3)
+                .map(|index| i32_at(layout.head_i32_offset() + index * 4))
+                .collect::<Vec<_>>(),
+            [0, 17, 1],
+        );
+        assert_eq!(u64_at(layout.sampling_state_offset()), 101);
+        assert_eq!(u64_at(layout.sampling_state_offset() + 8), 102);
+        assert_eq!(f32_at(layout.head_f32_offset()), 0.7);
+        assert_eq!(f32_at(layout.head_f32_offset() + 4), 0.8);
+        assert_eq!(f32_at(layout.head_f32_offset() + 8), 0.05);
+        assert_eq!(i32_at(layout.token_offset() + 4), 22);
+        assert_eq!(
+            (0..6)
+                .map(|index| i32_at(layout.layer_offset() + (6 + index) * 4))
+                .collect::<Vec<_>>(),
+            [0, 0, 0, 0, -1, -1],
+        );
+        assert_eq!(u64_at(layout.sampling_state_offset() + 16), 201);
+        assert!(family.is_serving());
+        assert!(!ShapeFamily::decode(32, 16).unwrap().is_serving());
+
+        let mut result = Vec::new();
+        for (token, states) in [(-1_i32, [101_u64, 102_u64]), (22, [201, 202])] {
+            result.extend_from_slice(&token.to_ne_bytes());
+            result.extend_from_slice(&states[0].to_ne_bytes());
+            result.extend_from_slice(&states[1].to_ne_bytes());
+        }
+        let decoded = decode_batch_output_bytes(&result, 2).unwrap();
+        assert_eq!(decoded.tokens, [-1, 22]);
+        assert_eq!(decoded.sampling_states, [101, 102, 201, 202]);
     }
 
     #[test]
