@@ -1538,6 +1538,24 @@ impl Builder {
         )
     }
 
+    /// Unmasked load with the `.cg` cache modifier for exact, once-through
+    /// tiles. Unlike [`Self::load_masked_streaming`], this form authors no
+    /// predicate or fallback value, so statically complete decode tiles do not
+    /// retain mask construction in their hot loop.
+    pub fn load_streaming(&mut self, pointer: &Value) -> Result<Value, Error> {
+        self.require_values(&[pointer])?;
+        let result = pointer.value_type.loaded().ok_or(Error::ExpectedPointer)?;
+        self.emit_value(
+            result.clone(),
+            format!(
+                "\"tt.load\"({}) <{{cache = 3 : i32, evict = 1 : i32, isVolatile = false, operandSegmentSizes = array<i32: 1, 0, 0>}}> : ({}) -> {}",
+                pointer.id,
+                pointer.value_type.spelling(),
+                result.spelling(),
+            ),
+        )
+    }
+
     pub fn load_masked(
         &mut self,
         pointer: &Value,

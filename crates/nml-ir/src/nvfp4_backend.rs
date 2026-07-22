@@ -13,6 +13,7 @@ use nml_kernel_triton::{
     TensorSpec,
 };
 use nml_mlir::{Block, Context, Region, Type, Value};
+use nml_parameter::nvfp4::{decode_e2m1, decode_e4m3fn_scale};
 use nml_types::{DType, Partition, Shape};
 
 pub(crate) struct LinearInputs<'context> {
@@ -107,7 +108,8 @@ struct LinearPlan {
 struct GroupedPlan {
     block_n: i64,
     block_k: i64,
-    warps: i32,
+    gate_warps: i32,
+    down_warps: i32,
     stages: i32,
 }
 
@@ -534,6 +536,11 @@ fn lower_triton_experts<'context>(
     let plan = GroupedPlan::new(inputs.hidden_shape.dimensions()[0]);
     let block_n = plan.block_n;
     let block_k = plan.block_k;
+    let decode_codebooks = if inputs.hidden_shape.dimensions()[0] == 1 {
+        Some(decode_codebook_constants(context, block)?)
+    } else {
+        None
+    };
     let expert_offset = match inputs.expert_offset {
         Some(value) => value,
         None => {
@@ -555,42 +562,60 @@ fn lower_triton_experts<'context>(
         block_k,
         role: NvFp4GroupedRole::GateUpActivated,
     };
+    let mut gate_specs = vec![
+        tensor(dtype, inputs.hidden_shape.dimensions())?,
+        tensor(KernelDType::I32, inputs.schedule_shape.dimensions())?,
+        tensor(KernelDType::I32, inputs.block_experts_shape.dimensions())?,
+        tensor(KernelDType::I32, &[])?,
+        tensor(KernelDType::U8, inputs.gate_payload_shape.dimensions())?,
+        tensor(KernelDType::U8, inputs.gate_scales_shape.dimensions())?,
+    ];
+    if decode_codebooks.is_some() {
+        gate_specs.extend([
+            tensor(KernelDType::I32, &[16])?,
+            tensor(KernelDType::I32, &[256])?,
+        ]);
+    }
+    gate_specs.extend([
+        tensor(KernelDType::F32, inputs.gate_global_shape.dimensions())?,
+        tensor(dtype, inputs.gate_bias_shape.dimensions())?,
+        tensor(KernelDType::I32, &[])?,
+    ]);
     let gate_specification = KernelSpec::new(
         build_nvfp4_grouped_projection(gate_config).map_err(kernel_error)?,
-        vec![
-            tensor(dtype, inputs.hidden_shape.dimensions())?,
-            tensor(KernelDType::I32, inputs.schedule_shape.dimensions())?,
-            tensor(KernelDType::I32, inputs.block_experts_shape.dimensions())?,
-            tensor(KernelDType::I32, &[])?,
-            tensor(KernelDType::U8, inputs.gate_payload_shape.dimensions())?,
-            tensor(KernelDType::U8, inputs.gate_scales_shape.dimensions())?,
-            tensor(KernelDType::F32, inputs.gate_global_shape.dimensions())?,
-            tensor(dtype, inputs.gate_bias_shape.dimensions())?,
-            tensor(KernelDType::I32, &[])?,
-        ],
+        gate_specs,
         vec![tensor(dtype, &[assignments, intermediate])?],
         vec![],
     )
     .map_err(kernel_error)?;
+    let mut gate_operands = vec![
+        ("input", inputs.hidden),
+        ("sorted_assignments", inputs.sorted_assignments),
+        ("block_experts", inputs.block_experts),
+        ("active_blocks", inputs.active_blocks),
+        ("payload", inputs.gate_payload),
+        ("block_scales", inputs.gate_scales),
+    ];
+    if let Some((e2m1_codebook, e4m3fn_codebook)) = decode_codebooks {
+        gate_operands.extend([
+            ("e2m1_codebook", e2m1_codebook),
+            ("e4m3fn_codebook", e4m3fn_codebook),
+        ]);
+    }
+    gate_operands.extend([
+        ("global_scale", inputs.gate_global),
+        ("bias", inputs.gate_bias),
+        ("expert_offset", expert_offset),
+    ]);
     let gate_call = gate_specification
         .lower(
             context,
-            &[
-                ("input", inputs.hidden),
-                ("sorted_assignments", inputs.sorted_assignments),
-                ("block_experts", inputs.block_experts),
-                ("active_blocks", inputs.active_blocks),
-                ("payload", inputs.gate_payload),
-                ("block_scales", inputs.gate_scales),
-                ("global_scale", inputs.gate_global),
-                ("bias", inputs.gate_bias),
-                ("expert_offset", expert_offset),
-            ],
+            &gate_operands,
             grouped_launch(
                 inputs.block_experts_shape.dimensions()[0],
                 intermediate,
                 block_n,
-                plan.warps,
+                plan.gate_warps,
                 plan.stages,
             )?,
         )
@@ -611,44 +636,62 @@ fn lower_triton_experts<'context>(
         block_k,
         role: NvFp4GroupedRole::Down,
     };
+    let mut down_specs = vec![
+        tensor(dtype, &[assignments, intermediate])?,
+        tensor(KernelDType::I32, inputs.schedule_shape.dimensions())?,
+        tensor(KernelDType::I32, inputs.block_experts_shape.dimensions())?,
+        tensor(KernelDType::I32, &[])?,
+        tensor(KernelDType::U8, inputs.down_payload_shape.dimensions())?,
+        tensor(KernelDType::U8, inputs.down_scales_shape.dimensions())?,
+    ];
+    if decode_codebooks.is_some() {
+        down_specs.extend([
+            tensor(KernelDType::I32, &[16])?,
+            tensor(KernelDType::I32, &[256])?,
+        ]);
+    }
+    down_specs.extend([
+        tensor(KernelDType::F32, inputs.down_global_shape.dimensions())?,
+        tensor(dtype, inputs.down_bias_shape.dimensions())?,
+        tensor(KernelDType::I32, &[])?,
+        tensor(dtype, inputs.routing_shape.dimensions())?,
+    ]);
     let down_specification = KernelSpec::new(
         build_nvfp4_grouped_projection(down_config).map_err(kernel_error)?,
-        vec![
-            tensor(dtype, &[assignments, intermediate])?,
-            tensor(KernelDType::I32, inputs.schedule_shape.dimensions())?,
-            tensor(KernelDType::I32, inputs.block_experts_shape.dimensions())?,
-            tensor(KernelDType::I32, &[])?,
-            tensor(KernelDType::U8, inputs.down_payload_shape.dimensions())?,
-            tensor(KernelDType::U8, inputs.down_scales_shape.dimensions())?,
-            tensor(KernelDType::F32, inputs.down_global_shape.dimensions())?,
-            tensor(dtype, inputs.down_bias_shape.dimensions())?,
-            tensor(KernelDType::I32, &[])?,
-            tensor(dtype, inputs.routing_shape.dimensions())?,
-        ],
+        down_specs,
         vec![tensor(dtype, &[assignments, hidden_size])?],
         vec![],
     )
     .map_err(kernel_error)?;
+    let mut down_operands = vec![
+        ("input", gate_output_value),
+        ("sorted_assignments", inputs.sorted_assignments),
+        ("block_experts", inputs.block_experts),
+        ("active_blocks", inputs.active_blocks),
+        ("payload", inputs.down_payload),
+        ("block_scales", inputs.down_scales),
+    ];
+    if let Some((e2m1_codebook, e4m3fn_codebook)) = decode_codebooks {
+        down_operands.extend([
+            ("e2m1_codebook", e2m1_codebook),
+            ("e4m3fn_codebook", e4m3fn_codebook),
+        ]);
+    }
+    down_operands.extend([
+        ("global_scale", inputs.down_global),
+        ("bias", inputs.down_bias),
+        ("expert_offset", expert_offset),
+        ("routing_weights", inputs.routing_weights),
+    ]);
     let down_call = down_specification
         .lower(
             context,
-            &[
-                ("input", gate_output_value),
-                ("sorted_assignments", inputs.sorted_assignments),
-                ("block_experts", inputs.block_experts),
-                ("active_blocks", inputs.active_blocks),
-                ("payload", inputs.down_payload),
-                ("block_scales", inputs.down_scales),
-                ("global_scale", inputs.down_global),
-                ("bias", inputs.down_bias),
-                ("expert_offset", expert_offset),
-                ("routing_weights", inputs.routing_weights),
-            ],
+            &down_operands,
             grouped_launch(
                 inputs.block_experts_shape.dimensions()[0],
                 hidden_size,
                 block_n,
-                plan.warps,
+                plan.down_warps,
                 plan.stages,
             )?,
         )
@@ -881,35 +924,40 @@ impl GroupedPlan {
             Self {
                 block_n: 8,
                 block_k: 256,
-                warps: 4,
+                gate_warps: 8,
+                down_warps: 4,
                 stages: 1,
             }
         } else if tokens <= 32 {
             Self {
                 block_n: 64,
                 block_k: 128,
-                warps: 4,
+                gate_warps: 4,
+                down_warps: 4,
                 stages: 4,
             }
         } else if tokens <= 64 {
             Self {
                 block_n: 64,
                 block_k: 128,
-                warps: 4,
+                gate_warps: 4,
+                down_warps: 4,
                 stages: 3,
             }
         } else if tokens <= 128 {
             Self {
                 block_n: 128,
                 block_k: 64,
-                warps: 4,
+                gate_warps: 4,
+                down_warps: 4,
                 stages: 3,
             }
         } else {
             Self {
                 block_n: 128,
                 block_k: 64,
-                warps: 8,
+                gate_warps: 8,
+                down_warps: 8,
                 stages: 3,
             }
         }
@@ -1055,6 +1103,31 @@ fn kernel_index_dtype(dtype: DType) -> Result<KernelDType, Error> {
 
 fn tensor(dtype: KernelDType, dimensions: &[i64]) -> Result<TensorSpec, Error> {
     TensorSpec::new(dtype, dimensions).map_err(kernel_error)
+}
+
+fn decode_codebook_constants<'context>(
+    context: &'context Context,
+    block: &mut Block<'context>,
+) -> Result<(Value<'context>, Value<'context>), Error> {
+    let mut e2m1_bits = Vec::with_capacity(16);
+    for code in 0_u8..16 {
+        let value = decode_e2m1(code)
+            .map_err(|_| Error::InvalidLinearAlgebra("invalid E2M1 decode codebook"))?;
+        e2m1_bits.push((value.to_bits() as i32).to_string());
+    }
+    let e2m1_literal = format!("[{}]", e2m1_bits.join(", "));
+    let e2m1_type = context.ranked_tensor_type(DType::I32, &[16])?;
+    let e2m1 = constant(context, block, e2m1_type, &e2m1_literal)?;
+
+    let mut e4m3fn_bits = Vec::with_capacity(256);
+    for bits in 0_u8..=u8::MAX {
+        let value = decode_e4m3fn_scale(bits).unwrap_or(f32::NAN);
+        e4m3fn_bits.push((value.to_bits() as i32).to_string());
+    }
+    let e4m3fn_literal = format!("[{}]", e4m3fn_bits.join(", "));
+    let e4m3fn_type = context.ranked_tensor_type(DType::I32, &[256])?;
+    let e4m3fn = constant(context, block, e4m3fn_type, &e4m3fn_literal)?;
+    Ok((e2m1, e4m3fn))
 }
 
 fn constant<'context>(

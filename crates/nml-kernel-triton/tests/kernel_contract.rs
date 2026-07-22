@@ -321,6 +321,50 @@ fn nvfp4_decode_experts_use_selected_expert_gemv_kernels() {
 }
 
 #[test]
+fn nvfp4_gpt_oss_decode_uses_exact_full_tiles_codebooks_and_a_narrow_tail() {
+    let build = |role, source_row_divisor| {
+        build_nvfp4_grouped_projection(NvFp4GroupedProjectionConfig {
+            dtype: DType::Bf16,
+            tokens: 1,
+            assignments: 4,
+            input_size: 2880,
+            output_size: 2880,
+            local_experts: 32,
+            source_row_divisor,
+            block_m: 16,
+            block_n: 8,
+            block_k: 256,
+            role,
+        })
+        .unwrap()
+        .text()
+        .to_owned()
+    };
+
+    let gate_up = build(NvFp4GroupedRole::GateUpActivated, 4);
+    assert!(gate_up.contains("end = 128 : i32"), "{gate_up}");
+    assert!(gate_up.contains("end = 32 : i32"), "{gate_up}");
+    assert!(gate_up.contains("end = 16 : i32"), "{gate_up}");
+    assert!(gate_up.contains("end = 4 : i32"), "{gate_up}");
+    assert_eq!(gate_up.matches(" = \"tt.reduce\"").count(), 4, "{gate_up}");
+    assert!(
+        gate_up.matches("cacheModifier = cg").count() >= 8,
+        "complete payload and scale tiles must use unmasked streaming loads: {gate_up}"
+    );
+
+    let down = build(NvFp4GroupedRole::Down, 1);
+    assert!(down.contains("end = 128 : i32"), "{down}");
+    assert!(down.contains("end = 32 : i32"), "{down}");
+    assert!(down.contains("end = 16 : i32"), "{down}");
+    assert!(down.contains("end = 4 : i32"), "{down}");
+    assert_eq!(down.matches(" = \"tt.reduce\"").count(), 2, "{down}");
+    assert!(
+        down.matches("cacheModifier = cg").count() >= 4,
+        "complete payload and scale tiles must use unmasked streaming loads: {down}"
+    );
+}
+
+#[test]
 fn microscaling_dot_surface_is_typed_and_verified_by_the_pinned_dialect() {
     let mut builder = Builder::new("nvfp4_scaled_dot_contract").unwrap();
     let left = builder.full_integer(&[128, 128], 0, DType::I8).unwrap();

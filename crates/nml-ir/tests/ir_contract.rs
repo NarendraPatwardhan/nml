@@ -419,11 +419,15 @@ fn decode_shaped_moe_launches_only_selected_expert_blocks() {
 
     assert!(text.contains("tensor<64xi32>"), "{text}");
     assert!(text.contains("tensor<4xi32>"), "{text}");
+    assert!(text.contains("tensor<16xi32>"), "{text}");
+    assert!(text.contains("tensor<256xi32>"), "{text}");
     assert_eq!(
         text.matches("grid_x = 4 : i32").count(),
         2,
         "gate/up and down must launch exactly one block per selected route: {text}"
     );
+    assert_eq!(text.matches("num_warps = 8 : i32").count(), 1, "{text}");
+    assert_eq!(text.matches("num_warps = 4 : i32").count(), 1, "{text}");
     assert!(text.contains("stablehlo.pad"), "{text}");
     assert_eq!(text.matches("scf.if").count(), 2, "{text}");
 }
