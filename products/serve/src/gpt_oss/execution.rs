@@ -531,15 +531,21 @@ impl ResidentModel<'_> {
         let mut first_decode_submission = SubmissionTimings::default();
         let mut steady_decode_submission = SubmissionTimings::default();
         let mut token_download = Slice::alloc(token_buffer.shape()).map_err(boxed)?;
-        let (first_decode_pair, remaining_decode_pairs) = decode_pairs
-            .split_first_mut()
-            .ok_or_else(|| message("GPT-OSS decode schedule contains no layer pair"))?;
-        if caches.len() < 2 {
+        if decode_pairs.len() < DECODE_LOOKAHEAD_PAIRS {
             return Err(message(
-                "GPT-OSS decode schedule contains no first cache pair",
+                "GPT-OSS decode schedule is shorter than the lookahead prefix",
             ));
         }
-        let (first_decode_caches, remaining_decode_caches) = caches.split_at_mut(2);
+        let lookahead_cache_count = DECODE_LOOKAHEAD_PAIRS * 2;
+        if caches.len() < lookahead_cache_count {
+            return Err(message(
+                "GPT-OSS decode cache schedule is shorter than the lookahead prefix",
+            ));
+        }
+        let (lookahead_decode_pairs, remaining_decode_pairs) =
+            decode_pairs.split_at_mut(DECODE_LOOKAHEAD_PAIRS);
+        let (lookahead_decode_caches, remaining_decode_caches) =
+            caches.split_at_mut(lookahead_cache_count);
         let mut lookahead = None;
         for generated_index in 0..request.max_new_tokens {
             let is_stop = super::protocol::is_stop_token(next_token);
@@ -558,11 +564,11 @@ impl ResidentModel<'_> {
                 Some(prefix) => prefix,
                 None => enqueue_decode_prefix(
                     &mut decode_embedding,
-                    first_decode_pair,
+                    lookahead_decode_pairs,
                     token_buffer.clone(),
                     position.clone(),
                     page_table.clone(),
-                    first_decode_caches,
+                    lookahead_decode_caches,
                 )?,
             };
             let mut hidden = prefix.hidden;
@@ -611,10 +617,10 @@ impl ResidentModel<'_> {
 
             // Start host observation before the device token gains another
             // consumer. PJRT can now order the tiny D2H transfer directly
-            // after the head while embedding and the first bounded layer pair
+            // after the head while embedding and the bounded layer-pair prefix
             // execute from the same dependency-carrying token buffer. Starting
-            // this transfer after that speculative consumer would serialize
-            // readback behind the pair and starve the remaining layer pairs.
+            // this transfer after those speculative consumers would serialize
+            // readback behind the prefix and starve the remaining layer pairs.
             let pending_token = token_buffer
                 .download_to(&mut token_download)
                 .map_err(boxed)?;
@@ -624,11 +630,11 @@ impl ResidentModel<'_> {
             if should_enqueue_lookahead(generated_index, request.max_new_tokens) {
                 lookahead = Some(enqueue_decode_prefix(
                     &mut decode_embedding,
-                    first_decode_pair,
+                    lookahead_decode_pairs,
                     token_buffer.clone(),
                     position.clone(),
                     page_table.clone(),
-                    first_decode_caches,
+                    lookahead_decode_caches,
                 )?);
             }
             token_buffer.wait().map_err(boxed)?;
@@ -755,6 +761,11 @@ struct DecodePrefix {
     hidden: Buffer,
     submission: SubmissionTimings,
 }
+
+// Three layer pairs provide enough independent device work to cover the
+// approximately 1.1 ms PJRT host-observation delay measured on A40, without
+// speculating an unbounded portion of the next token.
+const DECODE_LOOKAHEAD_PAIRS: usize = 3;
 
 impl LayerCache {
     fn allocate(platform: &Platform, shape: Shape, placement: &Sharding) -> Result<Self> {
@@ -916,20 +927,31 @@ fn bind_layer_pair<'family>(
 
 fn enqueue_decode_prefix(
     embedding: &mut Arguments<'_>,
-    first_pair: &mut Arguments<'_>,
+    pairs: &mut [Arguments<'_>],
     token: Buffer,
     position: Buffer,
     page_table: Buffer,
     caches: &mut [LayerCache],
 ) -> Result<DecodePrefix> {
+    if pairs.len() != DECODE_LOOKAHEAD_PAIRS || caches.len() != pairs.len() * 2 {
+        return Err(message("GPT-OSS decode lookahead schedule is invalid"));
+    }
     let mut submission = SubmissionTimings::default();
     let started = Instant::now();
     embedding.set("tokens", token).map_err(boxed)?;
-    let hidden = one(embedding.enqueue().map_err(boxed)?)?;
+    let mut hidden = one(embedding.enqueue().map_err(boxed)?)?;
     submission.embedding = started.elapsed();
-    let (hidden, elapsed) =
-        execute_layer_pair(first_pair, hidden, position, page_table, caches)?;
-    submission.layer_pairs = elapsed;
+    for (pair, pair_caches) in pairs.iter_mut().zip(caches.chunks_exact_mut(2)) {
+        let (next_hidden, elapsed) = execute_layer_pair(
+            pair,
+            hidden,
+            position.clone(),
+            page_table.clone(),
+            pair_caches,
+        )?;
+        hidden = next_hidden;
+        submission.layer_pairs += elapsed;
+    }
     Ok(DecodePrefix { hidden, submission })
 }
 
