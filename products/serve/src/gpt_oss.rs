@@ -66,13 +66,91 @@ pub(crate) struct Generator<'platform> {
     model: ResidentModel<'platform>,
     pages: PageManager,
     next_sequence: u64,
-    stable_decode: Option<StableDecodeBatch>,
+    stable_decode: StableDecodeLaneState,
+}
+
+#[derive(Default)]
+struct StableDecodeLaneState {
+    current: Option<StableDecodeBatch>,
 }
 
 struct StableDecodeBatch {
+    descriptor: StableDecodeDescriptor,
+    lane: StableDecodeBatchLane,
+}
+
+#[derive(Eq, PartialEq)]
+struct StableDecodeDescriptor {
     members: Vec<SequenceId>,
     page_tables: Vec<i32>,
-    lane: StableDecodeBatchLane,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StableDecodeTransition {
+    Reuse,
+    Rebind { preserve_lookahead: bool },
+}
+
+impl StableDecodeDescriptor {
+    fn transition_to(&self, replacement: &Self) -> StableDecodeTransition {
+        if self == replacement {
+            return StableDecodeTransition::Reuse;
+        }
+        let preserve_lookahead = self.members == replacement.members
+            && self.page_tables.len() == replacement.page_tables.len()
+            && self
+                .page_tables
+                .iter()
+                .zip(&replacement.page_tables)
+                .all(|(&old, &new)| old == new || (old == -1 && new >= 0));
+        StableDecodeTransition::Rebind { preserve_lookahead }
+    }
+}
+
+impl StableDecodeLaneState {
+    fn transition_to(&self, replacement: &StableDecodeDescriptor) -> StableDecodeTransition {
+        self.current.as_ref().map_or(
+            StableDecodeTransition::Rebind {
+                preserve_lookahead: false,
+            },
+            |current| current.descriptor.transition_to(replacement),
+        )
+    }
+
+    fn install(
+        &mut self,
+        descriptor: StableDecodeDescriptor,
+        mut lane: StableDecodeBatchLane,
+    ) {
+        let transition = self.transition_to(&descriptor);
+        debug_assert_ne!(transition, StableDecodeTransition::Reuse);
+        if transition
+            == (StableDecodeTransition::Rebind {
+                preserve_lookahead: true,
+            })
+        {
+            let carried = lane.carry_lookahead_from(
+                &mut self
+                    .current
+                    .as_mut()
+                    .expect("lookahead-preserving transition has a resident lane")
+                    .lane,
+            );
+            debug_assert!(
+                carried,
+                "lookahead-preserving transition must have pending prefix work",
+            );
+        }
+        self.current = Some(StableDecodeBatch { descriptor, lane });
+    }
+
+    fn lane_mut(&mut self) -> Option<&mut StableDecodeBatchLane> {
+        self.current.as_mut().map(|current| &mut current.lane)
+    }
+
+    fn clear(&mut self) {
+        self.current.take();
+    }
 }
 
 pub(crate) struct ProductReport {
@@ -250,7 +328,7 @@ impl<'platform> Generator<'platform> {
             model,
             pages: PageManager::new(physical_pages).map_err(boxed)?,
             next_sequence: 1,
-            stable_decode: None,
+            stable_decode: StableDecodeLaneState::default(),
         })
     }
 
@@ -436,7 +514,7 @@ impl<'platform> Generator<'platform> {
         batch_capacity: usize,
         query_capacity: usize,
     ) -> Result<Vec<Option<RawToken>>> {
-        self.stable_decode.take();
+        self.stable_decode.clear();
         if sessions.len() != chunk_tokens.len() || sessions.len() > batch_capacity {
             return Err(checkpoint::message("prefill batch row count is inconsistent"));
         }
@@ -603,14 +681,17 @@ impl<'platform> Generator<'platform> {
                 .iter()
                 .map(|session| session.sequence)
                 .collect::<Vec<_>>();
-            let reuse = self.stable_decode.as_ref().is_some_and(|stable| {
-                stable.members == members
-                    && stable.page_tables == metadata.block_tables
-            });
-            if !reuse {
-                let page_tables = metadata.block_tables;
+            let descriptor = StableDecodeDescriptor {
+                members,
+                page_tables: metadata.block_tables,
+            };
+            if self.stable_decode.transition_to(&descriptor) != StableDecodeTransition::Reuse {
                 let mut input =
-                    padded_batch_inputs(batch_capacity, query_capacity, page_tables.clone());
+                    padded_batch_inputs(
+                        batch_capacity,
+                        query_capacity,
+                        descriptor.page_tables.clone(),
+                    );
                 input.sequence_lengths = metadata.sequence_lengths;
                 input.active_rows = metadata.active_rows;
                 input.sample_rows[..sessions.len()].fill(true);
@@ -640,24 +721,18 @@ impl<'platform> Generator<'platform> {
                 let lane = self
                     .model
                     .prepare_stable_decode_batch(batch_capacity, input)?;
-                self.stable_decode = Some(StableDecodeBatch {
-                    members,
-                    page_tables,
-                    lane,
-                });
+                self.stable_decode.install(descriptor, lane);
             }
             self.model.execute_stable_decode_batch(
-                &mut self
-                    .stable_decode
-                    .as_mut()
-                    .expect("stable decode lane was prepared")
-                    .lane,
+                self.stable_decode
+                    .lane_mut()
+                    .expect("stable decode lane was prepared"),
             )
         })();
         let outputs = match execution {
             Ok(outputs) => outputs,
             Err(error) => {
-                self.stable_decode.take();
+                self.stable_decode.clear();
                 for checkpoint in checkpoints {
                     self.pages.rollback(checkpoint).map_err(boxed)?;
                 }
@@ -682,7 +757,7 @@ impl<'platform> Generator<'platform> {
     }
 
     pub(crate) fn release_server_session(&mut self, session: &mut ServerSession) -> Result<bool> {
-        self.stable_decode.take();
+        self.stable_decode.clear();
         if session.released {
             return Ok(false);
         }
@@ -1148,5 +1223,70 @@ mod tests {
     #[test]
     fn checkpoint_selection_accepts_the_listed_index_without_a_direct_file() {
         validate_checkpoint_entries(&[entry(CHECKPOINT_INDEX)], false).unwrap();
+    }
+
+    #[test]
+    fn stable_decode_page_extension_preserves_lookahead() {
+        let current = StableDecodeDescriptor {
+            members: vec![SequenceId::new(1), SequenceId::new(2)],
+            page_tables: vec![3, 7, -1, -1, 11, -1],
+        };
+        let replacement = StableDecodeDescriptor {
+            members: vec![SequenceId::new(1), SequenceId::new(2)],
+            page_tables: vec![3, 7, 19, -1, 11, 23],
+        };
+        assert_eq!(
+            current.transition_to(&replacement),
+            StableDecodeTransition::Rebind {
+                preserve_lookahead: true,
+            },
+        );
+    }
+
+    #[test]
+    fn stable_decode_transition_distinguishes_reuse_from_invalidation() {
+        let current = StableDecodeDescriptor {
+            members: vec![SequenceId::new(1)],
+            page_tables: vec![3, 7, -1, 11],
+        };
+        let exact = StableDecodeDescriptor {
+            members: vec![SequenceId::new(1)],
+            page_tables: vec![3, 7, -1, 11],
+        };
+        assert_eq!(
+            current.transition_to(&exact),
+            StableDecodeTransition::Reuse,
+        );
+        for replacement in [
+            StableDecodeDescriptor {
+                members: vec![SequenceId::new(1)],
+                page_tables: vec![3, 19, -1, 11],
+            },
+            StableDecodeDescriptor {
+                members: vec![SequenceId::new(1)],
+                page_tables: vec![3, 7, -1],
+            },
+            StableDecodeDescriptor {
+                members: vec![SequenceId::new(2)],
+                page_tables: vec![3, 7, -1, 11],
+            },
+        ] {
+            assert_eq!(
+                current.transition_to(&replacement),
+                StableDecodeTransition::Rebind {
+                    preserve_lookahead: false,
+                },
+            );
+        }
+        let allocated = StableDecodeDescriptor {
+            members: vec![SequenceId::new(1)],
+            page_tables: vec![3, 7, 19, 11],
+        };
+        assert_eq!(
+            allocated.transition_to(&current),
+            StableDecodeTransition::Rebind {
+                preserve_lookahead: false,
+            },
+        );
     }
 }

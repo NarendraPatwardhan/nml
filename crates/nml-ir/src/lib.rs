@@ -2738,6 +2738,91 @@ impl ProgramBuilder {
         )
     }
 
+    /// Applies disjoint, statically placed one-dimensional patches in one
+    /// assignment scatter.
+    ///
+    /// This is the graph-level form of an in-place control-buffer transition:
+    /// callers describe only changed ranges, while the backend receives one
+    /// sorted, unique scatter instead of a chain of whole-buffer rebuilds.
+    /// Patches may be supplied in any order but must not overlap.
+    pub fn patch_1d(
+        &mut self,
+        input: Tensor,
+        patches: &[(i64, Tensor)],
+    ) -> Result<Tensor, Error> {
+        self.require_local(input)?;
+        if input.shape.rank() != 1 {
+            return Err(Error::RankMismatch {
+                operation: "patch_1d input",
+                expected: 1,
+                actual: input.shape.rank(),
+            });
+        }
+        if patches.is_empty() {
+            return Err(Error::EmptyOperands("patch_1d"));
+        }
+        let mut ordered = patches.to_vec();
+        ordered.sort_by_key(|(offset, _)| *offset);
+        let mut previous_end = 0_i64;
+        let mut indices = Vec::new();
+        let mut updates = Vec::with_capacity(ordered.len());
+        for (offset, update) in ordered {
+            self.require_local(update)?;
+            if update.shape.rank() != 1 {
+                return Err(Error::RankMismatch {
+                    operation: "patch_1d update",
+                    expected: 1,
+                    actual: update.shape.rank(),
+                });
+            }
+            if update.shape.dtype() != input.shape.dtype() {
+                return Err(Error::DTypeMismatch {
+                    left: input.shape.dtype(),
+                    right: update.shape.dtype(),
+                });
+            }
+            if update.shape.axis_tags() != input.shape.axis_tags()
+                || update.shape.partitions() != input.shape.partitions()
+            {
+                return Err(Error::MetadataMismatch {
+                    operation: "patch_1d",
+                    field: "axis metadata",
+                });
+            }
+            let length = update.shape.dimensions()[0];
+            let end = offset
+                .checked_add(length)
+                .ok_or(Error::InvalidIndexing("patch_1d range overflows"))?;
+            if offset < 0 || length <= 0 || end > input.shape.dimensions()[0] {
+                return Err(Error::InvalidIndexing(
+                    "patch_1d range is outside the input",
+                ));
+            }
+            if offset < previous_end {
+                return Err(Error::InvalidIndexing("patch_1d ranges overlap"));
+            }
+            for index in offset..end {
+                indices.push(
+                    i32::try_from(index)
+                        .map_err(|_| Error::InvalidIndexing("patch_1d index exceeds I32"))?,
+                );
+            }
+            previous_end = end;
+            updates.push(update);
+        }
+        let index_count = i64::try_from(indices.len())
+            .map_err(|_| Error::InvalidIndexing("patch_1d index count exceeds I64"))?;
+        let index_vector_shape = Shape::new(DType::I32, &[index_count])?;
+        let indices = self.constant(&Slice::from_typed(index_vector_shape, &indices)?)?;
+        let indices = self.reshape(indices, Shape::new(DType::I32, &[index_count, 1])?)?;
+        let updates = if updates.len() == 1 {
+            updates[0]
+        } else {
+            self.concatenate(&updates, 0)?
+        };
+        self.scatter_update_with_promises(input, indices, updates, &[0], true, true)
+    }
+
     /// Gathers rows from a `[vocabulary, embedding]` weight without imposing a
     /// model-layer type or a particular checkpoint path.
     pub fn token_embedding(

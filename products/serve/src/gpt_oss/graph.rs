@@ -808,7 +808,6 @@ fn next_decode_slab(
 ) -> Result<Tensor> {
     let batch = dimension(family.batch())?;
     let width_usize = LAYER_CONTROL_FIELDS + family.page_count();
-    let width = dimension(width_usize)?;
 
     let token_bytes = nml(graph.bitcast(token, DataType::U8))?;
     let token_bytes = nml(graph.reshape(
@@ -840,32 +839,8 @@ fn next_decode_slab(
         next_sequence_length,
         shape(DataType::I32, &[batch, 1])?,
     ))?;
-    let unchanged_layer = nml(graph.slice(
-        layer,
-        &[0, 2],
-        &[batch, width],
-        &[1, 1],
-    ))?;
-    let next_layer = nml(graph.concatenate(
-        &[next_position, next_sequence_length, unchanged_layer],
-        1,
-    ))?;
-    let next_layer = nml(graph.bitcast(next_layer, DataType::U8))?;
-    let layer_bytes = layout
-        .head_i32_offset()
-        .checked_sub(layout.layer_offset())
-        .ok_or_else(|| message("serving layer slab range underflows"))?;
-    let next_layer = nml(graph.reshape(
-        next_layer,
-        shape(DataType::U8, &[dimension(layer_bytes)?])?,
-    ))?;
-
-    let head_i32 = slab_byte_range(
-        graph,
-        slab,
-        layout.head_i32_offset(),
-        layout.sampling_state_offset(),
-    )?;
+    let next_positions_and_lengths =
+        nml(graph.concatenate(&[next_position, next_sequence_length], 1))?;
     let state_bytes = nml(graph.bitcast(sampling_state, DataType::U8))?;
     let state_bytes = nml(graph.reshape(
         state_bytes,
@@ -879,30 +854,50 @@ fn next_decode_slab(
             )?],
         )?,
     ))?;
-    let head_f32 = slab_byte_range(
-        graph,
-        slab,
-        layout.head_f32_offset(),
-        layout.total_bytes(),
-    )?;
-    nml(graph.concatenate(
-        &[token_bytes, next_layer, head_i32, state_bytes, head_f32],
-        0,
-    ))
-}
 
-fn slab_byte_range(
-    graph: &mut Graph,
-    slab: Tensor,
-    start: usize,
-    end: usize,
-) -> Result<Tensor> {
-    nml(graph.slice(
-        slab,
-        &[dimension(start)?],
-        &[dimension(end)?],
-        &[1],
-    ))
+    // The slab is donated to this result. Describe the complete state
+    // transition as one set of disjoint byte ranges; the generic graph API
+    // lowers it to one sorted, unique assignment scatter.
+    let mut patches = Vec::with_capacity(family.batch() + 2);
+    patches.push((0_i64, token_bytes));
+    let row_control_bytes = 2 * std::mem::size_of::<i32>();
+    let row_stride_bytes = width_usize
+        .checked_mul(std::mem::size_of::<i32>())
+        .ok_or_else(|| message("serving layer row byte count overflows"))?;
+    for row in 0..family.batch() {
+        let row_end = row
+            .checked_add(1)
+            .ok_or_else(|| message("serving batch row overflows"))?;
+        let controls = nml(graph.slice(
+            next_positions_and_lengths,
+            &[dimension(row)?, 0],
+            &[dimension(row_end)?, 2],
+            &[1, 1],
+        ))?;
+        let controls = nml(graph.bitcast(controls, DataType::U8))?;
+        let controls = nml(graph.reshape(
+            controls,
+            shape(DataType::U8, &[dimension(row_control_bytes)?])?,
+        ))?;
+        let offset = layout
+            .layer_offset()
+            .checked_add(
+                row.checked_mul(row_stride_bytes)
+                    .ok_or_else(|| message("serving layer row offset overflows"))?,
+            )
+            .ok_or_else(|| message("serving layer row offset overflows"))?;
+        patches.push((
+            i64::try_from(offset)
+                .map_err(|_| message("serving layer row offset exceeds I64"))?,
+            controls,
+        ));
+    }
+    patches.push((
+        i64::try_from(layout.sampling_state_offset())
+            .map_err(|_| message("serving sampling state offset exceeds I64"))?,
+        state_bytes,
+    ));
+    nml(graph.patch_1d(slab, &patches))
 }
 
 fn control_vector(

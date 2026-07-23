@@ -1626,6 +1626,34 @@ fn nd_gather_and_typed_scatter_are_verified_without_public_mlir_configuration() 
 }
 
 #[test]
+fn disjoint_static_patches_lower_to_one_sorted_unique_scatter() {
+    let mut builder = ProgramBuilder::new();
+    let input = builder.input("input", Shape::new(DType::U8, &[64]).unwrap());
+    let later = builder.input("later", Shape::new(DType::U8, &[4]).unwrap());
+    let earlier = builder.input("earlier", Shape::new(DType::U8, &[2]).unwrap());
+    let patched = builder
+        .patch_1d(input, &[(40, later), (3, earlier)])
+        .unwrap();
+    assert_eq!(patched.shape(), input.shape());
+    let text = builder.finish(&[patched]).unwrap().stablehlo().unwrap();
+    assert_eq!(text.matches("\"stablehlo.scatter\"(").count(), 1, "{text}");
+    assert!(text.contains("indices_are_sorted = true"), "{text}");
+    assert!(text.contains("unique_indices = true"), "{text}");
+}
+
+#[test]
+fn static_patches_reject_overlapping_ranges() {
+    let mut builder = ProgramBuilder::new();
+    let input = builder.input("input", Shape::new(DType::U8, &[16]).unwrap());
+    let first = builder.input("first", Shape::new(DType::U8, &[8]).unwrap());
+    let second = builder.input("second", Shape::new(DType::U8, &[4]).unwrap());
+    assert!(matches!(
+        builder.patch_1d(input, &[(2, first), (8, second)]),
+        Err(Error::InvalidIndexing("patch_1d ranges overlap"))
+    ));
+}
+
+#[test]
 fn nd_indexing_rejects_structural_index_vector_and_update_errors() {
     use nml_types::Partition;
 

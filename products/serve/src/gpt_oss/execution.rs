@@ -220,6 +220,22 @@ pub(super) struct StableDecodeBatchLane {
     lookahead: Option<StableDecodePrefix>,
 }
 
+impl StableDecodeBatchLane {
+    /// Carries already-enqueued prefix work into a replacement control slab.
+    ///
+    /// The caller is responsible for proving that the replacement slab
+    /// describes the same batch members and only extends their page tables.
+    /// The prefix owns hidden state and has already updated the shared cache
+    /// for the current token, so moving it avoids replaying those layer pairs.
+    pub(super) fn carry_lookahead_from(&mut self, previous: &mut Self) -> bool {
+        if self.family != previous.family || self.lookahead.is_some() {
+            return false;
+        }
+        self.lookahead = previous.lookahead.take();
+        self.lookahead.is_some()
+    }
+}
+
 struct StableDecodePrefix {
     hidden: Buffer,
 }
