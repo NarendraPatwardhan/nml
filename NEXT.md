@@ -256,8 +256,40 @@ the TTIR ABI incorrectly declared I1 storage pointers. The kernel now declares
 I8 storage pointers, converts loaded 0/1 bytes to register predicates, and the
 typed custom-call boundary explicitly permits this Bool-storage ABI. This adds
 no mask-conversion graph or CUDA launch. BuildBuddy Triton, IR, serve, and full
-CUDA construction gates pass; a replacement A40 image remains the runtime
-proof.
+CUDA construction gates pass.
+
+The corrected replacement, digest
+`sha256:b9c637c1408cf5a65b05e873fc0937da42e5faee0e2e8d928c1a4c851b0d3fb8`,
+became ready in 286.738 seconds with 18 total compiled families: the 16
+provisional serving families plus the two retained non-serving families. Its
+first request then exposed a separate deterministic ownership bug in the new
+stable decode lane. Absolute Nsight timestamps show:
+
+- prefill uploaded its compact slab, launched embedding, all 24 layers and
+  head, then completed its compact D2H;
+- first decode uploaded its initial slab, launched embedding and all 12
+  two-layer graphs;
+- no decode-head graph or result D2H was submitted before the request failed.
+
+The boundary is explained completely by runtime ownership. The decode head
+aliases `next_batch_slab` to its `batch_slab` input, and
+`Arguments::enqueue` correctly requires donated storage to have exactly one
+live `Buffer` owner. The lane called the body with
+`lane.batch_slab.clone()`, while embedding and every layer-pair `Arguments`
+object also retained its non-donated slab binding after enqueue. The head
+therefore could never launch: donation was rejected for non-unique ownership.
+
+The repair moves the lane-owned slab into the decode body instead of cloning
+it, explicitly releases every read-only embedding/layer slab binding after
+submission, and stores the donated replacement back in the lane. A permanent
+CPU execution contract now reproduces the rejection with a live reader alias,
+releases that dynamic binding, and proves the same donor then executes. The
+server also records internal execution detail in its error log rather than
+collapsing diagnostics to the public error code. The focused runtime,
+neural-operations CPU, and serve contracts now pass on BuildBuddy, as does the
+complete CUDA server construction. This is the required static threshold for
+publishing one immutable replacement; no pod should be rented from an
+unvalidated intermediate tree.
 
 ## 4. External reference facts and what they do not prove
 

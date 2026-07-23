@@ -1238,6 +1238,24 @@ pub mod exe {
             Ok(self)
         }
 
+        /// Releases one dynamic binding without changing the executable.
+        ///
+        /// Reusable inference pipelines must drop non-donated aliases before
+        /// handing the same physical buffer to a later executable that donates
+        /// it. Baked parameter bindings are immutable and cannot be released.
+        pub fn unset(&mut self, name: &str) -> Result<Option<Buffer>, Error> {
+            let index = self
+                .executable
+                .input_indices
+                .get(name)
+                .copied()
+                .ok_or_else(|| Error::UnknownArgument(name.to_owned()))?;
+            if self.baked[index] {
+                return Err(Error::BakedArgument(name.to_owned()));
+            }
+            Ok(self.slots[index].take())
+        }
+
         fn validate(&self, index: usize, buffer: &Buffer) -> Result<(), Error> {
             let binding = &self.executable.inputs[index];
             if binding.shape != buffer.shape {

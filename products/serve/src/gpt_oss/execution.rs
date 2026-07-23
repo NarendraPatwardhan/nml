@@ -216,7 +216,7 @@ pub(super) struct BatchOutputs {
 /// the next step without another host upload.
 pub(super) struct StableDecodeBatchLane {
     family: ShapeFamily,
-    batch_slab: Buffer,
+    batch_slab: Option<Buffer>,
     lookahead: Option<StableDecodePrefix>,
 }
 
@@ -568,7 +568,7 @@ impl ResidentModel<'_> {
         )?;
         Ok(StableDecodeBatchLane {
             family,
-            batch_slab,
+            batch_slab: Some(batch_slab),
             lookahead: None,
         })
     }
@@ -581,13 +581,20 @@ impl ResidentModel<'_> {
             .bound_families
             .get_mut(&lane.family)
             .ok_or_else(|| message("stable decode family was not retained"))?;
+        // Move the lane's only slab reference into the decode body. The head
+        // donates this storage into `next_batch_slab`; cloning it here makes
+        // that donation fail before the head executable can launch.
+        let batch_slab = lane
+            .batch_slab
+            .take()
+            .ok_or_else(|| message("stable decode control slab is owned by an execution"))?;
         let (result, next_slab) = enqueue_stable_decode_body(
             bound,
             &mut self.caches,
-            lane.batch_slab.clone(),
+            batch_slab,
             lane.lookahead.take(),
         )?;
-        lane.batch_slab = next_slab;
+        lane.batch_slab = Some(next_slab);
         let result_download = self
             .stable_result_downloads
             .get_mut(&lane.family)
@@ -597,7 +604,10 @@ impl ResidentModel<'_> {
             hidden: enqueue_stable_decode_prefix(
                 bound,
                 &mut self.caches,
-                lane.batch_slab.clone(),
+                lane.batch_slab
+                    .as_ref()
+                    .expect("the donated decode slab was replaced")
+                    .clone(),
             )?,
         });
         download.wait().map_err(boxed)?;
@@ -1815,7 +1825,7 @@ fn enqueue_stable_decode_body(
             .embedding
             .set("batch_slab", batch_slab.clone())
             .map_err(boxed)?;
-        hidden = one(bound.embedding.enqueue().map_err(boxed)?)?;
+        hidden = one(enqueue_releasing_batch_slab(&mut bound.embedding)?)?;
         first_pair = 0;
     }
     for (arguments, pair_caches) in pairs[first_pair..]
@@ -1864,7 +1874,7 @@ fn enqueue_stable_decode_prefix(
         .embedding
         .set("batch_slab", batch_slab.clone())
         .map_err(boxed)?;
-    let mut hidden = one(bound.embedding.enqueue().map_err(boxed)?)?;
+    let mut hidden = one(enqueue_releasing_batch_slab(&mut bound.embedding)?)?;
     for (arguments, pair_caches) in pairs[..DECODE_LOOKAHEAD_PAIRS]
         .iter_mut()
         .zip(caches[..DECODE_LOOKAHEAD_PAIRS * 2].chunks_exact_mut(2))
@@ -1885,7 +1895,7 @@ fn enqueue_serving_family(
         .embedding
         .set("batch_slab", batch_slab.clone())
         .map_err(boxed)?;
-    let mut hidden = one(bound.embedding.enqueue().map_err(boxed)?)?;
+    let mut hidden = one(enqueue_releasing_batch_slab(&mut bound.embedding)?)?;
     match &mut bound.layers {
         BoundLayerExecutables::Prefill { layers, kinds } => {
             for ((arguments, kind), cache) in
@@ -1947,9 +1957,7 @@ fn execute_serving_layer(
         .map_err(boxed)?;
     arguments.set("cache.key", key).map_err(boxed)?;
     arguments.set("cache.value", value).map_err(boxed)?;
-    let mut outputs = arguments
-        .enqueue()
-        .map_err(boxed)?
+    let mut outputs = enqueue_releasing_batch_slab(arguments)?
         .into_buffers()
         .into_iter();
     let hidden = outputs
@@ -1996,9 +2004,7 @@ fn execute_serving_layer_pair(
     arguments
         .set("full.cache.value", full_value)
         .map_err(boxed)?;
-    let mut outputs = arguments
-        .enqueue()
-        .map_err(boxed)?
+    let mut outputs = enqueue_releasing_batch_slab(arguments)?
         .into_buffers()
         .into_iter();
     let hidden = outputs
@@ -2024,6 +2030,24 @@ fn execute_serving_layer_pair(
     sliding.install(sliding_key, sliding_value)?;
     full.install(full_key, full_value)?;
     Ok((hidden, started.elapsed()))
+}
+
+/// Enqueues a component and immediately releases its non-donated slab alias.
+///
+/// Embedding and layer executables only read `batch_slab`. Leaving those
+/// bindings populated keeps shared `Buffer` references alive and prevents the
+/// decode head from uniquely owning and donating the slab.
+fn enqueue_releasing_batch_slab(arguments: &mut Arguments) -> Result<nml::exe::Results> {
+    let execution = arguments.enqueue().map_err(boxed);
+    let release = arguments.unset("batch_slab").map_err(boxed);
+    match (execution, release) {
+        (Ok(results), Ok(Some(_))) => Ok(results),
+        (Ok(_), Ok(None)) => Err(message(
+            "component execution did not retain its dynamic batch slab",
+        )),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
 }
 
 fn record_layer_submission(

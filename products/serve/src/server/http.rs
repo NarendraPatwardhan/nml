@@ -503,6 +503,7 @@ async fn translate(
                     state = "terminal",
                     phase = "failed",
                     error_code = error.code().as_str(),
+                    error_message = error.message(),
                     "chat request failed"
                 );
                 let _ = sender

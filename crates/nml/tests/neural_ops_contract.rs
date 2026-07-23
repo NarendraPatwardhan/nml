@@ -22,6 +22,7 @@ fn model_enabling_operations_execute_on_the_product_backends() {
     execute_nd_indexing_contract(&platform);
     execute_ordering_random_and_sampling_contract(&platform);
     execute_batched_sampling_independence_contract(&platform);
+    execute_dynamic_binding_release_contract(&platform);
     execute_single_device_collective_contract(&platform);
     if platform.name() == "cpu" {
         execute_expert_parallel_moe_contract(&platform);
@@ -896,6 +897,54 @@ fn execute_scatter_donation_contract(platform: &nml::Platform) {
             &[3.0, 4.0, 0.0, 0.0, 1.0, 2.0],
         );
     }
+}
+
+fn execute_dynamic_binding_release_contract(platform: &nml::Platform) {
+    let shape = Shape::new(DType::F32, &[4]).unwrap();
+    let compile = |donate| {
+        let mut builder = ProgramBuilder::new();
+        let input = builder.input("input", shape);
+        let one = builder.scalar(1.0f32).unwrap();
+        let one = builder.broadcast_in_dim(one, shape, &[]).unwrap();
+        let output = builder.add(input, one).unwrap();
+        let output = if donate {
+            builder.reuse_buffer(output, input).unwrap()
+        } else {
+            output
+        };
+        let program = builder
+            .finish_named(&[("output".to_owned(), output)])
+            .unwrap();
+        platform.compile(&program, nml::Sharding::single()).unwrap()
+    };
+    let reader = compile(false);
+    let donor = compile(true);
+    let host = nml::Slice::from_typed(shape, &[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+    let shared = platform
+        .upload(&host, nml::Sharding::single(), nml::Memory::Default)
+        .unwrap();
+
+    let mut reader_arguments = reader.args();
+    reader_arguments.set("input", shared.clone()).unwrap();
+    reader_arguments.enqueue().unwrap().wait().unwrap();
+
+    let mut donor_arguments = donor.args();
+    donor_arguments.set("input", shared).unwrap();
+    let error = match donor_arguments.enqueue() {
+        Ok(_) => panic!("donation accepted a live reader alias"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("must be uniquely owned before donation"),
+        "{error}"
+    );
+
+    assert!(reader_arguments.unset("input").unwrap().is_some());
+    assert!(reader_arguments.unset("input").unwrap().is_none());
+    let results = donor_arguments.enqueue().unwrap().wait().unwrap();
+    assert_close(&results, "output", DType::F32, &[2.0, 3.0, 4.0, 5.0]);
 }
 
 fn execute_spatial_contract(platform: &nml::Platform, dtype: DType) {

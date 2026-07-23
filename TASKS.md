@@ -219,8 +219,10 @@ cancellation, and reclamation pass exact accounting.
   tensor semantics, address predicate buffers through I8 TTIR pointers, and
   convert loaded 0/1 bytes to register predicates without adding conversion
   kernels.
-- [ ] Confirm on A40/Nsight that each layer emits the paired append and that the
-  prior decomposed mask/index/scatter kernel cluster is gone.
+- [x] Confirm on A40/Nsight that prefill and first decode each emit one paired
+  append per layer and that the prior decomposed cache mask/index/scatter
+  cluster is gone. The `b9c637c1408c` run reached this kernel evidence before
+  exposing the independent decode-slab ownership failure.
 
 ### 2.2 Allocate global target storage
 
@@ -345,6 +347,10 @@ control.
 - [x] Make the serving head donate the next batch slab, advancing token, RNG,
   position, and sequence length on device with zero steady H2D and one compact
   B*20-byte D2H.
+- [x] Make slab donation ownership-correct: move the lane's only slab owner
+  into the decode body, release every non-donated embedding/layer binding
+  after enqueue, and cover the exact live-reader/donor invariant with a CPU
+  execution contract.
 - [x] Queue the next embedding and five layer pairs immediately after the head
   submission, overlapping the compact result download and host token handling
   with useful GPU work.

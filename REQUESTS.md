@@ -270,6 +270,15 @@ the exact C1/Q128 control, exercises real B2-B8 batching, and keeps Q256
 chunked prefill. After B1 recovers at least 150 end-to-end tokens/s, expand the
 same generic machinery to the production B/Q envelope.
 
+The first corrected-ABI image compiled and became ready, then failed on the
+first decode before its head launch. This was not a kernel-performance result.
+The lane and the already-submitted embedding/layer argument sets retained
+aliases of the slab that the head must donate, so runtime ownership validation
+rejected the head deterministically. The implementation now transfers the sole
+lane owner into the body and releases every read-only component binding after
+submission. This exact ownership transition is covered on CPU before another
+paid A40 run.
+
 The remaining current-phase proof is one published immutable image on A40:
 
 - the exact 106+320 C1 end-to-end control must recover at least 150 tokens/s;
