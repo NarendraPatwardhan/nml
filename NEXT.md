@@ -77,8 +77,8 @@ These are architecture constraints, not optional implementation preferences.
   smallest precompiled batch/query family and masks inactive rows; it does not
   create an unbounded family cross-product.
 - The current recipe-v2 NVFP4 representation, fused QKV, expert kernels,
-  five-pair single-stream lookahead, and compact model artifact remain the
-  control. Serving work does not reopen the quantization format.
+  bounded one-token lookahead, and compact model artifact remain the control.
+  Serving work does not reopen the quantization format.
 - Page allocation policy cannot change attention semantics or CUDA tile width.
   GPT-OSS pages remain 16 tokens; attention compute tiles remain independently
   bounded.
@@ -138,7 +138,7 @@ The current implementation now provides:
 - a paired generic Triton paged K/V append whose donated results alias the
   process-wide cache buffers on CUDA;
 - one generic stable decode lane for every retained batch family, with a
-  donated device-resident batch slab and five-layer-pair lookahead;
+  donated device-resident batch slab and nine-layer-pair lookahead;
 - direct stable-batch continuation until membership, page tables,
   cancellation, deadline, backpressure, or shutdown requires replanning;
 - reusable process-lifetime executable bindings and per-family compact result
@@ -212,7 +212,7 @@ server. The current repair is one generic stable-batch data plane:
 - stable membership for any retained B family therefore performs zero steady
   H2D transfers and one compact B*20-byte D2H;
 - after submitting the result download, the engine immediately queues the next
-  embedding and five layer pairs from the donated slab, overlapping visible
+  embedding and nine layer pairs from the donated slab, overlapping visible
   token handling with useful GPU work;
 - the engine continues the same batch without scheduler re-entry while all
   rows survive and no command, cancellation, deadline, shutdown, backpressure,
@@ -227,10 +227,11 @@ server. The current repair is one generic stable-batch data plane:
 Two trace-correlated compute repairs are included in the same current phase:
 
 - inactive `[B,Q]` positions now enter routed MoE as masked assignments, receive
-  expert ID `-1`, create no expert schedule entries, and return exact zero; and
-- sparse masked B1/B2 decode compacts valid routes with one scan and two small
-  scatters, preserving one grouped block per selected route instead of
-  regressing to the full per-expert scheduler; and
+  expert ID `-1`, are rejected before expert weight loads, and return exact
+  zero; and
+- sparse masked B1/B2 decode retains one fixed grouped block per selected
+  route; inactive expert ID `-1` is rejected inside the grouped Triton kernel,
+  avoiding a scan and two scatters in every layer; and
 - K and V page writes lower together to one generic Triton custom call on
   CUDA, resolving the physical page once and aliasing both donated cache
   buffers.
@@ -290,6 +291,53 @@ neural-operations CPU, and serve contracts now pass on BuildBuddy, as does the
 complete CUDA server construction. This is the required static threshold for
 publishing one immutable replacement; no pod should be rented from an
 unvalidated intermediate tree.
+
+The next immutable server-load report,
+`20260723T120216Z-wqx4ob2yp2ovh3-23b2aad61aa6-server-load`, completed the full
+C1/C2/C4/C8 matrix. C1 reached 129.382-130.309 end-to-end tokens/s and
+141.644-142.799 decode tokens/s. The page-extension repair was real: relative
+to the preceding server report, two measured C1 waves removed 199 graph
+launches, 4,277 graph-parameter updates, and 39.0 ms of decode time.
+
+Nsight also isolates the remaining parity loss:
+
+- useful C1 kernels consume 6.687 ms/token versus 6.502 ms/token in the
+  accepted diagnostic control;
+- masked sparse routing rebuilds four already-separated routes in every layer,
+  adding a scan, two scatters, and supporting elementwise launches even when
+  the only row is active; and
+- the principal device holes begin exactly after lookahead pair five. Across
+  one measured wave, 92 pair-five-to-pair-six boundaries were late, with
+  0.5-2.04 ms gaps. Once the prefix drained, later suffix submissions could
+  also fall behind.
+
+The current repair addresses those measured causes without a B1-only route:
+
+1. Sparse masked decode uses the same fixed padded schedule as unmasked
+   decode. Inactive routes retain expert ID `-1`; existing grouped Triton
+   guards skip their weight loads and dot products. This removes the redundant
+   per-layer compaction while preserving partial-family semantics.
+2. Stable decode rebuilds padded page metadata only when membership or the
+   physical page list changes. The device slab remains authoritative for
+   per-token positions, lengths, tokens, and RNG state.
+3. Committing one token no longer clones the request's complete page table;
+   host commit work is constant in context length.
+4. Generic one-token lookahead is nine layer pairs. The measured extra four
+   pairs provide the missing submission runway while retaining a three-pair
+   suffix and visible-token cancellation boundary.
+5. Small decode batches no longer inherit prefill-shaped compact kernels.
+   Nsight showed B2/B4/B8 splitting Q, K, and V into three matrix launches and
+   running routed experts as 16-row matrix tiles even though the sparse route
+   schedule usually supplied one live row per expert block. Through eight
+   rows, Q/K/V now share one fused GEMV launch ordered weight-tile-major and
+   row-minor, keeping identical compact weight tiles adjacent for L2 reuse.
+   Each selected expert route uses the compact recipe-v2 GEMV geometry. At 16
+   rows and above, lowering retains the grouped matrix family so useful
+   row/expert reuse is not discarded.
+
+Focused Triton, IR, and serve contracts pass on BuildBuddy, and the complete
+CUDA server target builds remotely. Runtime performance remains unclaimed
+until the next immutable A40 server-load report.
 
 ## 4. External reference facts and what they do not prove
 
@@ -823,8 +871,15 @@ Correct portable execution comes first, but CUDA promotion requires retained
 compact weights throughout:
 
 - batch 1 continues to use the accepted M=1 fused-QKV/GEMV/expert path;
-- small `M=B*Q` batches use a Triton family that shares weight loads across
-  rows where profitable instead of launching B independent one-row kernels;
+- `M<=8` QKV uses one weight-tile-major, row-minor Triton launch spanning all
+  rows and all three projections, avoiding both three-launch Q/K/V dispatch
+  and 16-row padding while placing identical compact weight tiles in adjacent
+  CTAs for L2 reuse;
+- `M<=8` sparse routed experts use one selected-route compact GEMV block per
+  assignment instead of tensor-core tiles whose unused rows cannot amortize
+  their cost;
+- `M>=16` retains grouped matrix lowering so repeated experts can reuse their
+  weights across genuinely occupied rows;
 - routed MoE flattens active tokens, builds one assignment schedule, and
   launches only selected expert blocks;
 - padded rows produce no assignments and no weight traffic;
@@ -852,7 +907,7 @@ request's slot as permanent identity.
 ### 9.5 Preserve low-latency execution in the generic path
 
 Stable membership at any batch size retains the complete batch slab and the
-bounded five-layer-pair prefix on device. The serving head donates the updated
+bounded nine-layer-pair prefix on device. The serving head donates the updated
 slab, the next prefix is enqueued while the compact result downloads, and the
 engine bypasses remove/requeue/replan until useful work or a lifecycle event
 changes membership.

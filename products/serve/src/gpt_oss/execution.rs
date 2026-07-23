@@ -1514,9 +1514,12 @@ struct DecodePrefix {
     submission: SubmissionTimings,
 }
 
-// Five layer pairs cover the pair-four host-submission bubble observed on A40
-// while keeping terminal speculation bounded to ten of the model's 24 layers.
-const DECODE_LOOKAHEAD_PAIRS: usize = 5;
+// Nine layer pairs cover the measured server-side submission tail on A40.
+// The prior five-pair prefix repeatedly drained before the generic scheduler
+// and PJRT submission path had queued pair six, leaving 0.5-2.0 ms device
+// holes. This remains one-token lookahead and bounds terminal speculation to
+// eighteen of the model's 24 layers.
+const DECODE_LOOKAHEAD_PAIRS: usize = 9;
 
 impl LayerCache {
     fn allocate(platform: &Platform, shape: Shape, placement: &Sharding) -> Result<Self> {
@@ -2482,7 +2485,7 @@ mod tests {
 
     #[test]
     fn decode_lookahead_never_crosses_the_visible_token_budget() {
-        assert_eq!(DECODE_LOOKAHEAD_PAIRS, 5);
+        assert_eq!(DECODE_LOOKAHEAD_PAIRS, 9);
         assert!(!should_enqueue_lookahead(0, 0));
         assert!(!should_enqueue_lookahead(0, 1));
         assert!(!should_enqueue_lookahead(0, 2));

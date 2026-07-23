@@ -108,6 +108,18 @@ impl StableDecodeDescriptor {
 }
 
 impl StableDecodeLaneState {
+    fn matches_members(&self, sessions: &[&mut ServerSession]) -> bool {
+        self.current.as_ref().is_some_and(|current| {
+            current.descriptor.members.len() == sessions.len()
+                && current
+                    .descriptor
+                    .members
+                    .iter()
+                    .zip(sessions)
+                    .all(|(member, session)| *member == session.sequence)
+        })
+    }
+
     fn transition_to(&self, replacement: &StableDecodeDescriptor) -> StableDecodeTransition {
         self.current.as_ref().map_or(
             StableDecodeTransition::Rebind {
@@ -637,17 +649,24 @@ impl<'platform> Generator<'platform> {
             batch_capacity,
             query_capacity,
         )?;
+        let same_members = self.stable_decode.matches_members(sessions);
+        let mut page_table_expanded = false;
         let mut checkpoints = Vec::with_capacity(sessions.len());
         for session in sessions.iter_mut() {
             if session.released || !session.prefill_complete() || session.is_complete() {
                 return Err(checkpoint::message("invalid decode batch transition"));
             }
             checkpoints.push(self.pages.checkpoint(session.sequence).map_err(boxed)?);
+            let previous_pages = self
+                .pages
+                .page_table(session.sequence)
+                .map_err(boxed)?
+                .len();
             let (committed, tentative) = self
                 .pages
                 .sequence_lengths(session.sequence)
                 .map_err(boxed)?;
-            // The generic stable lane submits the next token's first five
+            // The generic stable lane submits the next token's bounded
             // layer pairs before waiting for this token's download. Reserve
             // one uncommitted position ahead so that prefix always has a
             // valid physical page, including at 16-token boundaries.
@@ -665,27 +684,37 @@ impl<'platform> Generator<'platform> {
                 }
                 return Err(error);
             }
+            page_table_expanded |= self
+                .pages
+                .page_table(session.sequence)
+                .map_err(boxed)?
+                .len()
+                != previous_pages;
         }
         let execution = (|| {
-            let rows = sessions
-                .iter()
-                .map(|session| Some(session.sequence))
-                .chain(std::iter::repeat(None))
-                .take(batch_capacity)
-                .collect::<Vec<_>>();
-            let metadata = self
-                .pages
-                .compact_metadata(&rows, table_width)
-                .map_err(boxed)?;
-            let members = sessions
-                .iter()
-                .map(|session| session.sequence)
-                .collect::<Vec<_>>();
-            let descriptor = StableDecodeDescriptor {
-                members,
-                page_tables: metadata.block_tables,
-            };
-            if self.stable_decode.transition_to(&descriptor) != StableDecodeTransition::Reuse {
+            // The resident slab advances positions, lengths, tokens, and
+            // sampling state on device. Rebuilding the padded host metadata
+            // every token only repeats an unchanged page-table transfer
+            // decision. Rebind solely when membership or physical pages
+            // actually change.
+            if !same_members || page_table_expanded {
+                let rows = sessions
+                    .iter()
+                    .map(|session| Some(session.sequence))
+                    .chain(std::iter::repeat(None))
+                    .take(batch_capacity)
+                    .collect::<Vec<_>>();
+                let metadata = self
+                    .pages
+                    .compact_metadata(&rows, table_width)
+                    .map_err(boxed)?;
+                let descriptor = StableDecodeDescriptor {
+                    members: sessions
+                        .iter()
+                        .map(|session| session.sequence)
+                        .collect(),
+                    page_tables: metadata.block_tables,
+                };
                 let mut input =
                     padded_batch_inputs(
                         batch_capacity,

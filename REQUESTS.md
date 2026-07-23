@@ -110,14 +110,15 @@ The implemented repair has two parts:
 1. `Q128` is now a retained prefill family, reducing this example from 150
    padded positions to 22.
 2. The active `[B,Q]` mask is flattened into routed MoE. Inactive tokens receive
-   expert ID `-1`, create no schedule entries, touch no expert weights, and
-   produce exact zero routed output.
+   expert ID `-1`, touch no expert weights, and produce exact zero routed
+   output. Sparse fixed schedules may retain a masked route slot when that
+   avoids runtime compaction.
 
 The mask is semantic, not merely a final output select. Portable IR remains
 available, while CUDA keeps the compact expert schedule. Masked B1/B2 decode
-retains the sparse one-block-per-selected-route path: one scan and two small
-scatters compact valid routes instead of falling back to the full per-expert
-scheduler.
+retains the sparse one-block-per-selected-route path without runtime
+compaction. Inactive routes keep expert ID `-1`; the grouped Triton kernels
+reject those blocks before weight loads or dot products.
 
 ### 3.2 Decomposed paged-cache updates
 
@@ -156,14 +157,14 @@ rebuilt a slab, and only then submitted more GPU work.
 The implemented stable-batch transaction now behaves as follows:
 
 ```text
-current five-pair prefix already queued
+current nine-pair prefix already queued
                  |
                  v
 remaining pairs -> head/sampling
                  |
                  +---- compact result D2H ----> host visible token
                  |
-                 `---- next embedding + five pairs queued immediately
+                 `---- next embedding + nine pairs queued immediately
 ```
 
 The serving head also produces the donated next batch slab. It updates token,
@@ -207,23 +208,33 @@ The same repairs apply:
 There is no B1-to-batch state export protocol because there is no separate B1
 engine. The stable lane itself changes family.
 
-Small-B NVFP4 weight reuse remains a measurement question. The prior report
-only profiled B1, so it cannot establish whether B2-B32 matrix dispatch uses
-the A40 efficiently. The next A40 run must distinguish:
+The recovered C2/C4/C8 trace answered the small-B dispatch question. Stable
+decode selected the intended B2/B4/B8 families, but those families fell off
+both compact decode paths:
 
-```text
-C8 mostly schedules B1
-    -> admission, compaction, or scheduler defect
+- Q, K, and V became three separate NVFP4 matrix launches per layer, averaging
+  roughly 83, 85, and 189-192 microseconds respectively across B2/B4/B8,
+  while accepted B1 fused all three projections in roughly 28 microseconds;
+- expert gate/up used a `[B*4,45]` grid and averaged 795, 969, and 1,368
+  microseconds at B2, B4, and B8, versus roughly 98 microseconds at B1; and
+- expert down averaged 303, 374, and 504 microseconds, versus roughly 48
+  microseconds at B1.
 
-C8 schedules B8 but aggregate throughput is weak
-    -> small-M NVFP4, routing, or memory-layout defect
+The cause was geometric, not a dense-weight conversion: through B8 there are
+only 8/16/32 routed assignments across 32 experts, so the grouped matrix
+kernel's 16-row tile was usually almost empty. The implementation now selects
+the compact selected-route GEMV family through `M=8`, authors one fixed block
+per route, and fuses all small-batch rows plus Q/K/V projections into one
+weight-tile-major, row-minor launch. Adjacent QKV CTAs therefore read the same
+payload/scales for different active rows and can reuse them from L2. B1 is the
+same member of this generic dispatch, not a separate server route. B16 and
+larger retain grouped matrix lowering where route collisions can supply useful
+rows.
 
-C8 schedules B8 efficiently but tail latency is poor
-    -> prefill interference, queueing, or fairness defect
-```
-
-Kernel tuning must follow this evidence; selecting a convenient test shape is
-not a product optimization.
+BuildBuddy proves TTIR construction, CUDA lowering, and the complete server
+build. The next A40 run must measure the new B2/B4/B8 kernel times and determine
+the empirical crossover; no throughput improvement is claimed from compile
+evidence alone.
 
 ## 5. Long prompt during decode
 
@@ -256,10 +267,12 @@ Implemented in the current tree:
 1. mask-aware routed MoE for prompt padding and inactive batch rows;
 2. a paired Triton K/V paged append for every retained batch family;
 3. a donated device-resident batch slab advanced by the serving head;
-4. generic stable execution with five-pair lookahead;
+4. generic stable execution with nine-pair lookahead;
 5. direct stable-batch continuation without ordinary scheduler re-entry;
-6. reusable per-family executable bindings and result workspaces; and
-7. the `Q128` prefill family.
+6. reusable per-family executable bindings and result workspaces;
+7. the `Q128` prefill family; and
+8. weight-tile-major fused QKV and selected-route expert GEMV for every
+   retained `B<=8` decode family.
 
 BuildBuddy CPU/IR/serve contracts and the full CUDA server build validate
 construction and lowering. They do not establish runtime performance.

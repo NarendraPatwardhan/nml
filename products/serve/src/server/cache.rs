@@ -387,11 +387,18 @@ impl PageManager {
             ));
         }
         let start = reservation.committed_tokens;
-        let pages = reservation.pages.clone();
         for token in start..target {
             let logical_page = token / self.page_size;
             let within_page = token % self.page_size + 1;
-            let page = pages[logical_page];
+            // Copy the one page ID needed by this token instead of cloning the
+            // complete logical page table on every decode commit. At long
+            // contexts that clone made host work grow with sequence length
+            // even though committing one token touches exactly one page.
+            let page = self
+                .reservations
+                .get(&sequence)
+                .expect("the reservation was validated above")
+                .pages[logical_page];
             match &mut self.descriptors[page.as_usize()] {
                 PageState::Private {
                     owner, committed, ..

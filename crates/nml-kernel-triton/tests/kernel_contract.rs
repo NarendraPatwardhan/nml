@@ -173,6 +173,7 @@ fn nvfp4_decode_linear_uses_compact_gemv_without_dead_matrix_rows() {
 fn nvfp4_decode_qkv_combines_three_projection_tails_in_one_grid() {
     let production = NvFp4QkvConfig {
         dtype: DType::Bf16,
+        rows: 1,
         inputs: 2_880,
         query_outputs: 4_096,
         key_outputs: 512,
@@ -185,6 +186,7 @@ fn nvfp4_decode_qkv_combines_three_projection_tails_in_one_grid() {
 
     let ttir = build_nvfp4_qkv(NvFp4QkvConfig {
         dtype: DType::Bf16,
+        rows: 1,
         inputs: 80,
         query_outputs: 32,
         key_outputs: 8,
@@ -209,6 +211,29 @@ fn nvfp4_decode_qkv_combines_three_projection_tails_in_one_grid() {
     assert_eq!(signature.matches("!tt.ptr<bf16>").count(), 7, "{signature}");
     assert_eq!(signature.matches("!tt.ptr<i8>").count(), 6, "{signature}");
     assert_eq!(signature.matches("!tt.ptr<f32>").count(), 3, "{signature}");
+}
+
+#[test]
+fn nvfp4_small_batch_qkv_fuses_rows_and_projections_in_one_grid() {
+    let config = NvFp4QkvConfig {
+        dtype: DType::Bf16,
+        rows: 8,
+        inputs: 2_880,
+        query_outputs: 4_096,
+        key_outputs: 512,
+        value_outputs: 512,
+        block_n: 8,
+        block_k: 256,
+        has_bias: true,
+    };
+    assert_eq!(config.launch_grid().unwrap(), [5_120, 1, 1]);
+    let ttir = build_nvfp4_qkv(config).unwrap();
+    let ttir = ttir.text();
+    assert!(ttir.contains("@nvfp4_qkv_gemv"), "{ttir}");
+    assert!(ttir.contains("arith.divsi"), "{ttir}");
+    assert!(ttir.contains("arith.remsi"), "{ttir}");
+    assert_eq!(ttir.matches("tt.store").count(), 3, "{ttir}");
+    assert!(!ttir.contains("tt.dot"), "{ttir}");
 }
 
 #[test]
@@ -301,53 +326,56 @@ fn nvfp4_grouped_experts_keep_routing_and_decode_inside_verified_kernels() {
 #[test]
 fn nvfp4_decode_experts_use_selected_expert_gemv_kernels() {
     for dtype in [DType::F16, DType::Bf16] {
-        let gate_up = build_nvfp4_grouped_projection(NvFp4GroupedProjectionConfig {
-            dtype,
-            tokens: 1,
-            assignments: 4,
-            input_size: 64,
-            output_size: 64,
-            local_experts: 4,
-            source_row_divisor: 4,
-            block_m: 16,
-            block_n: 32,
-            block_k: 32,
-            role: NvFp4GroupedRole::GateUpActivated,
-        })
-        .unwrap();
-        let gate_up = gate_up.text();
-        assert!(gate_up.contains("@nvfp4_grouped_gate_up_gemv"), "{gate_up}");
-        assert_eq!(gate_up.matches(" = \"tt.reduce\"").count(), 2, "{gate_up}");
-        assert_eq!(gate_up.matches("math.exp2").count(), 1, "{gate_up}");
-        assert!(!gate_up.contains("tt.dot"), "{gate_up}");
-        assert!(
-            gate_up.rfind("arith.mulf").unwrap() > gate_up.rfind("tt.reduce").unwrap(),
-            "the tensor-wide scale must be applied after the K reduction: {gate_up}"
-        );
+        for tokens in [1, 2, 4, 8] {
+            let assignments = tokens * 4;
+            let gate_up = build_nvfp4_grouped_projection(NvFp4GroupedProjectionConfig {
+                dtype,
+                tokens,
+                assignments,
+                input_size: 64,
+                output_size: 64,
+                local_experts: 32,
+                source_row_divisor: 4,
+                block_m: 16,
+                block_n: 32,
+                block_k: 32,
+                role: NvFp4GroupedRole::GateUpActivated,
+            })
+            .unwrap();
+            let gate_up = gate_up.text();
+            assert!(gate_up.contains("@nvfp4_grouped_gate_up_gemv"), "{gate_up}");
+            assert_eq!(gate_up.matches(" = \"tt.reduce\"").count(), 2, "{gate_up}");
+            assert_eq!(gate_up.matches("math.exp2").count(), 1, "{gate_up}");
+            assert!(!gate_up.contains("tt.dot"), "{gate_up}");
+            assert!(
+                gate_up.rfind("arith.mulf").unwrap() > gate_up.rfind("tt.reduce").unwrap(),
+                "the tensor-wide scale must be applied after the K reduction: {gate_up}"
+            );
 
-        let down = build_nvfp4_grouped_projection(NvFp4GroupedProjectionConfig {
-            dtype,
-            tokens: 1,
-            assignments: 4,
-            input_size: 64,
-            output_size: 64,
-            local_experts: 4,
-            source_row_divisor: 1,
-            block_m: 16,
-            block_n: 32,
-            block_k: 32,
-            role: NvFp4GroupedRole::Down,
-        })
-        .unwrap();
-        let down = down.text();
-        assert!(down.contains("@nvfp4_grouped_down_gemv"), "{down}");
-        assert_eq!(down.matches(" = \"tt.reduce\"").count(), 1, "{down}");
-        assert!(!down.contains("math.exp2"), "{down}");
-        assert!(!down.contains("tt.dot"), "{down}");
-        assert!(
-            down.rfind("arith.mulf").unwrap() > down.find("tt.reduce").unwrap(),
-            "the tensor-wide scale must be applied after the K reduction: {down}"
-        );
+            let down = build_nvfp4_grouped_projection(NvFp4GroupedProjectionConfig {
+                dtype,
+                tokens,
+                assignments,
+                input_size: 64,
+                output_size: 64,
+                local_experts: 32,
+                source_row_divisor: 1,
+                block_m: 16,
+                block_n: 32,
+                block_k: 32,
+                role: NvFp4GroupedRole::Down,
+            })
+            .unwrap();
+            let down = down.text();
+            assert!(down.contains("@nvfp4_grouped_down_gemv"), "{down}");
+            assert_eq!(down.matches(" = \"tt.reduce\"").count(), 1, "{down}");
+            assert!(!down.contains("math.exp2"), "{down}");
+            assert!(!down.contains("tt.dot"), "{down}");
+            assert!(
+                down.rfind("arith.mulf").unwrap() > down.find("tt.reduce").unwrap(),
+                "the tensor-wide scale must be applied after the K reduction: {down}"
+            );
+        }
     }
 }
 

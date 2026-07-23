@@ -176,7 +176,26 @@ fn nvfp4_decode_qkv_is_one_sm8x_launch_without_changing_portable_semantics() {
     assert!(!portable.contains("nvfp4_qkv_gemv"), "{portable}");
 
     let context = Context::new();
-    let prefill = program(2)
+    let small_batch = program(8)
+        .module_with_sharding_cuda(
+            &context,
+            &nml_sharding::Sharding::single(),
+            84,
+            8,
+            6,
+        )
+        .unwrap();
+    small_batch.verify().unwrap();
+    let small_batch = small_batch.text();
+    assert_eq!(
+        small_batch.matches("__gpu$xla.gpu.triton").count(),
+        1,
+        "{small_batch}"
+    );
+    assert!(small_batch.contains("nvfp4_qkv_gemv"), "{small_batch}");
+
+    let context = Context::new();
+    let prefill = program(16)
         .module_with_sharding_cuda(
             &context,
             &nml_sharding::Sharding::single(),
@@ -383,7 +402,7 @@ fn clamped_swiglu_moe_keeps_model_semantics_above_weight_representation() {
 }
 
 #[test]
-fn masked_compact_moe_excludes_inactive_tokens_from_the_schedule() {
+fn masked_compact_moe_rejects_inactive_routes_before_expert_weights() {
     let mut builder = ProgramBuilder::new();
     let hidden = builder.input("hidden", Shape::new(DType::Bf16, &[4, 32]).unwrap());
     let router = builder.input("router", Shape::new(DType::F32, &[4, 8]).unwrap());
@@ -436,8 +455,8 @@ fn masked_compact_moe_excludes_inactive_tokens_from_the_schedule() {
         .unwrap();
     cuda.verify().unwrap();
     let cuda = cuda.text();
-    assert!(cuda.contains("nvfp4_grouped_gate_up"), "{cuda}");
-    assert!(cuda.contains("nvfp4_grouped_down"), "{cuda}");
+    assert!(cuda.contains("nvfp4_grouped_gate_up_gemv"), "{cuda}");
+    assert!(cuda.contains("nvfp4_grouped_down_gemv"), "{cuda}");
 }
 
 #[test]
@@ -537,9 +556,10 @@ fn masked_decode_shaped_moe_keeps_the_sparse_schedule() {
 
     assert_eq!(
         text.matches("\"stablehlo.scatter\"").count(),
-        2,
-        "masked sparse decode should use one assignment scatter and one expert scatter: {text}"
+        0,
+        "masked sparse decode must not compact an already one-route-per-block schedule: {text}"
     );
+    assert!(text.contains("stablehlo.pad"), "{text}");
     assert_eq!(
         text.matches("grid_x = 4 : i32").count(),
         2,

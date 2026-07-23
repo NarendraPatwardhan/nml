@@ -213,18 +213,14 @@ pub(crate) fn lower_qkv<'context>(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let first = plans[0];
-    let fused_decode = first.config.rows == 1
+    let fused_small_batch = first.config.rows <= 8
         && plans.iter().all(|plan| {
-            plan.config.rows == 1
+            plan.config.rows == first.config.rows
                 && plan.config.dtype == first.config.dtype
                 && plan.config.inputs == first.config.inputs
-                && plan.config.block_n == first.config.block_n
-                && plan.config.block_k == first.config.block_k
                 && plan.config.has_bias == first.config.has_bias
-                && plan.warps == first.warps
-                && plan.stages == first.stages
         });
-    if !fused_decode {
+    if !fused_small_batch {
         let mut results = Vec::with_capacity(3);
         for projection in projections {
             results.push(lower_linear(
@@ -248,12 +244,13 @@ pub(crate) fn lower_qkv<'context>(
     }
     let config = NvFp4QkvConfig {
         dtype: first.config.dtype,
+        rows: first.config.rows,
         inputs: first.config.inputs,
         query_outputs: plans[0].config.outputs,
         key_outputs: plans[1].config.outputs,
         value_outputs: plans[2].config.outputs,
-        block_n: first.config.block_n,
-        block_k: first.config.block_k,
+        block_n: 8,
+        block_k: 256,
         has_bias: first.config.has_bias,
     };
     let mut argument_specs = vec![tensor(
@@ -277,9 +274,9 @@ pub(crate) fn lower_qkv<'context>(
         }
     }
     let output_shapes = [
-        [1, config.query_outputs],
-        [1, config.key_outputs],
-        [1, config.value_outputs],
+        [config.rows, config.query_outputs],
+        [config.rows, config.key_outputs],
+        [config.rows, config.value_outputs],
     ];
     let specification = KernelSpec::new(
         build_nvfp4_qkv(config).map_err(kernel_error)?,
@@ -319,8 +316,8 @@ pub(crate) fn lower_qkv<'context>(
             &borrowed_arguments,
             KernelLaunch {
                 grid: config.launch_grid().map_err(kernel_error)?,
-                warps: first.warps,
-                stages: first.stages,
+                warps: 4,
+                stages: 1,
             },
         )
         .map_err(kernel_error)?;
@@ -536,7 +533,7 @@ fn lower_triton_experts<'context>(
     let plan = GroupedPlan::new(inputs.hidden_shape.dimensions()[0]);
     let block_n = plan.block_n;
     let block_k = plan.block_k;
-    let decode_codebooks = if inputs.hidden_shape.dimensions()[0] == 1 {
+    let decode_codebooks = if inputs.hidden_shape.dimensions()[0] <= 8 {
         Some(decode_codebook_constants(context, block)?)
     } else {
         None
@@ -851,7 +848,7 @@ impl LinearPlan {
             ));
         }
 
-        // Decode (M=1) GEMV is a memory-bandwidth-bound problem. Each program
+        // Single-row decode GEMV is a memory-bandwidth-bound problem. Each program
         // handles 8 output columns over a 256-wide K tile with 4 warps and a
         // single pipeline stage — Recipe v2 proven geometry. Narrow tiles keep
         // grid blocks numerous (360 for N=2880), filling SM count to hide
@@ -913,14 +910,14 @@ impl LinearPlan {
 }
 
 impl GroupedPlan {
-    /// Selects from a finite, reviewable tile family. Decode and small batches
-    /// are dominated by expert-weight traffic, so they use a wider K tile and
-    /// four pipeline stages. Larger M exposes activation reuse and uses wider
-    /// output tiles; sufficiently large batches employ eight warps on every
-    /// retained Triton-capable NVIDIA generation. These boundaries deliberately
-    /// match ZML's built-in grouped-MoE policy.
+    /// Selects from a finite, reviewable tile family. Through eight tokens,
+    /// sparse routing rarely fills a 16-row expert tile, so selected-route
+    /// GEMV avoids tensor-core padding and uses the proven decode geometry.
+    /// Larger M exposes enough activation and expert-weight reuse for the
+    /// grouped matrix family; sufficiently large batches employ eight warps on
+    /// every retained Triton-capable NVIDIA generation.
     const fn new(tokens: i64) -> Self {
-        if tokens == 1 {
+        if tokens <= 8 {
             Self {
                 block_n: 8,
                 block_k: 256,

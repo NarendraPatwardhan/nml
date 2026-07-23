@@ -33,7 +33,7 @@ history—not a growing list of superseded tasks—is the implementation archive
   mesh/physical shard loading substrate.
 - [x] Retain the accepted A40 batch-1 kernel path: fused compact QKV,
   recipe-v2 expert gate/up and down, exact-tail/codebook decoder, and bounded
-  five-layer-pair lookahead.
+  one-token lookahead.
 - [x] Pin the server performance control to source
   `fb415a8dadd51a0053b9be314faa836e2b274721`, image
   `sha256:3c81704ea85512df7ff76de83ea21f403ef592dc50c23c5ae20e8d70c1e7f3ff`,
@@ -102,7 +102,7 @@ global page sharing yet.
 - [x] Retain a blocking `Generator::generate` diagnostic adapter as the pinned
   151-TPS migration control; it is temporary until the generic serving lane
   proves parity and is then deleted by the Milestone 3 convergence task.
-- [x] Preserve the batch-1 five-pair lookahead and its “never past visible
+- [x] Preserve the batch-1 bounded lookahead and its “never past visible
   budget”/terminal-discard invariants in the step driver.
 - [ ] Add fixed-seed equivalence tests for normal return, tool call, early stop,
   maximum-token truncation, zero-new-token request, and stochastic sampling.
@@ -305,20 +305,27 @@ control.
 
 ### 3.3 Batched compact CUDA paths
 
-- [ ] Audit actual lowering for every retained small-M family; reject any path
+- [x] Audit actual lowering for every retained small-M family; reject any path
   that expands persistent NVFP4 weights to BF16.
-- [ ] Preserve the accepted M=1 fused-QKV/GEMV/expert/head dispatch unchanged.
-- [ ] Add or tune Triton compact QKV/projection kernels for small
-  `M=B*Q` so weights can be reused across active rows rather than issuing B
-  isolated M=1 launches.
+- [x] Preserve the accepted M=1 fused-QKV/GEMV/expert/head dispatch unchanged.
+- [x] Add a bounded `M<=8` Triton dispatch selected from the C2/C4/C8 Nsight
+  trace: fuse all rows and Q/K/V projections into one weight-tile-major,
+  row-minor launch so adjacent CTAs reuse compact weights from L2, and use
+  selected-route expert GEMV instead of a 16-row matrix tile when the sparse
+  schedule contains at most one route per block. Keep `M>=16` on the grouped
+  matrix family where row and expert reuse becomes meaningful.
 - [x] Flatten the active `[B,Q]` mask into routed MoE, encode inactive routes
-  with expert ID `-1`, exclude them from the assignment schedule, touch no
-  inactive expert weights, and return exact zero for inactive tokens.
-- [x] Preserve sparse masked B1/B2 routing with one scan and two compact
-  scatters so a runtime mask does not force decode through the full per-expert
-  scheduler.
+  with expert ID `-1`, prevent them from touching expert weights, and return
+  exact zero for inactive tokens. Sparse fixed schedules may retain a masked
+  route slot to avoid runtime compaction.
+- [x] Preserve sparse masked B1/B2/B4/B8 routing with one fixed block per selected
+  route. Keep inactive expert ID `-1` through the schedule so Triton skips
+  inactive weight work without a per-layer scan or scatter compaction.
+- [x] Cover B1/B2/B4/B8 QKV and selected-route expert construction with
+  permanent TTIR/IR contracts and pass the complete CUDA server build through
+  BuildBuddy.
 - [ ] Confirm on A40/Nsight that Q128 serves the 106-token control and padded
-  prompt/batch positions no longer launch expert blocks.
+  prompt/batch positions perform no expert weight work.
 - [ ] Add batch-aware vocabulary projection/sampling and retain the global
   top-64 candidate contract.
 - [ ] Benchmark each batch bucket against issuing the same active rows
@@ -343,7 +350,7 @@ control.
 - [x] Replace per-token batch reconstruction with one generic stable
   continuation lane for every retained B family. Keep token, RNG, position,
   sequence length, page-table metadata, executable arguments, and the accepted
-  five-pair prefix resident while membership is stable.
+  bounded prefix resident while membership is stable.
 - [x] Make the serving head donate the next batch slab, advancing token, RNG,
   position, and sequence length on device with zero steady H2D and one compact
   B*20-byte D2H.
@@ -351,9 +358,13 @@ control.
   into the decode body, release every non-donated embedding/layer binding
   after enqueue, and cover the exact live-reader/donor invariant with a CPU
   execution contract.
-- [x] Queue the next embedding and five layer pairs immediately after the head
+- [x] Queue the next embedding and nine layer pairs immediately after the head
   submission, overlapping the compact result download and host token handling
   with useful GPU work.
+- [x] Rebuild stable padded page metadata only on membership or physical-page
+  change; keep ordinary token/position/length/RNG advancement on device.
+- [x] Make one-token page commit O(1) in context length instead of cloning the
+  request's complete logical page table.
 - [x] Continue every retained stable batch without scheduler re-entry until a command,
   cancellation, deadline, shutdown, backpressure, terminal row, page-table
   change, or membership change requires a visible-token-boundary replan.

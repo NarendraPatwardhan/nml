@@ -23,6 +23,7 @@ pub struct NvFp4LinearConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NvFp4QkvConfig {
     pub dtype: DType,
+    pub rows: i64,
     pub inputs: i64,
     pub query_outputs: i64,
     pub key_outputs: i64,
@@ -113,7 +114,7 @@ impl NvFp4GroupedProjectionConfig {
             || !tiled(self.block_k)
             || self.block_m > 128
             || self.block_n > 128
-            || self.block_k > if self.tokens == 1 { 256 } else { 128 }
+            || self.block_k > if self.tokens <= 8 { 256 } else { 128 }
             || self.block_k % REPRESENTATION_BLOCK != 0
             || match self.role {
                 NvFp4GroupedRole::GateUpActivated => {
@@ -123,7 +124,7 @@ impl NvFp4GroupedProjectionConfig {
                 }
                 NvFp4GroupedRole::Down => {
                     self.block_n
-                        % (if self.tokens == 1 {
+                        % (if self.tokens <= 8 {
                             8
                         } else {
                             REPRESENTATION_BLOCK
@@ -186,6 +187,7 @@ impl NvFp4QkvConfig {
         .try_fold(0_i64, |programs, outputs| {
             programs.checked_add(ceil_div(outputs, self.block_n))
         })
+        .and_then(|programs| programs.checked_mul(self.rows))
         .ok_or(Error::InvalidKernelSpec("NVFP4 QKV launch grid overflows"))?;
         Ok([
             i32::try_from(programs)
@@ -198,6 +200,7 @@ impl NvFp4QkvConfig {
     fn validate(self) -> Result<(), Error> {
         if !matches!(self.dtype, DType::F16 | DType::Bf16)
             || [
+                self.rows,
                 self.inputs,
                 self.query_outputs,
                 self.key_outputs,
@@ -226,9 +229,12 @@ pub fn build_nvfp4_linear(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
     build_nvfp4_linear_matrix(config)
 }
 
-/// Builds one autoregressive compact QKV launch over three independent source
-/// tensors. The representation remains unchanged; only the scheduling domain
-/// is combined so the two 64-CTA K/V tails share waves with Q on SM8x.
+/// Builds one compact QKV launch over a small row family and three independent
+/// projection tensors. The representation remains unchanged; the scheduling
+/// domain combines both rows and projections so Q/K/V share one launch without
+/// paying for a mostly empty matrix tile. Rows are the minor grid dimension:
+/// adjacent CTAs consume the same compact weight tile for different inputs,
+/// allowing the immutable payload and scales to remain hot in L2.
 pub fn build_nvfp4_qkv(config: NvFp4QkvConfig) -> Result<Kernel, Error> {
     config.validate()?;
     let mut builder = Builder::new("nvfp4_qkv_gemv")?;
@@ -261,6 +267,24 @@ pub fn build_nvfp4_qkv(config: NvFp4QkvConfig) -> Result<Kernel, Error> {
     let program = builder.program_id(0)?;
     let query_programs = ceil_div(config.query_outputs, config.block_n);
     let key_programs = ceil_div(config.key_outputs, config.block_n);
+    let rows = builder.integer(config.rows, DType::I32)?;
+    let projection_program = builder.divide(&program, &rows)?;
+    let row = builder.remainder(&program, &rows)?;
+    let row_i64 = builder.cast(&row, DType::I64)?;
+    let input_stride = builder.integer(config.inputs, DType::I64)?;
+    let input_offset = builder.multiply(&row_i64, &input_stride)?;
+    let row_input = builder.add_pointer(&input, &input_offset)?;
+    let row_output = |builder: &mut Builder,
+                      output: &Value,
+                      width: i64|
+     -> Result<Value, Error> {
+        let stride = builder.integer(width, DType::I64)?;
+        let offset = builder.multiply(&row_i64, &stride)?;
+        builder.add_pointer(output, &offset)
+    };
+    let row_query_output = row_output(&mut builder, &query_output, config.query_outputs)?;
+    let row_key_output = row_output(&mut builder, &key_output, config.key_outputs)?;
+    let row_value_output = row_output(&mut builder, &value_output, config.value_outputs)?;
     let query_limit = builder.integer(query_programs, DType::I32)?;
     let key_limit = builder.integer(
         query_programs
@@ -269,52 +293,56 @@ pub fn build_nvfp4_qkv(config: NvFp4QkvConfig) -> Result<Kernel, Error> {
         DType::I32,
     )?;
 
-    let query_program = builder.compare(Comparison::Less, &program, &query_limit)?;
+    let query_program =
+        builder.compare(Comparison::Less, &projection_program, &query_limit)?;
     builder.if_only(&query_program, |body| {
         build_nvfp4_gemv_projection(
             body,
             qkv_projection(config, config.query_outputs),
-            &program,
-            &input,
+            &projection_program,
+            &row_input,
             &query_payload,
             &query_block_scales,
             &query_global_scale,
             query_bias.as_ref(),
-            &query_output,
+            &row_query_output,
         )
     })?;
 
-    let after_query = builder.compare(Comparison::GreaterEqual, &program, &query_limit)?;
-    let before_value = builder.compare(Comparison::Less, &program, &key_limit)?;
+    let after_query =
+        builder.compare(Comparison::GreaterEqual, &projection_program, &query_limit)?;
+    let before_value =
+        builder.compare(Comparison::Less, &projection_program, &key_limit)?;
     let key_program = builder.bit_and(&after_query, &before_value)?;
     builder.if_only(&key_program, |body| {
-        let local_program = body.subtract(&program, &query_limit)?;
+        let local_program = body.subtract(&projection_program, &query_limit)?;
         build_nvfp4_gemv_projection(
             body,
             qkv_projection(config, config.key_outputs),
             &local_program,
-            &input,
+            &row_input,
             &key_payload,
             &key_block_scales,
             &key_global_scale,
             key_bias.as_ref(),
-            &key_output,
+            &row_key_output,
         )
     })?;
 
-    let value_program = builder.compare(Comparison::GreaterEqual, &program, &key_limit)?;
+    let value_program =
+        builder.compare(Comparison::GreaterEqual, &projection_program, &key_limit)?;
     builder.if_only(&value_program, |body| {
-        let local_program = body.subtract(&program, &key_limit)?;
+        let local_program = body.subtract(&projection_program, &key_limit)?;
         build_nvfp4_gemv_projection(
             body,
             qkv_projection(config, config.value_outputs),
             &local_program,
-            &input,
+            &row_input,
             &value_payload,
             &value_block_scales,
             &value_global_scale,
             value_bias.as_ref(),
-            &value_output,
+            &row_value_output,
         )
     })?;
     builder.return_void()?;
@@ -750,7 +778,7 @@ pub fn build_nvfp4_grouped_projection(
     config: NvFp4GroupedProjectionConfig,
 ) -> Result<Kernel, Error> {
     let config = config.validate()?;
-    match (config.tokens == 1, config.role) {
+    match (config.tokens <= 8, config.role) {
         (true, NvFp4GroupedRole::GateUpActivated) => build_grouped_gate_up_gemv(config),
         (true, NvFp4GroupedRole::Down) => build_grouped_down_gemv(config),
         (false, NvFp4GroupedRole::GateUpActivated) => build_grouped_gate_up_matrix(config),
@@ -863,9 +891,9 @@ fn grouped_decode_schedule(
     let active_blocks = builder.load(active_blocks_pointer)?;
     let active_block = builder.compare(Comparison::Less, &block_index, &active_blocks)?;
 
-    // With one token, top-k routing produces at most one assignment for each
-    // selected expert. StableHLO still authors padded block-sized schedules;
-    // the compact GEMV consumes only the first live slot of each active block.
+    // Sparse small-batch routing authors one aligned block for every selected
+    // route. The compact GEMV consumes the first live slot from each block;
+    // `source_row_divisor` maps that route back to its source token.
     let block_m = builder.integer(config.block_m, DType::I32)?;
     let schedule_position = builder.multiply(&block_index, &block_m)?;
     let assignment_address = builder.add_pointer(sorted_assignments, &schedule_position)?;

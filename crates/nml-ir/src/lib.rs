@@ -1450,12 +1450,8 @@ impl ProgramBuilder {
                     down_bias,
                 ),
             (RepresentationSpec::NvFp4(_), RepresentationSpec::NvFp4(_)) => {
-                let assignment_plan = self.moe_assignment_plan(
-                    expert_ids,
-                    expert_count,
-                    16,
-                    active_tokens.is_some(),
-                )?;
+                let assignment_plan =
+                    self.moe_assignment_plan(expert_ids, expert_count, 16)?;
                 let [gate_payload, gate_scales, gate_global] =
                     require_nvfp4_components(gate_up_weights)?;
                 let [down_payload, down_scales, down_global] =
@@ -5518,7 +5514,7 @@ impl ProgramBuilder {
         let normalizer = self.broadcast_in_dim(normalizer, routing_weights.shape, &[0])?;
         let routing_weights = self.divide(routing_weights, normalizer)?;
         let routing_weights = self.convert(routing_weights, hidden.shape.dtype())?;
-        let assignment_plan = self.moe_assignment_plan(expert_ids, experts, 16, false)?;
+        let assignment_plan = self.moe_assignment_plan(expert_ids, experts, 16)?;
 
         // Keep the expert dimension explicit throughout the portable graph.
         // Besides avoiding one graph copy per expert, this lets Shardy tile
@@ -5596,7 +5592,6 @@ impl ProgramBuilder {
         expert_ids: Tensor,
         experts: usize,
         block_size: usize,
-        contains_inactive_assignments: bool,
     ) -> Result<MoeAssignmentPlan, Error> {
         let assignments = expert_ids.shape.element_count().map_err(Error::Shape)?;
         let assignments = i64::try_from(assignments)
@@ -5639,87 +5634,33 @@ impl ProgramBuilder {
             Error::InvalidMoe("assignment count must fit the I32 routing contract")
         })?)?;
 
-        // Decode and other very sparse shapes do not need global expert
-        // alignment. Give every route one block directly: the first lane is
-        // the assignment and all remaining lanes are sentinels. This preserves
-        // top-k order and makes launch capacity exactly proportional to the
-        // selected routes. The factor is the same conservative crossover used
-        // by the referenced ZML schedule.
-        if assignments
-            .checked_mul(4)
-            .is_some_and(|scaled| scaled <= expert_count)
-        {
-            let (sorted_assignments, block_experts, active_blocks) =
-                if contains_inactive_assignments {
-                    // A serving mask must not force sparse B1/B2 decode through
-                    // the full per-expert scheduler. Compact the valid routes
-                    // into consecutive one-assignment blocks with one scan and
-                    // two scatters. The grouped kernels still launch only the
-                    // runtime `active_blocks` prefix.
-                    let zero = self.scalar(0_i32)?;
-                    let valid = self.greater_equal(flat_ids, zero)?;
-                    let valid_i32 = self.convert(valid, DType::I32)?;
-                    let one = self.scalar(1_i32)?;
-                    let ranks = self.cumulative_sum(valid_i32, 0)?;
-                    let ranks = self.subtract(ranks, one)?;
-                    let block = self.scalar(i32::try_from(block_size).map_err(|_| {
-                        Error::InvalidMoe("expert block size must fit the I32 routing contract")
-                    })?)?;
-                    let assignment_targets = self.multiply(ranks, block)?;
-                    let dropped_position =
-                        self.scalar(i32::try_from(max_positions).map_err(|_| {
-                            Error::InvalidMoe("padded schedule must fit the I32 routing contract")
-                        })?)?;
-                    let assignment_targets =
-                        self.select(valid, assignment_targets, dropped_position)?;
-                    let assignment_targets =
-                        self.insert_axis(assignment_targets, 1, AxisTag::UNKNOWN)?;
-                    let empty_assignments = self.broadcast_in_dim(
-                        sentinel,
-                        Shape::new(DType::I32, &[max_positions])?,
-                        &[],
-                    )?;
-                    let sorted_assignments = self.scatter_update(
-                        empty_assignments,
-                        assignment_targets,
-                        assignment_ids,
-                        &[0],
-                    )?;
-
-                    let dropped_block =
-                        self.scalar(i32::try_from(max_blocks).map_err(|_| {
-                            Error::InvalidMoe("expert block count must fit the I32 routing contract")
-                        })?)?;
-                    let block_targets = self.select(valid, ranks, dropped_block)?;
-                    let block_targets =
-                        self.insert_axis(block_targets, 1, AxisTag::UNKNOWN)?;
-                    let invalid_expert = self.scalar(-1_i32)?;
-                    let empty_experts = self.broadcast_in_dim(
-                        invalid_expert,
-                        Shape::new(DType::I32, &[max_blocks])?,
-                        &[],
-                    )?;
-                    let block_experts =
-                        self.scatter_update(empty_experts, block_targets, flat_ids, &[0])?;
-                    let active_blocks = self.reduce_sum(valid_i32, &[0])?;
-                    (sorted_assignments, block_experts, active_blocks)
-                } else {
-                    let sorted_assignments = self.pad(
-                        assignment_ids,
-                        sentinel,
-                        &[0],
-                        &[block_size_i64 - 1],
-                        &[block_size_i64 - 1],
-                    )?;
-                    let active_blocks =
-                        self.scalar(i32::try_from(assignments).map_err(|_| {
-                            Error::InvalidMoe("active expert block count must fit I32")
-                        })?)?;
-                    (sorted_assignments, flat_ids, active_blocks)
-                };
+        // Sparse shapes with no more routes than experts do not benefit from
+        // global expert alignment. Give every route one block directly: the
+        // first lane is the assignment and all remaining lanes are sentinels.
+        // This preserves top-k order and makes launch capacity exactly
+        // proportional to selected routes.
+        if assignments <= expert_count {
+            // Sparse decode already has exactly one route per aligned block.
+            // Keep that fixed schedule for masked serving families too:
+            // inactive routes carry expert -1, which the grouped Triton
+            // kernels reject before loading weights or issuing a dot. Runtime
+            // compaction previously added a scan, two scatters, and their
+            // supporting elementwise kernels to every decoder layer even when
+            // every row was active.
+            let sorted_assignments = self.pad(
+                assignment_ids,
+                sentinel,
+                &[0],
+                &[block_size_i64 - 1],
+                &[block_size_i64 - 1],
+            )?;
+            let active_blocks =
+                self.scalar(i32::try_from(assignments).map_err(|_| {
+                    Error::InvalidMoe("active expert block count must fit I32")
+                })?)?;
             return Ok(MoeAssignmentPlan {
                 sorted_assignments,
-                block_experts,
+                block_experts: flat_ids,
                 active_blocks,
                 block_size,
             });
