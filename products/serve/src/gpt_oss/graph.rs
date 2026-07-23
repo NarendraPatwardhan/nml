@@ -499,17 +499,10 @@ fn apply_layer(
         &[0],
     ))?;
     let write_mask = nml(graph.logical_and(valid_queries, active_queries))?;
-    let key_cache = nml(graph.paged_cache_update(
+    let (key_cache, value_cache) = nml(graph.paged_cache_update_pair(
         key_input,
-        key,
-        page_table,
-        position,
-        query_lengths_vector,
-        active_rows,
-        write_mask,
-    ))?;
-    let value_cache = nml(graph.paged_cache_update(
         value_input,
+        key,
         value,
         page_table,
         position,
@@ -563,12 +556,16 @@ fn apply_layer(
         hidden,
         shape(DataType::Bf16, &[routed_tokens, hidden_size])?,
     ))?;
+    let active_tokens = nml(graph.reshape(
+        write_mask,
+        shape(DataType::Bool, &[routed_tokens])?,
+    ))?;
     let router_logits = nml(graph.linear(
         routed,
         &layer.mlp.router.weight,
         Some(&layer.mlp.router.bias),
     ))?;
-    let routed = nml(graph.routed_clamped_swiglu(
+    let routed = nml(graph.routed_clamped_swiglu_masked(
         routed,
         router_logits,
         &layer.mlp.experts.gate_up_proj,
@@ -576,6 +573,7 @@ fn apply_layer(
         &layer.mlp.experts.down_proj,
         &layer.mlp.experts.down_proj_bias,
         config.experts_per_token(),
+        active_tokens,
     ))?;
     let routed = nml(graph.reshape(routed, hidden_shape))?;
     hidden = nml(graph.add(residual, routed))?;
@@ -601,7 +599,16 @@ pub(super) fn build_head(
         "hidden",
         shape(DataType::Bf16, &[batch, sequence, hidden_size])?,
     );
-    let (last_index, sampling_state_input, top_k, temperature, top_p, min_p, active_rows) =
+    let (
+        last_index,
+        sampling_state_input,
+        top_k,
+        temperature,
+        top_p,
+        min_p,
+        active_rows,
+        serving_slab,
+    ) =
         head_inputs(graph, family)?;
     let last = nml(graph.gather_batched_nd(hidden, last_index, 1, &[1]))?;
     let final_norm = nml(graph.parameter_value(&checkpoint.model.norm.weight))?;
@@ -628,7 +635,25 @@ pub(super) fn build_head(
             )?,
         ))?;
         let result = nml(graph.concatenate(&[token_bytes, state_bytes], 1))?;
-        return Ok(vec![("batch_result".to_owned(), result)]);
+        let mut outputs = vec![("batch_result".to_owned(), result)];
+        if family.phase() == Phase::Decode {
+            let (slab, layout) =
+                serving_slab.expect("serving decode head retains its slab input");
+            let next_slab = next_decode_slab(
+                graph,
+                family,
+                slab,
+                layout,
+                token,
+                sampling_state,
+                active_rows,
+            )?;
+            outputs.push((
+                "next_batch_slab".to_owned(),
+                nml(graph.reuse_buffer(next_slab, slab))?,
+            ));
+        }
+        return Ok(outputs);
     }
 
     let sampling_state = nml(graph.reuse_buffer(sampling_state, sampling_state_input))?;
@@ -703,7 +728,16 @@ fn layer_inputs(
 fn head_inputs(
     graph: &mut Graph,
     family: ShapeFamily,
-) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
+) -> Result<(
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Option<(Tensor, ServingSlabLayout)>,
+)> {
     let batch = dimension(family.batch())?;
     if !family.is_serving() {
         return Ok((
@@ -714,6 +748,7 @@ fn head_inputs(
             graph.input("top_p", shape(DataType::F32, &[batch])?),
             graph.input("min_p", shape(DataType::F32, &[batch])?),
             graph.input("active_rows", shape(DataType::Bool, &[batch])?),
+            None,
         ));
     }
 
@@ -758,6 +793,115 @@ fn head_inputs(
         top_p,
         min_p,
         active_rows,
+        Some((slab, layout)),
+    ))
+}
+
+fn next_decode_slab(
+    graph: &mut Graph,
+    family: ShapeFamily,
+    slab: Tensor,
+    layout: ServingSlabLayout,
+    token: Tensor,
+    sampling_state: Tensor,
+    active_rows: Tensor,
+) -> Result<Tensor> {
+    let batch = dimension(family.batch())?;
+    let width_usize = LAYER_CONTROL_FIELDS + family.page_count();
+    let width = dimension(width_usize)?;
+
+    let token_bytes = nml(graph.bitcast(token, DataType::U8))?;
+    let token_bytes = nml(graph.reshape(
+        token_bytes,
+        shape(DataType::U8, &[dimension(layout.layer_offset())?])?,
+    ))?;
+
+    let layer = slab_typed_range(
+        graph,
+        slab,
+        layout.layer_offset(),
+        family.batch(),
+        width_usize,
+        DataType::I32,
+    )?;
+    let position = control_vector(graph, layer, 0, batch, DataType::I32)?;
+    let sequence_length = control_vector(graph, layer, 1, batch, DataType::I32)?;
+    let one = nml(graph.scalar(1_i32))?;
+    let advanced_position = nml(graph.add(position, one))?;
+    let next_position = nml(graph.select(active_rows, advanced_position, position))?;
+    let advanced_sequence_length = nml(graph.add(sequence_length, one))?;
+    let next_sequence_length =
+        nml(graph.select(active_rows, advanced_sequence_length, sequence_length))?;
+    let next_position = nml(graph.reshape(
+        next_position,
+        shape(DataType::I32, &[batch, 1])?,
+    ))?;
+    let next_sequence_length = nml(graph.reshape(
+        next_sequence_length,
+        shape(DataType::I32, &[batch, 1])?,
+    ))?;
+    let unchanged_layer = nml(graph.slice(
+        layer,
+        &[0, 2],
+        &[batch, width],
+        &[1, 1],
+    ))?;
+    let next_layer = nml(graph.concatenate(
+        &[next_position, next_sequence_length, unchanged_layer],
+        1,
+    ))?;
+    let next_layer = nml(graph.bitcast(next_layer, DataType::U8))?;
+    let layer_bytes = layout
+        .head_i32_offset()
+        .checked_sub(layout.layer_offset())
+        .ok_or_else(|| message("serving layer slab range underflows"))?;
+    let next_layer = nml(graph.reshape(
+        next_layer,
+        shape(DataType::U8, &[dimension(layer_bytes)?])?,
+    ))?;
+
+    let head_i32 = slab_byte_range(
+        graph,
+        slab,
+        layout.head_i32_offset(),
+        layout.sampling_state_offset(),
+    )?;
+    let state_bytes = nml(graph.bitcast(sampling_state, DataType::U8))?;
+    let state_bytes = nml(graph.reshape(
+        state_bytes,
+        shape(
+            DataType::U8,
+            &[dimension(
+                layout
+                    .head_f32_offset()
+                    .checked_sub(layout.sampling_state_offset())
+                    .ok_or_else(|| message("serving state slab range underflows"))?,
+            )?],
+        )?,
+    ))?;
+    let head_f32 = slab_byte_range(
+        graph,
+        slab,
+        layout.head_f32_offset(),
+        layout.total_bytes(),
+    )?;
+    nml(graph.concatenate(
+        &[token_bytes, next_layer, head_i32, state_bytes, head_f32],
+        0,
+    ))
+}
+
+fn slab_byte_range(
+    graph: &mut Graph,
+    slab: Tensor,
+    start: usize,
+    end: usize,
+) -> Result<Tensor> {
+    nml(graph.slice(
+        slab,
+        &[dimension(start)?],
+        &[dimension(end)?],
+        &[1],
     ))
 }
 
@@ -1033,7 +1177,7 @@ mod tests {
         assert!(!batched_layer_inputs.contains(&"position"));
         assert!(!batched_layer_inputs.contains(&"page_table"));
         let batched_head = finish!(|graph| build_head(graph, &checkpoint, &config, batched));
-        assert_contract!(batched_head, 2, 4, 1, &[None]);
+        assert_contract!(batched_head, 2, 4, 2, &[None, Some(1)]);
         let batched_head_inputs = batched_head.input_names().collect::<Vec<_>>();
         assert!(batched_head_inputs.contains(&"batch_slab"));
         assert!(!batched_head_inputs.contains(&"sampling_state"));
@@ -1042,6 +1186,10 @@ mod tests {
         assert_eq!(
             outputs[0].1.dimensions(),
             &[4, BATCH_RESULT_BYTES_PER_ROW as i64],
+        );
+        assert_eq!(
+            outputs[1].1.dimensions(),
+            &[ServingSlabLayout::for_family(batched).unwrap().total_bytes() as i64],
         );
 
     }

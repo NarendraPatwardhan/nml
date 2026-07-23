@@ -3,10 +3,11 @@ use nml_kernel_triton::{
     GatedActivation, GroupedProjectionConfig, Kernel, KernelLaunch, KernelSpec,
     NvFp4EmbeddingConfig,
     NvFp4GroupedProjectionConfig, NvFp4GroupedRole, NvFp4LinearConfig, NvFp4QkvConfig, OutputAlias,
-    PagedAttention2dConfig, PagedAttention3dConfig, Reduction, ScaleDotElement,
+    PagedAttention2dConfig, PagedAttention3dConfig, PagedCacheAppendConfig, Reduction, ScaleDotElement,
     SegmentReductionConfig, TensorSpec, build_grouped_projection, build_nvfp4_embedding,
     build_nvfp4_grouped_projection, build_nvfp4_linear, build_nvfp4_qkv, build_paged_attention_2d,
-    build_paged_attention_3d, build_segment_reduction, select_attention_launch,
+    build_paged_attention_3d, build_paged_cache_append, build_segment_reduction,
+    select_attention_launch,
 };
 use nml_mlir::{Block, Context, Region};
 
@@ -53,6 +54,35 @@ fn named_typed_kernel_is_deterministic_and_verified() {
     assert!(first.text().contains("tt.load"), "{first}");
     assert!(first.text().contains("arith.addf"), "{first}");
     assert!(first.text().contains("tt.store"), "{first}");
+}
+
+#[test]
+fn paired_paged_cache_append_resolves_pages_once_and_writes_kv() {
+    let ttir = build_paged_cache_append(PagedCacheAppendConfig {
+        dtype: DType::Bf16,
+        batch: 8,
+        query: 1,
+        physical_pages: 2_048,
+        page_size: 16,
+        heads: 8,
+        head_dim: 64,
+        logical_pages: 128,
+        block_elements: 128,
+    })
+    .unwrap();
+    let ttir = ttir.text();
+    assert!(ttir.contains("@paged_cache_append"), "{ttir}");
+    assert_eq!(ttir.matches("tt.get_program_id").count(), 2, "{ttir}");
+    assert_eq!(ttir.matches("tt.store").count(), 2, "{ttir}");
+    assert!(ttir.contains("scf.if"), "{ttir}");
+    assert!(!ttir.contains("atomic"), "{ttir}");
+    let signature = ttir
+        .lines()
+        .find(|line| line.contains("tt.func public @paged_cache_append"))
+        .unwrap();
+    assert_eq!(signature.matches("!tt.ptr<bf16>").count(), 6, "{signature}");
+    assert_eq!(signature.matches("!tt.ptr<i32>").count(), 3, "{signature}");
+    assert_eq!(signature.matches("!tt.ptr<i1>").count(), 2, "{signature}");
 }
 
 #[test]

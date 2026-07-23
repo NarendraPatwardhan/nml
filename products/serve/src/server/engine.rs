@@ -391,8 +391,8 @@ fn run_loop(
         let mut submitted = false;
         if let Some(decode) = &plan.decode {
             submitted = true;
-            if plan.single_sequence_decode {
-                execute_single_sequence_decode(
+            if plan.stable_decode {
+                execute_stable_decode(
                     &mut generator,
                     &mut active,
                     &mut scheduler,
@@ -701,12 +701,12 @@ fn take_rows(
         .collect()
 }
 
-/// Runs the sole decode sequence as one device-resident continuation lane.
-/// The scheduler remains the owner of admission and transitions, but it is
-/// not re-entered between tokens while membership is unchanged. Commands,
-/// cancellation, deadlines, and response backpressure are observed after
-/// every downloaded token before another decode suffix is submitted.
-fn execute_single_sequence_decode(
+/// Runs one complete, stable decode membership through the generic resident
+/// batch lane. The scheduler is not re-entered between tokens while every row
+/// survives and no queued work needs service. Any finish, cancellation,
+/// backpressure event, page-family change, or command returns survivors to the
+/// scheduler at the visible-token boundary.
+fn execute_stable_decode(
     generator: &mut Generator<'_>,
     active: &mut BTreeMap<super::contracts::SequenceId, Active>,
     scheduler: &mut Scheduler,
@@ -715,18 +715,6 @@ fn execute_single_sequence_decode(
     snapshot: &mut EngineSnapshot,
     metrics: &Metrics,
 ) {
-    if submission.family_capacity != 1 || submission.items.len() != 1 {
-        let mut empty_queue = VecDeque::new();
-        fail_everything(
-            generator,
-            &mut empty_queue,
-            active,
-            scheduler,
-            "single-sequence lane received a non-B1 submission".to_owned(),
-            snapshot,
-        );
-        return;
-    }
     let mut rows = match take_rows(active, &submission.items) {
         Ok(rows) => rows,
         Err(_) => {
@@ -734,13 +722,16 @@ fn execute_single_sequence_decode(
             return;
         }
     };
-    let mut request = rows
-        .pop()
-        .expect("single-sequence submission contains one active row");
     loop {
-        metrics.decode_batch_rows.observe(1.0);
+        metrics.decode_batch_rows.observe(rows.len() as f64);
         let started = Instant::now();
-        let result = generator.decode_single_sequence(&mut request.session);
+        let result = {
+            let mut sessions = rows
+                .iter_mut()
+                .map(|request| &mut request.session)
+                .collect::<Vec<_>>();
+            generator.decode_batch(&mut sessions, submission.family_capacity)
+        };
         metrics
             .decode_batch_seconds
             .observe(started.elapsed().as_secs_f64());
@@ -750,79 +741,85 @@ fn execute_single_sequence_decode(
                 fail_rows(
                     generator,
                     scheduler,
-                    vec![request],
+                    rows,
                     error.to_string(),
                     snapshot,
                 );
                 return;
             }
         };
-        let sequence = request.session.sequence();
-        let delivered = request.events.try_send(EngineEvent::Raw(raw)).is_ok();
-        let terminal = request.session.is_complete() || !delivered;
-        if terminal {
-            if scheduler.complete_decode(sequence, true).is_err() {
-                fail_rows(
-                    generator,
-                    scheduler,
-                    vec![request],
-                    "single-sequence result did not match its scheduler state".to_owned(),
-                    snapshot,
-                );
-                return;
-            }
-            if delivered {
-                complete_active(generator, request, snapshot);
-            } else {
-                request.cancellation.cancel();
-                let _ = generator.release_server_session(&mut request.session);
-                snapshot.cancelled += 1;
-            }
-            return;
-        }
-
         let now = Instant::now();
-        let cancellation = if request.cancellation.is_cancelled() {
-            Some(CancelReason::ClientDisconnect)
-        } else if request
-            .deadline
-            .is_some_and(|deadline| deadline.is_expired(now))
-        {
-            Some(CancelReason::Deadline)
-        } else {
-            None
-        };
-        if let Some(reason) = cancellation {
-            if scheduler.cancel(sequence).is_err() {
-                fail_rows(
-                    generator,
-                    scheduler,
-                    vec![request],
-                    "single-sequence cancellation did not match its scheduler state".to_owned(),
-                    snapshot,
-                );
-            } else {
-                cancel_active(generator, request, reason, snapshot);
+        let previous_rows = rows.len();
+        let mut survivors = Vec::with_capacity(previous_rows);
+        for (mut request, raw) in rows.into_iter().zip(raw) {
+            let sequence = request.session.sequence();
+            let delivered = request.events.try_send(EngineEvent::Raw(raw)).is_ok();
+            if request.session.is_complete() || !delivered {
+                if scheduler.complete_decode(sequence, true).is_err() {
+                    fail_rows(
+                        generator,
+                        scheduler,
+                        vec![request],
+                        "stable decode result did not match its scheduler state".to_owned(),
+                        snapshot,
+                    );
+                } else if delivered {
+                    complete_active(generator, request, snapshot);
+                } else {
+                    request.cancellation.cancel();
+                    let _ = generator.release_server_session(&mut request.session);
+                    snapshot.cancelled += 1;
+                }
+                continue;
             }
-            return;
+            let cancellation = if request.cancellation.is_cancelled() {
+                Some(CancelReason::ClientDisconnect)
+            } else if request
+                .deadline
+                .is_some_and(|deadline| deadline.is_expired(now))
+            {
+                Some(CancelReason::Deadline)
+            } else {
+                None
+            };
+            if let Some(reason) = cancellation {
+                if scheduler.cancel(sequence).is_err() {
+                    fail_rows(
+                        generator,
+                        scheduler,
+                        vec![request],
+                        "stable decode cancellation did not match its scheduler state".to_owned(),
+                        snapshot,
+                    );
+                } else {
+                    cancel_active(generator, request, reason, snapshot);
+                }
+            } else {
+                survivors.push(request);
+            }
         }
 
-        if commands.is_closed() || !commands.is_empty() {
-            if scheduler.complete_decode(sequence, false).is_err() {
-                fail_rows(
-                    generator,
-                    scheduler,
-                    vec![request],
-                    "single-sequence continuation did not match its scheduler state".to_owned(),
-                    snapshot,
-                );
-                return;
+        let membership_changed = survivors.len() != previous_rows;
+        if membership_changed || commands.is_closed() || !commands.is_empty() {
+            for request in survivors {
+                let sequence = request.session.sequence();
+                if scheduler.complete_decode(sequence, false).is_err() {
+                    fail_rows(
+                        generator,
+                        scheduler,
+                        vec![request],
+                        "stable decode continuation did not match its scheduler state".to_owned(),
+                        snapshot,
+                    );
+                } else {
+                    active.insert(sequence, request);
+                }
             }
-            active.insert(sequence, request);
             return;
         }
-        // Keep the scheduler row in InFlightDecode. The next token consumes
-        // the retained device prefix directly and never reconstructs B1.
+        rows = survivors;
+        // All rows remain InFlightDecode. The next token consumes the donated
+        // device slab directly without rebuilding or uploading the batch.
     }
 }
 

@@ -8,6 +8,7 @@ nml_rust_library(
         "src/lib.rs",
         "src/moe.rs",
         "src/nvfp4.rs",
+        "src/paged_cache.rs",
         "src/paged_attention.rs",
         "src/specification.rs",
         "src/unified_attention.rs",

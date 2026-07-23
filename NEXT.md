@@ -131,8 +131,18 @@ The current implementation now provides:
 - one global paged K/V arena with arbitrary page-aware reads/writes,
   reservations, rollback, reclamation, and exact host accounting;
 - continuous decode-first batching with chunked prefill, dynamic row repacking,
-  finite `B={1,2,4,8,16,32}`/`Q={16,64,256}` families, per-row sampling, and
+  finite `B={1,2,4,8,16,32}`/`Q={16,64,128,256}` families, per-row sampling, and
   inactive-row preservation;
+- mask-aware routed MoE that excludes inactive prompt positions and batch rows
+  from the expert assignment schedule;
+- a paired generic Triton paged K/V append whose donated results alias the
+  process-wide cache buffers on CUDA;
+- one generic stable decode lane for every retained batch family, with a
+  donated device-resident batch slab and five-layer-pair lookahead;
+- direct stable-batch continuation until membership, page tables,
+  cancellation, deadline, backpressure, or shutdown requires replanning;
+- reusable process-lifetime executable bindings and per-family compact result
+  workspaces;
 - complete Harmony tool schema/history/output handling without server-side tool
   execution; and
 - a serving-only compact control/result ABI: every token, page-table entry,
@@ -151,7 +161,7 @@ page-aware update indexed by physical page and page offset. Prefix sharing must
 still wait for immutable sealed-page identity, reference ownership, and
 eviction policy; correct page indirection alone is not a prefix cache.
 
-### 3.1 First continuous-batching A40 evidence and immediate repair
+### 3.1 Continuous-batching A40 evidence and current repair
 
 The first immutable server image accepted 45/45 requests, reclaimed all 2,389
 cache pages, and produced real decode families B1/B2/B4/B8. Aggregate output
@@ -193,29 +203,49 @@ pairs. The synchronous serving transaction returned through output decoding,
 page accounting, event delivery, scheduler requeue/replan, batch reconstruction,
 and a fresh slab upload before submitting that suffix.
 
-The data plane is now refactored around an uncontended device-resident B1 lane:
+The B1-specific continuation architecture has now been removed from the
+server. The current repair is one generic stable-batch data plane:
 
-- batched prefill and generic changing-membership batches retain the compact
-  one-H2D/one-D2H serving ABI;
-- an idle B1 sequence imports its current token/RNG once, then retains token,
-  RNG, position, executable arguments, page table, and the accepted five-pair
-  prefix as device dependencies;
-- steady B1 performs zero H2D transfers and one four-byte token D2H; its page
-  table is uploaded only when physical-page membership changes;
-- the engine keeps the row in `InFlightDecode` and continues directly while
-  the command queue is empty, checking cancellation, deadline, output
-  backpressure, shutdown, and new commands after every visible token;
-- a membership-changing command retires the lane at a token boundary, reads
-  RNG once, discards the bounded prefix, and resumes generic batching over the
-  same process-wide paged K/V arena; and
-- the duplicate serving-only lookahead embedding/pair executable and its
-  sequence/position/token identity bridge are removed.
+- the serving head returns the compact token/RNG result and a donated next
+  batch slab;
+- that slab advances token, RNG, position, and sequence length on device;
+- stable membership for any retained B family therefore performs zero steady
+  H2D transfers and one compact B*20-byte D2H;
+- after submitting the result download, the engine immediately queues the next
+  embedding and five layer pairs from the donated slab, overlapping visible
+  token handling with useful GPU work;
+- the engine continues the same batch without scheduler re-entry while all
+  rows survive and no command, cancellation, deadline, shutdown, backpressure,
+  page-table change, or membership change requires replanning;
+- a membership change occurs at a visible-token boundary and selects the next
+  smallest generic family over the same process-wide K/V arena;
+- compiled family arguments remain process-resident and every family owns a
+  reusable compact result-download workspace; and
+- the old `SingleSequenceDecodeLane` and its RNG export/import transition have
+  been deleted rather than retained as a second serving route.
 
-BuildBuddy and A40 evidence for this refactor are separate gates. The legacy
-diagnostic route remains only as the immutable performance control until this
-new server lane reaches at least 150 decode-loop tokens/s; after that proof,
-the diagnostic adapter must drive the serving lane and the old request-local
-prefill/execution route must be deleted.
+Two trace-correlated compute repairs are included in the same current phase:
+
+- inactive `[B,Q]` positions now enter routed MoE as masked assignments, receive
+  expert ID `-1`, create no expert schedule entries, and return exact zero; and
+- sparse masked B1/B2 decode compacts valid routes with one scan and two small
+  scatters, preserving one grouped block per selected route instead of
+  regressing to the full per-expert scheduler; and
+- K and V page writes lower together to one generic Triton custom call on
+  CUDA, resolving the physical page once and aliasing both donated cache
+  buffers.
+
+The prefill family set also includes Q128, routing the 106-token control prompt
+to 128 positions rather than 256. This complements mask-aware MoE by reducing
+padding in dense QKV/projection operations.
+
+BuildBuddy contracts prove the portable semantics, Triton construction,
+serving graph aliasing, scheduler selection, and complete CUDA build. They are
+not runtime evidence. The immediate promotion gate is an immutable A40 run
+covering the 106+320 C1 end-to-end control and the full B1-B32 concurrency
+matrix. Nsight must confirm the compact append, masked expert work, zero steady
+H2D contract, and removal of the recurring orchestration hole. No later
+roadmap capability may be credited toward this gate.
 
 ## 4. External reference facts and what they do not prove
 
@@ -709,7 +739,7 @@ First A40 family set:
 
 - batch capacities: `1, 2, 4, 8, 16, 32`;
 - decode query capacity: `1`;
-- prefill query capacities: `16, 64, 256`;
+- prefill query capacities: `16, 64, 128, 256`;
 - one operator-selected maximum model length/page-table width; and
 - one exact physical-page count derived at startup.
 
@@ -771,43 +801,28 @@ After every batch result:
 No CUDA graph, executable arguments object, or cache table may capture a
 request's slot as permanent identity.
 
-### 9.5 Preserve the single-stream fast path
+### 9.5 Preserve low-latency execution in the generic path
 
-When there is exactly one active decode request and no useful queued/prefill
-work, retain that request in a device-resident decode lane with the accepted
-bounded five-layer-pair lookahead. Terminal speculative work remains within
-that request's private tail and is discarded on completion. This prevents the
-server abstraction from giving back the accepted 151.324 decode-loop tokens/s.
+Stable membership at any batch size retains the complete batch slab and the
+bounded five-layer-pair prefix on device. The serving head donates the updated
+slab, the next prefix is enqueued while the compact result downloads, and the
+engine bypasses remove/requeue/replan until useful work or a lifecycle event
+changes membership.
 
-When other work exists, the scheduler fills the observed host boundary with
-another request/batch instead of blindly looking ahead for one sequence.
+B1 is therefore the smallest instance of the ordinary mechanism:
 
-Implemented batch-1 serving pipeline:
+- zero steady H2D and one compact result D2H;
+- the same process-wide physical cache and paired page append as B2-B32;
+- the same token/RNG/position advancement in the donated device slab;
+- the same visible-token-boundary checks for command arrival, cancellation,
+  deadline, shutdown, and output backpressure; and
+- the same family re-selection when a request joins or leaves.
 
-- the first entry imports the token/RNG returned by batched prefill into the
-  ordinary device decode state;
-- token, RNG, position, executable arguments, and the five-pair prefix remain
-  device-resident across steady tokens, producing zero steady H2D and one
-  four-byte D2H;
-- the global physical page table is installed once and refreshed only when a
-  new page is allocated;
-- the engine retains the request locally in `InFlightDecode`, bypassing
-  remove/requeue/replan while no command or competing work exists;
-- command arrival, cancellation, deadline, shutdown, or output backpressure
-  ends the lane at the next visible-token boundary;
-- B1-to-batch transition downloads the current RNG once, drops the bounded
-  hidden prefix, and lets the generic batch overwrite its tentative cache
-  position through the same dependency-ordered global K/V buffers; and
-- a later B1 re-entry reconstructs the device position from
-  `prompt_tokens + visible_generated_tokens - 1`, so membership changes never
-  rewind or overwrite committed K/V; and
-- the superseded serving-only lookahead graph family is deleted rather than
-  retained as a second implementation.
-
-The remaining promotion gate is the real A40 single-stream measurement; do
-not call this recovered until that run shows at least 150 steady decode-loop
-tokens/s. Once it does, route the diagnostic adapter through this lane and
-delete the old request-local execution path.
+There is no RNG export/import bridge, private B1 scheduler, or second cache
+owner. The remaining promotion gate is the real A40 measurement: do not call
+the regression recovered until the exact C1 end-to-end control reaches at
+least 150 tokens/s and the concurrency matrix proves larger stable batches
+retain useful aggregate throughput.
 
 ### 9.6 Continuous-batching acceptance
 

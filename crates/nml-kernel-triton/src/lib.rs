@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 mod moe;
 mod nvfp4;
+mod paged_cache;
 mod paged_attention;
 mod specification;
 mod unified_attention;
@@ -26,6 +27,7 @@ pub use nvfp4::{
     build_nvfp4_qkv, NvFp4EmbeddingConfig, NvFp4GroupedProjectionConfig, NvFp4GroupedRole,
     NvFp4LinearConfig, NvFp4QkvConfig,
 };
+pub use paged_cache::{build_paged_cache_append, PagedCacheAppendConfig};
 pub use paged_attention::{select_attention_launch, AttentionGeometry, AttentionLaunch};
 pub use specification::{KernelLaunch, KernelSpec, OutputAlias, TensorSpec};
 pub use unified_attention::{

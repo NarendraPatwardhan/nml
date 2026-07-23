@@ -133,10 +133,10 @@ pub(crate) struct BatchPlan {
     /// Prefill is a separate submission, so a long prompt cannot sit in front
     /// of the decode rows selected in the same scheduler iteration.
     pub(crate) prefill: Option<BatchSubmission>,
-    /// The selected decode is the only runnable sequence, so the engine may
-    /// retain it in the device-resident continuation lane until membership
-    /// changes.
-    pub(crate) single_sequence_decode: bool,
+    /// Every active request is in this decode submission and no queued prefill
+    /// or waiter requires a scheduling boundary. The engine may retain this
+    /// complete batch on device until membership changes.
+    pub(crate) stable_decode: bool,
 }
 
 impl BatchPlan {
@@ -392,18 +392,18 @@ impl Scheduler {
                 items: prefill_items,
             })
         };
-        let single_sequence_decode = decode
-            .as_ref()
-            .is_some_and(|submission| submission.items.len() == 1)
+        let stable_decode = decode.is_some()
             && prefill.is_none()
             && self.waiting.is_empty()
             && self.prefill.is_empty()
             && self.decode.is_empty()
-            && self.active == 1;
+            && decode
+                .as_ref()
+                .is_some_and(|submission| self.active == submission.items.len());
         Ok(BatchPlan {
             decode,
             prefill,
-            single_sequence_decode,
+            stable_decode,
         })
     }
 
@@ -672,7 +672,7 @@ mod tests {
             .plan(now + Duration::from_millis(11))
             .unwrap();
         assert_eq!(plan.active_tokens(), 4);
-        assert!(!plan.single_sequence_decode);
+        assert!(!plan.stable_decode);
         let decode = plan.decode.unwrap();
         let prefill = plan.prefill.unwrap();
         assert_eq!(decode.phase, ScheduledPhase::Decode);
@@ -716,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn device_lane_is_exactly_the_idle_batch_one_fast_path() {
+    fn stable_decode_lane_covers_every_idle_batch_family() {
         let now = Instant::now();
         let mut scheduler = Scheduler::new(config()).unwrap();
         let mut pages = PageManager::new(8).unwrap();
@@ -728,12 +728,29 @@ mod tests {
             .unwrap();
         let decode = scheduler.plan(now).unwrap();
         assert_eq!(decode.decode.as_ref().unwrap().family_capacity, 1);
-        assert!(decode.single_sequence_decode);
+        assert!(decode.stable_decode);
         scheduler.complete_decode(id(1), false).unwrap();
 
         scheduler.enqueue(id(2), 1, 8, now).unwrap();
         let with_waiter = scheduler.plan(now).unwrap();
-        assert!(!with_waiter.single_sequence_decode);
+        assert!(!with_waiter.stable_decode);
+
+        let mut scheduler = Scheduler::new(config()).unwrap();
+        let mut pages = PageManager::new(16).unwrap();
+        for sequence in [id(10), id(20), id(30)] {
+            scheduler.enqueue(sequence, 1, 8, now).unwrap();
+            admit(&mut scheduler, &mut pages, sequence, now).unwrap();
+        }
+        let prefill = scheduler.plan(now).unwrap().prefill.unwrap();
+        for item in prefill.items {
+            scheduler
+                .complete_prefill(item.sequence, item.tokens)
+                .unwrap();
+        }
+        let stable = scheduler.plan(now).unwrap();
+        assert_eq!(stable.decode.as_ref().unwrap().family_capacity, 4);
+        assert_eq!(stable.decode.as_ref().unwrap().items.len(), 3);
+        assert!(stable.stable_decode);
     }
 
     #[test]

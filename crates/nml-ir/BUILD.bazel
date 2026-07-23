@@ -13,6 +13,7 @@ nml_rust_library(
         "src/nvfp4_backend.rs",
         "src/ordinary_attention.rs",
         "src/paged_attention.rs",
+        "src/paged_cache_update.rs",
     ],
     crate_root = "src/lib.rs",
     deps = [

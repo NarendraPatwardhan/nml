@@ -357,7 +357,7 @@ impl ServerProfile {
                 max_sequence_tokens: cache_capacity,
             }],
             batch_buckets: vec![1, 2, 4, 8, 16, 32],
-            prefill_query_buckets: vec![16, 64, 256],
+            prefill_query_buckets: vec![16, 64, 128, 256],
             max_model_length: cache_capacity,
             max_batched_tokens: 4_096,
             max_prefill_chunk: 256,
@@ -802,7 +802,7 @@ mod tests {
             .push(profile.compilation_families[0]);
         profile.validate(&limits).unwrap();
         assert_eq!(profile.batch_buckets, [1, 2, 4, 8, 16, 32]);
-        assert_eq!(profile.prefill_query_buckets, [16, 64, 256]);
+        assert_eq!(profile.prefill_query_buckets, [16, 64, 128, 256]);
         assert_eq!(profile.compilation_families.len(), 1);
 
         for degree in [1, 2, 4] {

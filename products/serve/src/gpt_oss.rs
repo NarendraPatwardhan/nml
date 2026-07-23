@@ -23,7 +23,7 @@ use config::Config;
 pub(crate) use execution::RawToken;
 use execution::{
     BatchInputs, ModelDefinition, PreparedRequest, RequestExecution, ResidentModel, RunMetrics,
-    ServingCompileConfig, SingleSequenceDecodeLane, StartupMetrics,
+    ServingCompileConfig, StableDecodeBatchLane, StartupMetrics,
 };
 use nml::io::ParameterSet;
 use nml::safetensors::TensorRegistry;
@@ -66,6 +66,13 @@ pub(crate) struct Generator<'platform> {
     model: ResidentModel<'platform>,
     pages: PageManager,
     next_sequence: u64,
+    stable_decode: Option<StableDecodeBatch>,
+}
+
+struct StableDecodeBatch {
+    members: Vec<SequenceId>,
+    page_tables: Vec<i32>,
+    lane: StableDecodeBatchLane,
 }
 
 pub(crate) struct ProductReport {
@@ -92,8 +99,6 @@ pub(crate) struct ServerSession {
     sampling: SamplingOptions,
     stopped: bool,
     released: bool,
-    decode_lane: Option<SingleSequenceDecodeLane>,
-    installed_lane_page_table: Vec<i32>,
 }
 
 impl ServerSession {
@@ -245,6 +250,7 @@ impl<'platform> Generator<'platform> {
             model,
             pages: PageManager::new(physical_pages).map_err(boxed)?,
             next_sequence: 1,
+            stable_decode: None,
         })
     }
 
@@ -420,8 +426,6 @@ impl<'platform> Generator<'platform> {
             sampling,
             stopped: false,
             released: false,
-            decode_lane: None,
-            installed_lane_page_table: Vec::new(),
         })
     }
 
@@ -432,6 +436,7 @@ impl<'platform> Generator<'platform> {
         batch_capacity: usize,
         query_capacity: usize,
     ) -> Result<Vec<Option<RawToken>>> {
+        self.stable_decode.take();
         if sessions.len() != chunk_tokens.len() || sessions.len() > batch_capacity {
             return Err(checkpoint::message("prefill batch row count is inconsistent"));
         }
@@ -540,79 +545,6 @@ impl<'platform> Generator<'platform> {
         Ok(raw)
     }
 
-    /// Advances the uncontended batch-one lane without reconstructing a host
-    /// batch. The first entry imports the token/RNG state produced by batched
-    /// prefill; steady iterations retain token, RNG, position, executable
-    /// arguments, and the bounded prefix on the device. The page table is
-    /// uploaded only when a new physical page appears.
-    pub(crate) fn decode_single_sequence(
-        &mut self,
-        session: &mut ServerSession,
-    ) -> Result<RawToken> {
-        if session.released || !session.prefill_complete() || session.is_complete() {
-            return Err(checkpoint::message(
-                "invalid single-sequence decode transition",
-            ));
-        }
-        if session.decode_lane.is_none() {
-            session.decode_lane = Some(self.model.prepare_single_sequence_decode(
-                session.prompt.len(),
-                session.max_new_tokens,
-                &session.generated,
-                session.sampling,
-            )?);
-        }
-        let checkpoint = self.pages.checkpoint(session.sequence).map_err(boxed)?;
-        let lane = session
-            .decode_lane
-            .as_mut()
-            .expect("single-sequence lane was initialized");
-        let lookahead = self.model.single_sequence_lookahead_tokens(lane)?;
-        let (committed, tentative) = self
-            .pages
-            .sequence_lengths(session.sequence)
-            .map_err(boxed)?;
-        let required = committed
-            .checked_add(lookahead)
-            .ok_or_else(|| checkpoint::message("decode lane lookahead overflows usize"))?;
-        if tentative < required {
-            if let Err(error) = self
-                .pages
-                .append_tentative(session.sequence, required - tentative)
-                .map_err(boxed)
-            {
-                self.pages.rollback(checkpoint).map_err(boxed)?;
-                return Err(error);
-            }
-        }
-        let execution = (|| {
-            let table_width = self.model.single_sequence_page_table_width(lane);
-            let metadata = self
-                .pages
-                .compact_metadata(&[Some(session.sequence)], table_width)
-                .map_err(boxed)?;
-            if session.installed_lane_page_table != metadata.block_tables {
-                self.model.install_single_sequence_page_table(
-                    lane,
-                    &metadata.block_tables,
-                )?;
-                session.installed_lane_page_table = metadata.block_tables;
-            }
-            self.model.decode_single_sequence_step(lane)
-        })();
-        let raw = match execution {
-            Ok(raw) => raw,
-            Err(error) => {
-                self.pages.rollback(checkpoint).map_err(boxed)?;
-                return Err(error);
-            }
-        };
-        self.pages.commit(session.sequence, 1).map_err(boxed)?;
-        session.generated.push(raw.token);
-        session.stopped = raw.is_stop;
-        Ok(raw)
-    }
-
     pub(crate) fn decode_batch(
         &mut self,
         sessions: &mut [&mut ServerSession],
@@ -620,9 +552,6 @@ impl<'platform> Generator<'platform> {
     ) -> Result<Vec<RawToken>> {
         if sessions.is_empty() || sessions.len() > batch_capacity {
             return Err(checkpoint::message("decode batch row count is inconsistent"));
-        }
-        for session in sessions.iter_mut() {
-            self.retire_decode_lane(session)?;
         }
         let query_capacity = 1;
         let table_width = self.model.batch_page_table_width(
@@ -640,8 +569,12 @@ impl<'platform> Generator<'platform> {
                 .pages
                 .sequence_lengths(session.sequence)
                 .map_err(boxed)?;
+            // The generic stable lane submits the next token's first five
+            // layer pairs before waiting for this token's download. Reserve
+            // one uncommitted position ahead so that prefix always has a
+            // valid physical page, including at 16-token boundaries.
             let required = committed
-                .checked_add(1)
+                .checked_add(2)
                 .ok_or_else(|| checkpoint::message("decode lookahead length overflows usize"))?;
             let extension = required.saturating_sub(tentative);
             if let Err(error) = self
@@ -666,44 +599,65 @@ impl<'platform> Generator<'platform> {
                 .pages
                 .compact_metadata(&rows, table_width)
                 .map_err(boxed)?;
-            let mut input = padded_batch_inputs(batch_capacity, query_capacity, metadata.block_tables);
-            input.sequence_lengths = metadata.sequence_lengths;
-            input.active_rows = metadata.active_rows;
-            input.sample_rows[..sessions.len()].fill(true);
-            for (row, session) in sessions.iter().enumerate() {
-                let token = *session
-                    .generated
-                    .last()
-                    .ok_or_else(|| checkpoint::message("decode row has no visible input token"))?;
-                input.tokens[row] = i32::try_from(token)
-                    .map_err(|_| checkpoint::message("decode token exceeds I32"))?;
-                let position = session
-                    .prompt
-                    .len()
-                    .checked_add(session.generated.len() - 1)
-                    .ok_or_else(|| checkpoint::message("decode position overflows usize"))?;
-                input.positions[row] = i32::try_from(position)
-                    .map_err(|_| checkpoint::message("decode position exceeds I32"))?;
-                // Tentative page allocation may be ahead of the visible
-                // sequence after leaving the device-resident lane. Generic
-                // decode must still attend through exactly its own position.
-                input.sequence_lengths[row] = input.positions[row]
-                    .checked_add(1)
-                    .ok_or_else(|| checkpoint::message("decode length exceeds I32"))?;
-                input.query_lengths[row] = 1;
-                input.last_indices[row] = 0;
-                install_sampling_row(&mut input, row, session)?;
+            let members = sessions
+                .iter()
+                .map(|session| session.sequence)
+                .collect::<Vec<_>>();
+            let reuse = self.stable_decode.as_ref().is_some_and(|stable| {
+                stable.members == members
+                    && stable.page_tables == metadata.block_tables
+            });
+            if !reuse {
+                let page_tables = metadata.block_tables;
+                let mut input =
+                    padded_batch_inputs(batch_capacity, query_capacity, page_tables.clone());
+                input.sequence_lengths = metadata.sequence_lengths;
+                input.active_rows = metadata.active_rows;
+                input.sample_rows[..sessions.len()].fill(true);
+                for (row, session) in sessions.iter().enumerate() {
+                    let token = *session.generated.last().ok_or_else(|| {
+                        checkpoint::message("decode row has no visible input token")
+                    })?;
+                    input.tokens[row] = i32::try_from(token)
+                        .map_err(|_| checkpoint::message("decode token exceeds I32"))?;
+                    let position = session
+                        .prompt
+                        .len()
+                        .checked_add(session.generated.len() - 1)
+                        .ok_or_else(|| checkpoint::message("decode position overflows usize"))?;
+                    input.positions[row] = i32::try_from(position)
+                        .map_err(|_| checkpoint::message("decode position exceeds I32"))?;
+                    // Tentative page allocation may be ahead of the visible
+                    // sequence. The resident slab still attends only through
+                    // the current visible token and advances itself on device.
+                    input.sequence_lengths[row] = input.positions[row]
+                        .checked_add(1)
+                        .ok_or_else(|| checkpoint::message("decode length exceeds I32"))?;
+                    input.query_lengths[row] = 1;
+                    input.last_indices[row] = 0;
+                    install_sampling_row(&mut input, row, session)?;
+                }
+                let lane = self
+                    .model
+                    .prepare_stable_decode_batch(batch_capacity, input)?;
+                self.stable_decode = Some(StableDecodeBatch {
+                    members,
+                    page_tables,
+                    lane,
+                });
             }
-            self.model.execute_batch(
-                graph::Phase::Decode,
-                batch_capacity,
-                query_capacity,
-                input,
+            self.model.execute_stable_decode_batch(
+                &mut self
+                    .stable_decode
+                    .as_mut()
+                    .expect("stable decode lane was prepared")
+                    .lane,
             )
         })();
         let outputs = match execution {
             Ok(outputs) => outputs,
             Err(error) => {
+                self.stable_decode.take();
                 for checkpoint in checkpoints {
                     self.pages.rollback(checkpoint).map_err(boxed)?;
                 }
@@ -727,22 +681,12 @@ impl<'platform> Generator<'platform> {
         Ok(raw)
     }
 
-    fn retire_decode_lane(&mut self, session: &mut ServerSession) -> Result<()> {
-        let Some(lane) = session.decode_lane.take() else {
-            return Ok(());
-        };
-        session.sampling.seed = self.model.retire_single_sequence_decode(lane)?;
-        session.installed_lane_page_table.clear();
-        Ok(())
-    }
-
     pub(crate) fn release_server_session(&mut self, session: &mut ServerSession) -> Result<bool> {
+        self.stable_decode.take();
         if session.released {
             return Ok(false);
         }
         session.released = true;
-        session.decode_lane.take();
-        session.installed_lane_page_table.clear();
         self.pages.release_sequence(session.sequence).map_err(boxed)
     }
 

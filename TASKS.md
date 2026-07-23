@@ -100,8 +100,8 @@ global page sharing yet.
 - [x] Keep model definition -> compilation -> parameter residency ordering and
   make every step select only precompiled executables.
 - [x] Retain a blocking `Generator::generate` diagnostic adapter as the pinned
-  151-TPS migration control; it is temporary until the serving B1 lane proves
-  parity and is then deleted by the Milestone 3 convergence task.
+  151-TPS migration control; it is temporary until the generic serving lane
+  proves parity and is then deleted by the Milestone 3 convergence task.
 - [x] Preserve the batch-1 five-pair lookahead and its “never past visible
   budget”/terminal-discard invariants in the step driver.
 - [ ] Add fixed-seed equivalence tests for normal return, tool call, early stop,
@@ -212,8 +212,11 @@ cancellation, and reclamation pass exact accounting.
   prefill/decode layer graph.
 - [x] Add a contract using a non-monotonic page table and boundary-crossing
   query chunk; compare full output/cache bytes to an independent dense oracle.
-- [ ] Add a Triton update only after real profiling shows the portable update
-  costs at least 2% of serving time.
+- [x] Replace the trace-correlated decomposed CUDA K/V scatters with one paired
+  generic Triton append that resolves each active row's page once, writes K and
+  V, skips inactive rows, and aliases both donated cache buffers.
+- [ ] Confirm on A40/Nsight that each layer emits the paired append and that the
+  prior decomposed mask/index/scatter kernel cluster is gone.
 
 ### 2.2 Allocate global target storage
 
@@ -270,7 +273,8 @@ control.
 - [x] Extend GPT-OSS `ShapeFamily` with batch capacity, query capacity,
   logical-page capacity, physical-page count, and parallel config.
 - [x] Compile the first A40 batch buckets `1,2,4,8,16,32`, decode query size 1,
-  and prefill query buckets `16,64,256` from one validated `ServerProfile`.
+  and prefill query buckets `16,64,128,256` from one validated
+  `ServerProfile`.
 - [x] Log and report the exact family count/compile time; reject duplicate or
   combinatorially unbounded profile input.
 - [ ] Continue compiling all families before parameter residency and warm each
@@ -299,8 +303,14 @@ control.
 - [ ] Add or tune Triton compact QKV/projection kernels for small
   `M=B*Q` so weights can be reused across active rows rather than issuing B
   isolated M=1 launches.
-- [ ] Flatten active routed tokens into one MoE assignment plan; padded rows
-  create no assignments and inactive experts touch no weights.
+- [x] Flatten the active `[B,Q]` mask into routed MoE, encode inactive routes
+  with expert ID `-1`, exclude them from the assignment schedule, touch no
+  inactive expert weights, and return exact zero for inactive tokens.
+- [x] Preserve sparse masked B1/B2 routing with one scan and two compact
+  scatters so a runtime mask does not force decode through the full per-expert
+  scheduler.
+- [ ] Confirm on A40/Nsight that Q128 serves the 106-token control and padded
+  prompt/batch positions no longer launch expert blocks.
 - [ ] Add batch-aware vocabulary projection/sampling and retain the global
   top-64 candidate contract.
 - [ ] Benchmark each batch bucket against issuing the same active rows
@@ -322,25 +332,29 @@ control.
   iteration; do not block all decode behind one long prompt.
 - [x] Repack surviving/new sequences into the smallest next batch family after
   every result; request identity must not equal batch slot.
-- [x] Replace per-token B1 reconstruction with one device-resident continuation
-  lane. Import token/RNG once after batched prefill; retain token, RNG,
-  position, page table, executable arguments, and the accepted five-pair
-  prefix; perform zero steady H2D plus one four-byte D2H; and remain
-  `InFlightDecode` until a command, cancellation, deadline, shutdown, or
-  backpressure changes membership.
-- [x] Make B1-to-batch transition explicit: retire device RNG once, discard the
-  bounded prefix, preserve the same global paged K/V buffers, and resume the
-  generic compact batch family at a visible-token boundary. On later B1
-  re-entry, derive position from prompt length plus the complete visible-token
-  history rather than rewinding to the first decode position.
-- [x] Delete the superseded serving-only lookahead embedding/pair executable
-  and its sequence/position/token identity bridge.
+- [x] Replace per-token batch reconstruction with one generic stable
+  continuation lane for every retained B family. Keep token, RNG, position,
+  sequence length, page-table metadata, executable arguments, and the accepted
+  five-pair prefix resident while membership is stable.
+- [x] Make the serving head donate the next batch slab, advancing token, RNG,
+  position, and sequence length on device with zero steady H2D and one compact
+  B*20-byte D2H.
+- [x] Queue the next embedding and five layer pairs immediately after the head
+  submission, overlapping the compact result download and host token handling
+  with useful GPU work.
+- [x] Continue stable B1-B32 batches without scheduler re-entry until a command,
+  cancellation, deadline, shutdown, backpressure, terminal row, page-table
+  change, or membership change requires a visible-token-boundary replan.
+- [x] Reuse process-lifetime compiled family bindings and one compact
+  result-download workspace per family.
+- [x] Delete `SingleSequenceDecodeLane`, its RNG export/import transition, and
+  its private B1 serving lifecycle; B1 is now the smallest generic family.
 - [ ] Publish the refactored server image and prove at least 150 decode-loop
   tokens/s on the exact 106+320 A40 control before removing the diagnostic
   performance route.
-- [ ] After A40 parity, drive `generate` through the serving B1 lane and delete
+- [ ] After A40 parity, drive `generate` through the generic serving lane and delete
   `ProductSession`/request-local prefill plus the remaining non-serving route;
-  retain specialized B1 graph shapes as serving policy, not a second engine.
+  retain static family specialization as graph policy, not a second engine.
 
 ### 3.5 Deterministic and load acceptance
 

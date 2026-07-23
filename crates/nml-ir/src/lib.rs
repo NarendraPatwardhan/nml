@@ -12,6 +12,7 @@ mod moe_backend;
 mod nvfp4_backend;
 mod ordinary_attention;
 mod paged_attention;
+mod paged_cache_update;
 
 use nml_mlir::{
     Attribute as MlirAttribute, Block, Context, ConvolutionDimensionNumbers, ConvolutionWindow,
@@ -1263,6 +1264,60 @@ impl ProgramBuilder {
         down_bias: &Parameter,
         experts_per_token: usize,
     ) -> Result<Tensor, Error> {
+        self.routed_clamped_swiglu_impl(
+            hidden,
+            router_logits,
+            gate_up_weights,
+            gate_up_bias,
+            down_weights,
+            down_bias,
+            experts_per_token,
+            None,
+        )
+    }
+
+    /// Routed clamped SwiGLU with a runtime active-token mask.
+    ///
+    /// Static serving families retain their complete `[tokens, hidden]`
+    /// geometry, but masked tokens are removed from the expert assignment
+    /// schedule. They therefore create no active expert blocks on compact
+    /// backends and return an exact zero residual.
+    #[allow(clippy::too_many_arguments)]
+    pub fn routed_clamped_swiglu_masked(
+        &mut self,
+        hidden: Tensor,
+        router_logits: Tensor,
+        gate_up_weights: &Parameter,
+        gate_up_bias: &Parameter,
+        down_weights: &Parameter,
+        down_bias: &Parameter,
+        experts_per_token: usize,
+        active_tokens: Tensor,
+    ) -> Result<Tensor, Error> {
+        self.routed_clamped_swiglu_impl(
+            hidden,
+            router_logits,
+            gate_up_weights,
+            gate_up_bias,
+            down_weights,
+            down_bias,
+            experts_per_token,
+            Some(active_tokens),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn routed_clamped_swiglu_impl(
+        &mut self,
+        hidden: Tensor,
+        router_logits: Tensor,
+        gate_up_weights: &Parameter,
+        gate_up_bias: &Parameter,
+        down_weights: &Parameter,
+        down_bias: &Parameter,
+        experts_per_token: usize,
+        active_tokens: Option<Tensor>,
+    ) -> Result<Tensor, Error> {
         self.require_local(hidden)?;
         self.require_local(router_logits)?;
         self.require_float(hidden, "clamped_swiglu_moe")?;
@@ -1342,9 +1397,19 @@ impl ProgramBuilder {
                 "experts per token must be positive and not exceed the expert count",
             ));
         }
+        if let Some(active_tokens) = active_tokens {
+            self.require_local(active_tokens)?;
+            if active_tokens.shape.dtype() != DType::Bool
+                || active_tokens.shape.dimensions() != [tokens]
+            {
+                return Err(Error::InvalidMoe(
+                    "active MoE token mask must be Bool [tokens]",
+                ));
+            }
+        }
 
         let probabilities = self.softmax(router_logits, 1)?;
-        let (routing_weights, expert_ids) =
+        let (mut routing_weights, mut expert_ids) =
             self.top_k(probabilities, 1, experts_per_token, true)?;
         let normalizer = self.reduce_sum(routing_weights, &[1])?;
         let epsilon = self.scalar_for(
@@ -1357,9 +1422,20 @@ impl ProgramBuilder {
         )?;
         let normalizer = self.maximum(normalizer, epsilon)?;
         let normalizer = self.broadcast_in_dim(normalizer, routing_weights.shape, &[0])?;
-        let routing_weights = self.divide(routing_weights, normalizer)?;
-        let routing_weights = self.convert(routing_weights, hidden.shape.dtype())?;
-        match (
+        routing_weights = self.divide(routing_weights, normalizer)?;
+        if let Some(active_tokens) = active_tokens {
+            let active_routes = self.broadcast_in_dim(
+                active_tokens,
+                routing_weights.shape.with_dtype(DType::Bool),
+                &[0],
+            )?;
+            let zero = self.scalar_for(routing_weights.shape.dtype(), 0.0)?;
+            routing_weights = self.select(active_routes, routing_weights, zero)?;
+            let invalid_expert = self.scalar(-1_i32)?;
+            expert_ids = self.select(active_routes, expert_ids, invalid_expert)?;
+        }
+        routing_weights = self.convert(routing_weights, hidden.shape.dtype())?;
+        let result = match (
             gate_up_weights.representation(),
             down_weights.representation(),
         ) {
@@ -1374,7 +1450,12 @@ impl ProgramBuilder {
                     down_bias,
                 ),
             (RepresentationSpec::NvFp4(_), RepresentationSpec::NvFp4(_)) => {
-                let assignment_plan = self.moe_assignment_plan(expert_ids, expert_count, 16)?;
+                let assignment_plan = self.moe_assignment_plan(
+                    expert_ids,
+                    expert_count,
+                    16,
+                    active_tokens.is_some(),
+                )?;
                 let [gate_payload, gate_scales, gate_global] =
                     require_nvfp4_components(gate_up_weights)?;
                 let [down_payload, down_scales, down_global] =
@@ -1411,6 +1492,17 @@ impl ProgramBuilder {
             _ => Err(Error::InvalidMoe(
                 "gate/up and down expert weights must use one representation",
             )),
+        }?;
+        if let Some(active_tokens) = active_tokens {
+            let active_output = self.broadcast_in_dim(
+                active_tokens,
+                result.shape.with_dtype(DType::Bool),
+                &[0],
+            )?;
+            let zero = self.scalar_for(result.shape.dtype(), 0.0)?;
+            self.select(active_output, result, zero)
+        } else {
+            Ok(result)
         }
     }
 
@@ -4425,6 +4517,68 @@ impl ProgramBuilder {
         self.scatter_update(cache, indices, updates, &[0, 1])
     }
 
+    /// Updates matching K/V paged caches through one semantic operation.
+    ///
+    /// The portable meaning is the same pair of StableHLO scatters exposed by
+    /// [`Self::paged_cache_update`]. CUDA lowers the semantic boundary to one
+    /// compact aliased append kernel, avoiding duplicated page resolution and
+    /// the decomposed gather/scatter launch chain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paged_cache_update_pair(
+        &mut self,
+        key_cache: Tensor,
+        value_cache: Tensor,
+        key_updates: Tensor,
+        value_updates: Tensor,
+        block_tables: Tensor,
+        start_positions: Tensor,
+        query_lengths: Tensor,
+        active_rows: Tensor,
+        write_mask: Tensor,
+    ) -> Result<(Tensor, Tensor), Error> {
+        if key_cache.shape != value_cache.shape || key_updates.shape != value_updates.shape {
+            return Err(Error::InvalidIndexing(
+                "paired K/V cache and update shapes must match",
+            ));
+        }
+        let portable_key = self.paged_cache_update(
+            key_cache,
+            key_updates,
+            block_tables,
+            start_positions,
+            query_lengths,
+            active_rows,
+            write_mask,
+        )?;
+        let portable_value = self.paged_cache_update(
+            value_cache,
+            value_updates,
+            block_tables,
+            start_positions,
+            query_lengths,
+            active_rows,
+            write_mask,
+        )?;
+        let key_result = self.push_value("paged_cache_update_key", key_cache.shape);
+        let value_result = self.push_value("paged_cache_update_value", value_cache.shape);
+        self.operations.push(Operation::PagedCacheUpdate {
+            key_cache: key_cache.value,
+            value_cache: value_cache.value,
+            key_updates: key_updates.value,
+            value_updates: value_updates.value,
+            block_tables: block_tables.value,
+            start_positions: start_positions.value,
+            query_lengths: query_lengths.value,
+            active_rows: active_rows.value,
+            write_mask: write_mask.value,
+            portable_key: portable_key.value,
+            portable_value: portable_value.value,
+            key_result: key_result.value,
+            value_result: value_result.value,
+        });
+        Ok((key_result, value_result))
+    }
+
     /// Portable blockwise paged attention. K/V storage is
     /// `[physical_pages, page_size, kv_heads, head_dim]`; the page table is
     /// `[batch, logical_pages]` and sequence lengths are `[batch]`.
@@ -5279,7 +5433,7 @@ impl ProgramBuilder {
         let normalizer = self.broadcast_in_dim(normalizer, routing_weights.shape, &[0])?;
         let routing_weights = self.divide(routing_weights, normalizer)?;
         let routing_weights = self.convert(routing_weights, hidden.shape.dtype())?;
-        let assignment_plan = self.moe_assignment_plan(expert_ids, experts, 16)?;
+        let assignment_plan = self.moe_assignment_plan(expert_ids, experts, 16, false)?;
 
         // Keep the expert dimension explicit throughout the portable graph.
         // Besides avoiding one graph copy per expert, this lets Shardy tile
@@ -5357,6 +5511,7 @@ impl ProgramBuilder {
         expert_ids: Tensor,
         experts: usize,
         block_size: usize,
+        contains_inactive_assignments: bool,
     ) -> Result<MoeAssignmentPlan, Error> {
         let assignments = expert_ids.shape.element_count().map_err(Error::Shape)?;
         let assignments = i64::try_from(assignments)
@@ -5409,19 +5564,77 @@ impl ProgramBuilder {
             .checked_mul(4)
             .is_some_and(|scaled| scaled <= expert_count)
         {
-            let sorted_assignments = self.pad(
-                assignment_ids,
-                sentinel,
-                &[0],
-                &[block_size_i64 - 1],
-                &[block_size_i64 - 1],
-            )?;
-            let active_blocks = self.scalar(i32::try_from(assignments).map_err(|_| {
-                Error::InvalidMoe("active expert block count must fit I32")
-            })?)?;
+            let (sorted_assignments, block_experts, active_blocks) =
+                if contains_inactive_assignments {
+                    // A serving mask must not force sparse B1/B2 decode through
+                    // the full per-expert scheduler. Compact the valid routes
+                    // into consecutive one-assignment blocks with one scan and
+                    // two scatters. The grouped kernels still launch only the
+                    // runtime `active_blocks` prefix.
+                    let zero = self.scalar(0_i32)?;
+                    let valid = self.greater_equal(flat_ids, zero)?;
+                    let valid_i32 = self.convert(valid, DType::I32)?;
+                    let one = self.scalar(1_i32)?;
+                    let ranks = self.cumulative_sum(valid_i32, 0)?;
+                    let ranks = self.subtract(ranks, one)?;
+                    let block = self.scalar(i32::try_from(block_size).map_err(|_| {
+                        Error::InvalidMoe("expert block size must fit the I32 routing contract")
+                    })?)?;
+                    let assignment_targets = self.multiply(ranks, block)?;
+                    let dropped_position =
+                        self.scalar(i32::try_from(max_positions).map_err(|_| {
+                            Error::InvalidMoe("padded schedule must fit the I32 routing contract")
+                        })?)?;
+                    let assignment_targets =
+                        self.select(valid, assignment_targets, dropped_position)?;
+                    let assignment_targets =
+                        self.insert_axis(assignment_targets, 1, AxisTag::UNKNOWN)?;
+                    let empty_assignments = self.broadcast_in_dim(
+                        sentinel,
+                        Shape::new(DType::I32, &[max_positions])?,
+                        &[],
+                    )?;
+                    let sorted_assignments = self.scatter_update(
+                        empty_assignments,
+                        assignment_targets,
+                        assignment_ids,
+                        &[0],
+                    )?;
+
+                    let dropped_block =
+                        self.scalar(i32::try_from(max_blocks).map_err(|_| {
+                            Error::InvalidMoe("expert block count must fit the I32 routing contract")
+                        })?)?;
+                    let block_targets = self.select(valid, ranks, dropped_block)?;
+                    let block_targets =
+                        self.insert_axis(block_targets, 1, AxisTag::UNKNOWN)?;
+                    let invalid_expert = self.scalar(-1_i32)?;
+                    let empty_experts = self.broadcast_in_dim(
+                        invalid_expert,
+                        Shape::new(DType::I32, &[max_blocks])?,
+                        &[],
+                    )?;
+                    let block_experts =
+                        self.scatter_update(empty_experts, block_targets, flat_ids, &[0])?;
+                    let active_blocks = self.reduce_sum(valid_i32, &[0])?;
+                    (sorted_assignments, block_experts, active_blocks)
+                } else {
+                    let sorted_assignments = self.pad(
+                        assignment_ids,
+                        sentinel,
+                        &[0],
+                        &[block_size_i64 - 1],
+                        &[block_size_i64 - 1],
+                    )?;
+                    let active_blocks =
+                        self.scalar(i32::try_from(assignments).map_err(|_| {
+                            Error::InvalidMoe("active expert block count must fit I32")
+                        })?)?;
+                    (sorted_assignments, flat_ids, active_blocks)
+                };
             return Ok(MoeAssignmentPlan {
                 sorted_assignments,
-                block_experts: flat_ids,
+                block_experts,
                 active_blocks,
                 block_size,
             });
@@ -6951,6 +7164,70 @@ impl Program {
                 block.append_operation(generated)?;
                 continue;
             }
+            if let Operation::PagedCacheUpdate {
+                key_cache,
+                value_cache,
+                key_updates,
+                value_updates,
+                block_tables,
+                start_positions,
+                query_lengths,
+                active_rows,
+                write_mask,
+                portable_key,
+                portable_value,
+                key_result,
+                value_result,
+            } = operation
+            {
+                let lowered = if capabilities.cuda_capabilities().is_some()
+                    && matches!(
+                        self.values[*key_cache].shape.dtype(),
+                        DType::F16 | DType::Bf16 | DType::F32
+                    )
+                {
+                    paged_cache_update::lower_triton(
+                        context,
+                        &mut block,
+                        paged_cache_update::Inputs {
+                            key_cache: mlir_value(&values, *key_cache),
+                            value_cache: mlir_value(&values, *value_cache),
+                            key_updates: mlir_value(&values, *key_updates),
+                            value_updates: mlir_value(&values, *value_updates),
+                            block_tables: mlir_value(&values, *block_tables),
+                            start_positions: mlir_value(&values, *start_positions),
+                            query_lengths: mlir_value(&values, *query_lengths),
+                            active_rows: mlir_value(&values, *active_rows),
+                            write_mask: mlir_value(&values, *write_mask),
+                            cache_shape: self.values[*key_cache].shape,
+                            updates_shape: self.values[*key_updates].shape,
+                            block_tables_shape: self.values[*block_tables].shape,
+                        },
+                    )?
+                } else {
+                    (
+                        mlir_value(&values, *portable_key),
+                        mlir_value(&values, *portable_value),
+                    )
+                };
+                values[*key_result] = Some(constrain_compound_result(
+                    context,
+                    &mut block,
+                    lowered.0,
+                    types[*key_result],
+                    sharding,
+                    self.values[*key_result].shape,
+                )?);
+                values[*value_result] = Some(constrain_compound_result(
+                    context,
+                    &mut block,
+                    lowered.1,
+                    types[*value_result],
+                    sharding,
+                    self.values[*value_result].shape,
+                )?);
+                continue;
+            }
             if let Operation::PagedAttention {
                 query,
                 key_cache,
@@ -7677,6 +7954,9 @@ impl Program {
                 Operation::PagedAttention { .. } => {
                     unreachable!("paged attention is lowered before scalar operations")
                 }
+                Operation::PagedCacheUpdate { .. } => {
+                    unreachable!("paged cache update is lowered before scalar operations")
+                }
                 Operation::MoeDispatch { .. } => {
                     unreachable!("MoE dispatch is lowered before scalar operations")
                 }
@@ -8037,6 +8317,21 @@ enum Operation {
         sinks: Option<usize>,
         result: usize,
         options: AttentionOptions,
+    },
+    PagedCacheUpdate {
+        key_cache: usize,
+        value_cache: usize,
+        key_updates: usize,
+        value_updates: usize,
+        block_tables: usize,
+        start_positions: usize,
+        query_lengths: usize,
+        active_rows: usize,
+        write_mask: usize,
+        portable_key: usize,
+        portable_value: usize,
+        key_result: usize,
+        value_result: usize,
     },
     GatedDeltaNet {
         queries: usize,

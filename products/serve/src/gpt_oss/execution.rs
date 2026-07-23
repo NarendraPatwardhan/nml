@@ -209,6 +209,21 @@ pub(super) struct BatchOutputs {
     pub(super) sampling_states: Vec<u64>,
 }
 
+/// Device-resident control slab for one stable serving decode membership.
+///
+/// The head donates and updates this slab after every token. Its token, RNG,
+/// position, lengths, masks, sampling controls, and page table therefore feed
+/// the next step without another host upload.
+pub(super) struct StableDecodeBatchLane {
+    family: ShapeFamily,
+    batch_slab: Buffer,
+    lookahead: Option<StableDecodePrefix>,
+}
+
+struct StableDecodePrefix {
+    hidden: Buffer,
+}
+
 /// Artifact-backed model description. Declaring this state opens checkpoint
 /// metadata but deliberately allocates no device parameter buffers.
 pub(super) struct ModelDefinition {
@@ -299,6 +314,23 @@ impl<'platform> CompiledDefinition<'platform> {
                     .map(|bound| (*shape, bound))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
+        let stable_result_downloads = plan
+            .families
+            .keys()
+            .copied()
+            .filter(|family| family.is_serving() && family.phase() == Phase::Decode)
+            .map(|family| {
+                let shape = Shape::new(
+                    nml::DataType::U8,
+                    &[
+                        usize_i64(family.batch())?,
+                        usize_i64(BATCH_RESULT_BYTES_PER_ROW)?,
+                    ],
+                )
+                .map_err(boxed)?;
+                Ok((family, Slice::alloc(shape).map_err(boxed)?))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
         let allocation_started = Instant::now();
         let family = plan
             .families
@@ -324,6 +356,7 @@ impl<'platform> CompiledDefinition<'platform> {
             plan,
             startup,
             bound_families,
+            stable_result_downloads,
             caches,
             cache_allocation,
             cache_storage_bytes,
@@ -454,6 +487,7 @@ pub(super) struct ResidentModel<'platform> {
     plan: ExecutionPlan<'platform>,
     startup: StartupMetrics,
     bound_families: BTreeMap<ShapeFamily, BoundComponentFamily>,
+    stable_result_downloads: BTreeMap<ShapeFamily, Slice<'static>>,
     caches: Vec<LayerCache>,
     cache_allocation: Duration,
     cache_storage_bytes: usize,
@@ -466,195 +500,6 @@ impl ResidentModel<'_> {
 
     pub(super) const fn startup(&self) -> StartupMetrics {
         self.startup
-    }
-
-    pub(super) fn prepare_single_sequence_decode(
-        &self,
-        prompt_tokens: usize,
-        max_new_tokens: usize,
-        generated_tokens: &[u32],
-        sampling: SamplingOptions,
-    ) -> Result<SingleSequenceDecodeLane> {
-        let first_token = *generated_tokens
-            .last()
-            .ok_or_else(|| message("single-sequence decode has no visible input token"))?;
-        if prompt_tokens == 0
-            || generated_tokens.len() >= max_new_tokens
-            || super::protocol::is_stop_token(first_token)
-        {
-            return Err(message(
-                "only an unfinished single sequence can enter the device decode lane",
-            ));
-        }
-        let lifecycle = RequestLifecycle::resume(max_new_tokens, generated_tokens)?;
-        let decode_position = lifecycle.decode_position(prompt_tokens)?;
-        let required_cache_capacity = prompt_tokens
-            .checked_add(max_new_tokens)
-            .ok_or_else(|| message("single-sequence decode capacity overflows usize"))?;
-        let profile = self
-            .plan
-            .profiles
-            .iter()
-            .copied()
-            .filter(|profile| {
-                profile.supports_lengths(prompt_tokens, required_cache_capacity)
-            })
-            .min_by_key(|profile| {
-                (profile.decode.cache_capacity(), profile.prefill.sequence())
-            })
-            .ok_or_else(|| {
-                message("single-sequence decode is not covered by a compiled profile")
-            })?;
-        let family = self
-            .plan
-            .families
-            .get(&profile.decode)
-            .ok_or_else(|| message("single-sequence decode family was not retained"))?;
-        let mut embedding = family.embedding.args();
-        bind_embedding(&mut embedding, &self.checkpoint, &self.parameters)?;
-        let pairs = bind_decode_pairs(family, &self.checkpoint, &self.parameters, &self.config)?;
-        let mut head = family.head.args();
-        bind_head(&mut head, &self.parameters)?;
-
-        let platform = self.plan.platform;
-        let placement = &self.plan.placement;
-        let active_rows = upload_bool(
-            platform,
-            Shape::new(nml::DataType::Bool, &[1]).map_err(boxed)?,
-            &[true],
-            placement,
-        )?;
-        head.set(
-            "top_k",
-            upload_i32(
-                platform,
-                Shape::new(nml::DataType::I32, &[1]).map_err(boxed)?,
-                &[i32::try_from(sampling.top_k)
-                    .map_err(|_| message("GPT-OSS top-k exceeds I32"))?],
-                placement,
-            )?,
-        )
-        .map_err(boxed)?;
-        head.set(
-            "temperature",
-            upload_f32_vector(platform, &[sampling.temperature], placement)?,
-        )
-        .map_err(boxed)?;
-        head.set(
-            "top_p",
-            upload_f32_vector(platform, &[sampling.top_p], placement)?,
-        )
-        .map_err(boxed)?;
-        head.set(
-            "min_p",
-            upload_f32_vector(platform, &[sampling.min_p], placement)?,
-        )
-        .map_err(boxed)?;
-        head.set("active_rows", active_rows.clone()).map_err(boxed)?;
-
-        let state_started = Instant::now();
-        let token_buffer = upload_i32(
-            platform,
-            Shape::new(nml::DataType::I32, &[1]).map_err(boxed)?,
-            &[i32::try_from(first_token).map_err(|_| message("GPT-OSS token exceeds I32"))?],
-            placement,
-        )?;
-        let sampling_state = upload_u64(
-            platform,
-            Shape::new(nml::DataType::U64, &[1, 2]).map_err(boxed)?,
-            &sampling.seed,
-            placement,
-        )?;
-        let position = upload_i32(
-            platform,
-            Shape::new(nml::DataType::I32, &[1]).map_err(boxed)?,
-            &[i32::try_from(decode_position)
-                .map_err(|_| message("GPT-OSS decode position exceeds I32"))?],
-            placement,
-        )?;
-        let query_lengths = upload_i32(
-            platform,
-            Shape::new(nml::DataType::I32, &[1]).map_err(boxed)?,
-            &[1],
-            placement,
-        )?;
-        let last_index = upload_i32(
-            platform,
-            Shape::new(nml::DataType::I32, &[1, 1]).map_err(boxed)?,
-            &[0],
-            placement,
-        )?;
-        let token_download = Slice::alloc(token_buffer.shape()).map_err(boxed)?;
-        let cache_metadata_bytes = page_table_shape(profile.decode)?.byte_count().map_err(boxed)?;
-        Ok(SingleSequenceDecodeLane {
-            execution: RequestExecution {
-                lifecycle,
-                profile,
-                prompt_token_count: prompt_tokens,
-                cache_capacity: profile.decode.cache_capacity(),
-                cache_storage_bytes: self.cache_storage_bytes,
-                cache_metadata_bytes,
-                metrics: RunMetrics {
-                    cache_allocation: self.cache_allocation,
-                    decode_state_initialization: state_started.elapsed(),
-                    ..RunMetrics::default()
-                },
-                page_table: None,
-                prefill: None,
-                decode: Some(DecodeState {
-                    embedding,
-                    pairs,
-                    head,
-                    token_buffer,
-                    sampling_state: Some(sampling_state),
-                    position: Some(position),
-                    query_lengths,
-                    active_rows,
-                    last_index,
-                    token_download,
-                    lookahead: None,
-                }),
-            },
-        })
-    }
-
-    pub(super) fn single_sequence_page_table_width(
-        &self,
-        lane: &SingleSequenceDecodeLane,
-    ) -> usize {
-        lane.execution.page_table_width()
-    }
-
-    pub(super) fn single_sequence_lookahead_tokens(
-        &self,
-        lane: &SingleSequenceDecodeLane,
-    ) -> Result<usize> {
-        lane.execution.decode_cache_lookahead_tokens()
-    }
-
-    pub(super) fn install_single_sequence_page_table(
-        &self,
-        lane: &mut SingleSequenceDecodeLane,
-        pages: &[i32],
-    ) -> Result<()> {
-        self.install_page_table(&mut lane.execution, pages)
-    }
-
-    pub(super) fn decode_single_sequence_step(
-        &mut self,
-        lane: &mut SingleSequenceDecodeLane,
-    ) -> Result<RawToken> {
-        lane.execution
-            .decode_step(&mut self.caches)?
-            .ok_or_else(|| message("single-sequence decode lane omitted its token"))
-    }
-
-    pub(super) fn retire_single_sequence_decode(
-        &self,
-        mut lane: SingleSequenceDecodeLane,
-    ) -> Result<[u64; 2]> {
-        lane.execution.discard_decode_lookahead();
-        lane.execution.current_sampling_state()
     }
 
     pub(super) fn prefill_step(
@@ -695,64 +540,70 @@ impl ResidentModel<'_> {
             .bound_families
             .get_mut(&family)
             .expect("selected bound family exists");
-        bound
-            .embedding
-            .set("batch_slab", batch_slab.clone())
-            .map_err(boxed)?;
-        let mut hidden = one(bound.embedding.enqueue().map_err(boxed)?)?;
-        match &mut bound.layers {
-            BoundLayerExecutables::Prefill { layers, kinds } => {
-                for ((arguments, kind), cache) in
-                    layers.iter_mut().zip(kinds.iter()).zip(&mut self.caches)
-                {
-                    let (next, _) = execute_serving_layer(
-                        arguments,
-                        hidden,
-                        batch_slab.clone(),
-                        cache,
-                    )?;
-                    hidden = next;
-                    let _ = kind;
-                }
-            }
-            BoundLayerExecutables::Decode { pairs } => {
-                for (arguments, caches) in pairs
-                    .iter_mut()
-                    .zip(self.caches.chunks_exact_mut(2))
-                {
-                    let (next, _) = execute_serving_layer_pair(
-                        arguments,
-                        hidden,
-                        batch_slab.clone(),
-                        caches,
-                    )?;
-                    hidden = next;
-                }
-            }
-        }
-        bound.head.set("hidden", hidden).map_err(boxed)?;
-        bound
-            .head
-            .set("batch_slab", batch_slab.clone())
-            .map_err(boxed)?;
-        let mut results = bound
-            .head
-            .enqueue()
-            .map_err(boxed)?
-            .into_buffers()
-            .into_iter();
-        let result = results
-            .next()
-            .ok_or_else(|| message("batched head omitted its compact result"))?;
-        if results.next().is_some() {
-            return Err(message("batched head returned extra buffers"));
-        }
+        let (result, _) =
+            enqueue_serving_family(bound, &mut self.caches, batch_slab)?;
         let mut result_slice = Slice::alloc(result.shape()).map_err(boxed)?;
         let download = result.download_to(&mut result_slice).map_err(boxed)?;
         download.wait().map_err(boxed)?;
         decode_batch_output_bytes(
             result_slice.items::<u8>().map_err(boxed)?,
             family.batch(),
+        )
+    }
+
+    pub(super) fn prepare_stable_decode_batch(
+        &self,
+        batch_capacity: usize,
+        input: BatchInputs,
+    ) -> Result<StableDecodeBatchLane> {
+        let family = self.batch_family(Phase::Decode, batch_capacity, 1)?;
+        validate_batch_inputs(family, &input)?;
+        let layout = ServingSlabLayout::for_family(family)?;
+        let batch_slab = upload_u8(
+            self.plan.platform,
+            Shape::new(nml::DataType::U8, &[usize_i64(layout.total_bytes())?])
+                .map_err(boxed)?,
+            &pack_batch_slab(family, layout, &input)?,
+            &self.plan.placement,
+        )?;
+        Ok(StableDecodeBatchLane {
+            family,
+            batch_slab,
+            lookahead: None,
+        })
+    }
+
+    pub(super) fn execute_stable_decode_batch(
+        &mut self,
+        lane: &mut StableDecodeBatchLane,
+    ) -> Result<BatchOutputs> {
+        let bound = self
+            .bound_families
+            .get_mut(&lane.family)
+            .ok_or_else(|| message("stable decode family was not retained"))?;
+        let (result, next_slab) = enqueue_stable_decode_body(
+            bound,
+            &mut self.caches,
+            lane.batch_slab.clone(),
+            lane.lookahead.take(),
+        )?;
+        lane.batch_slab = next_slab;
+        let result_download = self
+            .stable_result_downloads
+            .get_mut(&lane.family)
+            .ok_or_else(|| message("stable decode family has no result workspace"))?;
+        let download = result.download_to(result_download).map_err(boxed)?;
+        lane.lookahead = Some(StableDecodePrefix {
+            hidden: enqueue_stable_decode_prefix(
+                bound,
+                &mut self.caches,
+                lane.batch_slab.clone(),
+            )?,
+        });
+        download.wait().map_err(boxed)?;
+        decode_batch_output_bytes(
+            result_download.items::<u8>().map_err(boxed)?,
+            lane.family.batch(),
         )
     }
 
@@ -1050,26 +901,6 @@ impl RequestLifecycle {
         }
     }
 
-    fn resume(max_new_tokens: usize, generated_tokens: &[u32]) -> Result<Self> {
-        if generated_tokens.is_empty() || generated_tokens.len() >= max_new_tokens {
-            return Err(message(
-                "single-sequence decode requires an unfinished visible token history",
-            ));
-        }
-        if generated_tokens
-            .last()
-            .is_some_and(|token| super::protocol::is_stop_token(*token))
-        {
-            return Err(message("a stopped sequence cannot resume device decode"));
-        }
-        Ok(Self {
-            phase: RequestPhase::DecodeReady,
-            max_new_tokens,
-            generated_tokens: generated_tokens.to_vec(),
-            stopped: false,
-        })
-    }
-
     fn record_prefill(&mut self, token: u32, is_stop: bool) -> Result<RawToken> {
         if self.phase != RequestPhase::PrefillPending {
             return Err(message("GPT-OSS prefill step is not pending"));
@@ -1108,12 +939,6 @@ impl RequestLifecycle {
             .ok_or_else(|| message("GPT-OSS decode has no visible input token"))
     }
 
-    fn decode_position(&self, prompt_tokens: usize) -> Result<usize> {
-        prompt_tokens
-            .checked_add(self.decode_generated_index()?)
-            .ok_or_else(|| message("GPT-OSS decode position overflows usize"))
-    }
-
     fn fail(&mut self) {
         if self.phase != RequestPhase::Complete {
             self.phase = RequestPhase::Failed;
@@ -1142,14 +967,6 @@ pub(super) struct RequestExecution {
     page_table: Option<Buffer>,
     prefill: Option<PrefillState>,
     decode: Option<DecodeState>,
-}
-
-/// Device-resident decode state for the uncontended serving lane. It shares
-/// the process-wide paged K/V buffers with generic batches, but keeps token,
-/// RNG, position, executable arguments, and the bounded decode prefix on the
-/// device until request membership changes.
-pub(super) struct SingleSequenceDecodeLane {
-    execution: RequestExecution,
 }
 
 struct PrefillState {
@@ -1233,28 +1050,6 @@ impl RequestExecution {
 
     pub(super) const fn stopped(&self) -> bool {
         self.lifecycle.stopped
-    }
-
-    fn discard_decode_lookahead(&mut self) {
-        if let Some(decode) = &mut self.decode {
-            decode.lookahead.take();
-        }
-    }
-
-    fn current_sampling_state(&self) -> Result<[u64; 2]> {
-        let state = self
-            .decode
-            .as_ref()
-            .and_then(|decode| decode.sampling_state.as_ref())
-            .ok_or_else(|| message("single-sequence decode has no sampling state"))?;
-        let slice = state.to_slice().map_err(boxed)?;
-        let values = slice.items::<u64>().map_err(boxed)?;
-        let [first, second] = values else {
-            return Err(message(
-                "single-sequence decode returned an invalid sampling state",
-            ));
-        };
-        Ok([*first, *second])
     }
 
     /// Executes the selected bounded prefill family once. Chunked prefill will
@@ -2001,6 +1796,143 @@ fn execute_layer_pair(
     Ok((hidden, started.elapsed()))
 }
 
+fn enqueue_stable_decode_body(
+    bound: &mut BoundComponentFamily,
+    caches: &mut [LayerCache],
+    batch_slab: Buffer,
+    lookahead: Option<StableDecodePrefix>,
+) -> Result<(Buffer, Buffer)> {
+    let BoundLayerExecutables::Decode { pairs } = &mut bound.layers else {
+        return Err(message("stable decode selected a prefill family"));
+    };
+    let mut hidden;
+    let first_pair;
+    if let Some(prefix) = lookahead {
+        hidden = prefix.hidden;
+        first_pair = DECODE_LOOKAHEAD_PAIRS;
+    } else {
+        bound
+            .embedding
+            .set("batch_slab", batch_slab.clone())
+            .map_err(boxed)?;
+        hidden = one(bound.embedding.enqueue().map_err(boxed)?)?;
+        first_pair = 0;
+    }
+    for (arguments, pair_caches) in pairs[first_pair..]
+        .iter_mut()
+        .zip(caches[first_pair * 2..].chunks_exact_mut(2))
+    {
+        let (next, _) =
+            execute_serving_layer_pair(arguments, hidden, batch_slab.clone(), pair_caches)?;
+        hidden = next;
+    }
+    bound.head.set("hidden", hidden).map_err(boxed)?;
+    bound
+        .head
+        .set("batch_slab", batch_slab)
+        .map_err(boxed)?;
+    let mut outputs = bound
+        .head
+        .enqueue()
+        .map_err(boxed)?
+        .into_buffers()
+        .into_iter();
+    let result = outputs
+        .next()
+        .ok_or_else(|| message("stable decode head omitted its compact result"))?;
+    let next_slab = outputs
+        .next()
+        .ok_or_else(|| message("stable decode head omitted its next control slab"))?;
+    if outputs.next().is_some() {
+        return Err(message("stable decode head returned extra buffers"));
+    }
+    Ok((result, next_slab))
+}
+
+fn enqueue_stable_decode_prefix(
+    bound: &mut BoundComponentFamily,
+    caches: &mut [LayerCache],
+    batch_slab: Buffer,
+) -> Result<Buffer> {
+    let BoundLayerExecutables::Decode { pairs } = &mut bound.layers else {
+        return Err(message("stable decode selected a prefill family"));
+    };
+    if pairs.len() < DECODE_LOOKAHEAD_PAIRS || caches.len() < DECODE_LOOKAHEAD_PAIRS * 2 {
+        return Err(message("stable decode family is shorter than its lookahead"));
+    }
+    bound
+        .embedding
+        .set("batch_slab", batch_slab.clone())
+        .map_err(boxed)?;
+    let mut hidden = one(bound.embedding.enqueue().map_err(boxed)?)?;
+    for (arguments, pair_caches) in pairs[..DECODE_LOOKAHEAD_PAIRS]
+        .iter_mut()
+        .zip(caches[..DECODE_LOOKAHEAD_PAIRS * 2].chunks_exact_mut(2))
+    {
+        let (next, _) =
+            execute_serving_layer_pair(arguments, hidden, batch_slab.clone(), pair_caches)?;
+        hidden = next;
+    }
+    Ok(hidden)
+}
+
+fn enqueue_serving_family(
+    bound: &mut BoundComponentFamily,
+    caches: &mut [LayerCache],
+    batch_slab: Buffer,
+) -> Result<(Buffer, Option<Buffer>)> {
+    bound
+        .embedding
+        .set("batch_slab", batch_slab.clone())
+        .map_err(boxed)?;
+    let mut hidden = one(bound.embedding.enqueue().map_err(boxed)?)?;
+    match &mut bound.layers {
+        BoundLayerExecutables::Prefill { layers, kinds } => {
+            for ((arguments, kind), cache) in
+                layers.iter_mut().zip(kinds.iter()).zip(caches)
+            {
+                let (next, _) =
+                    execute_serving_layer(arguments, hidden, batch_slab.clone(), cache)?;
+                hidden = next;
+                let _ = kind;
+            }
+        }
+        BoundLayerExecutables::Decode { pairs } => {
+            for (arguments, caches) in pairs.iter_mut().zip(caches.chunks_exact_mut(2)) {
+                let (next, _) =
+                    execute_serving_layer_pair(arguments, hidden, batch_slab.clone(), caches)?;
+                hidden = next;
+            }
+        }
+    }
+    bound.head.set("hidden", hidden).map_err(boxed)?;
+    bound
+        .head
+        .set("batch_slab", batch_slab)
+        .map_err(boxed)?;
+    let mut outputs = bound
+        .head
+        .enqueue()
+        .map_err(boxed)?
+        .into_buffers()
+        .into_iter();
+    let result = outputs
+        .next()
+        .ok_or_else(|| message("batched head omitted its compact result"))?;
+    let next_slab = match &bound.layers {
+        BoundLayerExecutables::Decode { .. } => Some(
+            outputs
+                .next()
+                .ok_or_else(|| message("serving decode head omitted its next control slab"))?,
+        ),
+        BoundLayerExecutables::Prefill { .. } => None,
+    };
+    if outputs.next().is_some() {
+        return Err(message("batched head returned extra buffers"));
+    }
+    Ok((result, next_slab))
+}
+
 fn execute_serving_layer(
     arguments: &mut Arguments,
     hidden: Buffer,
@@ -2506,19 +2438,6 @@ mod tests {
         complete.record_prefill(1, false).unwrap();
         complete.fail();
         assert_eq!(complete.phase, RequestPhase::Complete);
-    }
-
-    #[test]
-    fn resumed_single_sequence_lifecycle_preserves_the_visible_budget() {
-        let mut resumed = RequestLifecycle::resume(4, &[11, 12]).unwrap();
-        assert_eq!(resumed.phase, RequestPhase::DecodeReady);
-        assert_eq!(resumed.decode_generated_index().unwrap(), 1);
-        assert_eq!(resumed.decode_position(106).unwrap(), 107);
-        resumed.record_decode(13, false).unwrap();
-        assert_eq!(resumed.phase, RequestPhase::DecodeReady);
-        resumed.record_decode(14, false).unwrap();
-        assert_eq!(resumed.phase, RequestPhase::Complete);
-        assert!(RequestLifecycle::resume(2, &[11, 12]).is_err());
     }
 
     #[test]
