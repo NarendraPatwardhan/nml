@@ -463,8 +463,22 @@ count, M/N/K, route density, and latency/throughput phase select kernel tiles.
 - [x] Pass the affected IR, Triton, server, image-structure, CUDA-generation,
   and serving-image construction gates through BuildBuddy after the
   correction.
-- [ ] Publish one immutable corrected image and rerun the compact C1/C2/C4/C8
-  A40 matrix with complete Nsight recovery.
+- [x] Publish immutable image `d99185ac39ec` from source `dbab88689a4` and
+  rerun the compact C1/C2/C4/C8 A40 matrix with complete Nsight recovery.
+  End-to-end throughput was 137.9-138.4/122.3-123.1/169.2-169.4/205.9-206.1
+  TPS, restoring or exceeding the accepted control throughout.
+- [x] Segment the accepted, rejected, and corrected traces by concurrency and
+  distinguish the 2,880-wide output projection from the 201,088-wide
+  vocabulary head. At C2 the underfilled M16 output projection consumes 4.62
+  ms per decode batch while the rejected row-wise body measured 1.83 ms; the
+  matrix vocabulary head remains 1.72 ms faster than that rejected body.
+- [x] Add an exact rank-one row-minor dense GEMV wrapper and an M/N/SM-aware
+  finite selector. Preserve the exact B1 TTIR, the saturated B2/B4/B8
+  vocabulary-head matrix family, and the measured B8 ordinary matrix
+  crossover with permanent construction contracts.
+- [ ] Publish and measure the row-minor selector on A40 before promoting it.
+  Require no C1 or C8 regression and use the full end-to-end C1/C2/C4/C8
+  matrix; the trace-derived C2 target is at least 145 aggregate output TPS.
 
 ## Milestone 4: complete OpenAI tool calling
 

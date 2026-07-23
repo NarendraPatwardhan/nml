@@ -173,6 +173,47 @@ fn nvfp4_decode_linear_uses_compact_gemv_without_dead_matrix_rows() {
 }
 
 #[test]
+fn nvfp4_small_row_linear_wraps_the_exact_rank_one_gemv_body() {
+    let config = NvFp4LinearConfig {
+        dtype: DType::Bf16,
+        rows: 2,
+        outputs: 32,
+        inputs: 80,
+        block_m: 1,
+        block_n: 8,
+        block_k: 32,
+        has_bias: true,
+    };
+    assert_eq!(config.launch_grid().unwrap(), [8, 1, 1]);
+    let ttir = build_nvfp4_linear(config).unwrap();
+    let ttir = ttir.text();
+    assert!(
+        ttir.contains("@nvfp4_linear_row_gemv_r2_m1_n8_k32"),
+        "{ttir}"
+    );
+    assert!(ttir.contains("arith.divsi"), "{ttir}");
+    assert!(ttir.contains("arith.remsi"), "{ttir}");
+    assert!(ttir.contains("tt.reduce"), "{ttir}");
+    assert!(
+        ttir.contains("axis = 1 : i32") && !ttir.contains("axis = 2 : i32"),
+        "each row CTA must retain the exact scalar [N,K] reduction: {ttir}"
+    );
+    assert!(!ttir.contains("tt.dot"), "{ttir}");
+    assert!(
+        !ttir.contains("tensor<2x8x"),
+        "semantic rows must not enter the contraction tensor rank: {ttir}"
+    );
+    assert!(
+        build_nvfp4_linear(NvFp4LinearConfig {
+            block_m: 2,
+            ..config
+        })
+        .is_err(),
+        "small-row execution must use independent rank-one CTAs, not a leading-M contraction"
+    );
+}
+
+#[test]
 fn nvfp4_batched_linear_uses_tensor_core_weight_reuse() {
     let config = NvFp4LinearConfig {
         dtype: DType::Bf16,

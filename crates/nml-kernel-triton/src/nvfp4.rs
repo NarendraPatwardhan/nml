@@ -165,10 +165,13 @@ impl NvFp4LinearConfig {
             || [self.block_m, self.block_n, self.block_k]
                 .into_iter()
                 .any(|value| value <= 0 || !(value as u64).is_power_of_two())
+            || (self.rows > 1
+                && self.block_m != 1
+                && self.block_m < REPRESENTATION_BLOCK)
             || self.block_k % REPRESENTATION_BLOCK != 0
         {
             return Err(Error::InvalidKernelSpec(
-                "NVFP4 linear requires F16/BF16, positive geometry, power-of-two tiles, and a K tile divisible by sixteen",
+                "NVFP4 linear requires F16/BF16, positive geometry, a rank-one or at least M16 row tile, power-of-two tiles, and a K tile divisible by sixteen",
             ));
         }
         Ok(())
@@ -224,6 +227,9 @@ pub fn build_nvfp4_linear(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
             block_m: 1,
             ..config
         });
+    }
+    if config.block_m == 1 {
+        return build_nvfp4_linear_row_gemv(config);
     }
     build_nvfp4_linear_matrix(config)
 }
@@ -540,6 +546,58 @@ fn build_nvfp4_linear_gemv(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
         &global_scale,
         bias.as_ref(),
         &output,
+    )?;
+    builder.return_void()?;
+    builder.finish()
+}
+
+/// Builds a bounded small-row projection from the exact scalar GEMV body.
+///
+/// The grid is output-tile-major and row-minor. Adjacent CTAs therefore
+/// revisit the same immutable compact weight tile while it is hot in L2, but
+/// each CTA receives row-offset pointers and authors the same rank-one `[N,K]`
+/// contraction as `build_nvfp4_linear_gemv`. The contraction itself must not
+/// be widened to the rejected generalized `[M,N,K]` body.
+fn build_nvfp4_linear_row_gemv(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
+    let mut builder = Builder::new(&format!(
+        "nvfp4_linear_row_gemv_r{}_m1_n{}_k{}",
+        config.rows, config.block_n, config.block_k
+    ))?;
+    let input = pointer(&mut builder, "input", config.dtype)?;
+    let payload = pointer(&mut builder, "payload", DType::U8)?;
+    let block_scales = pointer(&mut builder, "block_scales", DType::U8)?;
+    let global_scale = pointer(&mut builder, "global_scale", DType::F32)?;
+    let bias = config
+        .has_bias
+        .then(|| pointer(&mut builder, "bias", config.dtype))
+        .transpose()?;
+    let output = pointer(&mut builder, "output", config.dtype)?;
+
+    let program = builder.program_id(0)?;
+    let rows = builder.integer(config.rows, DType::I32)?;
+    let output_program = builder.divide(&program, &rows)?;
+    let row = builder.remainder(&program, &rows)?;
+    let row_i64 = builder.cast(&row, DType::I64)?;
+    let input_width = builder.integer(config.inputs, DType::I64)?;
+    let input_offset = builder.multiply(&row_i64, &input_width)?;
+    let row_input = builder.add_pointer(&input, &input_offset)?;
+    let output_width = builder.integer(config.outputs, DType::I64)?;
+    let output_offset = builder.multiply(&row_i64, &output_width)?;
+    let row_output = builder.add_pointer(&output, &output_offset)?;
+    build_nvfp4_gemv_projection(
+        &mut builder,
+        NvFp4LinearConfig {
+            rows: 1,
+            block_m: 1,
+            ..config
+        },
+        &output_program,
+        &row_input,
+        &payload,
+        &block_scales,
+        &global_scale,
+        bias.as_ref(),
+        &row_output,
     )?;
     builder.return_void()?;
     builder.finish()

@@ -100,19 +100,16 @@ fn nvfp4_linear_is_one_semantic_operation_with_three_physical_components() {
 }
 
 #[test]
-fn nvfp4_dense_decode_keeps_scalar_gemv_and_batched_matrix_families_distinct() {
-    fn lowered(rows: i64) -> String {
+fn nvfp4_dense_decode_selects_row_gemv_only_for_underfilled_small_matrices() {
+    fn lowered(rows: i64, outputs: i64, core_count: usize) -> String {
         let weight = Parameter::nvfp4(
-            "lm_head.weight",
-            "model.lm_head.weight",
-            Shape::new(DType::Bf16, &[201_088, 2_880]).unwrap(),
+            "projection.weight",
+            "model.projection.weight",
+            Shape::new(DType::Bf16, &[outputs, 2_880]).unwrap(),
         )
         .unwrap();
         let mut builder = ProgramBuilder::new();
-        let input = builder.input(
-            "hidden",
-            Shape::new(DType::Bf16, &[rows, 2_880]).unwrap(),
-        );
+        let input = builder.input("hidden", Shape::new(DType::Bf16, &[rows, 2_880]).unwrap());
         let output = builder.linear(input, &weight, None).unwrap();
         let program = builder.finish(&[output]).unwrap();
         let context = Context::new();
@@ -120,7 +117,7 @@ fn nvfp4_dense_decode_keeps_scalar_gemv_and_batched_matrix_families_distinct() {
             .module_with_sharding_cuda(
                 &context,
                 &nml_sharding::Sharding::single(),
-                84,
+                core_count,
                 8,
                 6,
             )
@@ -129,24 +126,46 @@ fn nvfp4_dense_decode_keeps_scalar_gemv_and_batched_matrix_families_distinct() {
         module.text()
     }
 
-    let scalar = lowered(1);
-    assert!(
-        scalar.contains("nvfp4_linear_gemv_m1_n32_k256"),
-        "{scalar}"
-    );
+    let scalar = lowered(1, 2_880, 84);
+    assert!(scalar.contains("nvfp4_linear_gemv_m1_n8_k256"), "{scalar}");
     assert!(!scalar.contains("nvfp4_linear_m16"), "{scalar}");
 
-    for rows in [2, 4, 8] {
-        let batched = lowered(rows);
+    for rows in [2, 4] {
+        let compact = lowered(rows, 2_880, 84);
         assert!(
-            batched.contains("nvfp4_linear_m16_n64_k128"),
-            "B{rows} LM head must reuse weights through the matrix family: {batched}"
+            compact.contains(&format!("nvfp4_linear_row_gemv_r{rows}_m1_n8_k256")),
+            "an underfilled B{rows} matrix must use rank-one row CTAs: {compact}"
         );
         assert!(
-            !batched.contains("nvfp4_linear_gemv"),
-            "B{rows} LM head must not scale row-wise through GEMV: {batched}"
+            !compact.contains("nvfp4_linear_m16"),
+            "an underfilled B{rows} matrix must not pad to M16: {compact}"
         );
     }
+
+    let b8 = lowered(8, 2_880, 84);
+    assert!(
+        b8.contains("nvfp4_linear_m16_n64_k128"),
+        "the measured B8 crossover must retain tensor-core reuse: {b8}"
+    );
+    assert!(!b8.contains("nvfp4_linear_row_gemv"), "{b8}");
+
+    for rows in [2, 4, 8] {
+        let head = lowered(rows, 201_088, 84);
+        assert!(
+            head.contains("nvfp4_linear_m16_n64_k128"),
+            "a saturated B{rows} vocabulary grid must retain tensor-core reuse: {head}"
+        );
+        assert!(
+            !head.contains("nvfp4_linear_row_gemv"),
+            "the vocabulary head must not repeat its weight stream row-wise: {head}"
+        );
+    }
+
+    let lower_sm = lowered(2, 2_880, 8);
+    assert!(
+        lower_sm.contains("nvfp4_linear_m16_n64_k128"),
+        "a matrix grid which fills the reported device must retain reuse: {lower_sm}"
+    );
 }
 
 #[test]

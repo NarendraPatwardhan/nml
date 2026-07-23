@@ -16,9 +16,10 @@ use nml_parameter::nvfp4::{decode_e2m1, decode_e4m3fn_scale};
 use nml_types::{DType, Partition, Shape};
 
 // These are finite kernel-family boundaries, not product batch-size policy.
-// Dense projections have a proven scalar GEMV and a tensor-core matrix path;
-// sparse selected-route projections remain GEMV-efficient through eight
-// tokens because each route ordinarily owns only one useful row.
+// Dense projections have a proven rank-one GEMV body, a bounded row-minor
+// wrapper around that exact body, and a tensor-core matrix path. Sparse
+// selected-route projections remain GEMV-efficient through eight tokens
+// because each route ordinarily owns only one useful row.
 const DENSE_GEMV_ROWS: i64 = 1;
 const FUSED_QKV_MAX_ROWS: i64 = 8;
 const EMBEDDING_SCALAR_MAX_ROWS: i64 = 8;
@@ -34,6 +35,8 @@ const THROUGHPUT_BLOCK_K: i64 = 64;
 const EMBEDDING_WIDE_BLOCK_N: i64 = 64;
 const EMBEDDING_NARROW_BLOCK_N: i64 = WIDE_GEMV_BLOCK_N;
 const LOW_SM_COUNT: usize = 48;
+const MINIMUM_ROW_GEMV_WAVES: i64 = 1;
+const MINIMUM_MATRIX_ROW_UTILIZATION_DENOMINATOR: i64 = 4;
 
 pub(crate) struct LinearInputs<'context> {
     pub activation: Value<'context>,
@@ -891,12 +894,13 @@ impl LinearPlan {
             ));
         }
 
-        // A true scalar decode projection is memory-bandwidth-bound. Its TTIR
-        // deliberately remains rank-one: broadening the helper to a nominal
-        // small-M tensor changed generated code and regressed the A40 B1
-        // control. Every dense M > 1 instead uses the tensor-core matrix
-        // family, which reuses each decoded weight tile across real rows and
-        // is essential for the vocabulary-sized LM head.
+        // The contraction authored by both compact families remains exactly
+        // rank one. M=1 uses the accepted scalar grid. A bounded M>1 wrapper
+        // may place rows in the minor grid dimension when an M16 matrix tile
+        // would be at most one-quarter utilized and its N grid cannot fill
+        // the latency target. Large-N projections such as the vocabulary head
+        // retain the tensor-core family because their matrix grid is already
+        // sufficient and useful rows can reuse each decoded weight tile.
         let scalar_gemv = rows == DENSE_GEMV_ROWS;
         let latency_grid = i64::try_from(capabilities.latency_grid_target()).unwrap_or(i64::MAX);
         let wide_gemv_grid = ceil_div_positive(outputs, WIDE_GEMV_BLOCK_N);
@@ -907,7 +911,21 @@ impl LinearPlan {
             } else {
                 DECODE_BLOCK_N
             };
-        let block_m = if scalar_gemv {
+        let tensor_row_capacity =
+            ceil_div_positive(rows, TENSOR_CORE_MINIMUM_M).saturating_mul(TENSOR_CORE_MINIMUM_M);
+        let matrix_grid = ceil_div_positive(rows, TENSOR_CORE_MINIMUM_M)
+            .saturating_mul(ceil_div_positive(outputs, LATENCY_BLOCK_N));
+        let row_gemv_grid = rows.saturating_mul(ceil_div_positive(outputs, gemv_block_n));
+        let row_gemv = !scalar_gemv
+            && tensor_row_capacity
+                >= rows.saturating_mul(MINIMUM_MATRIX_ROW_UTILIZATION_DENOMINATOR)
+            && matrix_grid < latency_grid
+            && row_gemv_grid
+                >= i64::try_from(capabilities.multiprocessor_count())
+                    .unwrap_or(i64::MAX)
+                    .saturating_mul(MINIMUM_ROW_GEMV_WAVES);
+        let compact_gemv = scalar_gemv || row_gemv;
+        let block_m = if compact_gemv {
             1
         } else if rows <= 32 {
             TENSOR_CORE_MINIMUM_M
@@ -924,14 +942,14 @@ impl LinearPlan {
                 outputs,
                 inputs,
                 block_m,
-                block_n: if scalar_gemv {
+                block_n: if compact_gemv {
                     gemv_block_n
                 } else if latency_sensitive {
                     LATENCY_BLOCK_N
                 } else {
                     THROUGHPUT_BLOCK_N
                 },
-                block_k: if scalar_gemv {
+                block_k: if compact_gemv {
                     DECODE_BLOCK_K
                 } else if latency_sensitive {
                     LATENCY_BLOCK_K
@@ -945,7 +963,7 @@ impl LinearPlan {
             } else {
                 4
             },
-            stages: if scalar_gemv {
+            stages: if compact_gemv {
                 1
             } else if latency_sensitive {
                 4

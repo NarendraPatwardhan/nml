@@ -39,17 +39,23 @@ arrival patterns, and permanent evidence from the hardware path being claimed.
 ## 2. Current status at a glance
 
 The latest measured serving implementation is commit
-`9f75e94c8eb4f3d3551c914ea7f33187cbe6d598`. Its immutable serving image is:
+`dbab88689a4ce56250d46c18c7f3ee9d11a57bd3`. Its immutable serving image is:
 
 ```text
-ghcr.io/narendrapatwardhan/nml@sha256:00aaed758f68c51c679426805147f094271982e3e1563bb3580e187fed02172d
+ghcr.io/narendrapatwardhan/nml@sha256:d99185ac39ece189da79b6fd50461b0840eaa13fc49cbe44dd51987bd7ccdf59
 ```
 
 The A40 server-load report
-`20260723T131209Z-wvlc4ygb9ajxck-00aaed758f68-server-load` succeeded with the
+`20260723T222231Z-5dp45sih97fp4k-d99185ac39ec-server-load` succeeded with the
 106-token prompt, 320 generated tokens, two measured repetitions, and
 concurrency `C={1,2,4,8}`. The report includes the complete Nsight Systems
 capture and SQLite export.
+
+The accepted comparison control remains source
+`9f75e94c8eb4f3d3551c914ea7f33187cbe6d598`, image
+`sha256:00aaed758f68c51c679426805147f094271982e3e1563bb3580e187fed02172d`,
+and report
+`20260723T131209Z-wvlc4ygb9ajxck-00aaed758f68-server-load`.
 
 A later convergence experiment at source
 `652cd2589e445a8adf015b4be639098099e43809`, image
@@ -74,29 +80,29 @@ to preserve duplicate orchestration indefinitely.
 
 | Concurrency | Selected steady decode family | End-to-end output TPS | Decode-engine row TPS | Maximum p95 TTFT |
 | ---: | --- | ---: | ---: | ---: |
-| C1 | B1 | 135.741-136.851 | **150.08** | 0.242 s |
-| C2 | B2, apart from boundary B1 steps | 119.907-120.053 | 130.35 | 0.501 s |
-| C4 | B4, apart from one boundary B1 step | 166.955-167.105 | 181.58 | 0.704 s |
-| C8 | B8, apart from one boundary B1 step | 205.226-205.687 | 223.85 | 1.140 s |
+| C1 | B1 | 137.901-138.385 | 148.18-148.86 | 0.188 s |
+| C2 | B2, apart from boundary B1 steps | 122.288-123.096 | 130.23-131.12 | 0.390 s |
+| C4 | B4, apart from one boundary B1 step | 169.199-169.390 | 184.01-184.58 | 0.714 s |
+| C8 | B8, apart from one boundary B1 step | 205.867-206.127 | 225.23-225.53 | 1.185 s |
 
 `Decode-engine row TPS` is derived from the engine's measured decoded-row sum
 divided by measured decode-batch seconds. `End-to-end output TPS` includes
 prompt work, first-token latency, decode, server control, and client-visible
 completion. Neither number substitutes for the other.
 
-The immediate batch-one objective was to recover the former approximately
-150-TPS decode loop without creating a private B1 engine. That objective is
-now met by the generic serving lane. Full C1 request throughput remains about
-136 TPS, so another roughly 10% of request-level cost must be removed before
-claiming 150 end-to-end TPS.
+The generic B1 serving lane remains within approximately one percent of the
+accepted 150-TPS decode-engine control while full C1 request throughput
+improved to approximately 138 TPS. The latest trace reduced the measured
+106-token prefill from approximately 0.209 seconds to approximately 0.156
+seconds; the remaining decode difference is concentrated in expert gate/up.
 
-C8 now produces 1.51x C1 aggregate output throughput. This proves useful
+C8 now produces approximately 1.49x C1 aggregate output throughput. This proves useful
 concurrency scaling for the control workload, but it is not final production
 acceptance: C2 remains slower in aggregate than C1, per-request latency grows
 substantially, and the present matrix does not cover mixed prompt lengths,
 arrival rates, or long-prompt interference.
 
-### 2.2 Improvement from the preceding server image
+### 2.2 Accepted-control improvement from its preceding server image
 
 | Concurrency | Previous aggregate TPS | Current aggregate TPS | Change |
 | ---: | ---: | ---: | ---: |
@@ -105,8 +111,9 @@ arrival rates, or long-prompt interference.
 | C4 | 78.427 | 167.030 | +113.0% |
 | C8 | 121.459 | 205.457 | +69.2% |
 
-The change came from fixing generic small-batch execution rather than adding a
-special server route:
+These historical `9f75e94` numbers explain why it remains the comparison
+control. The change came from fixing generic small-batch execution rather than
+adding a special server route:
 
 - B1/B2/B4/B8 sparse expert decode uses one compact selected-route GEMV block
   per route instead of a mostly empty 16-row grouped matrix tile;
@@ -459,23 +466,24 @@ to finish the target-model server machinery and converge on one route.
 
 ### 9.1 Achieved
 
-- Generic B1 decode-engine parity: approximately 150.1 TPS.
-- C8 aggregate output throughput: approximately 205.5 TPS.
-- C8/C1 aggregate scaling: approximately 1.51x.
+- Generic B1 decode-engine parity: 148.2-148.9 TPS in the latest run versus
+  149.3-150.9 TPS in the accepted control.
+- C8 aggregate output throughput: 205.9-206.1 TPS.
+- C8/C1 aggregate scaling: approximately 1.49x.
 - Correct steady selection of B1/B2/B4/B8 decode families.
 - Major B2/B4/B8 kernel-time reduction.
 - Successful immutable A40 execution with complete Nsight recovery.
 
 ### 9.2 Remaining measured inefficiencies
 
-1. **C1 request overhead:** decode-engine throughput is approximately
-   150.1 TPS while complete request throughput is approximately 136.3 TPS.
-   Prefill/TTFT accounts for about 0.21-0.24 seconds on the 106-token prompt;
-   visible-token and request-boundary costs account for the rest.
-2. **C2 crossover:** B2 decode-engine throughput is approximately 130.4 row
-   TPS, below B1's 150.1. B2 improved radically, but batching two rows still
+1. **C1 request overhead:** decode-engine throughput is 148.2-148.9 TPS while
+   complete request throughput is 137.9-138.4 TPS. Prefill/TTFT accounts for
+   about 0.156-0.188 seconds on the 106-token prompt; visible-token and
+   request-boundary costs account for the rest.
+2. **C2 crossover:** B2 decode-engine throughput is 130.2-131.1 row TPS,
+   below B1. B2 improved radically, but batching two rows still
    does not amortize enough work to beat one B1 row in aggregate.
-3. **Sublinear B8:** B8 raises useful throughput to approximately 223.9 decode
+3. **Sublinear B8:** B8 raises useful throughput to 225.2-225.5 decode
    rows/s, but per-row latency is materially worse and the kernel times still
    grow nearly linearly from B4 to B8.
 4. **Prefill-family proof:** Q128 is compiled, but permanent runtime evidence
@@ -486,11 +494,11 @@ to finish the target-model server machinery and converge on one route.
    compile cost during parity work. They must be expanded after route
    convergence, then warmed before readiness.
 
-### 9.3 Implemented convergence set, pending A40 measurement
+### 9.3 Measured convergence set and next selector correction
 
-The trace-directed set below is implemented and covered by permanent
-construction/ownership contracts. None of its expected performance effect is
-claimed until it runs as one immutable image on A40.
+The trace-directed convergence set below is implemented, covered by permanent
+construction/ownership contracts, and measured in immutable image
+`d99185ac39ec`.
 
 1. Reservations now assign every private physical page at admission and upload
    the complete lifetime-stable table. Tentative/committed lengths alone
@@ -499,11 +507,11 @@ claimed until it runs as one immutable image on A40.
 2. An idle engine opens a 50-200 microsecond prefill-formation window derived
    from `max_prefill_wait`; a B1-only profile disables it and active decode can
    never enter it.
-3. Dense ordinary projections have separate algorithmic families: exact M1
-   uses the proven rank-one GEMV, while every M greater than one uses the
-   tensor-core matrix family and reuses decoded weights across real rows. On
-   the A40, permanent lowering contracts pin the LM head to M1/N32/K256 for B1
-   and M16/N64/K128 for B2/B4/B8.
+3. The measured image separated exact M1 rank-one GEMV from an M16 tensor-core
+   family for every M greater than one. On A40 the LM head used M1/N32/K256
+   for B1 and M16/N64/K128 for B2/B4/B8. The latest trace proved that this
+   boundary was correct for the vocabulary head but too broad for underfilled
+   2,880-wide B2/B4 projections; the correction is described below.
 4. Fused QKV keeps one scalar GEMV CTA per real row and projection tile. Rows
    remain the minor grid dimension for L2 locality, but the contraction body
    is never widened to M2. This restores the accepted B1 body and the
@@ -522,12 +530,23 @@ claimed until it runs as one immutable image on A40.
    can therefore prove plan reachability and absence of page-boundary rebinds
    directly.
 
-The corrected dense-linear and QKV family split has passed affected IR,
-Triton, server, image-structure, CUDA-generation, and serving-image BuildBuddy
-gates. A new immutable A40 run is still required before claiming that the
-accepted 150-TPS decode-engine result and higher-batch throughput are restored.
+The corrected dense-linear and QKV family split passed affected IR, Triton,
+server, image-structure, CUDA-generation, and serving-image BuildBuddy gates.
+The immutable `d99185ac39ec` A40 run then restored or exceeded the accepted
+end-to-end result at every measured concurrency. Its trace also exposed one
+remaining selector error: the ordinary 2,880-wide B2 projection and the
+201,088-wide B2 vocabulary head still shared one M16 policy despite radically
+different grid occupancy.
 
-After A40 validation:
+The next implementation therefore adds a third dense family without changing
+the accepted B1 contraction. Bounded underfilled matrices use output-tile-major,
+row-minor CTAs around the exact rank-one GEMV body; saturated large-N grids and
+the measured B8 crossover retain tensor-core reuse. On A40 this selects row
+GEMV for the B2/B4 2,880-wide projection, retains M16/N64/K128 for the
+B2/B4/B8 vocabulary head, and retains the B8 ordinary matrix path. The
+rejected leading-M `[M,N,K]` contraction is not restored.
+
+After validating that selector on A40:
 
 9. Make the diagnostic `generate` command use the generic serving engine, then
    delete the remaining request-local execution route. Static graph
