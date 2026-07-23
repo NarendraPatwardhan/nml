@@ -13,11 +13,11 @@ mod execution;
 mod graph;
 pub(crate) mod protocol;
 
-use crate::{CompilationProfile, SamplingOptions, SubmissionTimings};
 use crate::server::cache::{
-    CacheStats, FrozenCachePlan, PageManager, TargetCacheGeometry, TARGET_PAGE_SIZE,
+    CacheStats, FrozenCachePlan, PageManager, TARGET_PAGE_SIZE, TargetCacheGeometry,
 };
 use crate::server::contracts::{SequenceId, ServerProfile};
+use crate::{CompilationProfile, SamplingOptions, SubmissionTimings};
 use checkpoint::{BoxError, Result};
 use config::Config;
 pub(crate) use execution::RawToken;
@@ -67,6 +67,7 @@ pub(crate) struct Generator<'platform> {
     pages: PageManager,
     next_sequence: u64,
     stable_decode: StableDecodeLaneState,
+    stable_decode_rebinds: u64,
 }
 
 #[derive(Default)]
@@ -88,7 +89,7 @@ struct StableDecodeDescriptor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StableDecodeTransition {
     Reuse,
-    Rebind { preserve_lookahead: bool },
+    Rebind,
 }
 
 impl StableDecodeDescriptor {
@@ -96,14 +97,7 @@ impl StableDecodeDescriptor {
         if self == replacement {
             return StableDecodeTransition::Reuse;
         }
-        let preserve_lookahead = self.members == replacement.members
-            && self.page_tables.len() == replacement.page_tables.len()
-            && self
-                .page_tables
-                .iter()
-                .zip(&replacement.page_tables)
-                .all(|(&old, &new)| old == new || (old == -1 && new >= 0));
-        StableDecodeTransition::Rebind { preserve_lookahead }
+        StableDecodeTransition::Rebind
     }
 }
 
@@ -121,38 +115,16 @@ impl StableDecodeLaneState {
     }
 
     fn transition_to(&self, replacement: &StableDecodeDescriptor) -> StableDecodeTransition {
-        self.current.as_ref().map_or(
-            StableDecodeTransition::Rebind {
-                preserve_lookahead: false,
-            },
-            |current| current.descriptor.transition_to(replacement),
-        )
+        self.current
+            .as_ref()
+            .map_or(StableDecodeTransition::Rebind, |current| {
+                current.descriptor.transition_to(replacement)
+            })
     }
 
-    fn install(
-        &mut self,
-        descriptor: StableDecodeDescriptor,
-        mut lane: StableDecodeBatchLane,
-    ) {
+    fn install(&mut self, descriptor: StableDecodeDescriptor, lane: StableDecodeBatchLane) {
         let transition = self.transition_to(&descriptor);
         debug_assert_ne!(transition, StableDecodeTransition::Reuse);
-        if transition
-            == (StableDecodeTransition::Rebind {
-                preserve_lookahead: true,
-            })
-        {
-            let carried = lane.carry_lookahead_from(
-                &mut self
-                    .current
-                    .as_mut()
-                    .expect("lookahead-preserving transition has a resident lane")
-                    .lane,
-            );
-            debug_assert!(
-                carried,
-                "lookahead-preserving transition must have pending prefix work",
-            );
-        }
         self.current = Some(StableDecodeBatch { descriptor, lane });
     }
 
@@ -205,9 +177,7 @@ impl ServerSession {
     }
 
     pub(crate) fn is_complete(&self) -> bool {
-        self.max_new_tokens == 0
-            || self.stopped
-            || self.generated.len() >= self.max_new_tokens
+        self.max_new_tokens == 0 || self.stopped || self.generated.len() >= self.max_new_tokens
     }
 
     pub(crate) fn prompt_tokens(&self) -> usize {
@@ -226,6 +196,10 @@ impl ServerSession {
 impl Generator<'_> {
     pub(crate) fn cache_stats(&self) -> CacheStats {
         self.pages.stats()
+    }
+
+    pub(crate) const fn stable_decode_rebinds(&self) -> u64 {
+        self.stable_decode_rebinds
     }
 }
 
@@ -314,9 +288,7 @@ impl<'platform> Generator<'platform> {
                         .div_ceil(graph::CACHE_PAGE_SIZE)
                         .max(1)
                         .checked_next_power_of_two()
-                        .ok_or_else(|| {
-                            checkpoint::message("GPT-OSS cache profile overflows usize")
-                        })
+                        .ok_or_else(|| checkpoint::message("GPT-OSS cache profile overflows usize"))
                 })
                 .collect::<Result<Vec<_>>>()?
                 .into_iter()
@@ -341,6 +313,7 @@ impl<'platform> Generator<'platform> {
             pages: PageManager::new(physical_pages).map_err(boxed)?,
             next_sequence: 1,
             stable_decode: StableDecodeLaneState::default(),
+            stable_decode_rebinds: 0,
         })
     }
 
@@ -455,11 +428,7 @@ impl<'platform> Generator<'platform> {
                 self.pages
                     .append_tentative(sequence, prompt_tokens)
                     .map_err(boxed)?;
-                self.install_page_table(
-                    sequence,
-                    &mut execution,
-                    &mut installed_page_table,
-                )
+                self.install_page_table(sequence, &mut execution, &mut installed_page_table)
             })();
             if let Err(error) = installed {
                 self.pages.release_sequence(sequence).map_err(boxed)?;
@@ -468,9 +437,7 @@ impl<'platform> Generator<'platform> {
             Some((sequence, installed_page_table))
         };
         let (sequence, installed_page_table) = match sequence {
-            Some((sequence, installed_page_table)) => {
-                (Some(sequence), installed_page_table)
-            }
+            Some((sequence, installed_page_table)) => (Some(sequence), installed_page_table),
             None => (None, Vec::new()),
         };
         Ok(ProductSession {
@@ -497,7 +464,9 @@ impl<'platform> Generator<'platform> {
             .checked_add(max_new_tokens)
             .ok_or_else(|| checkpoint::message("GPT-OSS server token budget overflows usize"))?;
         if maximum > self.model.config().context_limit() {
-            return Err(checkpoint::message("GPT-OSS server request exceeds context"));
+            return Err(checkpoint::message(
+                "GPT-OSS server request exceeds context",
+            ));
         }
         let sequence = SequenceId::new(self.next_sequence);
         self.next_sequence = self
@@ -528,7 +497,9 @@ impl<'platform> Generator<'platform> {
     ) -> Result<Vec<Option<RawToken>>> {
         self.stable_decode.clear();
         if sessions.len() != chunk_tokens.len() || sessions.len() > batch_capacity {
-            return Err(checkpoint::message("prefill batch row count is inconsistent"));
+            return Err(checkpoint::message(
+                "prefill batch row count is inconsistent",
+            ));
         }
         let table_width = self.model.batch_page_table_width(
             graph::Phase::Prefill,
@@ -568,7 +539,8 @@ impl<'platform> Generator<'platform> {
                 .pages
                 .compact_metadata(&rows, table_width)
                 .map_err(boxed)?;
-            let mut input = padded_batch_inputs(batch_capacity, query_capacity, metadata.block_tables);
+            let mut input =
+                padded_batch_inputs(batch_capacity, query_capacity, metadata.block_tables);
             input.sequence_lengths = metadata.sequence_lengths;
             input.active_rows = metadata.active_rows;
             for (row, (session, chunk)) in sessions.iter().zip(chunk_tokens).enumerate() {
@@ -590,12 +562,8 @@ impl<'platform> Generator<'platform> {
                 input.sample_rows[row] = end == session.prompt.len();
                 install_sampling_row(&mut input, row, session)?;
             }
-            self.model.execute_batch(
-                graph::Phase::Prefill,
-                batch_capacity,
-                query_capacity,
-                input,
-            )
+            self.model
+                .execute_batch(graph::Phase::Prefill, batch_capacity, query_capacity, input)
         })();
         let outputs = match execution {
             Ok(outputs) => outputs,
@@ -608,13 +576,12 @@ impl<'platform> Generator<'platform> {
         };
         let mut raw = Vec::with_capacity(sessions.len());
         for (row, (session, chunk)) in sessions.iter_mut().zip(chunk_tokens).enumerate() {
-            self.pages
-                .commit(session.sequence, *chunk)
-                .map_err(boxed)?;
+            self.pages.commit(session.sequence, *chunk).map_err(boxed)?;
             session.prompt_cursor += *chunk;
-            session.sampling.seed.copy_from_slice(
-                &outputs.sampling_states[row * 2..row * 2 + 2],
-            );
+            session
+                .sampling
+                .seed
+                .copy_from_slice(&outputs.sampling_states[row * 2..row * 2 + 2]);
             if session.prefill_complete() {
                 let token = u32::try_from(outputs.tokens[row]).map_err(|_| {
                     checkpoint::message("active prefill sampling returned the padding sentinel")
@@ -641,7 +608,9 @@ impl<'platform> Generator<'platform> {
         batch_capacity: usize,
     ) -> Result<Vec<RawToken>> {
         if sessions.is_empty() || sessions.len() > batch_capacity {
-            return Err(checkpoint::message("decode batch row count is inconsistent"));
+            return Err(checkpoint::message(
+                "decode batch row count is inconsistent",
+            ));
         }
         let query_capacity = 1;
         let table_width = self.model.batch_page_table_width(
@@ -650,24 +619,18 @@ impl<'platform> Generator<'platform> {
             query_capacity,
         )?;
         let same_members = self.stable_decode.matches_members(sessions);
-        let mut page_table_expanded = false;
         let mut checkpoints = Vec::with_capacity(sessions.len());
         for session in sessions.iter_mut() {
             if session.released || !session.prefill_complete() || session.is_complete() {
                 return Err(checkpoint::message("invalid decode batch transition"));
             }
             checkpoints.push(self.pages.checkpoint(session.sequence).map_err(boxed)?);
-            let previous_pages = self
-                .pages
-                .page_table(session.sequence)
-                .map_err(boxed)?
-                .len();
             let (committed, tentative) = self
                 .pages
                 .sequence_lengths(session.sequence)
                 .map_err(boxed)?;
             // The generic stable lane submits the next token's bounded
-            // layer pairs before waiting for this token's download. Reserve
+            // layer groups before waiting for this token's download. Reserve
             // one uncommitted position ahead so that prefix always has a
             // valid physical page, including at 16-token boundaries.
             let required = committed
@@ -684,20 +647,14 @@ impl<'platform> Generator<'platform> {
                 }
                 return Err(error);
             }
-            page_table_expanded |= self
-                .pages
-                .page_table(session.sequence)
-                .map_err(boxed)?
-                .len()
-                != previous_pages;
         }
         let execution = (|| {
             // The resident slab advances positions, lengths, tokens, and
             // sampling state on device. Rebuilding the padded host metadata
             // every token only repeats an unchanged page-table transfer
-            // decision. Rebind solely when membership or physical pages
-            // actually change.
-            if !same_members || page_table_expanded {
+            // decision. Eager reservation makes physical pages lifetime-stable,
+            // so only a membership change requires a new slab binding.
+            if !same_members {
                 let rows = sessions
                     .iter()
                     .map(|session| Some(session.sequence))
@@ -709,18 +666,14 @@ impl<'platform> Generator<'platform> {
                     .compact_metadata(&rows, table_width)
                     .map_err(boxed)?;
                 let descriptor = StableDecodeDescriptor {
-                    members: sessions
-                        .iter()
-                        .map(|session| session.sequence)
-                        .collect(),
+                    members: sessions.iter().map(|session| session.sequence).collect(),
                     page_tables: metadata.block_tables,
                 };
-                let mut input =
-                    padded_batch_inputs(
-                        batch_capacity,
-                        query_capacity,
-                        descriptor.page_tables.clone(),
-                    );
+                let mut input = padded_batch_inputs(
+                    batch_capacity,
+                    query_capacity,
+                    descriptor.page_tables.clone(),
+                );
                 input.sequence_lengths = metadata.sequence_lengths;
                 input.active_rows = metadata.active_rows;
                 input.sample_rows[..sessions.len()].fill(true);
@@ -751,6 +704,7 @@ impl<'platform> Generator<'platform> {
                     .model
                     .prepare_stable_decode_batch(batch_capacity, input)?;
                 self.stable_decode.install(descriptor, lane);
+                self.stable_decode_rebinds = self.stable_decode_rebinds.saturating_add(1);
             }
             self.model.execute_stable_decode_batch(
                 self.stable_decode
@@ -771,9 +725,10 @@ impl<'platform> Generator<'platform> {
         let mut raw = Vec::with_capacity(sessions.len());
         for (row, session) in sessions.iter_mut().enumerate() {
             self.pages.commit(session.sequence, 1).map_err(boxed)?;
-            session.sampling.seed.copy_from_slice(
-                &outputs.sampling_states[row * 2..row * 2 + 2],
-            );
+            session
+                .sampling
+                .seed
+                .copy_from_slice(&outputs.sampling_states[row * 2..row * 2 + 2]);
             let token = u32::try_from(outputs.tokens[row]).map_err(|_| {
                 checkpoint::message("active decode sampling returned the padding sentinel")
             })?;
@@ -820,10 +775,7 @@ impl<'platform> Generator<'platform> {
         }
     }
 
-    pub(crate) fn decode_step(
-        &mut self,
-        session: &mut ProductSession,
-    ) -> Result<Option<RawToken>> {
+    pub(crate) fn decode_step(&mut self, session: &mut ProductSession) -> Result<Option<RawToken>> {
         let Some(sequence) = session.sequence else {
             return Err(checkpoint::message(
                 "completed GPT-OSS session has no decode cache reservation",
@@ -831,8 +783,7 @@ impl<'platform> Generator<'platform> {
         };
         let result = (|| {
             let lookahead = session.execution.decode_cache_lookahead_tokens()?;
-            let (committed, tentative) =
-                self.pages.sequence_lengths(sequence).map_err(boxed)?;
+            let (committed, tentative) = self.pages.sequence_lengths(sequence).map_err(boxed)?;
             let required = committed
                 .checked_add(lookahead)
                 .ok_or_else(|| checkpoint::message("GPT-OSS cache lookahead overflows usize"))?;
@@ -895,11 +846,7 @@ impl<'platform> Generator<'platform> {
     }
 }
 
-fn padded_batch_inputs(
-    batch: usize,
-    query: usize,
-    page_tables: Vec<i32>,
-) -> BatchInputs {
+fn padded_batch_inputs(batch: usize, query: usize, page_tables: Vec<i32>) -> BatchInputs {
     BatchInputs {
         tokens: vec![0; batch * query],
         positions: vec![0; batch],
@@ -1255,24 +1202,6 @@ mod tests {
     }
 
     #[test]
-    fn stable_decode_page_extension_preserves_lookahead() {
-        let current = StableDecodeDescriptor {
-            members: vec![SequenceId::new(1), SequenceId::new(2)],
-            page_tables: vec![3, 7, -1, -1, 11, -1],
-        };
-        let replacement = StableDecodeDescriptor {
-            members: vec![SequenceId::new(1), SequenceId::new(2)],
-            page_tables: vec![3, 7, 19, -1, 11, 23],
-        };
-        assert_eq!(
-            current.transition_to(&replacement),
-            StableDecodeTransition::Rebind {
-                preserve_lookahead: true,
-            },
-        );
-    }
-
-    #[test]
     fn stable_decode_transition_distinguishes_reuse_from_invalidation() {
         let current = StableDecodeDescriptor {
             members: vec![SequenceId::new(1)],
@@ -1282,10 +1211,7 @@ mod tests {
             members: vec![SequenceId::new(1)],
             page_tables: vec![3, 7, -1, 11],
         };
-        assert_eq!(
-            current.transition_to(&exact),
-            StableDecodeTransition::Reuse,
-        );
+        assert_eq!(current.transition_to(&exact), StableDecodeTransition::Reuse,);
         for replacement in [
             StableDecodeDescriptor {
                 members: vec![SequenceId::new(1)],
@@ -1302,9 +1228,7 @@ mod tests {
         ] {
             assert_eq!(
                 current.transition_to(&replacement),
-                StableDecodeTransition::Rebind {
-                    preserve_lookahead: false,
-                },
+                StableDecodeTransition::Rebind,
             );
         }
         let allocated = StableDecodeDescriptor {
@@ -1313,9 +1237,7 @@ mod tests {
         };
         assert_eq!(
             allocated.transition_to(&current),
-            StableDecodeTransition::Rebind {
-                preserve_lookahead: false,
-            },
+            StableDecodeTransition::Rebind,
         );
     }
 }

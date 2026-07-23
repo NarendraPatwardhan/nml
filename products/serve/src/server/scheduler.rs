@@ -39,10 +39,7 @@ impl SchedulerConfig {
             ));
         }
         if self.batch_buckets[0] != 1
-            || self
-                .batch_buckets
-                .windows(2)
-                .any(|pair| pair[0] >= pair[1])
+            || self.batch_buckets.windows(2).any(|pair| pair[0] >= pair[1])
         {
             return Err(SchedulerError::InvalidConfig(
                 "batch buckets must be strictly increasing and begin at one",
@@ -87,6 +84,20 @@ impl SchedulerConfig {
             .copied()
             .find(|capacity| *capacity >= tokens)
             .ok_or(SchedulerError::NoQueryFamily { tokens })
+    }
+
+    /// A short admission-coalescing interval paid only by an otherwise idle
+    /// engine. It is deliberately derived from the configured starvation
+    /// bound and useful batch geometry, then clamped to a latency-safe range.
+    /// This is not a decode scheduling delay.
+    pub(crate) fn idle_prefill_formation_window(&self) -> Duration {
+        if self.batch_buckets.last().copied().unwrap_or(1) == 1 {
+            return Duration::ZERO;
+        }
+        let derived = self.max_prefill_wait / 64;
+        derived
+            .max(Duration::from_micros(50))
+            .min(Duration::from_micros(200))
     }
 }
 
@@ -196,12 +207,22 @@ pub(crate) enum SchedulerError {
 impl fmt::Display for SchedulerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidConfig(message) => write!(formatter, "invalid scheduler config: {message}"),
+            Self::InvalidConfig(message) => {
+                write!(formatter, "invalid scheduler config: {message}")
+            }
             Self::DuplicateSequence(sequence) => {
-                write!(formatter, "duplicate scheduler sequence {}", sequence.as_u64())
+                write!(
+                    formatter,
+                    "duplicate scheduler sequence {}",
+                    sequence.as_u64()
+                )
             }
             Self::UnknownSequence(sequence) => {
-                write!(formatter, "unknown scheduler sequence {}", sequence.as_u64())
+                write!(
+                    formatter,
+                    "unknown scheduler sequence {}",
+                    sequence.as_u64()
+                )
             }
             Self::NotWaiting(sequence) => write!(
                 formatter,
@@ -213,7 +234,10 @@ impl fmt::Display for SchedulerError {
                 write!(formatter, "no compiled batch family can hold {rows} rows")
             }
             Self::NoQueryFamily { tokens } => {
-                write!(formatter, "no compiled prefill family can hold {tokens} tokens")
+                write!(
+                    formatter,
+                    "no compiled prefill family can hold {tokens} tokens"
+                )
             }
             Self::ResultDoesNotMatchPlan(sequence) => write!(
                 formatter,
@@ -330,7 +354,9 @@ impl Scheduler {
             self.states
                 .get(sequence)
                 .and_then(|state| state.admitted)
-                .is_some_and(|admitted| now.saturating_duration_since(admitted) >= self.config.max_prefill_wait)
+                .is_some_and(|admitted| {
+                    now.saturating_duration_since(admitted) >= self.config.max_prefill_wait
+                })
         });
         // Reserve one real token of an aged prompt before filling the decode
         // budget. Query-family padding does not count as semantic token work.
@@ -528,10 +554,7 @@ impl Scheduler {
 
     /// Removes a terminal sequence after its successful result has already
     /// transitioned out of an in-flight phase.
-    pub(crate) fn remove_terminal(
-        &mut self,
-        sequence: SequenceId,
-    ) -> Result<(), SchedulerError> {
+    pub(crate) fn remove_terminal(&mut self, sequence: SequenceId) -> Result<(), SchedulerError> {
         let state = self
             .states
             .remove(&sequence)
@@ -593,6 +616,18 @@ mod tests {
             max_prefill_chunk: 4,
             max_prefill_wait: Duration::from_millis(10),
         }
+    }
+
+    #[test]
+    fn idle_formation_window_is_bounded_and_disabled_without_a_batch_family() {
+        let config = config();
+        assert_eq!(
+            config.idle_prefill_formation_window(),
+            Duration::from_nanos(156_250)
+        );
+        let mut single = config;
+        single.batch_buckets = vec![1];
+        assert_eq!(single.idle_prefill_formation_window(), Duration::ZERO);
     }
 
     fn id(value: u64) -> SequenceId {
@@ -663,21 +698,27 @@ mod tests {
         }
         let initial = scheduler.plan(now).unwrap();
         for item in &initial.prefill.unwrap().items {
-            scheduler.complete_prefill(item.sequence, item.tokens).unwrap();
+            scheduler
+                .complete_prefill(item.sequence, item.tokens)
+                .unwrap();
         }
 
         scheduler.enqueue(id(4), 8, 16, now).unwrap();
         admit(&mut scheduler, &mut pages, id(4), now).unwrap();
-        let plan = scheduler
-            .plan(now + Duration::from_millis(11))
-            .unwrap();
+        let plan = scheduler.plan(now + Duration::from_millis(11)).unwrap();
         assert_eq!(plan.active_tokens(), 4);
         assert!(!plan.stable_decode);
         let decode = plan.decode.unwrap();
         let prefill = plan.prefill.unwrap();
         assert_eq!(decode.phase, ScheduledPhase::Decode);
         assert_eq!(decode.items.len(), 3);
-        assert_eq!(prefill.items, [BatchItem { sequence: id(4), tokens: 1 }]);
+        assert_eq!(
+            prefill.items,
+            [BatchItem {
+                sequence: id(4),
+                tokens: 1
+            }]
+        );
     }
 
     #[test]
@@ -693,10 +734,24 @@ mod tests {
         let first = scheduler.plan(now).unwrap();
         let first = first.prefill.unwrap();
         assert_eq!(first.family_capacity, 2);
-        assert_eq!(first.items[0], BatchItem { sequence: id(10), tokens: 4 });
-        assert_eq!(first.items[1], BatchItem { sequence: id(20), tokens: 4 });
+        assert_eq!(
+            first.items[0],
+            BatchItem {
+                sequence: id(10),
+                tokens: 4
+            }
+        );
+        assert_eq!(
+            first.items[1],
+            BatchItem {
+                sequence: id(20),
+                tokens: 4
+            }
+        );
         for item in first.items {
-            scheduler.complete_prefill(item.sequence, item.tokens).unwrap();
+            scheduler
+                .complete_prefill(item.sequence, item.tokens)
+                .unwrap();
         }
 
         scheduler.cancel(id(20)).unwrap();
@@ -706,8 +761,14 @@ mod tests {
         assert_eq!(
             second.items,
             [
-                BatchItem { sequence: id(30), tokens: 4 },
-                BatchItem { sequence: id(10), tokens: 2 },
+                BatchItem {
+                    sequence: id(30),
+                    tokens: 4
+                },
+                BatchItem {
+                    sequence: id(10),
+                    tokens: 2
+                },
             ]
         );
         assert_eq!(second.items[1].sequence, id(10));

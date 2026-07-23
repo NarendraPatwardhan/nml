@@ -1,14 +1,14 @@
 //! Definition, compilation, residency, and request-local execution state.
 
 use super::checkpoint::{
-    bind_tree, bind_tree_components, message, representative_layer, BoxError, Checkpoint,
-    LoadedCheckpoint, LoadedDecoderLayer, Result,
+    BoxError, Checkpoint, LoadedCheckpoint, LoadedDecoderLayer, Result, bind_tree,
+    bind_tree_components, message, representative_layer,
 };
 use super::config::{AttentionKind, Config};
 use super::graph::{
-    build_decode_layer_pair, build_embedding, build_head, build_layer, cache_shape,
-    page_table_shape, Phase, ShapeFamily, BATCH_RESULT_BYTES_PER_ROW, CACHE_PAGE_SIZE,
-    ServingSlabLayout, MAXIMUM_TOP_K,
+    BATCH_RESULT_BYTES_PER_ROW, CACHE_PAGE_SIZE, MAXIMUM_TOP_K, Phase, ServingSlabLayout,
+    ShapeFamily, build_decode_layer_group, build_embedding, build_head, build_layer, cache_shape,
+    page_table_shape,
 };
 use crate::{CompilationProfile, SamplingOptions, SubmissionTimings};
 use nml::exe::{Arguments, Results};
@@ -220,22 +220,6 @@ pub(super) struct StableDecodeBatchLane {
     lookahead: Option<StableDecodePrefix>,
 }
 
-impl StableDecodeBatchLane {
-    /// Carries already-enqueued prefix work into a replacement control slab.
-    ///
-    /// The caller is responsible for proving that the replacement slab
-    /// describes the same batch members and only extends their page tables.
-    /// The prefix owns hidden state and has already updated the shared cache
-    /// for the current token, so moving it avoids replaying those layer pairs.
-    pub(super) fn carry_lookahead_from(&mut self, previous: &mut Self) -> bool {
-        if self.family != previous.family || self.lookahead.is_some() {
-            return false;
-        }
-        self.lookahead = previous.lookahead.take();
-        self.lookahead.is_some()
-    }
-}
-
 struct StableDecodePrefix {
     hidden: Buffer,
 }
@@ -400,11 +384,8 @@ impl<'platform> ExecutionPlan<'platform> {
         physical_pages: usize,
         serving: Option<&ServingCompileConfig>,
     ) -> Result<Self> {
-        let profiles = normalize_profiles(
-            requested_profiles,
-            config.context_limit(),
-            physical_pages,
-        )?;
+        let profiles =
+            normalize_profiles(requested_profiles, config.context_limit(), physical_pages)?;
         let mut families = profiles
             .iter()
             .flat_map(|profile| [profile.prefill, profile.decode])
@@ -556,15 +537,11 @@ impl ResidentModel<'_> {
             .bound_families
             .get_mut(&family)
             .expect("selected bound family exists");
-        let (result, _) =
-            enqueue_serving_family(bound, &mut self.caches, batch_slab)?;
+        let (result, _) = enqueue_serving_family(bound, &mut self.caches, batch_slab)?;
         let mut result_slice = Slice::alloc(result.shape()).map_err(boxed)?;
         let download = result.download_to(&mut result_slice).map_err(boxed)?;
         download.wait().map_err(boxed)?;
-        decode_batch_output_bytes(
-            result_slice.items::<u8>().map_err(boxed)?,
-            family.batch(),
-        )
+        decode_batch_output_bytes(result_slice.items::<u8>().map_err(boxed)?, family.batch())
     }
 
     pub(super) fn prepare_stable_decode_batch(
@@ -577,8 +554,7 @@ impl ResidentModel<'_> {
         let layout = ServingSlabLayout::for_family(family)?;
         let batch_slab = upload_u8(
             self.plan.platform,
-            Shape::new(nml::DataType::U8, &[usize_i64(layout.total_bytes())?])
-                .map_err(boxed)?,
+            Shape::new(nml::DataType::U8, &[usize_i64(layout.total_bytes())?]).map_err(boxed)?,
             &pack_batch_slab(family, layout, &input)?,
             &self.plan.placement,
         )?;
@@ -604,12 +580,8 @@ impl ResidentModel<'_> {
             .batch_slab
             .take()
             .ok_or_else(|| message("stable decode control slab is owned by an execution"))?;
-        let (result, next_slab) = enqueue_stable_decode_body(
-            bound,
-            &mut self.caches,
-            batch_slab,
-            lane.lookahead.take(),
-        )?;
+        let (result, next_slab) =
+            enqueue_stable_decode_body(bound, &mut self.caches, batch_slab, lane.lookahead.take())?;
         lane.batch_slab = Some(next_slab);
         let result_download = self
             .stable_result_downloads
@@ -734,8 +706,7 @@ impl ResidentModel<'_> {
 
         let mut decode_embedding = decode_executables.embedding.args();
         bind_embedding(&mut decode_embedding, checkpoint, parameters)?;
-        let decode_pairs =
-            bind_decode_pairs(decode_executables, checkpoint, parameters, config)?;
+        let decode_groups = bind_decode_groups(decode_executables, checkpoint, parameters, config)?;
         let mut decode_head = decode_executables.head.args();
         bind_head(&mut decode_head, parameters)?;
 
@@ -808,7 +779,8 @@ impl ResidentModel<'_> {
                 .map_err(boxed)?;
             head.set("top_p", top_p.clone()).map_err(boxed)?;
             head.set("min_p", min_p.clone()).map_err(boxed)?;
-            head.set("active_rows", active_rows.clone()).map_err(boxed)?;
+            head.set("active_rows", active_rows.clone())
+                .map_err(boxed)?;
         }
         let prompt_upload = prompt_upload_started.elapsed();
 
@@ -834,12 +806,12 @@ impl ResidentModel<'_> {
         )?;
         let decode_state_initialization = decode_state_started.elapsed();
 
-        if decode_pairs.len() < DECODE_LOOKAHEAD_PAIRS {
+        if decode_groups.len() < DECODE_LOOKAHEAD_GROUPS {
             return Err(message(
                 "GPT-OSS decode schedule is shorter than the lookahead prefix",
             ));
         }
-        let lookahead_cache_count = DECODE_LOOKAHEAD_PAIRS * 2;
+        let lookahead_cache_count = DECODE_LOOKAHEAD_GROUPS * DECODE_GROUP_LAYERS;
         if config.layers() < lookahead_cache_count {
             return Err(message(
                 "GPT-OSS decode cache schedule is shorter than the lookahead prefix",
@@ -882,7 +854,7 @@ impl ResidentModel<'_> {
                 sampling_state,
                 decode: PreparedDecodeState {
                     embedding: decode_embedding,
-                    pairs: decode_pairs,
+                    groups: decode_groups,
                     head: decode_head,
                     position,
                     query_lengths: decode_query_lengths,
@@ -1012,7 +984,7 @@ struct PrefillState {
 
 struct PreparedDecodeState {
     embedding: Arguments,
-    pairs: Vec<Arguments>,
+    groups: Vec<Arguments>,
     head: Arguments,
     position: Buffer,
     query_lengths: Buffer,
@@ -1022,7 +994,7 @@ struct PreparedDecodeState {
 
 struct DecodeState {
     embedding: Arguments,
-    pairs: Vec<Arguments>,
+    groups: Vec<Arguments>,
     head: Arguments,
     token_buffer: Buffer,
     sampling_state: Option<Buffer>,
@@ -1081,10 +1053,7 @@ impl RequestExecution {
     /// Executes the selected bounded prefill family once. Chunked prefill will
     /// replace this full-prompt step in Milestone 3; until then its one-shot
     /// transition is explicit and cannot be repeated.
-    fn prefill_step(
-        &mut self,
-        caches: &mut [LayerCache],
-    ) -> Result<Option<RawToken>> {
+    fn prefill_step(&mut self, caches: &mut [LayerCache]) -> Result<Option<RawToken>> {
         let result = self.try_prefill_step(caches);
         if result.is_err() {
             self.lifecycle.fail();
@@ -1095,9 +1064,7 @@ impl RequestExecution {
     }
 
     fn try_prefill_step(&mut self, caches: &mut [LayerCache]) -> Result<Option<RawToken>> {
-        if self.lifecycle.phase == RequestPhase::Complete
-            && self.lifecycle.max_new_tokens == 0
-        {
+        if self.lifecycle.phase == RequestPhase::Complete && self.lifecycle.max_new_tokens == 0 {
             return Ok(None);
         }
         if self.lifecycle.phase != RequestPhase::PrefillPending {
@@ -1182,7 +1149,7 @@ impl RequestExecution {
         let token_download = Slice::alloc(token_buffer.shape()).map_err(boxed)?;
         self.decode = Some(DecodeState {
             embedding: prefill.decode.embedding,
-            pairs: prefill.decode.pairs,
+            groups: prefill.decode.groups,
             head: prefill.decode.head,
             token_buffer,
             sampling_state: Some(sampling_state),
@@ -1200,10 +1167,7 @@ impl RequestExecution {
     /// Consumes the preceding device token and returns exactly one newly
     /// sampled raw token. A terminal or budget-ending token may have a bounded
     /// prefix in flight; `finalize` discards it without executing the suffix.
-    fn decode_step(
-        &mut self,
-        caches: &mut [LayerCache],
-    ) -> Result<Option<RawToken>> {
+    fn decode_step(&mut self, caches: &mut [LayerCache]) -> Result<Option<RawToken>> {
         let result = self.try_decode_step(caches);
         if result.is_err() {
             self.lifecycle.fail();
@@ -1227,11 +1191,10 @@ impl RequestExecution {
             .as_ref()
             .ok_or_else(|| message("GPT-OSS decode position is owned by an execution"))?
             .clone();
-        let lookahead_cache_count = DECODE_LOOKAHEAD_PAIRS * 2;
-        let (lookahead_pairs, remaining_pairs) =
-            state.pairs.split_at_mut(DECODE_LOOKAHEAD_PAIRS);
-        let (lookahead_caches, remaining_caches) =
-            caches.split_at_mut(lookahead_cache_count);
+        let lookahead_cache_count = DECODE_LOOKAHEAD_GROUPS * DECODE_GROUP_LAYERS;
+        let (lookahead_groups, remaining_groups) =
+            state.groups.split_at_mut(DECODE_LOOKAHEAD_GROUPS);
+        let (lookahead_caches, remaining_caches) = caches.split_at_mut(lookahead_cache_count);
         let page_table = self
             .page_table
             .as_ref()
@@ -1243,7 +1206,7 @@ impl RequestExecution {
             Some(prefix) => prefix,
             None => enqueue_decode_prefix(
                 &mut state.embedding,
-                lookahead_pairs,
+                lookahead_groups,
                 state.token_buffer.clone(),
                 position.clone(),
                 state.query_lengths.clone(),
@@ -1254,11 +1217,11 @@ impl RequestExecution {
         };
         let mut hidden = prefix.hidden;
         let mut submission = prefix.submission;
-        for (arguments, caches) in remaining_pairs
+        for (arguments, caches) in remaining_groups
             .iter_mut()
-            .zip(remaining_caches.chunks_exact_mut(2))
+            .zip(remaining_caches.chunks_exact_mut(DECODE_GROUP_LAYERS))
         {
-            let (next_hidden, elapsed) = execute_layer_pair(
+            let (next_hidden, elapsed) = execute_layer_group(
                 arguments,
                 hidden,
                 position.clone(),
@@ -1280,9 +1243,10 @@ impl RequestExecution {
             .head
             .set(
                 "sampling_state",
-                state.sampling_state.take().ok_or_else(|| {
-                    message("GPT-OSS sampling state is owned by an execution")
-                })?,
+                state
+                    .sampling_state
+                    .take()
+                    .ok_or_else(|| message("GPT-OSS sampling state is owned by an execution"))?,
             )
             .map_err(boxed)?;
         state
@@ -1328,7 +1292,7 @@ impl RequestExecution {
         if should_enqueue_lookahead(generated_index, self.lifecycle.max_new_tokens) {
             state.lookahead = Some(enqueue_decode_prefix(
                 &mut state.embedding,
-                lookahead_pairs,
+                lookahead_groups,
                 state.token_buffer.clone(),
                 state
                     .position
@@ -1368,7 +1332,7 @@ impl RequestExecution {
         }
         // A stop token is observed after the bounded prefix was submitted.
         // Discard that prefix here: it is never extended through the remaining
-        // pairs or head, preserving terminal-token semantics.
+        // groups or head, preserving terminal-token semantics.
         if let Some(decode) = &mut self.decode {
             decode.lookahead.take();
         }
@@ -1391,7 +1355,7 @@ struct ComponentFamily {
 
 enum LayerExecutables {
     Prefill { sliding: Exe, full: Exe },
-    DecodePair(Exe),
+    DecodeGroup(Exe),
 }
 
 impl ComponentFamily {
@@ -1424,9 +1388,21 @@ impl ComponentFamily {
                     build_layer(graph, full, config, family, AttentionKind::FullAttention)
                 })?,
             },
-            Phase::Decode => LayerExecutables::DecodePair(compile(platform, placement, |graph| {
-                build_decode_layer_pair(graph, sliding, full, config, family)
-            })?),
+            Phase::Decode => {
+                let layers = checkpoint
+                    .model
+                    .layers
+                    .get(0..DECODE_GROUP_LAYERS)
+                    .ok_or_else(|| {
+                        message("GPT-OSS decode group requires four representative layers")
+                    })?;
+                let [first, second, third, fourth] = layers else {
+                    unreachable!("the exact slice length was checked")
+                };
+                LayerExecutables::DecodeGroup(compile(platform, placement, |graph| {
+                    build_decode_layer_group(graph, [first, second, third, fourth], config, family)
+                })?)
+            }
         };
         let head = compile(platform, placement, |graph| {
             build_head(graph, checkpoint, config, family)
@@ -1450,11 +1426,11 @@ impl ComponentFamily {
         })
     }
 
-    fn decode_pair(&self) -> Result<&Exe> {
+    fn decode_group(&self) -> Result<&Exe> {
         match &self.layers {
-            LayerExecutables::DecodePair(executable) => Ok(executable),
+            LayerExecutables::DecodeGroup(executable) => Ok(executable),
             LayerExecutables::Prefill { .. } => {
-                Err(message("prefill family does not contain a decode pair"))
+                Err(message("prefill family does not contain a decode group"))
             }
         }
     }
@@ -1472,7 +1448,7 @@ enum BoundLayerExecutables {
         kinds: Vec<AttentionKind>,
     },
     Decode {
-        pairs: Vec<Arguments>,
+        groups: Vec<Arguments>,
     },
 }
 
@@ -1492,8 +1468,8 @@ impl BoundComponentFamily {
                 layers: bind_layers(family, checkpoint, parameters, config)?,
                 kinds: config.layer_types().to_vec(),
             },
-            LayerExecutables::DecodePair(_) => BoundLayerExecutables::Decode {
-                pairs: bind_decode_pairs(family, checkpoint, parameters, config)?,
+            LayerExecutables::DecodeGroup(_) => BoundLayerExecutables::Decode {
+                groups: bind_decode_groups(family, checkpoint, parameters, config)?,
             },
         };
         Ok(Self {
@@ -1514,12 +1490,11 @@ struct DecodePrefix {
     submission: SubmissionTimings,
 }
 
-// Nine layer pairs cover the measured server-side submission tail on A40.
-// The prior five-pair prefix repeatedly drained before the generic scheduler
-// and PJRT submission path had queued pair six, leaving 0.5-2.0 ms device
-// holes. This remains one-token lookahead and bounds terminal speculation to
-// eighteen of the model's 24 layers.
-const DECODE_LOOKAHEAD_PAIRS: usize = 9;
+// Five four-layer groups cover the measured server-side submission tail on
+// A40. This remains one-token lookahead and bounds terminal speculation to
+// twenty of the model's 24 layers.
+const DECODE_GROUP_LAYERS: usize = 4;
+const DECODE_LOOKAHEAD_GROUPS: usize = 5;
 
 impl LayerCache {
     fn allocate(platform: &Platform, shape: Shape, placement: &Sharding) -> Result<Self> {
@@ -1615,39 +1590,50 @@ fn bind_layers(
         .collect()
 }
 
-fn bind_decode_pairs(
+fn bind_decode_groups(
     family: &ComponentFamily,
     checkpoint: &Checkpoint,
     parameters: &LoadedCheckpoint,
     config: &Config,
 ) -> Result<Vec<Arguments>> {
-    let executable = family.decode_pair()?;
+    let executable = family.decode_group()?;
     if checkpoint.model.layers.len() != parameters.model.layers.len()
         || checkpoint.model.layers.len() != config.layer_types().len()
-        || !checkpoint.model.layers.len().is_multiple_of(2)
+        || !checkpoint
+            .model
+            .layers
+            .len()
+            .is_multiple_of(DECODE_GROUP_LAYERS)
     {
         return Err(message(
-            "GPT-OSS decode pairing requires one complete alternating layer schedule",
+            "GPT-OSS decode grouping requires one complete alternating layer schedule",
         ));
     }
-    let slots = checkpoint.model.layers.get(0..2).ok_or_else(|| {
-        message("GPT-OSS decode pairing requires sliding and full representatives")
-    })?;
+    let slots = checkpoint
+        .model
+        .layers
+        .get(0..DECODE_GROUP_LAYERS)
+        .ok_or_else(|| message("GPT-OSS decode grouping requires four representatives"))?;
     parameters
         .model
         .layers
-        .chunks_exact(2)
+        .chunks_exact(DECODE_GROUP_LAYERS)
         .enumerate()
-        .map(|(pair, loaded)| {
-            let first = pair * 2;
-            if config.layer_types()[first] != AttentionKind::SlidingAttention
-                || config.layer_types()[first + 1] != AttentionKind::FullAttention
-            {
-                return Err(message(
-                    "GPT-OSS decode pair violates the alternating schedule",
-                ));
+        .map(|(group, loaded)| {
+            let first = group * DECODE_GROUP_LAYERS;
+            for offset in 0..DECODE_GROUP_LAYERS {
+                let expected = if offset.is_multiple_of(2) {
+                    AttentionKind::SlidingAttention
+                } else {
+                    AttentionKind::FullAttention
+                };
+                if config.layer_types()[first + offset] != expected {
+                    return Err(message(
+                        "GPT-OSS decode group violates the alternating schedule",
+                    ));
+                }
             }
-            bind_layer_pair(executable, slots, loaded)
+            bind_layer_group(executable, slots, loaded)
         })
         .collect()
 }
@@ -1662,27 +1648,27 @@ fn bind_layer(
     Ok(arguments)
 }
 
-fn bind_layer_pair(
+fn bind_layer_group(
     executable: &Exe,
     slots: &[super::checkpoint::DecoderLayer],
     loaded: &[LoadedDecoderLayer],
 ) -> Result<Arguments> {
-    let [sliding_slot, full_slot] = slots else {
-        return Err(message("GPT-OSS decode pair slot count is not two"));
-    };
-    let [sliding_loaded, full_loaded] = loaded else {
-        return Err(message("GPT-OSS decode pair parameter count is not two"));
-    };
+    if slots.len() != DECODE_GROUP_LAYERS || loaded.len() != DECODE_GROUP_LAYERS {
+        return Err(message(
+            "GPT-OSS decode group requires exactly four parameter sets",
+        ));
+    }
     let mut arguments = executable.args();
-    bind_tree_components(&mut arguments, sliding_slot, sliding_loaded)?;
-    bind_tree_components(&mut arguments, full_slot, full_loaded)?;
+    for (slot, loaded) in slots.iter().zip(loaded) {
+        bind_tree_components(&mut arguments, slot, loaded)?;
+    }
     arguments.bake().map_err(boxed)?;
     Ok(arguments)
 }
 
 fn enqueue_decode_prefix(
     embedding: &mut Arguments,
-    pairs: &mut [Arguments],
+    groups: &mut [Arguments],
     token: Buffer,
     position: Buffer,
     query_lengths: Buffer,
@@ -1690,7 +1676,8 @@ fn enqueue_decode_prefix(
     page_table: Buffer,
     caches: &mut [LayerCache],
 ) -> Result<DecodePrefix> {
-    if pairs.len() != DECODE_LOOKAHEAD_PAIRS || caches.len() != pairs.len() * 2 {
+    if groups.len() != DECODE_LOOKAHEAD_GROUPS || caches.len() != groups.len() * DECODE_GROUP_LAYERS
+    {
         return Err(message("GPT-OSS decode lookahead schedule is invalid"));
     }
     let mut submission = SubmissionTimings::default();
@@ -1698,15 +1685,18 @@ fn enqueue_decode_prefix(
     embedding.set("tokens", token).map_err(boxed)?;
     let mut hidden = one(embedding.enqueue().map_err(boxed)?)?;
     submission.embedding = started.elapsed();
-    for (pair, pair_caches) in pairs.iter_mut().zip(caches.chunks_exact_mut(2)) {
-        let (next_hidden, elapsed) = execute_layer_pair(
-            pair,
+    for (group, group_caches) in groups
+        .iter_mut()
+        .zip(caches.chunks_exact_mut(DECODE_GROUP_LAYERS))
+    {
+        let (next_hidden, elapsed) = execute_layer_group(
+            group,
             hidden,
             position.clone(),
             query_lengths.clone(),
             active_rows.clone(),
             page_table.clone(),
-            pair_caches,
+            group_caches,
         )?;
         hidden = next_hidden;
         submission.layer_pairs += elapsed;
@@ -1763,7 +1753,7 @@ fn execute_layer(
     Ok((hidden, started.elapsed()))
 }
 
-fn execute_layer_pair(
+fn execute_layer_group(
     arguments: &mut Arguments,
     hidden: Buffer,
     position: Buffer,
@@ -1772,14 +1762,12 @@ fn execute_layer_pair(
     page_table: Buffer,
     caches: &mut [LayerCache],
 ) -> Result<(Buffer, Duration)> {
-    let [sliding, full] = caches else {
+    if caches.len() != DECODE_GROUP_LAYERS {
         return Err(message(
-            "GPT-OSS decode execution requires exactly two caches",
+            "GPT-OSS decode execution requires exactly four caches",
         ));
-    };
+    }
     let started = Instant::now();
-    let (sliding_key, sliding_value) = sliding.take()?;
-    let (full_key, full_value) = full.take()?;
     arguments.set("hidden", hidden).map_err(boxed)?;
     arguments.set("position", position).map_err(boxed)?;
     arguments
@@ -1787,16 +1775,15 @@ fn execute_layer_pair(
         .map_err(boxed)?;
     arguments.set("active_rows", active_rows).map_err(boxed)?;
     arguments.set("page_table", page_table).map_err(boxed)?;
-    arguments
-        .set("sliding.cache.key", sliding_key)
-        .map_err(boxed)?;
-    arguments
-        .set("sliding.cache.value", sliding_value)
-        .map_err(boxed)?;
-    arguments.set("full.cache.key", full_key).map_err(boxed)?;
-    arguments
-        .set("full.cache.value", full_value)
-        .map_err(boxed)?;
+    for (index, cache) in caches.iter_mut().enumerate() {
+        let (key, value) = cache.take()?;
+        arguments
+            .set(&format!("layer{index}.cache.key"), key)
+            .map_err(boxed)?;
+        arguments
+            .set(&format!("layer{index}.cache.value"), value)
+            .map_err(boxed)?;
+    }
     let mut outputs = arguments
         .enqueue()
         .map_err(boxed)?
@@ -1804,24 +1791,19 @@ fn execute_layer_pair(
         .into_iter();
     let hidden = outputs
         .next()
-        .ok_or_else(|| message("GPT-OSS layer pair omitted hidden state"))?;
-    let sliding_key = outputs
-        .next()
-        .ok_or_else(|| message("GPT-OSS layer pair omitted sliding key cache"))?;
-    let sliding_value = outputs
-        .next()
-        .ok_or_else(|| message("GPT-OSS layer pair omitted sliding value cache"))?;
-    let full_key = outputs
-        .next()
-        .ok_or_else(|| message("GPT-OSS layer pair omitted full key cache"))?;
-    let full_value = outputs
-        .next()
-        .ok_or_else(|| message("GPT-OSS layer pair omitted full value cache"))?;
-    if outputs.next().is_some() {
-        return Err(message("GPT-OSS layer pair returned extra buffers"));
+        .ok_or_else(|| message("GPT-OSS layer group omitted hidden state"))?;
+    for cache in caches.iter_mut() {
+        let key = outputs
+            .next()
+            .ok_or_else(|| message("GPT-OSS layer group omitted key cache"))?;
+        let value = outputs
+            .next()
+            .ok_or_else(|| message("GPT-OSS layer group omitted value cache"))?;
+        cache.install(key, value)?;
     }
-    sliding.install(sliding_key, sliding_value)?;
-    full.install(full_key, full_value)?;
+    if outputs.next().is_some() {
+        return Err(message("GPT-OSS layer group returned extra buffers"));
+    }
     Ok((hidden, started.elapsed()))
 }
 
@@ -1831,35 +1813,32 @@ fn enqueue_stable_decode_body(
     batch_slab: Buffer,
     lookahead: Option<StableDecodePrefix>,
 ) -> Result<(Buffer, Buffer)> {
-    let BoundLayerExecutables::Decode { pairs } = &mut bound.layers else {
+    let BoundLayerExecutables::Decode { groups } = &mut bound.layers else {
         return Err(message("stable decode selected a prefill family"));
     };
     let mut hidden;
-    let first_pair;
+    let first_group;
     if let Some(prefix) = lookahead {
         hidden = prefix.hidden;
-        first_pair = DECODE_LOOKAHEAD_PAIRS;
+        first_group = DECODE_LOOKAHEAD_GROUPS;
     } else {
         bound
             .embedding
             .set("batch_slab", batch_slab.clone())
             .map_err(boxed)?;
         hidden = one(enqueue_releasing_batch_slab(&mut bound.embedding)?)?;
-        first_pair = 0;
+        first_group = 0;
     }
-    for (arguments, pair_caches) in pairs[first_pair..]
+    for (arguments, group_caches) in groups[first_group..]
         .iter_mut()
-        .zip(caches[first_pair * 2..].chunks_exact_mut(2))
+        .zip(caches[first_group * DECODE_GROUP_LAYERS..].chunks_exact_mut(DECODE_GROUP_LAYERS))
     {
         let (next, _) =
-            execute_serving_layer_pair(arguments, hidden, batch_slab.clone(), pair_caches)?;
+            execute_serving_layer_group(arguments, hidden, batch_slab.clone(), group_caches)?;
         hidden = next;
     }
     bound.head.set("hidden", hidden).map_err(boxed)?;
-    bound
-        .head
-        .set("batch_slab", batch_slab)
-        .map_err(boxed)?;
+    bound.head.set("batch_slab", batch_slab).map_err(boxed)?;
     let mut outputs = bound
         .head
         .enqueue()
@@ -1883,23 +1862,27 @@ fn enqueue_stable_decode_prefix(
     caches: &mut [LayerCache],
     batch_slab: Buffer,
 ) -> Result<Buffer> {
-    let BoundLayerExecutables::Decode { pairs } = &mut bound.layers else {
+    let BoundLayerExecutables::Decode { groups } = &mut bound.layers else {
         return Err(message("stable decode selected a prefill family"));
     };
-    if pairs.len() < DECODE_LOOKAHEAD_PAIRS || caches.len() < DECODE_LOOKAHEAD_PAIRS * 2 {
-        return Err(message("stable decode family is shorter than its lookahead"));
+    if groups.len() < DECODE_LOOKAHEAD_GROUPS
+        || caches.len() < DECODE_LOOKAHEAD_GROUPS * DECODE_GROUP_LAYERS
+    {
+        return Err(message(
+            "stable decode family is shorter than its lookahead",
+        ));
     }
     bound
         .embedding
         .set("batch_slab", batch_slab.clone())
         .map_err(boxed)?;
     let mut hidden = one(enqueue_releasing_batch_slab(&mut bound.embedding)?)?;
-    for (arguments, pair_caches) in pairs[..DECODE_LOOKAHEAD_PAIRS]
-        .iter_mut()
-        .zip(caches[..DECODE_LOOKAHEAD_PAIRS * 2].chunks_exact_mut(2))
-    {
+    for (arguments, group_caches) in groups[..DECODE_LOOKAHEAD_GROUPS].iter_mut().zip(
+        caches[..DECODE_LOOKAHEAD_GROUPS * DECODE_GROUP_LAYERS]
+            .chunks_exact_mut(DECODE_GROUP_LAYERS),
+    ) {
         let (next, _) =
-            execute_serving_layer_pair(arguments, hidden, batch_slab.clone(), pair_caches)?;
+            execute_serving_layer_group(arguments, hidden, batch_slab.clone(), group_caches)?;
         hidden = next;
     }
     Ok(hidden)
@@ -1917,28 +1900,26 @@ fn enqueue_serving_family(
     let mut hidden = one(enqueue_releasing_batch_slab(&mut bound.embedding)?)?;
     match &mut bound.layers {
         BoundLayerExecutables::Prefill { layers, kinds } => {
-            for ((arguments, kind), cache) in
-                layers.iter_mut().zip(kinds.iter()).zip(caches)
-            {
+            for ((arguments, kind), cache) in layers.iter_mut().zip(kinds.iter()).zip(caches) {
                 let (next, _) =
                     execute_serving_layer(arguments, hidden, batch_slab.clone(), cache)?;
                 hidden = next;
                 let _ = kind;
             }
         }
-        BoundLayerExecutables::Decode { pairs } => {
-            for (arguments, caches) in pairs.iter_mut().zip(caches.chunks_exact_mut(2)) {
+        BoundLayerExecutables::Decode { groups } => {
+            for (arguments, caches) in groups
+                .iter_mut()
+                .zip(caches.chunks_exact_mut(DECODE_GROUP_LAYERS))
+            {
                 let (next, _) =
-                    execute_serving_layer_pair(arguments, hidden, batch_slab.clone(), caches)?;
+                    execute_serving_layer_group(arguments, hidden, batch_slab.clone(), caches)?;
                 hidden = next;
             }
         }
     }
     bound.head.set("hidden", hidden).map_err(boxed)?;
-    bound
-        .head
-        .set("batch_slab", batch_slab)
-        .map_err(boxed)?;
+    bound.head.set("batch_slab", batch_slab).map_err(boxed)?;
     let mut outputs = bound
         .head
         .enqueue()
@@ -1971,9 +1952,7 @@ fn execute_serving_layer(
     let started = Instant::now();
     let (key, value) = cache.take()?;
     arguments.set("hidden", hidden).map_err(boxed)?;
-    arguments
-        .set("batch_slab", batch_slab)
-        .map_err(boxed)?;
+    arguments.set("batch_slab", batch_slab).map_err(boxed)?;
     arguments.set("cache.key", key).map_err(boxed)?;
     arguments.set("cache.value", value).map_err(boxed)?;
     let mut outputs = enqueue_releasing_batch_slab(arguments)?
@@ -1995,59 +1974,49 @@ fn execute_serving_layer(
     Ok((hidden, started.elapsed()))
 }
 
-fn execute_serving_layer_pair(
+fn execute_serving_layer_group(
     arguments: &mut Arguments,
     hidden: Buffer,
     batch_slab: Buffer,
     caches: &mut [LayerCache],
 ) -> Result<(Buffer, Duration)> {
-    let [sliding, full] = caches else {
+    if caches.len() != DECODE_GROUP_LAYERS {
         return Err(message(
-            "GPT-OSS serving decode execution requires exactly two caches",
+            "GPT-OSS serving decode execution requires exactly four caches",
         ));
-    };
+    }
     let started = Instant::now();
-    let (sliding_key, sliding_value) = sliding.take()?;
-    let (full_key, full_value) = full.take()?;
     arguments.set("hidden", hidden).map_err(boxed)?;
-    arguments
-        .set("batch_slab", batch_slab)
-        .map_err(boxed)?;
-    arguments
-        .set("sliding.cache.key", sliding_key)
-        .map_err(boxed)?;
-    arguments
-        .set("sliding.cache.value", sliding_value)
-        .map_err(boxed)?;
-    arguments.set("full.cache.key", full_key).map_err(boxed)?;
-    arguments
-        .set("full.cache.value", full_value)
-        .map_err(boxed)?;
+    arguments.set("batch_slab", batch_slab).map_err(boxed)?;
+    for (index, cache) in caches.iter_mut().enumerate() {
+        let (key, value) = cache.take()?;
+        arguments
+            .set(&format!("layer{index}.cache.key"), key)
+            .map_err(boxed)?;
+        arguments
+            .set(&format!("layer{index}.cache.value"), value)
+            .map_err(boxed)?;
+    }
     let mut outputs = enqueue_releasing_batch_slab(arguments)?
         .into_buffers()
         .into_iter();
     let hidden = outputs
         .next()
-        .ok_or_else(|| message("GPT-OSS serving layer pair omitted hidden state"))?;
-    let sliding_key = outputs
-        .next()
-        .ok_or_else(|| message("GPT-OSS serving layer pair omitted sliding key cache"))?;
-    let sliding_value = outputs
-        .next()
-        .ok_or_else(|| message("GPT-OSS serving layer pair omitted sliding value cache"))?;
-    let full_key = outputs
-        .next()
-        .ok_or_else(|| message("GPT-OSS serving layer pair omitted full key cache"))?;
-    let full_value = outputs
-        .next()
-        .ok_or_else(|| message("GPT-OSS serving layer pair omitted full value cache"))?;
+        .ok_or_else(|| message("GPT-OSS serving layer group omitted hidden state"))?;
+    for cache in caches.iter_mut() {
+        let key = outputs
+            .next()
+            .ok_or_else(|| message("GPT-OSS serving layer group omitted key cache"))?;
+        let value = outputs
+            .next()
+            .ok_or_else(|| message("GPT-OSS serving layer group omitted value cache"))?;
+        cache.install(key, value)?;
+    }
     if outputs.next().is_some() {
         return Err(message(
-            "GPT-OSS serving layer pair returned extra buffers",
+            "GPT-OSS serving layer group returned extra buffers",
         ));
     }
-    sliding.install(sliding_key, sliding_value)?;
-    full.install(full_key, full_value)?;
     Ok((hidden, started.elapsed()))
 }
 
@@ -2135,11 +2104,7 @@ fn upload_u8(
         .map_err(boxed)
 }
 
-fn upload_f32_vector(
-    platform: &Platform,
-    values: &[f32],
-    placement: &Sharding,
-) -> Result<Buffer> {
+fn upload_f32_vector(platform: &Platform, values: &[f32], placement: &Sharding) -> Result<Buffer> {
     let shape = Shape::new(
         nml::DataType::F32,
         &[i64::try_from(values.len()).map_err(|_| message("F32 upload length exceeds I64"))?],
@@ -2189,7 +2154,9 @@ fn validate_batch_inputs(family: ShapeFamily, input: &BatchInputs) -> Result<()>
         || input.top_p.len() != batch
         || input.min_p.len() != batch
     {
-        return Err(message("batch input vectors do not match the compiled family"));
+        return Err(message(
+            "batch input vectors do not match the compiled family",
+        ));
     }
     for row in 0..batch {
         if input.sample_rows[row] && !input.active_rows[row] {
@@ -2207,13 +2174,17 @@ fn validate_batch_inputs(family: ShapeFamily, input: &BatchInputs) -> Result<()>
                 || input.last_indices[row] < 0
                 || input.last_indices[row] >= input.query_lengths[row]
             {
-                return Err(message("active batch row has inconsistent positions or lengths"));
+                return Err(message(
+                    "active batch row has inconsistent positions or lengths",
+                ));
             }
         } else if input.positions[row] != 0
             || input.sequence_lengths[row] != 0
             || input.query_lengths[row] != 0
         {
-            return Err(message("inactive batch rows must have zero positions and lengths"));
+            return Err(message(
+                "inactive batch rows must have zero positions and lengths",
+            ));
         }
     }
     Ok(())
@@ -2262,11 +2233,7 @@ fn pack_batch_slab(
     }
     require_slab_offset(&packed, layout.head_f32_offset())?;
     for row in 0..family.batch() {
-        for value in [
-            input.temperature[row],
-            input.top_p[row],
-            input.min_p[row],
-        ] {
+        for value in [input.temperature[row], input.top_p[row], input.min_p[row]] {
             packed.extend_from_slice(&value.to_ne_bytes());
         }
     }
@@ -2485,7 +2452,8 @@ mod tests {
 
     #[test]
     fn decode_lookahead_never_crosses_the_visible_token_budget() {
-        assert_eq!(DECODE_LOOKAHEAD_PAIRS, 9);
+        assert_eq!(DECODE_GROUP_LAYERS, 4);
+        assert_eq!(DECODE_LOOKAHEAD_GROUPS, 5);
         assert!(!should_enqueue_lookahead(0, 0));
         assert!(!should_enqueue_lookahead(0, 1));
         assert!(!should_enqueue_lookahead(0, 2));
@@ -2518,15 +2486,12 @@ mod tests {
         let layout = ServingSlabLayout::for_family(family).unwrap();
         let slab = pack_batch_slab(family, layout, &input).unwrap();
         assert_eq!(slab.len(), layout.total_bytes());
-        let i32_at = |offset: usize| {
-            i32::from_ne_bytes(slab[offset..offset + 4].try_into().unwrap())
-        };
-        let u64_at = |offset: usize| {
-            u64::from_ne_bytes(slab[offset..offset + 8].try_into().unwrap())
-        };
-        let f32_at = |offset: usize| {
-            f32::from_ne_bytes(slab[offset..offset + 4].try_into().unwrap())
-        };
+        let i32_at =
+            |offset: usize| i32::from_ne_bytes(slab[offset..offset + 4].try_into().unwrap());
+        let u64_at =
+            |offset: usize| u64::from_ne_bytes(slab[offset..offset + 8].try_into().unwrap());
+        let f32_at =
+            |offset: usize| f32::from_ne_bytes(slab[offset..offset + 4].try_into().unwrap());
         assert_eq!(i32_at(layout.token_offset()), 11);
         assert_eq!(
             (0..6)
@@ -2636,15 +2601,17 @@ mod tests {
     #[test]
     fn requests_reject_unrepresentable_or_undersized_families() {
         assert!(normalize_profiles(&[], 131_072, 64).is_err());
-        assert!(PreparedRequest::new(
-            vec![],
-            1,
-            None,
-            SamplingOptions::default(),
-            131_072,
-            Duration::ZERO,
-        )
-        .is_err());
+        assert!(
+            PreparedRequest::new(
+                vec![],
+                1,
+                None,
+                SamplingOptions::default(),
+                131_072,
+                Duration::ZERO,
+            )
+            .is_err()
+        );
         for sampling in [
             SamplingOptions {
                 top_k: 0,
@@ -2683,42 +2650,50 @@ mod tests {
                 PreparedRequest::new(vec![1], 1, None, sampling, 131_072, Duration::ZERO,).is_err()
             );
         }
-        assert!(PreparedRequest::new(
-            vec![1; 17],
-            5,
-            Some(21),
-            SamplingOptions::default(),
-            131_072,
-            Duration::ZERO,
-        )
-        .is_err());
-        assert!(PreparedRequest::new(
-            vec![1; 17],
-            5,
-            Some(131_073),
-            SamplingOptions::default(),
-            131_072,
-            Duration::ZERO,
-        )
-        .is_err());
-        assert!(ExecutionProfile::new(
-            CompilationProfile {
-                max_prompt_tokens: 513,
-                max_sequence_tokens: 512,
-            },
-            131_072,
-            64,
-        )
-        .is_err());
-        assert!(ExecutionProfile::new(
-            CompilationProfile {
-                max_prompt_tokens: 16,
-                max_sequence_tokens: 131_073,
-            },
-            131_072,
-            64,
-        )
-        .is_err());
+        assert!(
+            PreparedRequest::new(
+                vec![1; 17],
+                5,
+                Some(21),
+                SamplingOptions::default(),
+                131_072,
+                Duration::ZERO,
+            )
+            .is_err()
+        );
+        assert!(
+            PreparedRequest::new(
+                vec![1; 17],
+                5,
+                Some(131_073),
+                SamplingOptions::default(),
+                131_072,
+                Duration::ZERO,
+            )
+            .is_err()
+        );
+        assert!(
+            ExecutionProfile::new(
+                CompilationProfile {
+                    max_prompt_tokens: 513,
+                    max_sequence_tokens: 512,
+                },
+                131_072,
+                64,
+            )
+            .is_err()
+        );
+        assert!(
+            ExecutionProfile::new(
+                CompilationProfile {
+                    max_prompt_tokens: 16,
+                    max_sequence_tokens: 131_073,
+                },
+                131_072,
+                64,
+            )
+            .is_err()
+        );
     }
 
     #[test]

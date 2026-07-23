@@ -1,13 +1,12 @@
 use nml_kernel_triton::{
     ArgumentKind, AttentionGeometry, AttentionLaunch, Builder, Comparison, DType, Error,
     GatedActivation, GroupedProjectionConfig, Kernel, KernelLaunch, KernelSpec,
-    NvFp4EmbeddingConfig,
-    NvFp4GroupedProjectionConfig, NvFp4GroupedRole, NvFp4LinearConfig, NvFp4QkvConfig, OutputAlias,
-    PagedAttention2dConfig, PagedAttention3dConfig, PagedCacheAppendConfig, Reduction, ScaleDotElement,
-    SegmentReductionConfig, TensorSpec, build_grouped_projection, build_nvfp4_embedding,
-    build_nvfp4_grouped_projection, build_nvfp4_linear, build_nvfp4_qkv, build_paged_attention_2d,
-    build_paged_attention_3d, build_paged_cache_append, build_segment_reduction,
-    select_attention_launch,
+    NvFp4EmbeddingConfig, NvFp4GroupedProjectionConfig, NvFp4GroupedRole, NvFp4LinearConfig,
+    NvFp4QkvConfig, OutputAlias, PagedAttention2dConfig, PagedAttention3dConfig,
+    PagedCacheAppendConfig, Reduction, ScaleDotElement, SegmentReductionConfig, TensorSpec,
+    build_grouped_projection, build_nvfp4_embedding, build_nvfp4_grouped_projection,
+    build_nvfp4_linear, build_nvfp4_qkv, build_paged_attention_2d, build_paged_attention_3d,
+    build_paged_cache_append, build_segment_reduction, select_attention_launch,
 };
 use nml_mlir::{Block, Context, Region};
 
@@ -157,7 +156,7 @@ fn nvfp4_decode_linear_uses_compact_gemv_without_dead_matrix_rows() {
     assert_eq!(config.launch_grid().unwrap(), [3_142, 1, 1]);
     let ttir = build_nvfp4_linear(config).unwrap();
     let ttir = ttir.text();
-    assert!(ttir.contains("@nvfp4_linear_gemv"), "{ttir}");
+    assert!(ttir.contains("@nvfp4_linear_gemv_m1_n64_k128"), "{ttir}");
     assert!(ttir.contains("tt.reduce"), "{ttir}");
     assert!(ttir.contains("tt.bitcast"), "{ttir}");
     assert!(ttir.contains("tt.reshape"), "{ttir}");
@@ -170,6 +169,27 @@ fn nvfp4_decode_linear_uses_compact_gemv_without_dead_matrix_rows() {
 }
 
 #[test]
+fn nvfp4_small_batch_linear_orders_output_tiles_before_real_rows() {
+    let config = NvFp4LinearConfig {
+        dtype: DType::Bf16,
+        rows: 8,
+        outputs: 2_880,
+        inputs: 2_880,
+        block_m: 1,
+        block_n: 8,
+        block_k: 256,
+        has_bias: false,
+    };
+    assert_eq!(config.launch_grid().unwrap(), [2_880, 1, 1]);
+    let kernel = build_nvfp4_linear(config).unwrap();
+    let ttir = kernel.text();
+    assert!(ttir.contains("@nvfp4_linear_gemv"), "{ttir}");
+    assert!(ttir.contains("arith.divsi"), "{ttir}");
+    assert!(ttir.contains("arith.remsi"), "{ttir}");
+    assert!(!ttir.contains("tt.dot"), "{ttir}");
+}
+
+#[test]
 fn nvfp4_decode_qkv_combines_three_projection_tails_in_one_grid() {
     let production = NvFp4QkvConfig {
         dtype: DType::Bf16,
@@ -178,6 +198,7 @@ fn nvfp4_decode_qkv_combines_three_projection_tails_in_one_grid() {
         query_outputs: 4_096,
         key_outputs: 512,
         value_outputs: 512,
+        block_m: 1,
         block_n: 8,
         block_k: 256,
         has_bias: true,
@@ -191,13 +212,14 @@ fn nvfp4_decode_qkv_combines_three_projection_tails_in_one_grid() {
         query_outputs: 32,
         key_outputs: 8,
         value_outputs: 8,
+        block_m: 1,
         block_n: 8,
         block_k: 32,
         has_bias: true,
     })
     .unwrap();
     let ttir = ttir.text();
-    assert!(ttir.contains("@nvfp4_qkv_gemv"), "{ttir}");
+    assert!(ttir.contains("@nvfp4_qkv_gemv_m1_n8_k32"), "{ttir}");
     assert_eq!(ttir.matches("scf.if ").count(), 3, "{ttir}");
     assert_eq!(ttir.matches("scf.for ").count(), 3, "{ttir}");
     assert_eq!(ttir.matches(" = \"tt.reduce\"").count(), 3, "{ttir}");
@@ -222,18 +244,37 @@ fn nvfp4_small_batch_qkv_fuses_rows_and_projections_in_one_grid() {
         query_outputs: 4_096,
         key_outputs: 512,
         value_outputs: 512,
+        block_m: 2,
         block_n: 8,
         block_k: 256,
         has_bias: true,
     };
-    assert_eq!(config.launch_grid().unwrap(), [5_120, 1, 1]);
+    assert_eq!(config.launch_grid().unwrap(), [2_560, 1, 1]);
     let ttir = build_nvfp4_qkv(config).unwrap();
     let ttir = ttir.text();
-    assert!(ttir.contains("@nvfp4_qkv_gemv"), "{ttir}");
+    assert!(ttir.contains("@nvfp4_qkv_gemv_m2_n8_k256"), "{ttir}");
     assert!(ttir.contains("arith.divsi"), "{ttir}");
     assert!(ttir.contains("arith.remsi"), "{ttir}");
     assert_eq!(ttir.matches("tt.store").count(), 3, "{ttir}");
     assert!(!ttir.contains("tt.dot"), "{ttir}");
+}
+
+#[test]
+fn nvfp4_qkv_rejects_a_partial_row_tile() {
+    let error = build_nvfp4_qkv(NvFp4QkvConfig {
+        dtype: DType::Bf16,
+        rows: 3,
+        inputs: 80,
+        query_outputs: 32,
+        key_outputs: 8,
+        value_outputs: 8,
+        block_m: 2,
+        block_n: 8,
+        block_k: 32,
+        has_bias: true,
+    })
+    .unwrap_err();
+    assert!(matches!(error, Error::InvalidKernelSpec(_)));
 }
 
 #[test]
@@ -567,7 +608,9 @@ fn invalid_kernel_contracts_fail_before_mlir() {
     let integer_tensor = second.full_integer(&[16], 0, DType::I32).unwrap();
     assert!(matches!(
         second.bitcast(&integer_tensor, DType::F16),
-        Err(Error::TypeMismatch { operation: "bitcast" })
+        Err(Error::TypeMismatch {
+            operation: "bitcast"
+        })
     ));
     assert!(matches!(
         second.reshape(&integer_tensor, &[2, 4]),

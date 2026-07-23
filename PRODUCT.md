@@ -390,14 +390,14 @@ The successful performance path was cumulative:
 2. Direct expert GEMV avoided materializing dense weights and matched sparse
    GPT-OSS decode geometry.
 3. Fused QKV removed three repeated compact-weight projection launches at B1.
-4. Correct layer-pair lookahead kept GPU work queued while the host handled a
+4. Correct layer lookahead kept GPU work queued while the host handled a
    visible token.
 5. The serving ABI collapsed fourteen H2D and three D2H operations into one
    initial slab upload and one compact result download.
 6. Device slab donation removed steady H2D entirely during stable membership.
 7. Paired K/V append removed decomposed mask/index/scatter launch clusters.
 8. Fixed sparse masked schedules removed per-layer scan/scatter rebuilding.
-9. O(1) page commit and metadata rebuild only on real page changes reduced
+9. O(1) page commit and metadata rebuild only on membership changes reduced
    host work and parameter rebinding.
 10. Small-batch fused QKV and selected-route expert GEMV restored efficient
     B2/B4/B8 geometry.
@@ -461,24 +461,65 @@ to finish the target-model server machinery and converge on one route.
    compile cost during parity work. They must be expanded after route
    convergence, then warmed before readiness.
 
-### 9.3 Next actions in this phase
+### 9.3 Implemented convergence set, pending A40 measurement
 
-1. Make the diagnostic `generate` command use the generic serving engine, then
+The trace-directed set below is implemented and covered by permanent
+construction/ownership contracts. None of its expected performance effect is
+claimed until it runs as one immutable image on A40.
+
+1. Reservations now assign every private physical page at admission and upload
+   the complete lifetime-stable table. Tentative/committed lengths alone
+   control visibility. Stable decode has no physical-growth transition or
+   page-boundary lookahead transfer path.
+2. An idle engine opens a 50-200 microsecond prefill-formation window derived
+   from `max_prefill_wait`; a B1-only profile disables it and active decode can
+   never enter it.
+3. Ordinary compact linears select from small-M GEMV and tensor-core families
+   using actual M/N/K, CUDA compute capability, and reported SM count. The
+   policy covers attention output, LM head, and embedding rather than naming a
+   product batch size.
+4. Fused QKV keeps the accepted B1 M1/N8/K256 geometry and uses M2 row tiles for
+   divisible small batches, decoding each compact weight tile once per two
+   activation rows.
+5. Sampling performs one batch-wide top-k/filter pipeline over `[B,V]`; only
+   the independent per-row RNG transition remains scalarized. Inactive rows
+   preserve state and the padding sentinel.
+6. Grouped expert prefill selects bounded N64/K128 or N128/K64 families from
+   scheduled route-block capacity, projection width, SM count, and architecture
+   capabilities. Compiler contracts pin the production Q16/Q128/Q256 choices.
+7. Decode uses one reusable four-layer executable across six layer groups,
+   reducing recurring transformer submissions from twelve pair calls to six
+   group calls while preserving sliding/full order and one-token lookahead.
+8. Triton function names include the selected M/N/K tile, and finite metrics
+   expose idle formation and stable decode metadata rebinds. The next profile
+   can therefore prove plan reachability and absence of page-boundary rebinds
+   directly.
+
+After A40 validation:
+
+9. Make the diagnostic `generate` command use the generic serving engine, then
    delete the remaining request-local execution route. Static graph
    specialization remains; duplicate orchestration and cache ownership do not.
-2. Attribute the C1 approximately 14-TPS end-to-end gap into prefill,
-   first-token, visible-step host, and finalization costs without changing
-   output semantics.
-3. Improve the B2 crossover using the current generic small-batch Triton
-   family. Do not reintroduce separate B1/B2 schedulers.
-4. Add explicit Q-family and active-token metrics so prefill padding claims are
-   observable without reverse-engineering a trace.
-5. Complete deterministic batched-output and concurrent page-lifecycle
-   contracts.
-6. Run a compact mixed-load A40 acceptance matrix only after the code and
-   BuildBuddy gates show the intended paths are reachable.
-7. Expand the production B/Q envelope and warm retained hot families before
+10. Run a compact mixed-load A40 acceptance matrix only after focused and full
+   CPU/CUDA BuildBuddy gates and the server image build prove every intended
+   path constructs successfully.
+11. Expand the production B/Q envelope and warm retained hot families before
    readiness.
+
+### 9.4 Tuning policy
+
+NML does not dispatch on marketing GPU names and does not runtime-autotune an
+unbounded set of graphs. Lowering receives normalized CUDA facts: compute
+capability and reported core count. It combines them with static workload
+geometry—M/N/K, projection role, route density, batch/query family, and whether
+the phase is latency- or throughput-sensitive—to select from a small,
+reviewable set of Triton configurations.
+
+Memory capacity is a separate concern. Discovered or declared memory, the
+resident compact model footprint, K/V page geometry, the safety reserve, and
+request token budgets determine the frozen page count and admission envelope.
+Changing memory capacity must not silently change numerical kernel semantics,
+compile an unbounded family, or resize the arena after readiness.
 
 ## 10. Realistic product scenarios
 

@@ -44,6 +44,18 @@ impl CudaCapabilities {
         (self.major, self.minor)
     }
 
+    /// PJRT CUDA reports `core_count` as the schedulable accelerator-core/SM
+    /// count (84 on A40), not the number of scalar FP32 ALUs.
+    pub(crate) fn multiprocessor_count(self) -> usize {
+        self.core_count.max(1)
+    }
+
+    /// Minimum independent CTA population used by latency-sensitive planners
+    /// to hide compact-weight memory latency.
+    pub(crate) fn latency_grid_target(self) -> usize {
+        self.multiprocessor_count().saturating_mul(4)
+    }
+
     // These hardware facts are part of the closed dispatch vocabulary. They
     // are consumed as the NVFP4 CUDA paths land; keeping them here prevents
     // those lowerings from reintroducing raw version arithmetic.

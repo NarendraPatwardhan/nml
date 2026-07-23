@@ -5,16 +5,32 @@
 //! W4A16 Triton kernel. The source payload and scale tensors are passed through
 //! unchanged; decoding is tile-local inside the contraction kernel.
 
-use crate::{device_capabilities::CudaCapabilities, Error};
+use crate::{Error, device_capabilities::CudaCapabilities};
 use nml_kernel_triton::{
-    build_nvfp4_embedding, build_nvfp4_grouped_projection, build_nvfp4_linear,
-    build_nvfp4_qkv, DType as KernelDType, KernelLaunch, KernelSpec, NvFp4EmbeddingConfig,
-    NvFp4GroupedProjectionConfig, NvFp4GroupedRole, NvFp4LinearConfig, NvFp4QkvConfig,
-    TensorSpec,
+    DType as KernelDType, KernelLaunch, KernelSpec, NvFp4EmbeddingConfig,
+    NvFp4GroupedProjectionConfig, NvFp4GroupedRole, NvFp4LinearConfig, NvFp4QkvConfig, TensorSpec,
+    build_nvfp4_embedding, build_nvfp4_grouped_projection, build_nvfp4_linear, build_nvfp4_qkv,
 };
 use nml_mlir::{Block, Context, Region, Type, Value};
 use nml_parameter::nvfp4::{decode_e2m1, decode_e4m3fn_scale};
 use nml_types::{DType, Partition, Shape};
+
+// These are the finite kernel families the planner may select, not product
+// batch-size policy. Selection below is driven by actual M/N/K geometry and
+// normalized device capabilities so adding a serving family does not require
+// another hand-authored recipe branch.
+const COMPACT_GEMV_MAX_ROWS: i64 = 8;
+const TENSOR_CORE_MINIMUM_M: i64 = 16;
+const DECODE_BLOCK_N: i64 = 8;
+const DECODE_BLOCK_K: i64 = 256;
+const WIDE_GEMV_BLOCK_N: i64 = 32;
+const LATENCY_BLOCK_N: i64 = 64;
+const LATENCY_BLOCK_K: i64 = 128;
+const THROUGHPUT_BLOCK_N: i64 = 128;
+const THROUGHPUT_BLOCK_K: i64 = 64;
+const EMBEDDING_WIDE_BLOCK_N: i64 = 64;
+const EMBEDDING_NARROW_BLOCK_N: i64 = WIDE_GEMV_BLOCK_N;
+const LOW_SM_COUNT: usize = 48;
 
 pub(crate) struct LinearInputs<'context> {
     pub activation: Value<'context>,
@@ -110,6 +126,23 @@ struct GroupedPlan {
     block_k: i64,
     gate_warps: i32,
     down_warps: i32,
+    stages: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QkvPlan {
+    block_m: i64,
+    block_n: i64,
+    block_k: i64,
+    warps: i32,
+    stages: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EmbeddingPlan {
+    block_m: i64,
+    block_n: i64,
+    warps: i32,
     stages: i32,
 }
 
@@ -242,6 +275,16 @@ pub(crate) fn lower_qkv<'context>(
             projection,
         ))?;
     }
+    let qkv_plan = QkvPlan::new(
+        first.config.rows,
+        first.config.inputs,
+        [
+            plans[0].config.outputs,
+            plans[1].config.outputs,
+            plans[2].config.outputs,
+        ],
+        capabilities,
+    );
     let config = NvFp4QkvConfig {
         dtype: first.config.dtype,
         rows: first.config.rows,
@@ -249,25 +292,17 @@ pub(crate) fn lower_qkv<'context>(
         query_outputs: plans[0].config.outputs,
         key_outputs: plans[1].config.outputs,
         value_outputs: plans[2].config.outputs,
-        block_n: 8,
-        block_k: 256,
+        block_m: qkv_plan.block_m,
+        block_n: qkv_plan.block_n,
+        block_k: qkv_plan.block_k,
         has_bias: first.config.has_bias,
     };
-    let mut argument_specs = vec![tensor(
-        config.dtype,
-        inputs.activation_shape.dimensions(),
-    )?];
+    let mut argument_specs = vec![tensor(config.dtype, inputs.activation_shape.dimensions())?];
     for projection in projections {
         argument_specs.extend([
             tensor(KernelDType::U8, projection.payload_shape.dimensions())?,
-            tensor(
-                KernelDType::U8,
-                projection.block_scales_shape.dimensions(),
-            )?,
-            tensor(
-                KernelDType::F32,
-                projection.global_scale_shape.dimensions(),
-            )?,
+            tensor(KernelDType::U8, projection.block_scales_shape.dimensions())?,
+            tensor(KernelDType::F32, projection.global_scale_shape.dimensions())?,
         ]);
         if let Some(shape) = projection.bias_shape {
             argument_specs.push(tensor(config.dtype, shape.dimensions())?);
@@ -316,8 +351,8 @@ pub(crate) fn lower_qkv<'context>(
             &borrowed_arguments,
             KernelLaunch {
                 grid: config.launch_grid().map_err(kernel_error)?,
-                warps: 4,
-                stages: 1,
+                warps: qkv_plan.warps,
+                stages: qkv_plan.stages,
             },
         )
         .map_err(kernel_error)?;
@@ -377,8 +412,7 @@ pub(crate) fn lower_routed_swiglu<'context>(
             return Err(Error::UnsupportedTarget {
                 operation: "NVFP4 routed clamped SwiGLU",
                 target: "sharded CUDA SM75 execution".to_owned(),
-                requirement:
-                    "the Turing grouped adapter currently owns one complete local expert set",
+                requirement: "the Turing grouped adapter currently owns one complete local expert set",
             });
         }
         require_unsharded_experts(&inputs)?;
@@ -441,6 +475,7 @@ pub(crate) fn lower_routed_swiglu<'context>(
             local_experts,
             intermediate,
             hidden_size,
+            capabilities,
         )?
     };
 
@@ -526,11 +561,17 @@ fn lower_triton_experts<'context>(
     local_experts: i64,
     intermediate: i64,
     hidden_size: i64,
+    capabilities: CudaCapabilities,
 ) -> Result<Value<'context>, Error> {
     let dtype = kernel_dtype(inputs.hidden_shape.dtype(), "NVFP4 routed clamped SwiGLU")?;
     let block_m = i64::try_from(inputs.block_size)
         .map_err(|_| Error::InvalidMoe("NVFP4 expert block size exceeds I64"))?;
-    let plan = GroupedPlan::new(inputs.hidden_shape.dimensions()[0]);
+    let plan = GroupedPlan::new(
+        inputs.hidden_shape.dimensions()[0],
+        inputs.block_experts_shape.dimensions()[0],
+        intermediate.max(hidden_size),
+        capabilities,
+    );
     let block_n = plan.block_n;
     let block_k = plan.block_k;
     let decode_codebooks = if inputs.hidden_shape.dimensions()[0] <= 8 {
@@ -726,14 +767,15 @@ pub(crate) fn lower_embedding<'context>(
         .ok_or(Error::InvalidIndexing(
             "NVFP4 embedding result must have a feature axis",
         ))?;
+    let plan = EmbeddingPlan::new(rows, width, capabilities);
     let config = NvFp4EmbeddingConfig {
         dtype: kernel_dtype(inputs.result_shape.dtype(), "NVFP4 embedding")?,
         index_dtype: kernel_index_dtype(inputs.indices_shape.dtype())?,
         rows,
         vocabulary,
         width,
-        block_m: 16,
-        block_n: 64,
+        block_m: plan.block_m,
+        block_n: plan.block_n,
     };
     let specification = KernelSpec::new(
         build_nvfp4_embedding(config).map_err(kernel_error)?,
@@ -758,8 +800,8 @@ pub(crate) fn lower_embedding<'context>(
             ],
             KernelLaunch {
                 grid: config.launch_grid().map_err(kernel_error)?,
-                warps: 4,
-                stages: 2,
+                warps: plan.warps,
+                stages: plan.stages,
             },
         )
         .map_err(kernel_error)?;
@@ -856,10 +898,20 @@ impl LinearPlan {
         // Prefill uses the tensor-core matrix family. Small batches get
         // narrower output tiles and deeper pipelines; large batches widen
         // the output tile and optionally use 8 warps for warp-group MMA.
-        let block_m = if rows == 1 {
+        let compact_gemv = rows <= COMPACT_GEMV_MAX_ROWS;
+        let latency_grid = i64::try_from(capabilities.latency_grid_target()).unwrap_or(i64::MAX);
+        let wide_gemv_grid = ceil_div_positive(outputs, WIDE_GEMV_BLOCK_N);
+        let lost_parallelism = WIDE_GEMV_BLOCK_N / DECODE_BLOCK_N;
+        let gemv_block_n =
+            if wide_gemv_grid >= latency_grid.saturating_mul(lost_parallelism.saturating_mul(2)) {
+                WIDE_GEMV_BLOCK_N
+            } else {
+                DECODE_BLOCK_N
+            };
+        let block_m = if compact_gemv {
             1
-        } else if rows <= 16 {
-            16
+        } else if rows <= 32 {
+            TENSOR_CORE_MINIMUM_M
         } else if capabilities.supports_warp_group_mma() {
             64
         } else {
@@ -873,23 +925,19 @@ impl LinearPlan {
                 outputs,
                 inputs,
                 block_m,
-                block_n: if rows == 1 {
-                    if outputs >= 65_536 {
-                        32
-                    } else {
-                        8
-                    }
+                block_n: if compact_gemv {
+                    gemv_block_n
                 } else if latency_sensitive {
-                    64
+                    LATENCY_BLOCK_N
                 } else {
-                    128
+                    THROUGHPUT_BLOCK_N
                 },
-                block_k: if rows == 1 {
-                    256
+                block_k: if compact_gemv {
+                    DECODE_BLOCK_K
                 } else if latency_sensitive {
-                    128
+                    LATENCY_BLOCK_K
                 } else {
-                    64
+                    THROUGHPUT_BLOCK_K
                 },
                 has_bias,
             },
@@ -898,7 +946,7 @@ impl LinearPlan {
             } else {
                 4
             },
-            stages: if rows == 1 {
+            stages: if compact_gemv {
                 1
             } else if latency_sensitive {
                 4
@@ -909,56 +957,139 @@ impl LinearPlan {
     }
 }
 
+impl QkvPlan {
+    fn new(rows: i64, inputs: i64, outputs: [i64; 3], capabilities: CudaCapabilities) -> Self {
+        let latency_grid = i64::try_from(capabilities.latency_grid_target()).unwrap_or(i64::MAX);
+        let block_m = if rows >= 2 && rows % 2 == 0 { 2 } else { 1 };
+        let row_tiles = ceil_div_positive(rows, block_m);
+        let programs_at_16 = outputs
+            .into_iter()
+            .map(|output| ceil_div_positive(output, 16))
+            .sum::<i64>()
+            .saturating_mul(row_tiles);
+        let block_n = if capabilities.supports_warp_group_mma()
+            && programs_at_16 >= latency_grid.saturating_mul(2)
+        {
+            16
+        } else {
+            // Ampere's accepted decode family uses narrow output tiles to
+            // expose enough independent memory transactions.
+            8
+        };
+        Self {
+            block_m,
+            block_n,
+            block_k: if inputs >= DECODE_BLOCK_K {
+                DECODE_BLOCK_K
+            } else {
+                LATENCY_BLOCK_K
+            },
+            warps: 4,
+            stages: 1,
+        }
+    }
+}
+
+impl EmbeddingPlan {
+    /// Vocabulary rows selected by different tokens do not share weight data,
+    /// so small-M embedding should expose each real row independently. For
+    /// larger prompt chunks, choose the largest row tile that still supplies
+    /// at least two waves of CTAs; column width and SM count decide whether a
+    /// 64- or 32-column tile is sufficiently parallel.
+    fn new(rows: i64, width: i64, capabilities: CudaCapabilities) -> Self {
+        let multiprocessors =
+            i64::try_from(capabilities.multiprocessor_count()).unwrap_or(i64::MAX);
+        let two_waves = multiprocessors.saturating_mul(2);
+        let grid = |block_m, block_n| {
+            ceil_div_positive(rows, block_m).saturating_mul(ceil_div_positive(width, block_n))
+        };
+        let block_n = if grid(1, EMBEDDING_WIDE_BLOCK_N) >= multiprocessors {
+            EMBEDDING_WIDE_BLOCK_N
+        } else {
+            EMBEDDING_NARROW_BLOCK_N
+        };
+        let block_m = if rows <= COMPACT_GEMV_MAX_ROWS {
+            1
+        } else if grid(TENSOR_CORE_MINIMUM_M, block_n) >= two_waves {
+            TENSOR_CORE_MINIMUM_M
+        } else if grid(8, block_n) >= two_waves {
+            8
+        } else {
+            4
+        };
+        Self {
+            block_m,
+            block_n,
+            warps: 4,
+            stages: if rows <= COMPACT_GEMV_MAX_ROWS { 1 } else { 2 },
+        }
+    }
+}
+
 impl GroupedPlan {
     /// Selects from a finite, reviewable tile family. Through eight tokens,
     /// sparse routing rarely fills a 16-row expert tile, so selected-route
     /// GEMV avoids tensor-core padding and uses the proven decode geometry.
     /// Larger M exposes enough activation and expert-weight reuse for the
-    /// grouped matrix family; sufficiently large batches employ eight warps on
-    /// every retained Triton-capable NVIDIA generation.
-    const fn new(tokens: i64) -> Self {
-        if tokens <= 8 {
+    /// grouped matrix family; sufficiently large batches employ eight warps
+    /// only where the architecture exposes warp-group MMA.
+    fn new(
+        tokens: i64,
+        scheduled_blocks: i64,
+        maximum_output: i64,
+        capabilities: CudaCapabilities,
+    ) -> Self {
+        if tokens <= COMPACT_GEMV_MAX_ROWS {
             Self {
-                block_n: 8,
-                block_k: 256,
+                block_n: DECODE_BLOCK_N,
+                block_k: DECODE_BLOCK_K,
                 gate_warps: 4,
                 down_warps: 4,
                 stages: 1,
             }
-        } else if tokens <= 32 {
-            Self {
-                block_n: 64,
-                block_k: 128,
-                gate_warps: 4,
-                down_warps: 4,
-                stages: 4,
-            }
-        } else if tokens <= 64 {
-            Self {
-                block_n: 64,
-                block_k: 128,
-                gate_warps: 4,
-                down_warps: 4,
-                stages: 3,
-            }
-        } else if tokens <= 128 {
-            Self {
-                block_n: 128,
-                block_k: 64,
-                gate_warps: 4,
-                down_warps: 4,
-                stages: 3,
-            }
         } else {
+            let grid_128 = scheduled_blocks
+                .saturating_mul(ceil_div_positive(maximum_output, THROUGHPUT_BLOCK_N));
+            let target = i64::try_from(capabilities.latency_grid_target()).unwrap_or(i64::MAX);
+            let multiprocessors =
+                i64::try_from(capabilities.multiprocessor_count()).unwrap_or(i64::MAX);
+            // N=64/K=128 reduces the live decoded-weight tile and doubles the
+            // CTA population. Retain it whenever N=128 would undersubscribe the
+            // latency target or there is no more than one routed block per SM,
+            // where register pressure dominates cross-row reuse.
+            let narrow = scheduled_blocks <= multiprocessors || grid_128 < target;
+            let block_n = if narrow {
+                LATENCY_BLOCK_N
+            } else {
+                THROUGHPUT_BLOCK_N
+            };
+            let block_k = if narrow {
+                LATENCY_BLOCK_K
+            } else {
+                THROUGHPUT_BLOCK_K
+            };
+            let large_throughput_family =
+                scheduled_blocks > multiprocessors && capabilities.supports_warp_group_mma();
             Self {
-                block_n: 128,
-                block_k: 64,
-                gate_warps: 8,
-                down_warps: 8,
-                stages: 3,
+                block_n,
+                block_k,
+                gate_warps: if large_throughput_family { 8 } else { 4 },
+                down_warps: if large_throughput_family { 8 } else { 4 },
+                stages: if scheduled_blocks.saturating_mul(2) < multiprocessors {
+                    4
+                } else if capabilities.multiprocessor_count() < LOW_SM_COUNT {
+                    2
+                } else {
+                    3
+                },
             }
         }
     }
+}
+
+fn ceil_div_positive(value: i64, divisor: i64) -> i64 {
+    debug_assert!(value > 0 && divisor > 0);
+    value / divisor + i64::from(value % divisor != 0)
 }
 
 fn require_unsharded(inputs: &LinearInputs<'_>) -> Result<(), Error> {

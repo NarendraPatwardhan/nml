@@ -1,11 +1,11 @@
 //! Bounded GPT-OSS component graphs.
 //!
 //! The compiler sees one bounded fusion domain at a time: embedding, one full
-//! prefill layer, one alternating decode-layer pair, or final projection and
+//! prefill layer, one alternating four-layer decode group, or final projection and
 //! sampling. Model depth remains an execution-plan concern and never duplicates
 //! the reusable component bodies in StableHLO.
 
-use super::checkpoint::{message, BoxError, Checkpoint, DecoderLayer, Result};
+use super::checkpoint::{BoxError, Checkpoint, DecoderLayer, Result, message};
 use super::config::{AttentionKind, Config};
 use nml::{DataType, Graph, Shape, Tensor};
 
@@ -353,71 +353,57 @@ pub(super) fn build_layer(
     ])
 }
 
-/// Builds the one decode fusion domain justified by GPT-OSS's immutable
-/// alternating schedule: one sliding layer followed by one full layer.
-///
-/// This halves recurring PJRT graph submissions without making model depth a
-/// compiler constant. The pair shares position and page-table inputs, owns two
-/// independent donated cache pairs, and aliases the final hidden state back to
-/// the original input. Prefill deliberately retains single-layer components.
-pub(super) fn build_decode_layer_pair(
+/// Builds one medium-grained decode fusion domain from two immutable
+/// sliding/full pairs. Four layers halve the accepted pair-level submission
+/// count without turning all model depth into one compiler monolith.
+pub(super) fn build_decode_layer_group(
     graph: &mut Graph,
-    sliding: &DecoderLayer,
-    full: &DecoderLayer,
+    layers: [&DecoderLayer; 4],
     config: &Config,
     family: ShapeFamily,
 ) -> Result<Vec<(String, Tensor)>> {
     if family.phase() != Phase::Decode {
-        return Err(message("GPT-OSS layer pairs are decode-only"));
+        return Err(message("GPT-OSS layer groups are decode-only"));
     }
     let hidden_shape = hidden_shape(config, family)?;
     let cache_shape = cache_shape(config, family)?;
     let hidden_input = graph.input("hidden", hidden_shape);
     let (position, sequence_lengths, query_lengths, active_rows, page_table) =
         layer_inputs(graph, family)?;
-    let sliding_key_input = graph.input("sliding.cache.key", cache_shape);
-    let sliding_value_input = graph.input("sliding.cache.value", cache_shape);
-    let full_key_input = graph.input("full.cache.key", cache_shape);
-    let full_value_input = graph.input("full.cache.value", cache_shape);
-
-    let (hidden, sliding_key, sliding_value) = apply_layer(
-        graph,
-        sliding,
-        config,
-        family,
-        AttentionKind::SlidingAttention,
-        hidden_input,
-        position,
-        sequence_lengths,
-        query_lengths,
-        active_rows,
-        page_table,
-        sliding_key_input,
-        sliding_value_input,
-    )?;
-    let (hidden, full_key, full_value) = apply_layer(
-        graph,
-        full,
-        config,
-        family,
-        AttentionKind::FullAttention,
-        hidden,
-        position,
-        sequence_lengths,
-        query_lengths,
-        active_rows,
-        page_table,
-        full_key_input,
-        full_value_input,
-    )?;
+    let mut hidden = hidden_input;
+    let mut outputs = Vec::with_capacity(9);
+    for (index, layer) in layers.into_iter().enumerate() {
+        let key_name = format!("layer{index}.cache.key");
+        let value_name = format!("layer{index}.cache.value");
+        let key_input = graph.input(&key_name, cache_shape);
+        let value_input = graph.input(&value_name, cache_shape);
+        let kind = if index.is_multiple_of(2) {
+            AttentionKind::SlidingAttention
+        } else {
+            AttentionKind::FullAttention
+        };
+        let (next_hidden, key, value) = apply_layer(
+            graph,
+            layer,
+            config,
+            family,
+            kind,
+            hidden,
+            position,
+            sequence_lengths,
+            query_lengths,
+            active_rows,
+            page_table,
+            key_input,
+            value_input,
+        )?;
+        hidden = next_hidden;
+        outputs.push((key_name, key));
+        outputs.push((value_name, value));
+    }
     let hidden = nml(graph.reuse_buffer(hidden, hidden_input))?;
-    Ok(vec![
-        ("hidden".to_owned(), hidden),
-        ("sliding.cache.key".to_owned(), sliding_key),
-        ("sliding.cache.value".to_owned(), sliding_value),
-        ("full.cache.key".to_owned(), full_key),
-        ("full.cache.value".to_owned(), full_value),
-    ])
+    outputs.insert(0, ("hidden".to_owned(), hidden));
+    Ok(outputs)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -468,11 +454,17 @@ fn apply_layer(
     ))?;
     let key = nml(graph.reshape(
         key,
-        shape(DataType::Bf16, &[batch, sequence, key_value_heads, head_dim])?,
+        shape(
+            DataType::Bf16,
+            &[batch, sequence, key_value_heads, head_dim],
+        )?,
     ))?;
     let value = nml(graph.reshape(
         value,
-        shape(DataType::Bf16, &[batch, sequence, key_value_heads, head_dim])?,
+        shape(
+            DataType::Bf16,
+            &[batch, sequence, key_value_heads, head_dim],
+        )?,
     ))?;
     let rope = nml::attention::RopeOptions {
         base: config.rope_theta(),
@@ -556,10 +548,7 @@ fn apply_layer(
         hidden,
         shape(DataType::Bf16, &[routed_tokens, hidden_size])?,
     ))?;
-    let active_tokens = nml(graph.reshape(
-        write_mask,
-        shape(DataType::Bool, &[routed_tokens])?,
-    ))?;
+    let active_tokens = nml(graph.reshape(write_mask, shape(DataType::Bool, &[routed_tokens])?))?;
     let router_logits = nml(graph.linear(
         routed,
         &layer.mlp.router.weight,
@@ -577,11 +566,8 @@ fn apply_layer(
     ))?;
     let routed = nml(graph.reshape(routed, hidden_shape))?;
     hidden = nml(graph.add(residual, routed))?;
-    let active_hidden = nml(graph.broadcast_in_dim(
-        write_mask,
-        hidden_shape.with_dtype(DataType::Bool),
-        &[0, 1],
-    ))?;
+    let active_hidden =
+        nml(graph.broadcast_in_dim(write_mask, hidden_shape.with_dtype(DataType::Bool), &[0, 1]))?;
     hidden = nml(graph.select(active_hidden, hidden, hidden_input))?;
     Ok((hidden, key_cache, value_cache))
 }
@@ -608,8 +594,7 @@ pub(super) fn build_head(
         min_p,
         active_rows,
         serving_slab,
-    ) =
-        head_inputs(graph, family)?;
+    ) = head_inputs(graph, family)?;
     let last = nml(graph.gather_batched_nd(hidden, last_index, 1, &[1]))?;
     let final_norm = nml(graph.parameter_value(&checkpoint.model.norm.weight))?;
     let last = nml(graph.rms_norm(last, Some(final_norm), 1, config.rms_norm_epsilon()))?;
@@ -637,8 +622,7 @@ pub(super) fn build_head(
         let result = nml(graph.concatenate(&[token_bytes, state_bytes], 1))?;
         let mut outputs = vec![("batch_result".to_owned(), result)];
         if family.phase() == Phase::Decode {
-            let (slab, layout) =
-                serving_slab.expect("serving decode head retains its slab input");
+            let (slab, layout) = serving_slab.expect("serving decode head retains its slab input");
             let next_slab = next_decode_slab(
                 graph,
                 family,
@@ -831,14 +815,9 @@ fn next_decode_slab(
     let advanced_sequence_length = nml(graph.add(sequence_length, one))?;
     let next_sequence_length =
         nml(graph.select(active_rows, advanced_sequence_length, sequence_length))?;
-    let next_position = nml(graph.reshape(
-        next_position,
-        shape(DataType::I32, &[batch, 1])?,
-    ))?;
-    let next_sequence_length = nml(graph.reshape(
-        next_sequence_length,
-        shape(DataType::I32, &[batch, 1])?,
-    ))?;
+    let next_position = nml(graph.reshape(next_position, shape(DataType::I32, &[batch, 1])?))?;
+    let next_sequence_length =
+        nml(graph.reshape(next_sequence_length, shape(DataType::I32, &[batch, 1])?))?;
     let next_positions_and_lengths =
         nml(graph.concatenate(&[next_position, next_sequence_length], 1))?;
     let state_bytes = nml(graph.bitcast(sampling_state, DataType::U8))?;
@@ -887,8 +866,7 @@ fn next_decode_slab(
             )
             .ok_or_else(|| message("serving layer row offset overflows"))?;
         patches.push((
-            i64::try_from(offset)
-                .map_err(|_| message("serving layer row offset exceeds I64"))?,
+            i64::try_from(offset).map_err(|_| message("serving layer row offset exceeds I64"))?,
             controls,
         ));
     }
@@ -908,12 +886,7 @@ fn control_vector(
     dtype: DataType,
 ) -> Result<Tensor> {
     let column = dimension(column)?;
-    let sliced = nml(graph.slice(
-        control,
-        &[0, column],
-        &[batch, column + 1],
-        &[1, 1],
-    ))?;
+    let sliced = nml(graph.slice(control, &[0, column], &[batch, column + 1], &[1, 1]))?;
     nml(graph.reshape(sliced, shape(dtype, &[batch])?))
 }
 
@@ -924,10 +897,7 @@ fn serving_slab_input(
     let layout = ServingSlabLayout::for_family(family)?;
     let slab = graph.input(
         "batch_slab",
-        shape(
-            DataType::U8,
-            &[dimension(layout.total_bytes())?],
-        )?,
+        shape(DataType::U8, &[dimension(layout.total_bytes())?])?,
     );
     Ok((slab, layout))
 }
@@ -961,11 +931,7 @@ fn slab_typed_range(
         bytes,
         shape(
             DataType::U8,
-            &[
-                batch,
-                dimension(elements)?,
-                dimension(byte_width)?,
-            ],
+            &[batch, dimension(elements)?, dimension(byte_width)?],
         )?,
     ))?;
     nml(graph.bitcast(packed, dtype))
@@ -1108,41 +1074,61 @@ mod tests {
             )
         });
         assert_contract!(prefill_layer, 8, 29, 3, &[Some(0), Some(6), Some(7)],);
-        assert!(prefill_layer
-            .input_names()
-            .any(|name| name == "sequence_lengths"));
+        assert!(
+            prefill_layer
+                .input_names()
+                .any(|name| name == "sequence_lengths")
+        );
         assert_single_layer_identity!(prefill_layer, 0);
 
-        let full =
-            representative_layer(&checkpoint, &config, AttentionKind::FullAttention).unwrap();
-        let decode_layer =
-            finish!(|graph| { build_decode_layer_pair(graph, sliding, full, &config, decode) });
+        let layers = &checkpoint.model.layers[..4];
+        let decode_layer = finish!(|graph| {
+            build_decode_layer_group(
+                graph,
+                [&layers[0], &layers[1], &layers[2], &layers[3]],
+                &config,
+                decode,
+            )
+        });
         assert_contract!(
             decode_layer,
+            13,
+            116,
             9,
-            58,
-            5,
-            &[Some(0), Some(5), Some(6), Some(7), Some(8)],
+            &[
+                Some(0),
+                Some(5),
+                Some(6),
+                Some(36),
+                Some(37),
+                Some(67),
+                Some(68),
+                Some(98),
+                Some(99)
+            ],
         );
-        assert!(!decode_layer
-            .input_names()
-            .any(|name| name == "sequence_lengths"));
+        assert!(
+            !decode_layer
+                .input_names()
+                .any(|name| name == "sequence_lengths")
+        );
         let layer_names = decode_layer
             .input_names()
             .filter(|name| name.starts_with("model.layers."))
             .collect::<Vec<_>>();
+        assert!(layer_names.iter().all(|name| {
+            (0..4).any(|layer| name.starts_with(&format!("model.layers.{layer}.")))
+        }));
         assert!(
             layer_names
                 .iter()
-                .all(|name| name.starts_with("model.layers.0.")
-                    || name.starts_with("model.layers.1."))
+                .any(|name| name.starts_with("model.layers.0."))
         );
-        assert!(layer_names
-            .iter()
-            .any(|name| name.starts_with("model.layers.0.")));
-        assert!(layer_names
-            .iter()
-            .any(|name| name.starts_with("model.layers.1.")));
+        assert!(
+            layer_names
+                .iter()
+                .any(|name| name.starts_with("model.layers.1."))
+        );
 
         let prefill_head = finish!(|graph| build_head(graph, &checkpoint, &config, prefill));
         assert_contract!(prefill_head, 8, 4, 2, &[None, Some(2)]);
@@ -1153,19 +1139,39 @@ mod tests {
         let batched_embedding =
             finish!(|graph| build_embedding(graph, &checkpoint, &config, batched));
         assert_contract!(batched_embedding, 1, 3, 1, &[None]);
-        assert!(batched_embedding.input_names().any(|name| name == "batch_slab"));
+        assert!(
+            batched_embedding
+                .input_names()
+                .any(|name| name == "batch_slab")
+        );
         assert_eq!(
             batched_embedding.outputs().next().unwrap().1.dimensions(),
             &[4, 1, config.hidden_size() as i64]
         );
-        let batched_layer =
-            finish!(|graph| { build_decode_layer_pair(graph, sliding, full, &config, batched) });
+        let batched_layer = finish!(|graph| {
+            build_decode_layer_group(
+                graph,
+                [&layers[0], &layers[1], &layers[2], &layers[3]],
+                &config,
+                batched,
+            )
+        });
         assert_contract!(
             batched_layer,
-            6,
-            58,
-            5,
-            &[Some(0), Some(2), Some(3), Some(4), Some(5)],
+            10,
+            116,
+            9,
+            &[
+                Some(0),
+                Some(2),
+                Some(3),
+                Some(33),
+                Some(34),
+                Some(64),
+                Some(65),
+                Some(95),
+                Some(96)
+            ],
         );
         let batched_layer_inputs = batched_layer.input_names().collect::<Vec<_>>();
         assert!(batched_layer_inputs.contains(&"batch_slab"));
@@ -1184,9 +1190,10 @@ mod tests {
         );
         assert_eq!(
             outputs[1].1.dimensions(),
-            &[ServingSlabLayout::for_family(batched).unwrap().total_bytes() as i64],
+            &[ServingSlabLayout::for_family(batched)
+                .unwrap()
+                .total_bytes() as i64],
         );
-
     }
 
     fn selected_config() -> Config {

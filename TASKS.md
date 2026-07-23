@@ -409,6 +409,49 @@ control.
   contracts pass, and the exact single-stream control remains at least 150
   decode-loop tokens/s.
 
+### 3.6 Trace-directed efficiency convergence
+
+Exit: the generic serving lane eliminates page-boundary stalls, forms useful
+idle prefills, uses shape- and capability-derived compact kernels throughout
+the retained B/Q families, and no graph grows linearly by cloning a complete
+sampling pipeline per row. GPU choices remain a finite auditable family:
+device memory sizes cache/admission capacity, while compute capability, core
+count, M/N/K, route density, and latency/throughput phase select kernel tiles.
+
+- [x] Eagerly assign every reservation's private physical page IDs at
+  admission. Upload the complete stable block table once, keep future pages
+  invisible through sequence lengths, and retain exact rollback/release
+  accounting without reallocating at 16-token boundaries.
+- [x] Remove physical-page growth as a stable-decode rebind condition and add
+  contracts proving a multi-page decode keeps one block table while committed
+  and tentative visibility advance independently.
+- [x] Add a bounded idle-only prefill formation window derived from the server
+  latency budget and retained batch geometry. Drain commands only when no
+  decode is active; active decode must never wait for the window.
+- [x] Replace the fixed `M=16` padding of ordinary compact linears with a
+  finite small-M plan derived from M/N/K and CUDA capabilities. Apply it to
+  attention output and vocabulary projection without expanding NVFP4 weights.
+- [x] Make fused QKV tile multiple active rows per CTA when the selected
+  architecture/shape plan predicts weight reuse, while preserving the proven
+  B1 geometry exactly.
+- [x] Replace the per-row sampling graph clone with one vectorized `[B,V]`
+  candidate/filter/select pipeline and explicit independent `[B,2]` random
+  state transition. Preserve inactive-row and insertion/removal invariance.
+- [x] Derive grouped expert prefill tiles from compute capability, core count,
+  M/N/K, and routed-row density. Keep only bounded candidate geometries and
+  cover the selected Q16/Q128/Q256 plans with construction contracts.
+- [x] Group decode submission into medium-grained layer executables only where
+  it removes graph-node update/launch overhead without changing model
+  semantics, page visibility, or the accepted lookahead ordering.
+- [x] Report every selected linear/QKV/grouped plan in compiler diagnostics and
+  expose idle-formation/page-rebind counters so the next Nsight run can verify
+  reachability without reverse engineering.
+- [x] Pass focused and full CPU/CUDA construction suites plus the server image
+  build through BuildBuddy before publishing or renting an A40. Focused IR,
+  Triton, and server contracts; `//...`; the CUDA GPT-OSS construction target;
+  and `//products/serve:serve_image` are green. No image has been published and
+  no GPU result is claimed yet.
+
 ## Milestone 4: complete OpenAI tool calling
 
 Exit: clients can submit function schemas, receive one strict Harmony tool

@@ -44,9 +44,8 @@ enum PageState {
 
 #[derive(Clone, Debug)]
 struct Reservation {
-    /// Credits not yet converted into private physical pages.
-    remaining_pages: usize,
-    /// Physical pages this request may allocate over its complete lifetime.
+    /// Lifetime-stable logical-to-physical table. Physical IDs are assigned at
+    /// admission; lengths, not absent IDs, control visibility.
     total_pages: usize,
     pages: Vec<PageId>,
     committed_tokens: usize,
@@ -68,7 +67,7 @@ pub(crate) struct CacheStats {
     pub(crate) private_pages: usize,
     pub(crate) sealed_pages: usize,
     pub(crate) sealed_references: usize,
-    pub(crate) reserved_unallocated_pages: usize,
+    pub(crate) reserved_future_pages: usize,
     pub(crate) sequences: usize,
     pub(crate) committed_tokens: usize,
     pub(crate) tentative_tokens: usize,
@@ -110,8 +109,12 @@ impl fmt::Display for CacheError {
                 "cache reservation for sequence {} is exhausted",
                 sequence.as_u64()
             ),
-            Self::InvalidTransition(message) => write!(formatter, "invalid cache transition: {message}"),
-            Self::InvalidMetadata(message) => write!(formatter, "invalid cache metadata: {message}"),
+            Self::InvalidTransition(message) => {
+                write!(formatter, "invalid cache transition: {message}")
+            }
+            Self::InvalidMetadata(message) => {
+                write!(formatter, "invalid cache metadata: {message}")
+            }
         }
     }
 }
@@ -165,9 +168,12 @@ impl FrozenCachePlan {
                 "target cache geometry is incomplete or uses a non-16-token page",
             ));
         }
-        let usable = cache_budget_bytes.checked_sub(safety_bytes).ok_or(
-            CacheError::InvalidTransition("cache safety reserve exceeds the cache budget"),
-        )?;
+        let usable =
+            cache_budget_bytes
+                .checked_sub(safety_bytes)
+                .ok_or(CacheError::InvalidTransition(
+                    "cache safety reserve exceeds the cache budget",
+                ))?;
         let page_bytes = geometry.bytes_per_physical_page()?;
         let physical_pages = usable / page_bytes;
         if physical_pages == 0 {
@@ -225,6 +231,7 @@ pub(crate) struct CompactCacheMetadata {
     pub(crate) sequence_lengths: Vec<i32>,
     pub(crate) active_rows: Vec<bool>,
     pub(crate) table_width: usize,
+    sequence_ids: Vec<Option<SequenceId>>,
 }
 
 impl CompactCacheMetadata {
@@ -285,8 +292,9 @@ impl PageManager {
         Ok(pages)
     }
 
-    /// Reserves only future physical allocations. Shared sealed prefix pages do
-    /// not consume these credits because they already occupy the arena.
+    /// Atomically reserves and assigns the complete private physical-page
+    /// table. A request therefore cannot encounter a later allocation failure
+    /// or require a block-table rebind at a page boundary.
     pub(crate) fn reserve_pages(
         &mut self,
         sequence: SequenceId,
@@ -302,12 +310,23 @@ impl PageManager {
                 available_pages: available,
             });
         }
+        let mut assigned = Vec::with_capacity(pages);
+        for _ in 0..pages {
+            let page = self.free.pop_front().ok_or(CacheError::InvalidTransition(
+                "admission capacity changed while assigning reserved pages",
+            ))?;
+            self.descriptors[page.as_usize()] = PageState::Private {
+                owner: sequence,
+                committed: 0,
+                tentative: 0,
+            };
+            assigned.push(page);
+        }
         self.reservations.insert(
             sequence,
             Reservation {
-                remaining_pages: pages,
                 total_pages: pages,
-                pages: Vec::new(),
+                pages: assigned,
                 committed_tokens: 0,
                 tentative_tokens: 0,
             },
@@ -322,27 +341,29 @@ impl PageManager {
     ) -> Result<(), CacheError> {
         self.require_sequence(sequence)?;
         while tokens != 0 {
-            let tail = self
+            let reservation = self
                 .reservations
                 .get(&sequence)
-                .and_then(|reservation| reservation.pages.last().copied());
-            let writable = tail.and_then(|page| match self.descriptors[page.as_usize()] {
+                .ok_or(CacheError::UnknownSequence(sequence))?;
+            let logical_page = reservation.tentative_tokens / self.page_size;
+            let within_page = reservation.tentative_tokens % self.page_size;
+            let page = *reservation
+                .pages
+                .get(logical_page)
+                .ok_or(CacheError::ReservationExhausted(sequence))?;
+            match self.descriptors[page.as_usize()] {
                 PageState::Private {
-                    owner,
-                    tentative,
-                    ..
-                } if owner == sequence && usize::from(tentative) < self.page_size => {
-                    Some((page, self.page_size - usize::from(tentative)))
+                    owner, tentative, ..
+                } if owner == sequence && usize::from(tentative) == within_page => {}
+                _ => {
+                    return Err(CacheError::InvalidTransition(
+                        "tentative append did not resolve to its reserved private page",
+                    ));
                 }
-                _ => None,
-            });
-            let (page, capacity) = match writable {
-                Some(writable) => writable,
-                None => (self.allocate_private(sequence)?, self.page_size),
-            };
+            }
+            let capacity = self.page_size - within_page;
             let appended = tokens.min(capacity);
-            let PageState::Private { tentative, .. } =
-                &mut self.descriptors[page.as_usize()]
+            let PageState::Private { tentative, .. } = &mut self.descriptors[page.as_usize()]
             else {
                 unreachable!("the selected cache tail was private")
             };
@@ -368,11 +389,7 @@ impl PageManager {
         self.commit(sequence, tokens)
     }
 
-    pub(crate) fn commit(
-        &mut self,
-        sequence: SequenceId,
-        tokens: usize,
-    ) -> Result<(), CacheError> {
+    pub(crate) fn commit(&mut self, sequence: SequenceId, tokens: usize) -> Result<(), CacheError> {
         let reservation = self
             .reservations
             .get(&sequence)
@@ -415,14 +432,14 @@ impl PageManager {
                 }
             }
         }
-        self.reservations.get_mut(&sequence).unwrap().committed_tokens = target;
+        self.reservations
+            .get_mut(&sequence)
+            .unwrap()
+            .committed_tokens = target;
         Ok(())
     }
 
-    pub(crate) fn checkpoint(
-        &self,
-        sequence: SequenceId,
-    ) -> Result<CacheCheckpoint, CacheError> {
+    pub(crate) fn checkpoint(&self, sequence: SequenceId) -> Result<CacheCheckpoint, CacheError> {
         let reservation = self
             .reservations
             .get(&sequence)
@@ -444,7 +461,7 @@ impl PageManager {
             .ok_or(CacheError::UnknownSequence(checkpoint.sequence))?;
         if current.committed_tokens != checkpoint.committed_tokens
             || checkpoint.tentative_tokens > current.tentative_tokens
-            || checkpoint.pages > current.pages.len()
+            || checkpoint.pages != current.pages.len()
         {
             return Err(CacheError::InvalidTransition(
                 "checkpoint is stale or would roll back committed tokens",
@@ -515,17 +532,32 @@ impl PageManager {
         Ok(sealed)
     }
 
-    /// Attaches one complete immutable page as the next logical prefix block.
+    /// Inserts one shared immutable prefix before the remaining eagerly
+    /// assigned private pages. Shared hits do not consume the request's private
+    /// miss/output reservation.
     pub(crate) fn share_sealed(
         &mut self,
         sequence: SequenceId,
         page: PageId,
     ) -> Result<(), CacheError> {
         self.require_sequence(sequence)?;
-        let descriptor = self
-            .descriptors
-            .get_mut(page.as_usize())
-            .ok_or(CacheError::InvalidTransition("shared page ID is out of range"))?;
+        let logical_page = {
+            let reservation = self.reservations.get(&sequence).unwrap();
+            if reservation.tentative_tokens != reservation.committed_tokens
+                || !reservation.committed_tokens.is_multiple_of(self.page_size)
+            {
+                return Err(CacheError::InvalidTransition(
+                    "shared pages may only extend a committed page-aligned prefix",
+                ));
+            }
+            reservation.committed_tokens / self.page_size
+        };
+        let descriptor =
+            self.descriptors
+                .get_mut(page.as_usize())
+                .ok_or(CacheError::InvalidTransition(
+                    "shared page ID is out of range",
+                ))?;
         let PageState::Sealed { references } = descriptor else {
             return Err(CacheError::InvalidTransition(
                 "only a sealed page may be shared",
@@ -535,15 +567,7 @@ impl PageManager {
             .checked_add(1)
             .ok_or(CacheError::ArithmeticOverflow)?;
         let reservation = self.reservations.get_mut(&sequence).unwrap();
-        if reservation.tentative_tokens != reservation.committed_tokens
-            || !reservation.committed_tokens.is_multiple_of(self.page_size)
-        {
-            *references -= 1;
-            return Err(CacheError::InvalidTransition(
-                "shared pages may only extend a committed page-aligned prefix",
-            ));
-        }
-        reservation.pages.push(page);
+        reservation.pages.insert(logical_page, page);
         reservation.committed_tokens = reservation
             .committed_tokens
             .checked_add(self.page_size)
@@ -554,10 +578,7 @@ impl PageManager {
 
     /// Releases pages in reverse logical order. Repeated terminal release is a
     /// no-op so the terminal ledger can remain idempotent.
-    pub(crate) fn release_sequence(
-        &mut self,
-        sequence: SequenceId,
-    ) -> Result<bool, CacheError> {
+    pub(crate) fn release_sequence(&mut self, sequence: SequenceId) -> Result<bool, CacheError> {
         let Some(reservation) = self.reservations.remove(&sequence) else {
             return Ok(false);
         };
@@ -599,6 +620,7 @@ impl PageManager {
             sequence_lengths: vec![0; rows.len()],
             active_rows: vec![false; rows.len()],
             table_width,
+            sequence_ids: rows.to_vec(),
         };
         for (row, sequence) in rows.iter().enumerate() {
             let Some(sequence) = sequence else {
@@ -608,8 +630,7 @@ impl PageManager {
                 .reservations
                 .get(sequence)
                 .ok_or(CacheError::UnknownSequence(*sequence))?;
-            let used_pages = div_ceil(reservation.tentative_tokens, self.page_size)?;
-            if used_pages > table_width || used_pages != reservation.pages.len() {
+            if reservation.pages.len() > table_width {
                 return Err(CacheError::InvalidMetadata(
                     "sequence does not fit the selected block-table width",
                 ));
@@ -634,6 +655,7 @@ impl PageManager {
         let rows = metadata.active_rows.len();
         if metadata.table_width == 0
             || metadata.sequence_lengths.len() != rows
+            || metadata.sequence_ids.len() != rows
             || metadata.block_tables.len()
                 != rows
                     .checked_mul(metadata.table_width)
@@ -645,9 +667,13 @@ impl PageManager {
         }
         for row in 0..rows {
             let length = metadata.sequence_lengths[row];
-            if length < 0 || (!metadata.active_rows[row] && length != 0) {
+            let sequence = metadata.sequence_ids[row];
+            if metadata.active_rows[row] != sequence.is_some()
+                || length < 0
+                || (!metadata.active_rows[row] && length != 0)
+            {
                 return Err(CacheError::InvalidMetadata(
-                    "inactive rows must have zero nonnegative length",
+                    "row identity, activity, and nonnegative length disagree",
                 ));
             }
             let used = if metadata.active_rows[row] {
@@ -662,16 +688,32 @@ impl PageManager {
             }
             for column in 0..metadata.table_width {
                 let page = metadata.block_tables[row * metadata.table_width + column];
-                if column >= used {
+                if !metadata.active_rows[row] {
                     if page != -1 {
                         return Err(CacheError::InvalidMetadata(
-                            "unused block-table slots must contain -1",
+                            "inactive rows must not carry assigned pages",
                         ));
                     }
                     continue;
                 }
+                let expected = self
+                    .reservations
+                    .get(&sequence.expect("active row identity was checked"))
+                    .and_then(|reservation| reservation.pages.get(column))
+                    .map(|page| i32::try_from(page.as_u32()))
+                    .transpose()
+                    .map_err(|_| CacheError::InvalidMetadata("physical page ID exceeds I32"))?
+                    .unwrap_or(-1);
+                if page != expected {
+                    return Err(CacheError::InvalidMetadata(
+                        "block table differs from the sequence reservation",
+                    ));
+                }
+                if column >= used && page == -1 {
+                    continue;
+                }
                 let page = usize::try_from(page).map_err(|_| {
-                    CacheError::InvalidMetadata("used block-table page ID is negative")
+                    CacheError::InvalidMetadata("assigned block-table page ID is negative")
                 })?;
                 if page >= self.descriptors.len()
                     || matches!(self.descriptors[page], PageState::Free)
@@ -703,7 +745,23 @@ impl PageManager {
             }
         }
         for reservation in self.reservations.values() {
-            stats.reserved_unallocated_pages += reservation.remaining_pages;
+            let visible_pages =
+                div_ceil(reservation.tentative_tokens, self.page_size).unwrap_or(usize::MAX);
+            let used_private = reservation
+                .pages
+                .iter()
+                .take(visible_pages)
+                .filter(|page| {
+                    matches!(
+                        self.descriptors[page.as_usize()],
+                        PageState::Private {
+                            tentative,
+                            ..
+                        } if tentative != 0
+                    )
+                })
+                .count();
+            stats.reserved_future_pages += reservation.total_pages.saturating_sub(used_private);
             stats.committed_tokens += reservation.committed_tokens;
             stats.tentative_tokens += reservation.tentative_tokens;
         }
@@ -721,10 +779,7 @@ impl PageManager {
         Ok((reservation.committed_tokens, reservation.tentative_tokens))
     }
 
-    pub(crate) fn page_table(
-        &self,
-        sequence: SequenceId,
-    ) -> Result<&[PageId], CacheError> {
+    pub(crate) fn page_table(&self, sequence: SequenceId) -> Result<&[PageId], CacheError> {
         self.reservations
             .get(&sequence)
             .map(|reservation| reservation.pages.as_slice())
@@ -732,12 +787,7 @@ impl PageManager {
     }
 
     fn unclaimed_pages(&self) -> usize {
-        let reserved = self
-            .reservations
-            .values()
-            .map(|reservation| reservation.remaining_pages)
-            .sum::<usize>();
-        self.free.len().saturating_sub(reserved)
+        self.free.len()
     }
 
     fn require_sequence(&self, sequence: SequenceId) -> Result<(), CacheError> {
@@ -747,67 +797,34 @@ impl PageManager {
             .ok_or(CacheError::UnknownSequence(sequence))
     }
 
-    fn allocate_private(&mut self, sequence: SequenceId) -> Result<PageId, CacheError> {
-        let reservation = self
-            .reservations
-            .get_mut(&sequence)
-            .ok_or(CacheError::UnknownSequence(sequence))?;
-        if reservation.remaining_pages == 0 {
-            return Err(CacheError::ReservationExhausted(sequence));
-        }
-        let page = self.free.pop_front().ok_or(CacheError::InvalidTransition(
-            "reserved cache page is unexpectedly unavailable",
-        ))?;
-        reservation.remaining_pages -= 1;
-        reservation.pages.push(page);
-        self.descriptors[page.as_usize()] = PageState::Private {
-            owner: sequence,
-            committed: 0,
-            tentative: 0,
-        };
-        Ok(page)
-    }
-
     fn shrink_private_tail(
         &mut self,
         sequence: SequenceId,
         tentative_tokens: usize,
         committed_tokens: usize,
     ) -> Result<(), CacheError> {
-        let keep_pages = div_ceil(tentative_tokens, self.page_size)?;
-        let current_pages = self
+        let visible_pages = div_ceil(tentative_tokens, self.page_size)?;
+        let pages = self
             .reservations
             .get(&sequence)
             .ok_or(CacheError::UnknownSequence(sequence))?
             .pages
-            .len();
-        if keep_pages > current_pages || committed_tokens > tentative_tokens {
+            .clone();
+        if visible_pages > pages.len() || committed_tokens > tentative_tokens {
             return Err(CacheError::InvalidTransition(
                 "rollback lengths exceed the current cache state",
             ));
         }
-        while self.reservations.get(&sequence).unwrap().pages.len() > keep_pages {
-            let page = self.reservations.get_mut(&sequence).unwrap().pages.pop().unwrap();
-            match self.descriptors[page.as_usize()] {
-                PageState::Private { owner, .. } if owner == sequence => {
-                    self.free_page(page);
-                    self.reservations.get_mut(&sequence).unwrap().remaining_pages += 1;
-                }
-                _ => {
-                    return Err(CacheError::InvalidTransition(
-                        "rollback may release only private tail pages",
-                    ));
-                }
-            }
-        }
-        if keep_pages != 0 {
-            let page = self.reservations[&sequence].pages[keep_pages - 1];
-            let tentative_in_page = nonzero_tail(tentative_tokens, self.page_size);
-            let committed_in_page = if committed_tokens / self.page_size == keep_pages - 1 {
-                nonzero_tail(committed_tokens, self.page_size)
-            } else {
-                self.page_size
-            };
+        for (logical_page, page) in pages.into_iter().enumerate() {
+            let page_start = logical_page
+                .checked_mul(self.page_size)
+                .ok_or(CacheError::ArithmeticOverflow)?;
+            let tentative_in_page = tentative_tokens
+                .saturating_sub(page_start)
+                .min(self.page_size);
+            let committed_in_page = committed_tokens
+                .saturating_sub(page_start)
+                .min(self.page_size);
             match &mut self.descriptors[page.as_usize()] {
                 PageState::Private {
                     owner,
@@ -832,7 +849,7 @@ impl PageManager {
         let reservation = self.reservations.get_mut(&sequence).unwrap();
         reservation.committed_tokens = committed_tokens;
         reservation.tentative_tokens = tentative_tokens;
-        debug_assert!(reservation.remaining_pages <= reservation.total_pages);
+        debug_assert!(reservation.pages.len() >= reservation.total_pages);
         Ok(())
     }
 
@@ -880,12 +897,14 @@ mod tests {
         assert_eq!(plan.physical_pages(), 101);
         assert_eq!(plan.arena_bytes(), 786_432 * 101);
         assert_eq!(plan.geometry(), geometry);
-        assert!(plan
-            .verify_remaining_bytes(plan.required_remaining_bytes().unwrap())
-            .is_ok());
-        assert!(plan
-            .verify_remaining_bytes(plan.required_remaining_bytes().unwrap() - 1)
-            .is_err());
+        assert!(
+            plan.verify_remaining_bytes(plan.required_remaining_bytes().unwrap())
+                .is_ok()
+        );
+        assert!(
+            plan.verify_remaining_bytes(plan.required_remaining_bytes().unwrap() - 1)
+                .is_err()
+        );
     }
 
     #[test]
@@ -894,12 +913,21 @@ mod tests {
         let first = SequenceId::new(1);
         let second = SequenceId::new(2);
         manager.reserve_tokens(first, 32).unwrap();
+        let assigned_before_write = manager.page_table(first).unwrap().to_vec();
+        assert_eq!(assigned_before_write.len(), 2);
+        assert_eq!(manager.stats().free_pages, 6);
         manager.append_committed(first, 32).unwrap();
+        assert_eq!(manager.page_table(first).unwrap(), assigned_before_write);
         assert_eq!(manager.seal_complete_pages(first).unwrap(), 2);
         let shared = manager.page_table(first).unwrap()[0];
 
         manager.reserve_pages(second, 1).unwrap();
+        let private_future = manager.page_table(second).unwrap()[0];
         manager.share_sealed(second, shared).unwrap();
+        assert_eq!(
+            manager.page_table(second).unwrap(),
+            &[shared, private_future]
+        );
         manager.append_committed(second, 8).unwrap();
         let checkpoint = manager.checkpoint(second).unwrap();
         manager.append_tentative(second, 8).unwrap();
@@ -1004,7 +1032,7 @@ mod tests {
             let stats = manager.stats();
             let expected_allocated = reference
                 .values()
-                .map(|state| div_ceil(state.tentative, TARGET_PAGE_SIZE).unwrap())
+                .map(|state| state.capacity_tokens / TARGET_PAGE_SIZE)
                 .sum::<usize>();
             let expected_credits = reference
                 .values()
@@ -1015,7 +1043,7 @@ mod tests {
                 .sum::<usize>();
             assert_eq!(stats.private_pages, expected_allocated);
             assert_eq!(stats.free_pages, 64 - expected_allocated);
-            assert_eq!(stats.reserved_unallocated_pages, expected_credits);
+            assert_eq!(stats.reserved_future_pages, expected_credits);
             assert_eq!(
                 stats.committed_tokens,
                 reference

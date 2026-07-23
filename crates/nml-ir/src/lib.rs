@@ -1450,8 +1450,7 @@ impl ProgramBuilder {
                     down_bias,
                 ),
             (RepresentationSpec::NvFp4(_), RepresentationSpec::NvFp4(_)) => {
-                let assignment_plan =
-                    self.moe_assignment_plan(expert_ids, expert_count, 16)?;
+                let assignment_plan = self.moe_assignment_plan(expert_ids, expert_count, 16)?;
                 let [gate_payload, gate_scales, gate_global] =
                     require_nvfp4_components(gate_up_weights)?;
                 let [down_payload, down_scales, down_global] =
@@ -1490,11 +1489,8 @@ impl ProgramBuilder {
             )),
         }?;
         if let Some(active_tokens) = active_tokens {
-            let active_output = self.broadcast_in_dim(
-                active_tokens,
-                result.shape.with_dtype(DType::Bool),
-                &[0],
-            )?;
+            let active_output =
+                self.broadcast_in_dim(active_tokens, result.shape.with_dtype(DType::Bool), &[0])?;
             let zero = self.scalar_for(result.shape.dtype(), 0.0)?;
             self.select(active_output, result, zero)
         } else {
@@ -2741,11 +2737,7 @@ impl ProgramBuilder {
     /// callers describe only changed ranges, while the backend receives one
     /// sorted, unique scatter instead of a chain of whole-buffer rebuilds.
     /// Patches may be supplied in any order but must not overlap.
-    pub fn patch_1d(
-        &mut self,
-        input: Tensor,
-        patches: &[(i64, Tensor)],
-    ) -> Result<Tensor, Error> {
+    pub fn patch_1d(&mut self, input: Tensor, patches: &[(i64, Tensor)]) -> Result<Tensor, Error> {
         self.require_local(input)?;
         if input.shape.rank() != 1 {
             return Err(Error::RankMismatch {
@@ -3935,7 +3927,8 @@ impl ProgramBuilder {
     ///
     /// The contract is intentionally rank-two: logits are `[B,V]`, states are
     /// `[B,2]`, and each control/active mask is `[B]`. A statically bounded row
-    /// loop emits one RNG chain per row, so inserting, removing, or padding a
+    /// vectorized candidate/filter pipeline is shared by the batch. Only the
+    /// explicit RNG chain remains per row, so inserting, removing, or padding a
     /// different row cannot perturb another row's random stream. Inactive rows
     /// preserve their input state exactly and return `-1` as the token sentinel.
     #[allow(clippy::too_many_arguments)]
@@ -3984,7 +3977,10 @@ impl ProgramBuilder {
             }
         }
         for (tensor, message) in [
-            (temperature, "batched temperature must be floating-point [B]"),
+            (
+                temperature,
+                "batched temperature must be floating-point [B]",
+            ),
             (top_p, "batched top-p must be floating-point [B]"),
             (min_p, "batched min-p must be floating-point [B]"),
         ] {
@@ -4003,7 +3999,72 @@ impl ProgramBuilder {
             ));
         }
 
-        let scalar_i32 = Shape::new(DType::I32, &[])?;
+        let candidate_axis = 1;
+        let (values, original_indices) = self.top_k(logits, candidate_axis, maximum_top_k, true)?;
+        let values = if matches!(values.shape.dtype(), DType::F16 | DType::Bf16) {
+            self.convert(values, DType::F32)?
+        } else {
+            values
+        };
+        let candidate_shape = values.shape;
+        let control_shape = Shape::new(values.shape.dtype(), &[batch, 1])?;
+        let control_grid = Shape::new(values.shape.dtype(), &[batch, maximum_top_k as i64])?;
+        let index_control_shape = Shape::new(DType::I32, &[batch, 1])?;
+        let index_grid = Shape::new(DType::I32, &[batch, maximum_top_k as i64])?;
+
+        let one_i32 = self.scalar(1_i32)?;
+        let maximum_i32 = self.scalar(maximum_top_k as i32)?;
+        let top_k = self.maximum(top_k, one_i32)?;
+        let top_k = self.minimum(top_k, maximum_i32)?;
+        let top_k = self.reshape(top_k, index_control_shape)?;
+        let top_k = self.broadcast_in_dim(top_k, index_grid, &[0, 1])?;
+        let candidate_indices = self.iota(index_grid, candidate_axis)?;
+        let outside_top_k = self.greater_equal(candidate_indices, top_k)?;
+
+        let dtype = values.shape.dtype();
+        let epsilon = self.scalar_for(
+            dtype,
+            if dtype == DType::F64 {
+                f64::EPSILON
+            } else {
+                f64::from(f32::EPSILON)
+            },
+        )?;
+        let one = self.scalar_for(dtype, 1.0)?;
+        let zero = self.scalar_for(dtype, 0.0)?;
+        let temperature = self.convert(temperature, dtype)?;
+        let temperature = self.maximum(temperature, epsilon)?;
+        let temperature = self.reshape(temperature, control_shape)?;
+        let temperature = self.broadcast_in_dim(temperature, control_grid, &[0, 1])?;
+        let top_p = self.convert(top_p, dtype)?;
+        let top_p = self.maximum(top_p, epsilon)?;
+        let top_p = self.minimum(top_p, one)?;
+        let top_p = self.reshape(top_p, control_shape)?;
+        let top_p = self.broadcast_in_dim(top_p, control_grid, &[0, 1])?;
+        let min_p = self.convert(min_p, dtype)?;
+        let min_p = self.maximum(min_p, zero)?;
+        let min_p = self.minimum(min_p, one)?;
+        let min_p = self.reshape(min_p, control_shape)?;
+        let min_p = self.broadcast_in_dim(min_p, control_grid, &[0, 1])?;
+
+        let negative_infinity = self.scalar_for(dtype, f64::NEG_INFINITY)?;
+        let filtered = self.select(outside_top_k, negative_infinity, values)?;
+        let filtered = self.divide(filtered, temperature)?;
+        let probabilities = self.softmax(filtered, candidate_axis)?;
+        let cumulative = self.cumulative_sum(probabilities, candidate_axis)?;
+        let cumulative_before = self.subtract(cumulative, probabilities)?;
+        let within_top_p = self.less(cumulative_before, top_p)?;
+        let maximum_probability = self.slice(probabilities, &[0, 0], &[batch, 1], &[1, 1])?;
+        let row_min_p = self.slice(min_p, &[0, 0], &[batch, 1], &[1, 1])?;
+        let threshold = self.multiply(maximum_probability, row_min_p)?;
+        let threshold = self.broadcast_in_dim(threshold, candidate_shape, &[0, 1])?;
+        let above_min_p = self.greater_equal(probabilities, threshold)?;
+        let accepted = self.logical_and(within_top_p, above_min_p)?;
+        let zero_i32 = self.scalar(0_i32)?;
+        let first = self.equal(candidate_indices, zero_i32)?;
+        let accepted = self.logical_or(accepted, first)?;
+        let filtered = self.select(accepted, filtered, negative_infinity)?;
+
         let scalar_bool = Shape::new(DType::Bool, &[])?;
         let state_shape = Shape::new(DType::U64, &[2])?;
         let row_state_shape = Shape::new(DType::U64, &[1, 2])?;
@@ -4012,34 +4073,29 @@ impl ProgramBuilder {
         let mut next_states = Vec::with_capacity(batch as usize);
         let mut tokens = Vec::with_capacity(batch as usize);
         for row in 0..batch {
-            let row_logits = self.slice(logits, &[row, 0], &[row + 1, vocabulary], &[1, 1])?;
             let input_state = self.slice(states, &[row, 0], &[row + 1, 2], &[1, 1])?;
             let input_state = self.reshape(input_state, state_shape)?;
-            let row_top_k = self.slice(top_k, &[row], &[row + 1], &[1])?;
-            let row_top_k = self.reshape(row_top_k, scalar_i32)?;
-            let row_temperature = self.slice(temperature, &[row], &[row + 1], &[1])?;
-            let row_temperature = self.reshape(
-                row_temperature,
-                Shape::new(temperature.shape.dtype(), &[])?,
-            )?;
-            let row_top_p = self.slice(top_p, &[row], &[row + 1], &[1])?;
-            let row_top_p = self.reshape(row_top_p, Shape::new(top_p.shape.dtype(), &[])?)?;
-            let row_min_p = self.slice(min_p, &[row], &[row + 1], &[1])?;
-            let row_min_p = self.reshape(row_min_p, Shape::new(min_p.shape.dtype(), &[])?)?;
             let active = self.slice(active_rows, &[row], &[row + 1], &[1])?;
             let active = self.reshape(active, scalar_bool)?;
 
             let random = self.random_state(input_state)?;
-            let (next_state, token) = self.sample_tokens_dynamic(
-                row_logits,
-                random,
-                1,
-                row_top_k,
-                row_temperature,
-                row_top_p,
-                row_min_p,
-                maximum_top_k,
+            let row_filtered = self.slice(
+                filtered,
+                &[row, 0],
+                &[row + 1, maximum_top_k as i64],
+                &[1, 1],
             )?;
+            let (next_state, noise) = self.random_gumbel(random, row_filtered.shape)?;
+            let scored = self.add(row_filtered, noise)?;
+            let (_, selected) = self.argmax(scored, candidate_axis)?;
+            let selected = self.insert_axis(selected, 1, AxisTag::UNKNOWN)?;
+            let row_indices = self.slice(
+                original_indices,
+                &[row, 0],
+                &[row + 1, maximum_top_k as i64],
+                &[1, 1],
+            )?;
+            let token = self.gather_batched_nd(row_indices, selected, 1, &[candidate_axis])?;
             let next_state = self.select(active, next_state.into_tensor(), input_state)?;
             let token = self.select(active, token, sentinel)?;
             next_states.push(self.reshape(next_state, row_state_shape)?);
@@ -4580,9 +4636,10 @@ impl ProgramBuilder {
         )?;
         let physical_pages_for_updates =
             self.gather_batched_nd(block_tables, logical_indices, 1, &[1])?;
-        let sentinel = self.scalar(i32::try_from(*physical_pages).map_err(|_| {
-            Error::InvalidIndexing("physical page count exceeds the I32 domain")
-        })?)?;
+        let sentinel =
+            self.scalar(i32::try_from(*physical_pages).map_err(|_| {
+                Error::InvalidIndexing("physical page count exceeds the I32 domain")
+            })?)?;
         let physical_pages_for_updates =
             self.select(enabled, physical_pages_for_updates, sentinel)?;
         let offsets = self.select(enabled, offsets, zero)?;
@@ -4590,10 +4647,7 @@ impl ProgramBuilder {
             physical_pages_for_updates,
             Shape::new(DType::I32, &[*batch, *query, 1])?,
         )?;
-        let offsets = self.reshape(
-            offsets,
-            Shape::new(DType::I32, &[*batch, *query, 1])?,
-        )?;
+        let offsets = self.reshape(offsets, Shape::new(DType::I32, &[*batch, *query, 1])?)?;
         let indices = self.concatenate(&[physical_pages_for_updates, offsets], 2)?;
         self.scatter_update(cache, indices, updates, &[0, 1])
     }
@@ -5654,10 +5708,10 @@ impl ProgramBuilder {
                 &[block_size_i64 - 1],
                 &[block_size_i64 - 1],
             )?;
-            let active_blocks =
-                self.scalar(i32::try_from(assignments).map_err(|_| {
-                    Error::InvalidMoe("active expert block count must fit I32")
-                })?)?;
+            let active_blocks = self.scalar(
+                i32::try_from(assignments)
+                    .map_err(|_| Error::InvalidMoe("active expert block count must fit I32"))?,
+            )?;
             return Ok(MoeAssignmentPlan {
                 sorted_assignments,
                 block_experts: flat_ids,
@@ -7210,8 +7264,7 @@ impl Program {
                     && matches!(
                         self.values[*key_cache].shape.dtype(),
                         DType::F16 | DType::Bf16 | DType::F32
-                    )
-                {
+                    ) {
                     paged_cache_update::lower_triton(
                         context,
                         &mut block,

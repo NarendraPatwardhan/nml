@@ -1,11 +1,13 @@
 //! Dedicated model/PJRT owner and bounded Tokio-facing command boundary.
 
-use super::contracts::{CancelReason, EngineError, EngineErrorCode, PreparedInferenceRequest, RequestId};
+use super::contracts::{
+    CancelReason, EngineError, EngineErrorCode, PreparedInferenceRequest, RequestId,
+};
 use super::metrics::Metrics;
 use super::scheduler::{BatchItem, BatchSubmission, Scheduler, SchedulerConfig};
+use crate::Error;
 use crate::gpt_oss::protocol::HarmonyProtocol;
 use crate::gpt_oss::{Generator, RawToken, ServerSession};
-use crate::Error;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
@@ -221,11 +223,7 @@ pub(crate) fn spawn(
                     max_prefill_chunk: profile.max_prefill_chunk,
                     max_prefill_wait: profile.max_prefill_wait,
                 };
-                let generator = Generator::load_server(
-                    &platform,
-                    &model,
-                    &profile,
-                )?;
+                let generator = Generator::load_server(&platform, &model, &profile)?;
                 let protocol = generator.protocol();
                 *protocol_for_thread
                     .write()
@@ -304,6 +302,7 @@ fn run_loop(
     scheduler_config: SchedulerConfig,
     metrics: Metrics,
 ) {
+    let idle_prefill_formation_window = scheduler_config.idle_prefill_formation_window();
     let mut queue = VecDeque::<Pending>::new();
     let mut active = BTreeMap::<super::contracts::SequenceId, Active>::new();
     let mut scheduler = match Scheduler::new(scheduler_config) {
@@ -359,12 +358,7 @@ fn run_loop(
             return;
         }
 
-        cancel_expired(
-            &mut generator,
-            &mut active,
-            &mut scheduler,
-            &mut snapshot,
-        );
+        cancel_expired(&mut generator, &mut active, &mut scheduler, &mut snapshot);
         admit_pending(
             &mut generator,
             &mut queue,
@@ -436,6 +430,7 @@ fn run_loop(
         }
         match commands.blocking_recv() {
             Some(command) => {
+                let may_form_prefill_batch = matches!(command, EngineCommand::Submit { .. });
                 let _ = handle_command(
                     &mut generator,
                     command,
@@ -447,6 +442,15 @@ fn run_loop(
                     &mut shutdown_reply,
                     readiness,
                 );
+                // The engine had no runnable work, so give concurrently
+                // arriving requests one tiny opportunity to join the same
+                // prefill family. The normal command drain consumes them at
+                // the top of the next iteration. This branch is unreachable
+                // while any decode row is active.
+                if may_form_prefill_batch && !idle_prefill_formation_window.is_zero() {
+                    metrics.idle_prefill_formation.inc();
+                    std::thread::park_timeout(idle_prefill_formation_window);
+                }
             }
             None => {
                 cancel_everything(
@@ -500,10 +504,13 @@ fn handle_command(
                 .iter()
                 .find_map(|(sequence, request)| (request.id == id).then_some(*sequence))
             {
-                let request = active.remove(&sequence).expect("located active request exists");
+                let request = active
+                    .remove(&sequence)
+                    .expect("located active request exists");
                 let _ = scheduler.cancel(sequence);
                 cancel_active(generator, request, reason, snapshot);
-            } else if let Some(index) = queue.iter().position(|request| request.request.id() == id) {
+            } else if let Some(index) = queue.iter().position(|request| request.request.id() == id)
+            {
                 let request = queue.remove(index).expect("located queued request exists");
                 let _ = request.events.try_send(EngineEvent::Cancelled(reason));
                 snapshot.cancelled += 1;
@@ -515,7 +522,7 @@ fn handle_command(
             let cache = generator.cache_stats();
             snapshot.cache_total_pages = cache.total_pages;
             snapshot.cache_free_pages = cache.free_pages;
-            snapshot.cache_reserved_pages = cache.reserved_unallocated_pages;
+            snapshot.cache_reserved_pages = cache.reserved_future_pages;
             let _ = reply.send(*snapshot);
         }
         EngineCommand::Shutdown { reply } => {
@@ -585,10 +592,12 @@ fn admit_pending(
                     queue.push_front(pending);
                     return;
                 }
-                let _ = pending.events.try_send(EngineEvent::Failed(EngineError::new(
-                    EngineErrorCode::ExecutionFailed,
-                    error.to_string(),
-                )));
+                let _ = pending
+                    .events
+                    .try_send(EngineEvent::Failed(EngineError::new(
+                        EngineErrorCode::ExecutionFailed,
+                        error.to_string(),
+                    )));
                 snapshot.failed += 1;
                 continue;
             }
@@ -600,7 +609,11 @@ fn admit_pending(
                 stopped: false,
             };
             let _ = generator.release_server_session(&mut session);
-            if pending.events.try_send(EngineEvent::Complete(completion)).is_ok() {
+            if pending
+                .events
+                .try_send(EngineEvent::Complete(completion))
+                .is_ok()
+            {
                 snapshot.completed += 1;
             } else {
                 snapshot.cancelled += 1;
@@ -618,20 +631,25 @@ fn admit_pending(
             .and_then(|_| scheduler.admit_reserved(sequence, now));
         if let Err(error) = scheduled {
             let _ = generator.release_server_session(&mut session);
-            let _ = pending.events.try_send(EngineEvent::Failed(EngineError::new(
-                EngineErrorCode::ExecutionFailed,
-                error.to_string(),
-            )));
+            let _ = pending
+                .events
+                .try_send(EngineEvent::Failed(EngineError::new(
+                    EngineErrorCode::ExecutionFailed,
+                    error.to_string(),
+                )));
             snapshot.failed += 1;
             continue;
         }
-        active.insert(sequence, Active {
-            id: pending.request.id(),
-            deadline: pending.request.deadline(),
-            cancellation: pending.cancellation,
-            events: pending.events,
-            session,
-        });
+        active.insert(
+            sequence,
+            Active {
+                id: pending.request.id(),
+                deadline: pending.request.deadline(),
+                cancellation: pending.cancellation,
+                events: pending.events,
+                session,
+            },
+        );
     }
 }
 
@@ -725,6 +743,7 @@ fn execute_stable_decode(
     loop {
         metrics.decode_batch_rows.observe(rows.len() as f64);
         let started = Instant::now();
+        let rebinds_before = generator.stable_decode_rebinds();
         let result = {
             let mut sessions = rows
                 .iter_mut()
@@ -732,19 +751,18 @@ fn execute_stable_decode(
                 .collect::<Vec<_>>();
             generator.decode_batch(&mut sessions, submission.family_capacity)
         };
+        metrics.decode_metadata_rebinds.inc_by(
+            generator
+                .stable_decode_rebinds()
+                .saturating_sub(rebinds_before),
+        );
         metrics
             .decode_batch_seconds
             .observe(started.elapsed().as_secs_f64());
         let raw = match result {
             Ok(raw) => raw,
             Err(error) => {
-                fail_rows(
-                    generator,
-                    scheduler,
-                    rows,
-                    error.to_string(),
-                    snapshot,
-                );
+                fail_rows(generator, scheduler, rows, error.to_string(), snapshot);
                 return;
             }
         };
@@ -841,6 +859,7 @@ fn execute_decode(
     };
     metrics.decode_batch_rows.observe(rows.len() as f64);
     let started = Instant::now();
+    let rebinds_before = generator.stable_decode_rebinds();
     let result = {
         let mut sessions = rows
             .iter_mut()
@@ -848,6 +867,11 @@ fn execute_decode(
             .collect::<Vec<_>>();
         generator.decode_batch(&mut sessions, submission.family_capacity)
     };
+    metrics.decode_metadata_rebinds.inc_by(
+        generator
+            .stable_decode_rebinds()
+            .saturating_sub(rebinds_before),
+    );
     metrics
         .decode_batch_seconds
         .observe(started.elapsed().as_secs_f64());
@@ -901,7 +925,11 @@ fn execute_prefill(
             return;
         }
     };
-    let chunks = submission.items.iter().map(|item| item.tokens).collect::<Vec<_>>();
+    let chunks = submission
+        .items
+        .iter()
+        .map(|item| item.tokens)
+        .collect::<Vec<_>>();
     metrics.prefill_batch_rows.observe(rows.len() as f64);
     metrics
         .prefill_batch_tokens
@@ -976,7 +1004,11 @@ fn complete_active(
             error.to_string(),
         )));
         snapshot.failed += 1;
-    } else if active.events.try_send(EngineEvent::Complete(completion)).is_ok() {
+    } else if active
+        .events
+        .try_send(EngineEvent::Complete(completion))
+        .is_ok()
+    {
         snapshot.completed += 1;
     } else {
         snapshot.cancelled += 1;
@@ -993,10 +1025,12 @@ fn fail_rows(
     for mut request in rows {
         let _ = scheduler.cancel(request.session.sequence());
         let _ = generator.release_server_session(&mut request.session);
-        let _ = request.events.try_send(EngineEvent::Failed(EngineError::new(
-            EngineErrorCode::ExecutionFailed,
-            message.clone(),
-        )));
+        let _ = request
+            .events
+            .try_send(EngineEvent::Failed(EngineError::new(
+                EngineErrorCode::ExecutionFailed,
+                message.clone(),
+            )));
         snapshot.failed += 1;
     }
 }
@@ -1031,10 +1065,12 @@ fn fail_everything(
     let rows = std::mem::take(active).into_values().collect();
     fail_rows(generator, scheduler, rows, message.clone(), snapshot);
     for pending in queue.drain(..) {
-        let _ = pending.events.try_send(EngineEvent::Failed(EngineError::new(
-            EngineErrorCode::ExecutionFailed,
-            message.clone(),
-        )));
+        let _ = pending
+            .events
+            .try_send(EngineEvent::Failed(EngineError::new(
+                EngineErrorCode::ExecutionFailed,
+                message.clone(),
+            )));
         snapshot.failed += 1;
     }
 }

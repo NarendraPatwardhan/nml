@@ -121,10 +121,7 @@ fn nvfp4_decode_qkv_is_one_sm8x_launch_without_changing_portable_semantics() {
         let (key_weight, key_bias) = projection("key", 8);
         let (value_weight, value_bias) = projection("value", 8);
         let mut builder = ProgramBuilder::new();
-        let input = builder.input(
-            "hidden",
-            Shape::new(DType::Bf16, &[1, rows, 16]).unwrap(),
-        );
+        let input = builder.input("hidden", Shape::new(DType::Bf16, &[1, rows, 16]).unwrap());
         let (query, key, value) = builder
             .linear_qkv(
                 input,
@@ -142,29 +139,17 @@ fn nvfp4_decode_qkv_is_one_sm8x_launch_without_changing_portable_semantics() {
     let decode = program(1);
     let context = Context::new();
     let sm86 = decode
-        .module_with_sharding_cuda(
-            &context,
-            &nml_sharding::Sharding::single(),
-            84,
-            8,
-            6,
-        )
+        .module_with_sharding_cuda(&context, &nml_sharding::Sharding::single(), 84, 8, 6)
         .unwrap();
     sm86.verify().unwrap();
     let sm86 = sm86.text();
     assert_eq!(sm86.matches("__gpu$xla.gpu.triton").count(), 1, "{sm86}");
-    assert!(sm86.contains("nvfp4_qkv_gemv"), "{sm86}");
+    assert!(sm86.contains("nvfp4_qkv_gemv_m1_n8_k128"), "{sm86}");
     assert!(!sm86.contains("nvfp4_linear_gemv"), "{sm86}");
 
     let context = Context::new();
     let sm75 = decode
-        .module_with_sharding_cuda(
-            &context,
-            &nml_sharding::Sharding::single(),
-            40,
-            7,
-            5,
-        )
+        .module_with_sharding_cuda(&context, &nml_sharding::Sharding::single(), 40, 7, 5)
         .unwrap();
     sm75.verify().unwrap();
     let sm75 = sm75.text();
@@ -172,18 +157,16 @@ fn nvfp4_decode_qkv_is_one_sm8x_launch_without_changing_portable_semantics() {
     assert!(!sm75.contains("nvfp4_qkv_gemv"), "{sm75}");
 
     let portable = decode.stablehlo().unwrap();
-    assert_eq!(portable.matches("nml.nvfp4.linear").count(), 3, "{portable}");
+    assert_eq!(
+        portable.matches("nml.nvfp4.linear").count(),
+        3,
+        "{portable}"
+    );
     assert!(!portable.contains("nvfp4_qkv_gemv"), "{portable}");
 
     let context = Context::new();
     let small_batch = program(8)
-        .module_with_sharding_cuda(
-            &context,
-            &nml_sharding::Sharding::single(),
-            84,
-            8,
-            6,
-        )
+        .module_with_sharding_cuda(&context, &nml_sharding::Sharding::single(), 84, 8, 6)
         .unwrap();
     small_batch.verify().unwrap();
     let small_batch = small_batch.text();
@@ -192,21 +175,22 @@ fn nvfp4_decode_qkv_is_one_sm8x_launch_without_changing_portable_semantics() {
         1,
         "{small_batch}"
     );
-    assert!(small_batch.contains("nvfp4_qkv_gemv"), "{small_batch}");
+    assert!(
+        small_batch.contains("nvfp4_qkv_gemv_m2_n8_k128"),
+        "{small_batch}"
+    );
 
     let context = Context::new();
     let prefill = program(16)
-        .module_with_sharding_cuda(
-            &context,
-            &nml_sharding::Sharding::single(),
-            84,
-            8,
-            6,
-        )
+        .module_with_sharding_cuda(&context, &nml_sharding::Sharding::single(), 84, 8, 6)
         .unwrap();
     prefill.verify().unwrap();
     let prefill = prefill.text();
-    assert_eq!(prefill.matches("__gpu$xla.gpu.triton").count(), 3, "{prefill}");
+    assert_eq!(
+        prefill.matches("__gpu$xla.gpu.triton").count(),
+        3,
+        "{prefill}"
+    );
     assert!(!prefill.contains("nvfp4_qkv_gemv"), "{prefill}");
 }
 
@@ -290,7 +274,7 @@ fn nvfp4_embedding_preserves_index_shape_and_decodes_only_selected_rows() {
         module.verify().unwrap();
         let text = module.text();
         assert_eq!(text.matches("__gpu$xla.gpu.triton").count(), 1, "{text}");
-        assert!(text.contains("nvfp4_embedding"), "{text}");
+        assert!(text.contains("nvfp4_embedding_m1_n32"), "{text}");
         assert!(!text.contains("nml.nvfp4.embedding"), "{text}");
         assert!(text.contains("tensor<6x17xf16>"), "{text}");
     }
@@ -423,20 +407,16 @@ fn masked_compact_moe_rejects_inactive_routes_before_expert_weights() {
     let down_bias = parameter("down_bias", Shape::new(DType::Bf16, &[8, 32]).unwrap());
     let output = builder
         .routed_clamped_swiglu_masked(
-            hidden,
-            router,
-            &gate,
-            &gate_bias,
-            &down,
-            &down_bias,
-            2,
-            active,
+            hidden, router, &gate, &gate_bias, &down, &down_bias, 2, active,
         )
         .unwrap();
     let program = builder.finish(&[output]).unwrap();
     let portable = program.stablehlo().unwrap();
     assert!(portable.contains("-1"), "{portable}");
-    assert!(portable.matches("stablehlo.select").count() >= 3, "{portable}");
+    assert!(
+        portable.matches("stablehlo.select").count() >= 3,
+        "{portable}"
+    );
     Context::new()
         .parse_module(&portable)
         .unwrap()
@@ -445,13 +425,7 @@ fn masked_compact_moe_rejects_inactive_routes_before_expert_weights() {
 
     let cuda_context = Context::new();
     let cuda = program
-        .module_with_sharding_cuda(
-            &cuda_context,
-            &nml_sharding::Sharding::single(),
-            108,
-            8,
-            6,
-        )
+        .module_with_sharding_cuda(&cuda_context, &nml_sharding::Sharding::single(), 108, 8, 6)
         .unwrap();
     cuda.verify().unwrap();
     let cuda = cuda.text();
@@ -510,6 +484,57 @@ fn decode_shaped_moe_launches_only_selected_expert_blocks() {
 }
 
 #[test]
+fn gpt_oss_prefill_moe_plan_tracks_routed_capacity_and_a40_parallelism() {
+    fn lower(tokens: i64) -> String {
+        let dtype = DType::Bf16;
+        let mut builder = ProgramBuilder::new();
+        let hidden = builder.input("hidden", Shape::new(dtype, &[tokens, 2_880]).unwrap());
+        let router = builder.input("router", Shape::new(DType::F32, &[tokens, 32]).unwrap());
+        let gate = Parameter::nvfp4(
+            "gate",
+            "model.gate",
+            Shape::new(dtype, &[32, 5_760, 2_880]).unwrap(),
+        )
+        .unwrap();
+        let gate_bias = parameter("gate_bias", Shape::new(dtype, &[32, 5_760]).unwrap());
+        let down = Parameter::nvfp4(
+            "down",
+            "model.down",
+            Shape::new(dtype, &[32, 2_880, 2_880]).unwrap(),
+        )
+        .unwrap();
+        let down_bias = parameter("down_bias", Shape::new(dtype, &[32, 2_880]).unwrap());
+        let output = builder
+            .routed_clamped_swiglu(hidden, router, &gate, &gate_bias, &down, &down_bias, 4)
+            .unwrap();
+        builder
+            .finish(&[output])
+            .unwrap()
+            .module_with_sharding_cuda(&Context::new(), &nml_sharding::Sharding::single(), 84, 8, 6)
+            .unwrap()
+            .text()
+    }
+
+    for tokens in [16, 128] {
+        let text = lower(tokens);
+        assert!(
+            text.contains("nvfp4_grouped_gate_up_m16_n64_k128"),
+            "Q{tokens}: {text}"
+        );
+        assert!(
+            text.contains("nvfp4_grouped_down_m16_n64_k128"),
+            "Q{tokens}: {text}"
+        );
+    }
+    let q256 = lower(256);
+    assert!(
+        q256.contains("nvfp4_grouped_gate_up_m16_n128_k64"),
+        "{q256}"
+    );
+    assert!(q256.contains("nvfp4_grouped_down_m16_n128_k64"), "{q256}");
+}
+
+#[test]
 fn masked_decode_shaped_moe_keeps_the_sparse_schedule() {
     let dtype = DType::Bf16;
     let mut builder = ProgramBuilder::new();
@@ -532,14 +557,7 @@ fn masked_decode_shaped_moe_keeps_the_sparse_schedule() {
     let down_bias = parameter("down_bias", Shape::new(dtype, &[32, 64]).unwrap());
     let output = builder
         .routed_clamped_swiglu_masked(
-            hidden,
-            router,
-            &gate,
-            &gate_bias,
-            &down,
-            &down_bias,
-            4,
-            active,
+            hidden, router, &gate, &gate_bias, &down, &down_bias, 4, active,
         )
         .unwrap();
     let program = builder.finish(&[output]).unwrap();
@@ -1511,10 +1529,23 @@ fn batched_sampling_has_one_independent_state_chain_per_row_and_masks_padding() 
         .unwrap()
         .stablehlo()
         .unwrap();
-    assert_eq!(text.matches("stablehlo.rng_bit_generator").count(), 3, "{text}");
+    assert_eq!(
+        text.matches("stablehlo.rng_bit_generator").count(),
+        3,
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("stablehlo.sort").count(),
+        1,
+        "candidate selection must be vectorized across rows: {text}"
+    );
     assert!(text.matches("stablehlo.select").count() >= 6, "{text}");
     assert!(text.contains("tf.aliasing_output"), "{text}");
-    Context::new().parse_module(&text).unwrap().verify().unwrap();
+    Context::new()
+        .parse_module(&text)
+        .unwrap()
+        .verify()
+        .unwrap();
 }
 
 #[test]
@@ -1772,27 +1803,13 @@ fn rope_and_ordinary_attention_are_verified_compositions() {
 #[test]
 fn paged_cache_update_is_one_masked_in_place_scatter() {
     let mut builder = ProgramBuilder::new();
-    let cache = builder.input(
-        "cache",
-        Shape::new(DType::F32, &[5, 4, 2, 3]).unwrap(),
-    );
-    let updates = builder.input(
-        "updates",
-        Shape::new(DType::F32, &[2, 3, 2, 3]).unwrap(),
-    );
-    let block_tables = builder.input(
-        "block_tables",
-        Shape::new(DType::I32, &[2, 3]).unwrap(),
-    );
-    let start_positions =
-        builder.input("start_positions", Shape::new(DType::I32, &[2]).unwrap());
-    let query_lengths =
-        builder.input("query_lengths", Shape::new(DType::I32, &[2]).unwrap());
+    let cache = builder.input("cache", Shape::new(DType::F32, &[5, 4, 2, 3]).unwrap());
+    let updates = builder.input("updates", Shape::new(DType::F32, &[2, 3, 2, 3]).unwrap());
+    let block_tables = builder.input("block_tables", Shape::new(DType::I32, &[2, 3]).unwrap());
+    let start_positions = builder.input("start_positions", Shape::new(DType::I32, &[2]).unwrap());
+    let query_lengths = builder.input("query_lengths", Shape::new(DType::I32, &[2]).unwrap());
     let active_rows = builder.input("active_rows", Shape::new(DType::Bool, &[2]).unwrap());
-    let write_mask = builder.input(
-        "write_mask",
-        Shape::new(DType::Bool, &[2, 3]).unwrap(),
-    );
+    let write_mask = builder.input("write_mask", Shape::new(DType::Bool, &[2, 3]).unwrap());
     let updated = builder
         .paged_cache_update(
             cache,
@@ -1822,10 +1839,7 @@ fn paged_cache_update_is_one_masked_in_place_scatter() {
 #[test]
 fn paired_paged_cache_update_has_portable_oracle_and_one_cuda_kernel() {
     let mut builder = ProgramBuilder::new();
-    let key_cache = builder.input(
-        "key_cache",
-        Shape::new(DType::Bf16, &[5, 4, 2, 8]).unwrap(),
-    );
+    let key_cache = builder.input("key_cache", Shape::new(DType::Bf16, &[5, 4, 2, 8]).unwrap());
     let value_cache = builder.input(
         "value_cache",
         Shape::new(DType::Bf16, &[5, 4, 2, 8]).unwrap(),
@@ -1861,7 +1875,11 @@ fn paired_paged_cache_update_has_portable_oracle_and_one_cuda_kernel() {
     let program = builder.finish(&[key, value]).unwrap();
 
     let portable = program.stablehlo().unwrap();
-    assert_eq!(portable.matches("\"stablehlo.scatter\"").count(), 2, "{portable}");
+    assert_eq!(
+        portable.matches("\"stablehlo.scatter\"").count(),
+        2,
+        "{portable}"
+    );
     Context::new()
         .parse_module(&portable)
         .unwrap()
@@ -1870,13 +1888,7 @@ fn paired_paged_cache_update_has_portable_oracle_and_one_cuda_kernel() {
 
     let cuda_context = Context::new();
     let cuda = program
-        .module_with_sharding_cuda(
-            &cuda_context,
-            &nml_sharding::Sharding::single(),
-            108,
-            8,
-            6,
-        )
+        .module_with_sharding_cuda(&cuda_context, &nml_sharding::Sharding::single(), 108, 8, 6)
         .unwrap();
     cuda.verify().unwrap();
     let cuda = cuda.text();
@@ -1888,18 +1900,9 @@ fn paired_paged_cache_update_has_portable_oracle_and_one_cuda_kernel() {
 #[test]
 fn paged_cache_update_rejects_incompatible_metadata_before_mlir() {
     let mut builder = ProgramBuilder::new();
-    let cache = builder.input(
-        "cache",
-        Shape::new(DType::F32, &[5, 4, 2, 3]).unwrap(),
-    );
-    let updates = builder.input(
-        "updates",
-        Shape::new(DType::F32, &[2, 3, 2, 3]).unwrap(),
-    );
-    let block_tables = builder.input(
-        "block_tables",
-        Shape::new(DType::I32, &[2, 3]).unwrap(),
-    );
+    let cache = builder.input("cache", Shape::new(DType::F32, &[5, 4, 2, 3]).unwrap());
+    let updates = builder.input("updates", Shape::new(DType::F32, &[2, 3, 2, 3]).unwrap());
+    let block_tables = builder.input("block_tables", Shape::new(DType::I32, &[2, 3]).unwrap());
     let starts = builder.input("starts", Shape::new(DType::I32, &[2]).unwrap());
     let lengths = builder.input("lengths", Shape::new(DType::I32, &[2]).unwrap());
     let active = builder.input("active", Shape::new(DType::Bool, &[2]).unwrap());
@@ -1917,21 +1920,10 @@ fn paged_cache_update_rejects_incompatible_metadata_before_mlir() {
         Err(Error::InvalidIndexing(_))
     ));
 
-    let wrong_table = builder.input(
-        "wrong_table",
-        Shape::new(DType::I64, &[2, 3]).unwrap(),
-    );
+    let wrong_table = builder.input("wrong_table", Shape::new(DType::I64, &[2, 3]).unwrap());
     let mask = builder.input("mask", Shape::new(DType::Bool, &[2, 3]).unwrap());
     assert!(matches!(
-        builder.paged_cache_update(
-            cache,
-            updates,
-            wrong_table,
-            starts,
-            lengths,
-            active,
-            mask,
-        ),
+        builder.paged_cache_update(cache, updates, wrong_table, starts, lengths, active, mask,),
         Err(Error::UnsupportedDType { .. })
     ));
 }

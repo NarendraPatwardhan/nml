@@ -3,7 +3,7 @@
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::gauge::Gauge;
-use prometheus_client::metrics::histogram::{exponential_buckets, Histogram};
+use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 use std::sync::{Arc, Mutex};
 
@@ -16,6 +16,8 @@ pub(crate) struct Metrics {
     pub(crate) cancelled: Counter,
     pub(crate) failed: Counter,
     pub(crate) queue_full: Counter,
+    pub(crate) idle_prefill_formation: Counter,
+    pub(crate) decode_metadata_rebinds: Counter,
     pub(crate) active: Gauge,
     pub(crate) queued: Gauge,
     pub(crate) cache_total_pages: Gauge,
@@ -41,6 +43,8 @@ impl Metrics {
         let cancelled = Counter::default();
         let failed = Counter::default();
         let queue_full = Counter::default();
+        let idle_prefill_formation = Counter::default();
+        let decode_metadata_rebinds = Counter::default();
         let active = Gauge::default();
         let queued = Gauge::default();
         let cache_total_pages = Gauge::default();
@@ -86,6 +90,16 @@ impl Metrics {
             queue_full.clone(),
         );
         registry.register(
+            "nml_engine_idle_prefill_formation",
+            "Idle-only bounded windows opened to coalesce prefill arrivals.",
+            idle_prefill_formation.clone(),
+        );
+        registry.register(
+            "nml_engine_decode_metadata_rebinds",
+            "Stable decode control-slab bindings rebuilt after membership changes.",
+            decode_metadata_rebinds.clone(),
+        );
+        registry.register(
             "nml_engine_active_sequences",
             "Sequences currently owned by the engine scheduler.",
             active.clone(),
@@ -106,8 +120,8 @@ impl Metrics {
             cache_free_pages.clone(),
         );
         registry.register(
-            "nml_cache_reserved_unallocated_pages",
-            "Reserved target-cache credits not yet converted to physical pages.",
+            "nml_cache_reserved_future_pages",
+            "Eagerly assigned target-cache pages beyond tentative visibility.",
             cache_reserved_pages.clone(),
         );
         registry.register(
@@ -163,6 +177,8 @@ impl Metrics {
             cancelled,
             failed,
             queue_full,
+            idle_prefill_formation,
+            decode_metadata_rebinds,
             active,
             queued,
             cache_total_pages,
@@ -184,7 +200,10 @@ impl Metrics {
         let mut output = String::new();
         encode(
             &mut output,
-            &self.registry.lock().expect("metrics registry is not poisoned"),
+            &self
+                .registry
+                .lock()
+                .expect("metrics registry is not poisoned"),
         )?;
         Ok(output)
     }
@@ -200,6 +219,9 @@ mod tests {
         metrics.received.inc();
         let text = metrics.render().unwrap();
         assert!(text.contains("nml_requests_received_total 1"));
+        assert!(text.contains("nml_engine_idle_prefill_formation_total 0"));
+        assert!(text.contains("nml_engine_decode_metadata_rebinds_total 0"));
+        assert!(text.contains("nml_cache_reserved_future_pages 0"));
         assert!(!text.contains("request_id"));
     }
 }
