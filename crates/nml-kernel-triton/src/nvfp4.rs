@@ -28,7 +28,6 @@ pub struct NvFp4QkvConfig {
     pub query_outputs: i64,
     pub key_outputs: i64,
     pub value_outputs: i64,
-    pub block_m: i64,
     pub block_n: i64,
     pub block_k: i64,
     pub has_bias: bool,
@@ -184,7 +183,7 @@ impl NvFp4QkvConfig {
             .try_fold(0_i64, |programs, outputs| {
                 programs.checked_add(ceil_div(outputs, self.block_n))
             })
-            .and_then(|programs| programs.checked_mul(ceil_div(self.rows, self.block_m)))
+            .and_then(|programs| programs.checked_mul(self.rows))
             .ok_or(Error::InvalidKernelSpec("NVFP4 QKV launch grid overflows"))?;
         Ok([
             i32::try_from(programs)
@@ -205,15 +204,13 @@ impl NvFp4QkvConfig {
             ]
             .into_iter()
             .any(|value| value <= 0)
-            || [self.block_m, self.block_n, self.block_k]
+            || [self.block_n, self.block_k]
                 .into_iter()
                 .any(|value| value <= 0 || !(value as u64).is_power_of_two())
-            || self.block_m > 2
-            || self.rows % self.block_m != 0
             || self.block_k % REPRESENTATION_BLOCK != 0
         {
             return Err(Error::InvalidKernelSpec(
-                "NVFP4 QKV requires F16/BF16, positive geometry, an exact row tile, power-of-two tiles, and a K tile divisible by sixteen",
+                "NVFP4 QKV requires F16/BF16, positive geometry, power-of-two tiles, and a K tile divisible by sixteen",
             ));
         }
         Ok(())
@@ -223,32 +220,26 @@ impl NvFp4QkvConfig {
 pub fn build_nvfp4_linear(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
     config.validate()?;
     if config.rows == 1 {
-        // A caller may retain its matrix-family M tile while specializing a
-        // one-row shape. The GEMV implementation materializes BLOCK_M rows,
-        // so normalize this semantic singleton rather than issuing masked
-        // reads for rows which do not exist.
         return build_nvfp4_linear_gemv(NvFp4LinearConfig {
             block_m: 1,
             ..config
         });
-    }
-    if config.block_m == 1 {
-        return build_nvfp4_linear_gemv(config);
     }
     build_nvfp4_linear_matrix(config)
 }
 
 /// Builds one compact QKV launch over a small row family and three independent
 /// projection tensors. The representation remains unchanged; the scheduling
-/// domain combines row tiles and projections so Q/K/V share one launch without
-/// paying for a mostly empty matrix tile. A row-tiled CTA decodes one compact
-/// weight tile and applies it to every active row, creating reuse inside the
-/// program instead of depending only on opportunistic L2 reuse between CTAs.
+/// domain combines both rows and projections so Q/K/V share one launch without
+/// paying for a mostly empty matrix tile. Rows are the minor grid dimension:
+/// adjacent CTAs consume the same compact weight tile for different inputs,
+/// allowing the immutable payload and scales to remain hot in L2 while every
+/// CTA retains the proven rank-one GEMV body.
 pub fn build_nvfp4_qkv(config: NvFp4QkvConfig) -> Result<Kernel, Error> {
     config.validate()?;
     let mut builder = Builder::new(&format!(
-        "nvfp4_qkv_gemv_m{}_n{}_k{}",
-        config.block_m, config.block_n, config.block_k
+        "nvfp4_qkv_gemv_m1_n{}_k{}",
+        config.block_n, config.block_k
     ))?;
     let input = pointer(&mut builder, "input", config.dtype)?;
     let query_payload = pointer(&mut builder, "query_payload", DType::U8)?;
@@ -279,13 +270,10 @@ pub fn build_nvfp4_qkv(config: NvFp4QkvConfig) -> Result<Kernel, Error> {
     let program = builder.program_id(0)?;
     let query_programs = ceil_div(config.query_outputs, config.block_n);
     let key_programs = ceil_div(config.key_outputs, config.block_n);
-    let row_tiles = ceil_div(config.rows, config.block_m);
-    let row_tiles = builder.integer(row_tiles, DType::I32)?;
-    let projection_program = builder.divide(&program, &row_tiles)?;
-    let row_tile = builder.remainder(&program, &row_tiles)?;
-    let block_m = builder.integer(config.block_m, DType::I32)?;
-    let row_base = builder.multiply(&row_tile, &block_m)?;
-    let row_i64 = builder.cast(&row_base, DType::I64)?;
+    let rows = builder.integer(config.rows, DType::I32)?;
+    let projection_program = builder.divide(&program, &rows)?;
+    let row = builder.remainder(&program, &rows)?;
+    let row_i64 = builder.cast(&row, DType::I64)?;
     let input_stride = builder.integer(config.inputs, DType::I64)?;
     let input_offset = builder.multiply(&row_i64, &input_stride)?;
     let row_input = builder.add_pointer(&input, &input_offset)?;
@@ -364,10 +352,10 @@ pub fn build_nvfp4_qkv(config: NvFp4QkvConfig) -> Result<Kernel, Error> {
 const fn qkv_projection(config: NvFp4QkvConfig, outputs: i64) -> NvFp4LinearConfig {
     NvFp4LinearConfig {
         dtype: config.dtype,
-        rows: config.block_m,
+        rows: 1,
         outputs,
         inputs: config.inputs,
-        block_m: config.block_m,
+        block_m: 1,
         block_n: config.block_n,
         block_k: config.block_k,
         has_bias: config.has_bias,
@@ -519,11 +507,7 @@ fn build_nvfp4_linear_matrix(config: NvFp4LinearConfig) -> Result<Kernel, Error>
     builder.finish()
 }
 
-/// Builds the latency-sensitive compact projection for a bounded small-M
-/// family. Programs are output-tile-major and row-minor, so adjacent CTAs for
-/// different rows revisit the same immutable compact weight tile while it is
-/// hot in L2. Each CTA still computes one real row: no tensor-core M padding
-/// and no persistent weight expansion.
+/// Builds the autoregressive `M = 1` compact projection.
 ///
 /// Tensor-core matrix tiles are intentionally not used here: promoting one
 /// row to a sixteen-row dot wastes fifteen rows of arithmetic and register
@@ -545,27 +529,17 @@ fn build_nvfp4_linear_gemv(config: NvFp4LinearConfig) -> Result<Kernel, Error> {
         .transpose()?;
     let output = pointer(&mut builder, "output", config.dtype)?;
 
-    let program = builder.program_id(0)?;
-    let rows = builder.integer(config.rows, DType::I32)?;
-    let output_program = builder.divide(&program, &rows)?;
-    let row = builder.remainder(&program, &rows)?;
-    let row = builder.cast(&row, DType::I64)?;
-    let input_width = builder.integer(config.inputs, DType::I64)?;
-    let input_offset = builder.multiply(&row, &input_width)?;
-    let row_input = builder.add_pointer(&input, &input_offset)?;
-    let output_width = builder.integer(config.outputs, DType::I64)?;
-    let output_offset = builder.multiply(&row, &output_width)?;
-    let row_output = builder.add_pointer(&output, &output_offset)?;
+    let output_program = builder.program_id(0)?;
     build_nvfp4_gemv_projection(
         &mut builder,
         config,
         &output_program,
-        &row_input,
+        &input,
         &payload,
         &block_scales,
         &global_scale,
         bias.as_ref(),
-        &row_output,
+        &output,
     )?;
     builder.return_void()?;
     builder.finish()
@@ -583,8 +557,6 @@ fn build_nvfp4_gemv_projection(
     bias: Option<&Value>,
     output: &Value,
 ) -> Result<(), Error> {
-    let block_m = i32::try_from(config.block_m)
-        .map_err(|_| Error::InvalidKernelSpec("NVFP4 M tile exceeds I32"))?;
     let block_n = i32::try_from(config.block_n)
         .map_err(|_| Error::InvalidKernelSpec("NVFP4 N tile exceeds I32"))?;
     let packed_k = config.block_k / 2;
@@ -602,15 +574,12 @@ fn build_nvfp4_gemv_projection(
     let outputs = builder.add(&output_base, &output_lanes)?;
     let output_limit = builder.integer(config.outputs, DType::I32)?;
     let valid_outputs = builder.compare(Comparison::Less, &outputs, &output_limit)?;
-    let row_lanes = builder.range(0, block_m)?;
-    let row_limit = builder.integer(config.rows, DType::I32)?;
-    let valid_rows = builder.compare(Comparison::Less, &row_lanes, &row_limit)?;
 
     let lower = builder.integer(0, DType::I32)?;
     let upper = builder.integer(config.inputs, DType::I32)?;
     let step = builder.integer(config.block_k, DType::I32)?;
     let global = builder.load(global_scale)?;
-    let accumulator = builder.full_float(&[config.block_m, config.block_n], 0.0, DType::F32)?;
+    let accumulator = builder.full_float(&[config.block_n], 0.0, DType::F32)?;
     let result = builder.for_loop(
         &lower,
         &upper,
@@ -627,23 +596,15 @@ fn build_nvfp4_gemv_projection(
             let valid_even = body.compare(Comparison::Less, &even_k, &input_limit)?;
             let valid_odd = body.compare(Comparison::Less, &odd_k, &input_limit)?;
 
-            let input_width = body.integer(config.inputs, DType::I32)?;
-            let input_rows = body.multiply(&row_lanes, &input_width)?;
-            let even_offsets = matrix_offsets(body, &input_rows, &even_k)?;
-            let odd_offsets = matrix_offsets(body, &input_rows, &odd_k)?;
-            let even_addresses = body.add_pointer(input, &even_offsets)?;
-            let odd_addresses = body.add_pointer(input, &odd_offsets)?;
-            let even_mask = body.mask_2d(&valid_rows, &valid_even)?;
-            let odd_mask = body.mask_2d(&valid_rows, &valid_odd)?;
-            let input_zero = body.full_float(&[config.block_m, packed_k], 0.0, config.dtype)?;
-            let even = body.load_masked(&even_addresses, &even_mask, &input_zero)?;
-            let odd = body.load_masked(&odd_addresses, &odd_mask, &input_zero)?;
+            let input_zero = body.full_float(&[packed_k], 0.0, config.dtype)?;
+            let even_addresses = body.add_pointer(input, &even_k)?;
+            let odd_addresses = body.add_pointer(input, &odd_k)?;
+            let even = body.load_masked(&even_addresses, &valid_even, &input_zero)?;
+            let odd = body.load_masked(&odd_addresses, &valid_odd, &input_zero)?;
             let even = body.cast(&even, DType::F32)?;
             let odd = body.cast(&odd, DType::F32)?;
-            let even = body.expand_dimension(&even, 1)?;
-            let odd = body.expand_dimension(&odd, 1)?;
-            let even = body.broadcast(&even, &[config.block_m, config.block_n, packed_k])?;
-            let odd = body.broadcast(&odd, &[config.block_m, config.block_n, packed_k])?;
+            let even = body.expand_dimension(&even, 0)?;
+            let odd = body.expand_dimension(&odd, 0)?;
 
             let packed_start = body.divide(&start, &two_i32)?;
             let packed_columns = body.add(&packed_start, &pair_lanes)?;
@@ -681,19 +642,12 @@ fn build_nvfp4_gemv_projection(
             let scales = body.reshape(&scales, &[config.block_n, scale_k, 1])?;
             let scales = body.broadcast(&scales, &[config.block_n, scale_k, 8])?;
             let scales = body.reshape(&scales, &[config.block_n, packed_k])?;
-            let low = body.expand_dimension(&low, 0)?;
-            let high = body.expand_dimension(&high, 0)?;
-            let scales = body.expand_dimension(&scales, 0)?;
-            let weight_shape = [config.block_m, config.block_n, packed_k];
-            let low = body.broadcast(&low, &weight_shape)?;
-            let high = body.broadcast(&high, &weight_shape)?;
-            let scales = body.broadcast(&scales, &weight_shape)?;
             let low = body.multiply(&low, &scales)?;
             let high = body.multiply(&high, &scales)?;
             let low = body.multiply(&low, &even)?;
             let high = body.multiply(&high, &odd)?;
             let products = body.add(&low, &high)?;
-            let partial = body.reduce(Reduction::Sum, &products, 2)?;
+            let partial = body.reduce(Reduction::Sum, &products, 1)?;
             Ok(vec![body.add(&carried[0], &partial)?])
         },
     )?[0]
@@ -708,19 +662,13 @@ fn build_nvfp4_gemv_projection(
         let bias_zero = builder.full_float(&[config.block_n], 0.0, config.dtype)?;
         let bias = builder.load_masked(&bias_addresses, &valid_outputs, &bias_zero)?;
         let bias = builder.cast(&bias, DType::F32)?;
-        let bias = builder.expand_dimension(&bias, 0)?;
-        let bias = builder.broadcast(&bias, &[config.block_m, config.block_n])?;
         builder.add(&result, &bias)?
     } else {
         result
     };
     let result = builder.cast(&result, config.dtype)?;
-    let output_width = builder.integer(config.outputs, DType::I32)?;
-    let output_rows = builder.multiply(&row_lanes, &output_width)?;
-    let output_offsets = matrix_offsets(builder, &output_rows, &outputs)?;
-    let output_addresses = builder.add_pointer(output, &output_offsets)?;
-    let output_mask = builder.mask_2d(&valid_rows, &valid_outputs)?;
-    builder.store_masked(&output_addresses, &result, &output_mask)?;
+    let output_addresses = builder.add_pointer(output, &outputs)?;
+    builder.store_masked(&output_addresses, &result, &valid_outputs)?;
     Ok(())
 }
 

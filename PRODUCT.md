@@ -51,6 +51,11 @@ The A40 server-load report
 concurrency `C={1,2,4,8}`. The report includes the complete Nsight Systems
 capture and SQLite export.
 
+A later convergence experiment at source
+`652cd2589e445a8adf015b4be639098099e43809`, image
+`sha256:552b27eb1ccc2a1493b80ac76c13ea1550f522a4ac060bad1b18087181c85911`,
+was measured and rejected. It does not supersede the accepted result above.
+
 The migration control remains source
 `fb415a8dadd51a0053b9be314faa836e2b274721`, image
 `sha256:3c81704ea85512df7ff76de83ea21f403ef592dc50c23c5ae20e8d70c1e7f3ff`,
@@ -124,6 +129,26 @@ approximately as follows:
 
 This is the relevant proof that the small-batch gain is kernel alpha rather
 than benchmark or scheduler manipulation.
+
+### 2.3 Rejected generalized small-M experiment
+
+The rejected `552b27eb1ccc` A40 run produced approximately
+106.1/122.8/134.6/139.8 aggregate output TPS at C1/C2/C4/C8. Relative to the
+accepted control, C1 fell 22.5%, C4 fell 19.5%, and C8 fell 32.0%; C2 improved
+only 2.3%. The complete trace makes the cause unambiguous:
+
+- measured decode-device time increased from 76.25 to 101.35 seconds;
+- ordinary linear families added approximately 19.65 GPU-seconds;
+- QKV added approximately 6.83 GPU-seconds; and
+- those two changes explain the complete approximately 25.10-second increase.
+
+One generalized small-M GEMV helper caused both failures. It broadened the
+proven scalar B1 contraction from rank-one TTIR to a leading-M tensor and sent
+dense B2/B4/B8 projections—including the 201,088-row LM head—through a
+row-wise algorithm. The LM-head GEMV alone consumed 28.84 GPU-seconds. The M2
+QKV body consumed 13.14 GPU-seconds and total QKV time rose from 7.53 to 14.37
+seconds. Selected-route expert gate/up and down time remained essentially
+flat, so sparse expert GEMV is retained.
 
 ## 3. Terms and product metrics
 
@@ -474,13 +499,15 @@ claimed until it runs as one immutable image on A40.
 2. An idle engine opens a 50-200 microsecond prefill-formation window derived
    from `max_prefill_wait`; a B1-only profile disables it and active decode can
    never enter it.
-3. Ordinary compact linears select from small-M GEMV and tensor-core families
-   using actual M/N/K, CUDA compute capability, and reported SM count. The
-   policy covers attention output, LM head, and embedding rather than naming a
-   product batch size.
-4. Fused QKV keeps the accepted B1 M1/N8/K256 geometry and uses M2 row tiles for
-   divisible small batches, decoding each compact weight tile once per two
-   activation rows.
+3. Dense ordinary projections have separate algorithmic families: exact M1
+   uses the proven rank-one GEMV, while every M greater than one uses the
+   tensor-core matrix family and reuses decoded weights across real rows. On
+   the A40, permanent lowering contracts pin the LM head to M1/N32/K256 for B1
+   and M16/N64/K128 for B2/B4/B8.
+4. Fused QKV keeps one scalar GEMV CTA per real row and projection tile. Rows
+   remain the minor grid dimension for L2 locality, but the contraction body
+   is never widened to M2. This restores the accepted B1 body and the
+   previously measured B2/B4/B8 fused-QKV path.
 5. Sampling performs one batch-wide top-k/filter pipeline over `[B,V]`; only
    the independent per-row RNG transition remains scalarized. Inactive rows
    preserve state and the padding sentinel.
@@ -494,6 +521,11 @@ claimed until it runs as one immutable image on A40.
    expose idle formation and stable decode metadata rebinds. The next profile
    can therefore prove plan reachability and absence of page-boundary rebinds
    directly.
+
+The corrected dense-linear and QKV family split has passed affected IR,
+Triton, server, image-structure, CUDA-generation, and serving-image BuildBuddy
+gates. A new immutable A40 run is still required before claiming that the
+accepted 150-TPS decode-engine result and higher-batch throughput are restored.
 
 After A40 validation:
 

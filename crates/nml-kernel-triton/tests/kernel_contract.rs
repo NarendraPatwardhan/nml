@@ -161,6 +161,10 @@ fn nvfp4_decode_linear_uses_compact_gemv_without_dead_matrix_rows() {
     assert!(ttir.contains("tt.bitcast"), "{ttir}");
     assert!(ttir.contains("tt.reshape"), "{ttir}");
     assert!(!ttir.contains("tt.dot"), "{ttir}");
+    assert!(
+        ttir.contains("axis = 1 : i32") && !ttir.contains("axis = 2 : i32"),
+        "the accepted scalar GEMV must reduce [N,K], not [M,N,K]: {ttir}"
+    );
     assert!(!ttir.contains("math.exp2"), "{ttir}");
     assert!(
         ttir.rfind("arith.mulf").unwrap() > ttir.find("tt.reduce").unwrap(),
@@ -169,24 +173,25 @@ fn nvfp4_decode_linear_uses_compact_gemv_without_dead_matrix_rows() {
 }
 
 #[test]
-fn nvfp4_small_batch_linear_orders_output_tiles_before_real_rows() {
+fn nvfp4_batched_linear_uses_tensor_core_weight_reuse() {
     let config = NvFp4LinearConfig {
         dtype: DType::Bf16,
         rows: 8,
         outputs: 2_880,
         inputs: 2_880,
-        block_m: 1,
-        block_n: 8,
-        block_k: 256,
+        block_m: 16,
+        block_n: 64,
+        block_k: 128,
         has_bias: false,
     };
-    assert_eq!(config.launch_grid().unwrap(), [2_880, 1, 1]);
+    assert_eq!(config.launch_grid().unwrap(), [45, 1, 1]);
     let kernel = build_nvfp4_linear(config).unwrap();
     let ttir = kernel.text();
-    assert!(ttir.contains("@nvfp4_linear_gemv"), "{ttir}");
+    assert!(ttir.contains("@nvfp4_linear_m16_n64_k128"), "{ttir}");
     assert!(ttir.contains("arith.divsi"), "{ttir}");
     assert!(ttir.contains("arith.remsi"), "{ttir}");
-    assert!(!ttir.contains("tt.dot"), "{ttir}");
+    assert!(ttir.contains("tt.dot"), "{ttir}");
+    assert!(!ttir.contains("@nvfp4_linear_gemv"), "{ttir}");
 }
 
 #[test]
@@ -198,7 +203,6 @@ fn nvfp4_decode_qkv_combines_three_projection_tails_in_one_grid() {
         query_outputs: 4_096,
         key_outputs: 512,
         value_outputs: 512,
-        block_m: 1,
         block_n: 8,
         block_k: 256,
         has_bias: true,
@@ -212,7 +216,6 @@ fn nvfp4_decode_qkv_combines_three_projection_tails_in_one_grid() {
         query_outputs: 32,
         key_outputs: 8,
         value_outputs: 8,
-        block_m: 1,
         block_n: 8,
         block_k: 32,
         has_bias: true,
@@ -236,7 +239,7 @@ fn nvfp4_decode_qkv_combines_three_projection_tails_in_one_grid() {
 }
 
 #[test]
-fn nvfp4_small_batch_qkv_fuses_rows_and_projections_in_one_grid() {
+fn nvfp4_small_batch_qkv_keeps_one_scalar_cta_per_row_and_projection_tile() {
     let config = NvFp4QkvConfig {
         dtype: DType::Bf16,
         rows: 8,
@@ -244,37 +247,22 @@ fn nvfp4_small_batch_qkv_fuses_rows_and_projections_in_one_grid() {
         query_outputs: 4_096,
         key_outputs: 512,
         value_outputs: 512,
-        block_m: 2,
         block_n: 8,
         block_k: 256,
         has_bias: true,
     };
-    assert_eq!(config.launch_grid().unwrap(), [2_560, 1, 1]);
+    assert_eq!(config.launch_grid().unwrap(), [5_120, 1, 1]);
     let ttir = build_nvfp4_qkv(config).unwrap();
     let ttir = ttir.text();
-    assert!(ttir.contains("@nvfp4_qkv_gemv_m2_n8_k256"), "{ttir}");
+    assert!(ttir.contains("@nvfp4_qkv_gemv_m1_n8_k256"), "{ttir}");
     assert!(ttir.contains("arith.divsi"), "{ttir}");
     assert!(ttir.contains("arith.remsi"), "{ttir}");
     assert_eq!(ttir.matches("tt.store").count(), 3, "{ttir}");
     assert!(!ttir.contains("tt.dot"), "{ttir}");
-}
-
-#[test]
-fn nvfp4_qkv_rejects_a_partial_row_tile() {
-    let error = build_nvfp4_qkv(NvFp4QkvConfig {
-        dtype: DType::Bf16,
-        rows: 3,
-        inputs: 80,
-        query_outputs: 32,
-        key_outputs: 8,
-        value_outputs: 8,
-        block_m: 2,
-        block_n: 8,
-        block_k: 32,
-        has_bias: true,
-    })
-    .unwrap_err();
-    assert!(matches!(error, Error::InvalidKernelSpec(_)));
+    assert!(
+        !ttir.contains("axis = 2 : i32"),
+        "row batching must not broaden QKV reduction to [M,N,K]: {ttir}"
+    );
 }
 
 #[test]

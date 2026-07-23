@@ -311,13 +311,14 @@ control.
 
 - [x] Audit actual lowering for every retained small-M family; reject any path
   that expands persistent NVFP4 weights to BF16.
-- [x] Preserve the accepted M=1 fused-QKV/GEMV/expert/head dispatch unchanged.
-- [x] Add a bounded `M<=8` Triton dispatch selected from the C2/C4/C8 Nsight
-  trace: fuse all rows and Q/K/V projections into one weight-tile-major,
-  row-minor launch so adjacent CTAs reuse compact weights from L2, and use
-  selected-route expert GEMV instead of a 16-row matrix tile when the sparse
-  schedule contains at most one route per block. Keep `M>=16` on the grouped
-  matrix family where row and expert reuse becomes meaningful.
+- [x] Preserve the accepted rank-one M=1 fused-QKV/GEMV/expert/head
+  contraction unchanged; permanent TTIR contracts reject a leading-M
+  generalization of the scalar body.
+- [x] Fuse B1/B2/B4/B8 Q/K/V projections into one output-tile-major,
+  row-minor launch so adjacent scalar CTAs reuse compact weights from L2; keep
+  selected-route expert GEMV when the sparse schedule contains at most one
+  useful route per block. Do not conflate either sparse case with dense
+  ordinary projection policy.
 - [x] Flatten the active `[B,Q]` mask into routed MoE, encode inactive routes
   with expert ID `-1`, prevent them from touching expert weights, and return
   exact zero for inactive tokens. Sparse fixed schedules may retain a masked
@@ -402,6 +403,11 @@ control.
   repetitions and a complete Nsight capture. Aggregate output throughput was
   approximately 136.3/120.0/167.0/205.5 TPS; steady family counts prove
   B1/B2/B4/B8 dispatch.
+- [x] Reject source `652cd2589e445a8adf015b4be639098099e43809` after the
+  complete A40 trace measured 106.1/122.8/134.6/139.8 TPS and attributed the
+  approximately 25.10-second decode-time regression to generalized dense
+  small-M linear and M2 QKV kernels. Retain the flat selected-route expert
+  kernels.
 - [ ] Report TTFT, TPOT, end-to-end latency, request/prompt/output throughput,
   queue time, batch histogram, GPU busy time, and page utilization.
 - [ ] Promote only if concurrency-8 aggregate output throughput is at least
@@ -428,12 +434,13 @@ count, M/N/K, route density, and latency/throughput phase select kernel tiles.
 - [x] Add a bounded idle-only prefill formation window derived from the server
   latency budget and retained batch geometry. Drain commands only when no
   decode is active; active decode must never wait for the window.
-- [x] Replace the fixed `M=16` padding of ordinary compact linears with a
-  finite small-M plan derived from M/N/K and CUDA capabilities. Apply it to
-  attention output and vocabulary projection without expanding NVFP4 weights.
-- [x] Make fused QKV tile multiple active rows per CTA when the selected
-  architecture/shape plan predicts weight reuse, while preserving the proven
-  B1 geometry exactly.
+- [x] Separate dense ordinary projection algorithms by useful reuse: retain
+  the proven rank-one GEMV only for exact M1 and use the tensor-core matrix
+  family for every M greater than one. Pin A40 LM-head lowering to
+  M1/N32/K256 for B1 and M16/N64/K128 for B2/B4/B8.
+- [x] Remove the regressing M2 QKV contraction body. Keep one rank-one GEMV
+  CTA per active row and projection tile, with rows minor in the launch grid
+  so the accepted fused B1/B2/B4/B8 path retains L2 locality.
 - [x] Replace the per-row sampling graph clone with one vectorized `[B,V]`
   candidate/filter/select pipeline and explicit independent `[B,2]` random
   state transition. Preserve inactive-row and insertion/removal invariance.
@@ -451,6 +458,13 @@ count, M/N/K, route density, and latency/throughput phase select kernel tiles.
   Triton, and server contracts; `//...`; the CUDA GPT-OSS construction target;
   and `//products/serve:serve_image` are green. No image has been published and
   no GPU result is claimed yet.
+- [x] Add focused lowering/TTIR regression contracts for the corrected dense
+  family boundary and pass them through BuildBuddy CUDA.
+- [x] Pass the affected IR, Triton, server, image-structure, CUDA-generation,
+  and serving-image construction gates through BuildBuddy after the
+  correction.
+- [ ] Publish one immutable corrected image and rerun the compact C1/C2/C4/C8
+  A40 matrix with complete Nsight recovery.
 
 ## Milestone 4: complete OpenAI tool calling
 

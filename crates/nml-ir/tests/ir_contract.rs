@@ -100,6 +100,56 @@ fn nvfp4_linear_is_one_semantic_operation_with_three_physical_components() {
 }
 
 #[test]
+fn nvfp4_dense_decode_keeps_scalar_gemv_and_batched_matrix_families_distinct() {
+    fn lowered(rows: i64) -> String {
+        let weight = Parameter::nvfp4(
+            "lm_head.weight",
+            "model.lm_head.weight",
+            Shape::new(DType::Bf16, &[201_088, 2_880]).unwrap(),
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::new();
+        let input = builder.input(
+            "hidden",
+            Shape::new(DType::Bf16, &[rows, 2_880]).unwrap(),
+        );
+        let output = builder.linear(input, &weight, None).unwrap();
+        let program = builder.finish(&[output]).unwrap();
+        let context = Context::new();
+        let module = program
+            .module_with_sharding_cuda(
+                &context,
+                &nml_sharding::Sharding::single(),
+                84,
+                8,
+                6,
+            )
+            .unwrap();
+        module.verify().unwrap();
+        module.text()
+    }
+
+    let scalar = lowered(1);
+    assert!(
+        scalar.contains("nvfp4_linear_gemv_m1_n32_k256"),
+        "{scalar}"
+    );
+    assert!(!scalar.contains("nvfp4_linear_m16"), "{scalar}");
+
+    for rows in [2, 4, 8] {
+        let batched = lowered(rows);
+        assert!(
+            batched.contains("nvfp4_linear_m16_n64_k128"),
+            "B{rows} LM head must reuse weights through the matrix family: {batched}"
+        );
+        assert!(
+            !batched.contains("nvfp4_linear_gemv"),
+            "B{rows} LM head must not scale row-wise through GEMV: {batched}"
+        );
+    }
+}
+
+#[test]
 fn nvfp4_decode_qkv_is_one_sm8x_launch_without_changing_portable_semantics() {
     fn projection(name: &str, outputs: i64) -> (Parameter, Parameter) {
         (
@@ -176,7 +226,7 @@ fn nvfp4_decode_qkv_is_one_sm8x_launch_without_changing_portable_semantics() {
         "{small_batch}"
     );
     assert!(
-        small_batch.contains("nvfp4_qkv_gemv_m2_n8_k128"),
+        small_batch.contains("nvfp4_qkv_gemv_m1_n8_k128"),
         "{small_batch}"
     );
 

@@ -15,11 +15,14 @@ use nml_mlir::{Block, Context, Region, Type, Value};
 use nml_parameter::nvfp4::{decode_e2m1, decode_e4m3fn_scale};
 use nml_types::{DType, Partition, Shape};
 
-// These are the finite kernel families the planner may select, not product
-// batch-size policy. Selection below is driven by actual M/N/K geometry and
-// normalized device capabilities so adding a serving family does not require
-// another hand-authored recipe branch.
-const COMPACT_GEMV_MAX_ROWS: i64 = 8;
+// These are finite kernel-family boundaries, not product batch-size policy.
+// Dense projections have a proven scalar GEMV and a tensor-core matrix path;
+// sparse selected-route projections remain GEMV-efficient through eight
+// tokens because each route ordinarily owns only one useful row.
+const DENSE_GEMV_ROWS: i64 = 1;
+const FUSED_QKV_MAX_ROWS: i64 = 8;
+const EMBEDDING_SCALAR_MAX_ROWS: i64 = 8;
+const SPARSE_GEMV_MAX_TOKENS: i64 = 8;
 const TENSOR_CORE_MINIMUM_M: i64 = 16;
 const DECODE_BLOCK_N: i64 = 8;
 const DECODE_BLOCK_K: i64 = 256;
@@ -131,7 +134,6 @@ struct GroupedPlan {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct QkvPlan {
-    block_m: i64,
     block_n: i64,
     block_k: i64,
     warps: i32,
@@ -246,7 +248,7 @@ pub(crate) fn lower_qkv<'context>(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let first = plans[0];
-    let fused_small_batch = first.config.rows <= 8
+    let fused_small_batch = first.config.rows <= FUSED_QKV_MAX_ROWS
         && plans.iter().all(|plan| {
             plan.config.rows == first.config.rows
                 && plan.config.dtype == first.config.dtype
@@ -292,7 +294,6 @@ pub(crate) fn lower_qkv<'context>(
         query_outputs: plans[0].config.outputs,
         key_outputs: plans[1].config.outputs,
         value_outputs: plans[2].config.outputs,
-        block_m: qkv_plan.block_m,
         block_n: qkv_plan.block_n,
         block_k: qkv_plan.block_k,
         has_bias: first.config.has_bias,
@@ -890,15 +891,13 @@ impl LinearPlan {
             ));
         }
 
-        // Single-row decode GEMV is a memory-bandwidth-bound problem. Each program
-        // handles 8 output columns over a 256-wide K tile with 4 warps and a
-        // single pipeline stage — Recipe v2 proven geometry. Narrow tiles keep
-        // grid blocks numerous (360 for N=2880), filling SM count to hide
-        // memory latency. Fewer K-iterations reduce loop and decode overhead.
-        // Prefill uses the tensor-core matrix family. Small batches get
-        // narrower output tiles and deeper pipelines; large batches widen
-        // the output tile and optionally use 8 warps for warp-group MMA.
-        let compact_gemv = rows <= COMPACT_GEMV_MAX_ROWS;
+        // A true scalar decode projection is memory-bandwidth-bound. Its TTIR
+        // deliberately remains rank-one: broadening the helper to a nominal
+        // small-M tensor changed generated code and regressed the A40 B1
+        // control. Every dense M > 1 instead uses the tensor-core matrix
+        // family, which reuses each decoded weight tile across real rows and
+        // is essential for the vocabulary-sized LM head.
+        let scalar_gemv = rows == DENSE_GEMV_ROWS;
         let latency_grid = i64::try_from(capabilities.latency_grid_target()).unwrap_or(i64::MAX);
         let wide_gemv_grid = ceil_div_positive(outputs, WIDE_GEMV_BLOCK_N);
         let lost_parallelism = WIDE_GEMV_BLOCK_N / DECODE_BLOCK_N;
@@ -908,7 +907,7 @@ impl LinearPlan {
             } else {
                 DECODE_BLOCK_N
             };
-        let block_m = if compact_gemv {
+        let block_m = if scalar_gemv {
             1
         } else if rows <= 32 {
             TENSOR_CORE_MINIMUM_M
@@ -925,14 +924,14 @@ impl LinearPlan {
                 outputs,
                 inputs,
                 block_m,
-                block_n: if compact_gemv {
+                block_n: if scalar_gemv {
                     gemv_block_n
                 } else if latency_sensitive {
                     LATENCY_BLOCK_N
                 } else {
                     THROUGHPUT_BLOCK_N
                 },
-                block_k: if compact_gemv {
+                block_k: if scalar_gemv {
                     DECODE_BLOCK_K
                 } else if latency_sensitive {
                     LATENCY_BLOCK_K
@@ -946,7 +945,7 @@ impl LinearPlan {
             } else {
                 4
             },
-            stages: if compact_gemv {
+            stages: if scalar_gemv {
                 1
             } else if latency_sensitive {
                 4
@@ -960,13 +959,11 @@ impl LinearPlan {
 impl QkvPlan {
     fn new(rows: i64, inputs: i64, outputs: [i64; 3], capabilities: CudaCapabilities) -> Self {
         let latency_grid = i64::try_from(capabilities.latency_grid_target()).unwrap_or(i64::MAX);
-        let block_m = if rows >= 2 && rows % 2 == 0 { 2 } else { 1 };
-        let row_tiles = ceil_div_positive(rows, block_m);
         let programs_at_16 = outputs
             .into_iter()
             .map(|output| ceil_div_positive(output, 16))
             .sum::<i64>()
-            .saturating_mul(row_tiles);
+            .saturating_mul(rows);
         let block_n = if capabilities.supports_warp_group_mma()
             && programs_at_16 >= latency_grid.saturating_mul(2)
         {
@@ -977,7 +974,6 @@ impl QkvPlan {
             8
         };
         Self {
-            block_m,
             block_n,
             block_k: if inputs >= DECODE_BLOCK_K {
                 DECODE_BLOCK_K
@@ -1008,7 +1004,7 @@ impl EmbeddingPlan {
         } else {
             EMBEDDING_NARROW_BLOCK_N
         };
-        let block_m = if rows <= COMPACT_GEMV_MAX_ROWS {
+        let block_m = if rows <= EMBEDDING_SCALAR_MAX_ROWS {
             1
         } else if grid(TENSOR_CORE_MINIMUM_M, block_n) >= two_waves {
             TENSOR_CORE_MINIMUM_M
@@ -1021,7 +1017,11 @@ impl EmbeddingPlan {
             block_m,
             block_n,
             warps: 4,
-            stages: if rows <= COMPACT_GEMV_MAX_ROWS { 1 } else { 2 },
+            stages: if rows <= EMBEDDING_SCALAR_MAX_ROWS {
+                1
+            } else {
+                2
+            },
         }
     }
 }
@@ -1039,7 +1039,7 @@ impl GroupedPlan {
         maximum_output: i64,
         capabilities: CudaCapabilities,
     ) -> Self {
-        if tokens <= COMPACT_GEMV_MAX_ROWS {
+        if tokens <= SPARSE_GEMV_MAX_TOKENS {
             Self {
                 block_n: DECODE_BLOCK_N,
                 block_k: DECODE_BLOCK_K,
