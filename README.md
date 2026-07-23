@@ -20,6 +20,7 @@
     <a href="#why-nml">Why NML</a> ·
     <a href="#quickstart">Quickstart</a> ·
     <a href="#current-capability-status">Capability Status</a> ·
+    <a href="./PRODUCT.md">Product Contract</a> ·
     <a href="./SYSTEM.md">System Architecture</a> ·
     <a href="./TASKS.md">Engineering Ledger</a>
   </p>

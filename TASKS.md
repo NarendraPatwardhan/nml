@@ -3,7 +3,8 @@
 Status: executable product tracker
 
 [`SYSTEM.md`](./SYSTEM.md) is the governing architecture.
-[`NVFP4.md`](./NVFP4.md) is the representation and kernel contract. This file
+[`PRODUCT.md`](./PRODUCT.md) is the unified representation, serving, progress,
+and roadmap contract. This file
 contains only durable evidence, unfinished product work, and ordered exits. Git
 history—not a growing list of superseded tasks—is the implementation archive.
 
@@ -264,8 +265,10 @@ cancellation, and reclamation pass exact accounting.
   rollback/cancel sequences.
 - [ ] Add engine integration tests with concurrent requests using permuted
   pages and prove free/private/referenced totals return to the startup snapshot.
-- [ ] Run a real A40 batch-1 regression before enabling batching. Page
-  indirection/global allocation must preserve at least 150 decode-loop TPS.
+- [x] Run a real A40 batch-1 regression with global page indirection. Image
+  `sha256:00aaed758f68c51c679426805147f094271982e3e1563bb3580e187fed02172d`
+  reached approximately **150.08 decode-engine row TPS** on the exact 106+320
+  control while using the generic B1 serving family.
 
 ## Milestone 3: continuous batching and chunked prefill
 
@@ -281,8 +284,9 @@ control.
 - [x] Compile the parity A40 batch buckets `1,2,4,8`, decode query size 1, and
   prefill query buckets `16,128,256` from one validated `ServerProfile`,
   reducing the serving family count from 30 to 16.
-- [ ] After generic B1 recovers at least 150 end-to-end tokens/s, expand the
-  same family mechanism to the production B/Q envelope.
+- [ ] After the diagnostic route is removed and the generic server retains
+  at least 150 decode-engine TPS, expand the same family mechanism to the
+  production B/Q envelope and remeasure complete request throughput.
 - [x] Log and report the exact family count/compile time; reject duplicate or
   combinatorially unbounded profile input.
 - [ ] Continue compiling all families before parameter residency and warm each
@@ -372,9 +376,12 @@ control.
   result-download workspace per family.
 - [x] Delete `SingleSequenceDecodeLane`, its RNG export/import transition, and
   its private B1 serving lifecycle; B1 is now the smallest generic family.
-- [ ] Publish the refactored server image and prove at least 150 decode-loop
-  tokens/s on the exact 106+320 A40 control before removing the diagnostic
-  performance route.
+- [x] Publish the refactored server image and recover legacy decode parity on
+  the exact 106+320 A40 control. Commit `9f75e94c8eb4f3d3551c914ea7f33187cbe6d598`
+  and image
+  `sha256:00aaed758f68c51c679426805147f094271982e3e1563bb3580e187fed02172d`
+  reached approximately **150.08 decode-engine row TPS** and
+  135.741-136.851 end-to-end output TPS.
 - [ ] After A40 parity, drive `generate` through the generic serving lane and delete
   `ProductSession`/request-local prefill plus the remaining non-serving route;
   retain static family specialization as graph policy, not a second engine.
@@ -391,6 +398,10 @@ control.
   prompt/output mixes.
 - [ ] Publish one immutable parity image and run warm A40 repetitions for
   `128/128`, `1K/128`, and `4K/256` at concurrency `1,2,4,8`.
+- [x] Run the compact 106+320 parity matrix at C1/C2/C4/C8 with two measured
+  repetitions and a complete Nsight capture. Aggregate output throughput was
+  approximately 136.3/120.0/167.0/205.5 TPS; steady family counts prove
+  B1/B2/B4/B8 dispatch.
 - [ ] Report TTFT, TPOT, end-to-end latency, request/prompt/output throughput,
   queue time, batch histogram, GPU busy time, and page utilization.
 - [ ] Promote only if concurrency-8 aggregate output throughput is at least

@@ -184,7 +184,7 @@ kernel and hardware capability
 ```
 
 NVFP4 is the current first-priority execution vertical, defined in
-[`NVFP4.md`](./NVFP4.md). It is represented as one logical `Parameter` backed
+[`PRODUCT.md`](./PRODUCT.md). It is represented as one logical `Parameter` backed
 by packed payload, scale, and global-factor components, not as an ordinary
 dtype or an arbitrary tuple of tensors. The representation must remain packed
 through loading and device residency and lower through capability-selected CPU,
@@ -438,7 +438,7 @@ pinned by distributor, revision, file hashes, configuration, tensor records,
 packing, scales, layout, and conversion provenance. The official MXFP4 release
 does not create an NML requirement to implement MXFP4. Unknown or ambiguous
 GPT-OSS checkpoint variants are rejected rather than interpreted
-heuristically. [`NVFP4.md`](./NVFP4.md) owns the complete representation,
+heuristically. [`PRODUCT.md`](./PRODUCT.md) owns the complete representation,
 kernel, hardware, and acceptance architecture.
 
 The GPT-OSS model vertical reuses the existing RMSNorm, GQA, RoPE/YaRN,
@@ -980,7 +980,7 @@ The remaining validation debt is explicit:
 - run native Apple Silicon CPU contracts.
 
 The current first-priority product territory is the exact GPT-OSS 20B NVFP4
-vertical in [`NVFP4.md`](./NVFP4.md): artifact identity, parameter/storage
+vertical in [`PRODUCT.md`](./PRODUCT.md): artifact identity, parameter/storage
 redesign, CPU execution, fused pre-Blackwell emulation, native Blackwell
 execution, grouped MoE, Shardy placement, and complete model evidence.
 
