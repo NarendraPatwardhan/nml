@@ -34,11 +34,11 @@ continuous scheduler
 
 The product goal is not to maximize one synthetic number. It is to keep
 interactive B1 fast while increasing useful aggregate throughput as
-concurrency creates B2-B32 work.
+concurrency creates larger batches.
 
 ## 2. Governing design
 
-There is one serving architecture for B1-B32:
+There is one serving architecture across every retained batch family:
 
 ```text
 active request membership
@@ -143,7 +143,7 @@ active row + position + page table + K row + V row
 
 The portable meaning is still expressed by two StableHLO scatters. CUDA lowers
 the pair to one typed custom call whose two results alias the two input cache
-buffers. The operation is identical for B1-B32.
+buffers. The operation is identical across batch families.
 
 ### 3.3 Graph-boundary bubbles
 
@@ -256,7 +256,7 @@ Implemented in the current tree:
 1. mask-aware routed MoE for prompt padding and inactive batch rows;
 2. a paired Triton K/V paged append for every retained batch family;
 3. a donated device-resident batch slab advanced by the serving head;
-4. generic B1-B32 stable execution with five-pair lookahead;
+4. generic stable execution with five-pair lookahead;
 5. direct stable-batch continuation without ordinary scheduler re-entry;
 6. reusable per-family executable bindings and result workspaces; and
 7. the `Q128` prefill family.
@@ -264,10 +264,16 @@ Implemented in the current tree:
 BuildBuddy CPU/IR/serve contracts and the full CUDA server build validate
 construction and lowering. They do not establish runtime performance.
 
+The parity profile deliberately compiles only `B={1,2,4,8}` and
+`Q={16,128,256}`, cutting the serving family count from 30 to 16. It retains
+the exact C1/Q128 control, exercises real B2-B8 batching, and keeps Q256
+chunked prefill. After B1 recovers at least 150 end-to-end tokens/s, expand the
+same generic machinery to the production B/Q envelope.
+
 The remaining current-phase proof is one published immutable image on A40:
 
 - the exact 106+320 C1 end-to-end control must recover at least 150 tokens/s;
-- B1-B32 must be exercised through real concurrent arrivals;
+- B1-B8 must be exercised through real concurrent arrivals;
 - Nsight must verify the paired append, masked expert schedule, transfer
   contract, and removal of the recurring orchestration hole;
 - aggregate output throughput, TTFT, TPOT, queue time, batch histogram, page

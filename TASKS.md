@@ -215,6 +215,10 @@ cancellation, and reclamation pass exact accounting.
 - [x] Replace the trace-correlated decomposed CUDA K/V scatters with one paired
   generic Triton append that resolves each active row's page once, writes K and
   V, skips inactive rows, and aliases both donated cache buffers.
+- [x] Correct XLA/Triton Bool storage at the custom-call boundary: retain Bool
+  tensor semantics, address predicate buffers through I8 TTIR pointers, and
+  convert loaded 0/1 bytes to register predicates without adding conversion
+  kernels.
 - [ ] Confirm on A40/Nsight that each layer emits the paired append and that the
   prior decomposed mask/index/scatter kernel cluster is gone.
 
@@ -272,9 +276,11 @@ control.
 
 - [x] Extend GPT-OSS `ShapeFamily` with batch capacity, query capacity,
   logical-page capacity, physical-page count, and parallel config.
-- [x] Compile the first A40 batch buckets `1,2,4,8,16,32`, decode query size 1,
-  and prefill query buckets `16,64,128,256` from one validated
-  `ServerProfile`.
+- [x] Compile the parity A40 batch buckets `1,2,4,8`, decode query size 1, and
+  prefill query buckets `16,128,256` from one validated `ServerProfile`,
+  reducing the serving family count from 30 to 16.
+- [ ] After generic B1 recovers at least 150 end-to-end tokens/s, expand the
+  same family mechanism to the production B/Q envelope.
 - [x] Log and report the exact family count/compile time; reject duplicate or
   combinatorially unbounded profile input.
 - [ ] Continue compiling all families before parameter residency and warm each
@@ -342,7 +348,7 @@ control.
 - [x] Queue the next embedding and five layer pairs immediately after the head
   submission, overlapping the compact result download and host token handling
   with useful GPU work.
-- [x] Continue stable B1-B32 batches without scheduler re-entry until a command,
+- [x] Continue every retained stable batch without scheduler re-entry until a command,
   cancellation, deadline, shutdown, backpressure, terminal row, page-table
   change, or membership change requires a visible-token-boundary replan.
 - [x] Reuse process-lifetime compiled family bindings and one compact
@@ -366,8 +372,8 @@ control.
 - [ ] Add a hermetic load client target supporting fixed concurrency,
   fixed arrival rate, streaming/non-streaming, deterministic disconnect, and
   prompt/output mixes.
-- [ ] Publish one immutable image and run five warm A40 repetitions for
-  `128/128`, `1K/128`, and `4K/256` at concurrency `1,2,4,8,16,32`.
+- [ ] Publish one immutable parity image and run warm A40 repetitions for
+  `128/128`, `1K/128`, and `4K/256` at concurrency `1,2,4,8`.
 - [ ] Report TTFT, TPOT, end-to-end latency, request/prompt/output throughput,
   queue time, batch histogram, GPU busy time, and page utilization.
 - [ ] Promote only if concurrency-8 aggregate output throughput is at least

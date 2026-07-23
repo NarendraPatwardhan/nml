@@ -106,11 +106,17 @@ impl KernelSpec {
                         element,
                         address_space: 1,
                     } if element == tensor.dtype
+                        // XLA materializes StableHLO `pred` buffers as one
+                        // byte per element. TTIR must therefore address a Bool
+                        // tensor through an I8 storage pointer; an I1 pointer
+                        // makes LLVM attempt an invalid `i8 -> <1 x i1>`
+                        // bitcast during Triton lowering.
+                        || (tensor.dtype == DType::I1 && element == DType::I8)
                 )
             })
         {
             return Err(Error::InvalidKernelSpec(
-                "authored TTIR arguments must be global pointers matching the custom-call tensor ABI",
+                "authored TTIR arguments must be compatible global storage pointers for the custom-call tensor ABI",
             ));
         }
 

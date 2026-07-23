@@ -356,8 +356,12 @@ impl ServerProfile {
                 max_prompt_tokens: prefill_capacity,
                 max_sequence_tokens: cache_capacity,
             }],
-            batch_buckets: vec![1, 2, 4, 8, 16, 32],
-            prefill_query_buckets: vec![16, 64, 128, 256],
+            // Keep the parity profile deliberately small until the generic
+            // serving lane recovers the accepted B1 A40 control. B8 still
+            // exercises real continuous batching; Q128 covers the 106-token
+            // control and Q256 retains bounded chunked prefill.
+            batch_buckets: vec![1, 2, 4, 8],
+            prefill_query_buckets: vec![16, 128, 256],
             max_model_length: cache_capacity,
             max_batched_tokens: 4_096,
             max_prefill_chunk: 256,
@@ -796,13 +800,13 @@ mod tests {
         let limits = ServerLimits::default();
         let mut profile = ServerProfile::a40(4_096, 8_192);
         profile.batch_buckets.extend([8, 1]);
-        profile.prefill_query_buckets.extend([64, 16]);
+        profile.prefill_query_buckets.extend([128, 16]);
         profile
             .compilation_families
             .push(profile.compilation_families[0]);
         profile.validate(&limits).unwrap();
-        assert_eq!(profile.batch_buckets, [1, 2, 4, 8, 16, 32]);
-        assert_eq!(profile.prefill_query_buckets, [16, 64, 128, 256]);
+        assert_eq!(profile.batch_buckets, [1, 2, 4, 8]);
+        assert_eq!(profile.prefill_query_buckets, [16, 128, 256]);
         assert_eq!(profile.compilation_families.len(), 1);
 
         for degree in [1, 2, 4] {

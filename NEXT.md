@@ -131,7 +131,7 @@ The current implementation now provides:
 - one global paged K/V arena with arbitrary page-aware reads/writes,
   reservations, rollback, reclamation, and exact host accounting;
 - continuous decode-first batching with chunked prefill, dynamic row repacking,
-  finite `B={1,2,4,8,16,32}`/`Q={16,64,128,256}` families, per-row sampling, and
+  provisional `B={1,2,4,8}`/`Q={16,128,256}` families, per-row sampling, and
   inactive-row preservation;
 - mask-aware routed MoE that excludes inactive prompt positions and batch rows
   from the expert assignment schedule;
@@ -242,10 +242,22 @@ padding in dense QKV/projection operations.
 BuildBuddy contracts prove the portable semantics, Triton construction,
 serving graph aliasing, scheduler selection, and complete CUDA build. They are
 not runtime evidence. The immediate promotion gate is an immutable A40 run
-covering the 106+320 C1 end-to-end control and the full B1-B32 concurrency
+covering the 106+320 C1 end-to-end control and the provisional B1-B8 concurrency
 matrix. Nsight must confirm the compact append, masked expert work, zero steady
 H2D contract, and removal of the recurring orchestration hole. No later
 roadmap capability may be credited toward this gate.
+
+The first image containing the paired append, digest
+`sha256:5dda558dd3c016cff514f4c72726648b6f383a0e582bc9ebe0dfe9475541b211`,
+failed readiness before executing a request. Its A40 log identified an invalid
+LLVM `i8 -> <1 x i1>` bitcast for the append's Bool mask pointers. XLA stores
+StableHLO predicates as one byte per element at a Triton custom-call boundary;
+the TTIR ABI incorrectly declared I1 storage pointers. The kernel now declares
+I8 storage pointers, converts loaded 0/1 bytes to register predicates, and the
+typed custom-call boundary explicitly permits this Bool-storage ABI. This adds
+no mask-conversion graph or CUDA launch. BuildBuddy Triton, IR, serve, and full
+CUDA construction gates pass; a replacement A40 image remains the runtime
+proof.
 
 ## 4. External reference facts and what they do not prove
 
@@ -735,16 +747,20 @@ Extend `ShapeFamily` into a serving family containing:
 - process-wide physical-page count; and
 - tensor-parallel configuration.
 
-First A40 family set:
+Parity A40 family set:
 
-- batch capacities: `1, 2, 4, 8, 16, 32`;
+- batch capacities: `1, 2, 4, 8`;
 - decode query capacity: `1`;
-- prefill query capacities: `16, 64, 128, 256`;
+- prefill query capacities: `16, 128, 256`;
 - one operator-selected maximum model length/page-table width; and
 - one exact physical-page count derived at startup.
 
-The family count is therefore bounded, auditable, and logged. Do not compile a
-batch x every prompt bucket x every sequence-length bucket cross-product.
+This reduces serving compilation from 30 to 16 families while retaining the
+106-token Q128 control, B2-B8 continuous batching, and Q256 chunked prefill.
+After the generic B1 path recovers at least 150 end-to-end tokens/s, expand the
+same family mechanism to the production envelope. The family count remains
+bounded, auditable, and logged; do not compile a batch x every prompt bucket x
+every sequence-length bucket cross-product.
 
 ### 9.2 Batched model shapes
 
@@ -843,7 +859,7 @@ Permanent deterministic contracts:
 Real A40 promotion workload, five warm repetitions per point:
 
 - prompt/output mixes: `128/128`, `1K/128`, and `4K/256`;
-- concurrency: `1, 2, 4, 8, 16, 32`;
+- parity concurrency: `1, 2, 4, 8`;
 - report request throughput, prompt tokens/s, output tokens/s, TTFT, TPOT,
   end-to-end latency, batch-size histogram, GPU busy time, queue time, and page
   utilization;

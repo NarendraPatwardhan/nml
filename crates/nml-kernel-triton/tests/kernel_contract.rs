@@ -82,7 +82,8 @@ fn paired_paged_cache_append_resolves_pages_once_and_writes_kv() {
         .unwrap();
     assert_eq!(signature.matches("!tt.ptr<bf16>").count(), 6, "{signature}");
     assert_eq!(signature.matches("!tt.ptr<i32>").count(), 3, "{signature}");
-    assert_eq!(signature.matches("!tt.ptr<i1>").count(), 2, "{signature}");
+    assert_eq!(signature.matches("!tt.ptr<i8>").count(), 2, "{signature}");
+    assert_eq!(signature.matches("!tt.ptr<i1>").count(), 0, "{signature}");
 }
 
 #[test]

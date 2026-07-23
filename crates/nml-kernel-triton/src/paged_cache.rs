@@ -59,8 +59,10 @@ pub fn build_paged_cache_append(config: PagedCacheAppendConfig) -> Result<Kernel
     let block_tables = pointer(&mut builder, "block_tables", DType::I32)?;
     let start_positions = pointer(&mut builder, "start_positions", DType::I32)?;
     let query_lengths = pointer(&mut builder, "query_lengths", DType::I32)?;
-    let active_rows = pointer(&mut builder, "active_rows", DType::I1)?;
-    let write_mask = pointer(&mut builder, "write_mask", DType::I1)?;
+    // StableHLO Bool is byte-addressed at the XLA custom-call boundary. Read
+    // it as I8 and turn the stored 0/1 byte into a register predicate.
+    let active_rows = pointer(&mut builder, "active_rows", DType::I8)?;
+    let write_mask = pointer(&mut builder, "write_mask", DType::I8)?;
     let key_output = pointer(&mut builder, "key_output", config.dtype)?;
     let value_output = pointer(&mut builder, "value_output", config.dtype)?;
 
@@ -72,11 +74,14 @@ pub fn build_paged_cache_append(config: PagedCacheAppendConfig) -> Result<Kernel
 
     let active_address = builder.add_pointer(&active_rows, &batch_row)?;
     let active = builder.load(&active_address)?;
+    let zero_i8 = builder.integer(0, DType::I8)?;
+    let active = builder.compare(Comparison::Greater, &active, &zero_i8)?;
     let length_address = builder.add_pointer(&query_lengths, &batch_row)?;
     let query_length = builder.load(&length_address)?;
     let within_query = builder.compare(Comparison::Less, &query_offset, &query_length)?;
     let write_address = builder.add_pointer(&write_mask, &row)?;
     let write = builder.load(&write_address)?;
+    let write = builder.compare(Comparison::Greater, &write, &zero_i8)?;
     let enabled = builder.bit_and(&active, &within_query)?;
     let enabled = builder.bit_and(&enabled, &write)?;
 
